@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Product Inspection</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      * { -webkit-tap-highlight-color: transparent; }
+      body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      @media print { body * { visibility: hidden; } #print-area, #print-area * { visibility: visible; } }
+    </style>
+  </head>
+  <body class="bg-slate-100 min-h-screen">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
