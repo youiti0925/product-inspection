@@ -158,6 +158,7 @@ const FONT_SIZE_AREAS = [
   { key: 'header', label: 'ヘッダー・タブ', default: 100, min: 70, max: 160, desc: '上部ナビゲーション・タブ' },
   { key: 'dashboard', label: 'ダッシュボード', default: 100, min: 70, max: 160, desc: 'カード・マップ・ゾーン表示' },
   { key: 'execution', label: '作業実行画面', default: 100, min: 70, max: 160, desc: '作業モーダル・ボタン・タイマー' },
+  { key: 'measurement', label: '測定画面 (最大化)', default: 100, min: 70, max: 200, desc: '測定値入力・計算結果 (最大化時)' },
   { key: 'tables', label: 'テーブル・リスト', default: 100, min: 70, max: 160, desc: '検査リスト・完了履歴・分析' },
   { key: 'settings', label: '設定画面', default: 100, min: 70, max: 160, desc: 'マスタ設定・テンプレート編集' },
 ];
@@ -182,6 +183,11 @@ const applyFontSizes = (fontSizes = {}) => {
   const execScale = (fontSizes.execution || 100) / 100;
   if (execScale !== 1) {
     rules.push(`[data-fs="execution"] { zoom: ${execScale}; width: ${100 / execScale}vw; height: ${100 / execScale}vh; left: 0; top: 0; transform-origin: top left; }`);
+  }
+  // measurement: 測定モーダル専用 (最大化時の文字サイズ)
+  const measScale = (fontSizes.measurement || 100) / 100;
+  if (measScale !== 1) {
+    rules.push(`[data-fs="measurement"] { zoom: ${measScale}; width: ${100 / measScale}vw; height: ${100 / measScale}vh; left: 0; top: 0; transform-origin: top left; }`);
   }
   styleEl.textContent = rules.join('\n');
 };
@@ -2736,7 +2742,7 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
           const isFilled = isCombobox ? (val !== '' && val != null) : (val !== '' && val != null && !isNaN(Number(val)));
           return (
             <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)', zIndex: isActive ? 20 : 10 }}>
-              <span className={`${splitLayout ? 'text-[10px]' : 'text-[9px]'} font-bold text-slate-500 mb-0.5 bg-white/80 px-1 rounded whitespace-nowrap`}>{inp.label}</span>
+              <span className={`${splitLayout ? 'text-sm' : 'text-[9px]'} font-bold text-slate-500 mb-0.5 bg-white/85 px-1.5 rounded whitespace-nowrap`}>{inp.label}</span>
               {isCombobox ? (
                 <div className="flex flex-col items-center gap-0.5">
                   <select
@@ -2745,7 +2751,7 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
                     onChange={e => handleInputChange(inp.id, e.target.value)}
                     onFocus={() => setActiveInputIdx(idx)}
                     onKeyDown={e => handleKeyDown(e, idx)}
-                    className={`${splitLayout ? 'w-20 h-7 text-xs' : 'w-16 h-6 text-[11px]'} text-center font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
+                    className={`${splitLayout ? 'w-28 h-12 text-base' : 'w-16 h-6 text-[11px]'} text-center font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
                   >
                     <option value="">--</option>
                     {comboValues.map((pv, pi) => <option key={pi} value={pv}>{pv}</option>)}
@@ -2756,7 +2762,7 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
                     onChange={e => handleInputChange(inp.id, e.target.value)}
                     onFocus={() => setActiveInputIdx(idx)}
                     placeholder="直接"
-                    className={`${splitLayout ? 'w-20 h-7' : 'w-20 h-7'} text-center text-[11px] font-mono rounded border-2 shadow-sm outline-none ${isActive ? 'border-blue-300 bg-white' : 'border-slate-200 bg-slate-50'}`}
+                    className={`${splitLayout ? 'w-28 h-9 text-sm' : 'w-20 h-7 text-[11px]'} text-center font-mono rounded border-2 shadow-sm outline-none ${isActive ? 'border-blue-300 bg-white' : 'border-slate-200 bg-slate-50'}`}
                   />
                 </div>
               ) : (
@@ -2770,11 +2776,11 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
                   onChange={e => handleInputChange(inp.id, e.target.value)}
                   onFocus={() => setActiveInputIdx(idx)}
                   onKeyDown={e => handleKeyDown(e, idx)}
-                  className={`${splitLayout ? 'w-24 h-11 text-base' : 'w-20 h-10 text-sm'} min-h-[44px] text-center font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
+                  className={`${splitLayout ? 'w-36 h-14 text-2xl' : 'w-20 h-10 text-sm'} min-h-[44px] text-center font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
                 />
               )}
-              {pastStats && (
-                <span className="text-[10px] text-slate-600 mt-0.5 whitespace-nowrap bg-white/90 px-1 rounded font-medium">
+              {pastStats && isActive && (
+                <span className={`${splitLayout ? 'text-xs' : 'text-[10px]'} text-slate-600 mt-1 whitespace-nowrap bg-white/95 px-1.5 py-0.5 rounded font-medium shadow-sm ring-1 ring-blue-100`}>
                   前:{pastStats.last?.toFixed(3)} 平均:{pastStats.avg?.toFixed(3)}
                 </span>
               )}
@@ -2824,11 +2830,11 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
       </div>{/* end left (測定パネル+音声入力) */}
 
       {/* 計算結果エリア: splitLayout 時は右サイドバー (2割幅)、それ以外は下に配置 */}
-      <div className={splitLayout ? 'flex-1 flex flex-col gap-1 overflow-y-auto min-w-[180px] max-w-[280px]' : 'mt-2 space-y-1'}>
-        {splitLayout && <div className="text-[10px] font-bold text-slate-500 px-1">計算結果</div>}
+      <div className={splitLayout ? 'flex-1 flex flex-col gap-2 overflow-y-auto min-w-[240px] max-w-[360px]' : 'mt-2 space-y-1'}>
+        {splitLayout && <div className="text-sm font-bold text-slate-600 px-1">計算結果</div>}
         {calcResults.map((cr, crIdx) => (
           <div key={cr.id || crIdx} className={splitLayout
-            ? `bg-white rounded-lg border ${cr.isOk === false ? 'border-rose-300' : cr.isOk === true ? 'border-emerald-300' : 'border-slate-200'} px-2 py-1.5 shadow-sm`
+            ? `bg-white rounded-lg border-2 ${cr.isOk === false ? 'border-rose-400' : cr.isOk === true ? 'border-emerald-400' : 'border-slate-200'} px-3 py-2 shadow-sm`
             : 'bg-white rounded-lg border border-slate-200 px-2 py-1 shadow-sm flex items-center justify-between gap-2'
           }>
             {(() => {
@@ -2847,19 +2853,19 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
               }
               return splitLayout ? (
                 <>
-                  <div className="flex items-center justify-between gap-1 mb-0.5">
-                    <span className="text-[10px] font-bold text-slate-700 truncate">{cr.label}</span>
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-sm font-bold text-slate-700 truncate">{cr.label}</span>
                     {cr.result !== null && cr.isOk !== null && (
-                      <span className={`px-1.5 py-0 rounded text-[9px] font-black shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                      <span className={`px-2 py-0.5 rounded text-sm font-black shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
                         {cr.isOk ? 'OK' : 'NG'}
                       </span>
                     )}
                   </div>
-                  <div className="flex items-baseline gap-0.5">
-                    <span className="text-lg font-mono font-black text-slate-800">{cr.result !== null ? cr.result.toFixed(cr.precision ?? 4) : '---'}</span>
-                    <span className="text-[9px] text-slate-500">{cr.unit}</span>
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-3xl font-mono font-black text-slate-800">{cr.result !== null ? cr.result.toFixed(cr.precision ?? 4) : '---'}</span>
+                    <span className="text-sm text-slate-500">{cr.unit}</span>
                   </div>
-                  <div className="text-[8px] text-slate-400 mt-0.5">{rangeText}</div>
+                  <div className="text-xs text-slate-500 mt-1 font-medium">{rangeText}</div>
                 </>
               ) : (
                 <>
@@ -4651,7 +4657,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           if (!activeStep || activeStep.type !== 'measurement' || !activeStep.measurementConfig) return null;
           const activeUnitIdx = displayUnitIdx;
           return (
-            <div className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
+            <div data-fs="measurement" className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
               <div className="bg-slate-800 text-white p-3 flex justify-between items-center shrink-0">
                 <div className="flex items-center gap-3">
                   <Ruler className="w-5 h-5 text-teal-400"/>
@@ -4907,7 +4913,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
         if (!activeStep || activeStep.type !== 'measurement' || !activeStep.measurementConfig) return null;
         const activeUnitIdx = executionType === 'sequential' ? 0 : displayUnitIdx;
         return (
-          <div className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
+          <div data-fs="measurement" className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
             <div className="bg-slate-800 text-white p-3 flex justify-between items-center shrink-0">
               <div className="flex items-center gap-3">
                 <Ruler className="w-5 h-5 text-teal-400"/>
