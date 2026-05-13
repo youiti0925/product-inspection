@@ -2134,6 +2134,18 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                       next.calculations = preset.calculations.map(c => ({ ...c }));
                     }
                   }
+                  // arrows もプリセットに登録されていれば引き継ぐ (登録時に sourceA/sourceB の入力ID存在もチェック)
+                  if (preset.arrows && preset.arrows.length > 0) {
+                    const existingArrows = measurementConfig.arrows || [];
+                    const hasExistingArrows = existingArrows.length > 0;
+                    if (hasExistingArrows) {
+                      if (confirm('既存の矢印比較設定があります。プリセットの矢印で上書きしますか？\n（OK=上書き、キャンセル=既存を保持）')) {
+                        next.arrows = preset.arrows.map(a => ({ ...a }));
+                      }
+                    } else {
+                      next.arrows = preset.arrows.map(a => ({ ...a }));
+                    }
+                  }
                   if (preset.diagramImage) next.diagramImage = preset.diagramImage;
                   setMeasurementConfig(next);
                 }
