@@ -17,21 +17,77 @@ import {
   Bot, Zap, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool,
   Bell, BellRing, Megaphone, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
   ListChecks, ArrowUpDown, Calculator, Ruler, MicOff, Printer, Coffee, ChevronDown,
-  Wrench, RotateCcw, XCircle
+  Wrench, RotateCcw, XCircle, Pause, Minimize2
 } from 'lucide-react';
 
 // --- Firebase Imports (SDK v9) ---
 import { initializeApp } from "firebase/app";
-import { 
-  getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, 
-  serverTimestamp 
+import {
+  getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot,
+  serverTimestamp, query, orderBy, limit, where, getDocs, updateDoc,
+  initializeFirestore, persistentLocalCache, persistentMultipleTabManager
 } from "firebase/firestore";
+import {
+  getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject
+} from "firebase/storage";
+
+// 切り出した測定機能ヘルパー (純粋関数)
+import {
+  evaluateFormula, evalArith, BLOCK_GAUGE_PRESETS, CALCULATION_METHODS,
+  MAX_CALCULATIONS, groupKeyFor
+} from './measurement-utils';
 import { 
   getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken 
 } from "firebase/auth";
 
-import ExcelJS from 'exceljs';
-import JSZip from 'jszip';
+// 画像を Cloud Storage にアップロードして URL を返す。失敗時は base64 のまま返す (フォールバック)
+// 既存データ (base64 直保存) と互換: <img src={...}> は URL/base64 両方扱える
+let _storageInstance = null;
+const getStorageInstance = () => {
+  if (_storageInstance) return _storageInstance;
+  try {
+    _storageInstance = getStorage();
+  } catch (e) {
+    console.warn('Storage init failed', e);
+  }
+  return _storageInstance;
+};
+
+const uploadImageToStorage = async (base64DataUrl, pathHint = 'images') => {
+  // 100KB 未満なら base64 維持（小さい画像は Storage より直保存の方が早い）
+  if (!base64DataUrl || typeof base64DataUrl !== 'string') return base64DataUrl;
+  if (!base64DataUrl.startsWith('data:')) return base64DataUrl; // 既に URL
+  const sizeKB = base64DataUrl.length / 1024;
+  if (sizeKB < 100) return base64DataUrl;
+  try {
+    const storage = getStorageInstance();
+    if (!storage) return base64DataUrl;
+    const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}.jpg`;
+    const ref = storageRef(storage, `artifacts/product-inspection-v1/${pathHint}/${fileId}`);
+    await uploadString(ref, base64DataUrl, 'data_url');
+    const url = await getDownloadURL(ref);
+    return url;
+  } catch (e) {
+    console.warn('Image upload failed, falling back to base64', e);
+    return base64DataUrl;
+  }
+};
+
+// ExcelJS / JSZip は動的 import で初回バンドルから除外 (各 ~1MB / ~100KB)
+let _ExcelJS = null;
+const loadExcelJS = async () => {
+  if (_ExcelJS) return _ExcelJS;
+  const mod = await import('exceljs');
+  _ExcelJS = mod.default || mod;
+  return _ExcelJS;
+};
+let _JSZip = null;
+const loadJSZip = async () => {
+  if (_JSZip) return _JSZip;
+  const mod = await import('jszip');
+  _JSZip = mod.default || mod;
+  return _JSZip;
+};
 
 // --- Global Constants & Config ---
 // 修正: IDを固定化して、どの端末からでも同じデータを参照できるようにする
@@ -131,13 +187,25 @@ const applyFontSizes = (fontSizes = {}) => {
 };
 
 // --- Utilities ---
-const generateId = () => Math.random().toString(36).substr(2, 9);
-const formatTime = (sec) => { 
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60); 
-  const s = Math.floor(sec % 60); 
+// 衝突防止: crypto.randomUUID 利用可能ならそれを使う、なければ Math.random.
+// substr は deprecated なので slice を使用
+const generateId = () => {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+    }
+  } catch {}
+  return Math.random().toString(36).slice(2, 11) + Math.random().toString(36).slice(2, 5);
+};
+const formatTime = (sec) => {
+  // NaN/undefined/null/負数 を安全にハンドル (旧データ修復時の表示崩れ防止)
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) return '0:00';
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = Math.floor(n % 60);
   if (h > 0) return `${h}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
-  return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`; 
+  return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
 };
 const toDatetimeLocal = (timestamp) => {
   const d = new Date(timestamp);
@@ -159,30 +227,83 @@ const calculateLotEstimatedTime = (lot) => {
   return perUnitTime * (lot.quantity || 1);
 };
 
-// --- Measurement Utilities ---
-const evaluateFormula = (formula, values) => {
-  if (!formula) return null;
-  try {
-    let expr = formula;
-    const vars = Object.keys(values).sort((a, b) => b.length - a.length);
-    for (const v of vars) {
-      const val = Number(values[v]);
-      if (isNaN(val)) return null;
-      expr = expr.replace(new RegExp(v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), val.toString());
+// === 進捗・ETA・遅延の計算ヘルパー ===
+// ロットの進捗状況を一元計算 (LotCard / ProgressOverview / 遅延アラート 共通利用)
+const computeLotProgress = (lot) => {
+  if (!lot || !lot.steps || lot.steps.length === 0) return null;
+
+  const totalTasks = lot.steps.length * (lot.quantity || 1);
+  let completedCount = 0;
+  let totalCompletedDuration = 0;
+  const tasks = lot.tasks || {};
+
+  lot.steps.forEach((step, sIdx) => {
+    for (let u = 0; u < (lot.quantity || 1); u++) {
+      const t = (step.id && tasks[`${step.id}-${u}`]) || tasks[`${sIdx}-${u}`];
+      if (t && (t.status === 'completed' || t.status === 'skipped')) {
+        completedCount++;
+        totalCompletedDuration += (t.duration || 0);
+      }
     }
-    if (!/^[\d\s+\-*/().]+$/.test(expr)) return null;
-    return new Function('return ' + expr)();
-  } catch { return null; }
+  });
+
+  const progressPct = totalTasks > 0 ? Math.round((completedCount / totalTasks) * 100) : 0;
+  const remainingTasks = totalTasks - completedCount;
+
+  // 平均タスク時間 (完了済みタスクから算出、なければ targetTime ベース)
+  let avgTaskTime;
+  if (completedCount > 0) {
+    avgTaskTime = totalCompletedDuration / completedCount;
+  } else {
+    const targetSum = lot.steps.reduce((s, st) => s + (st.targetTime || 60), 0);
+    avgTaskTime = targetSum / lot.steps.length;
+  }
+
+  // 開始時刻 (Firestore Timestamp / number / undefined どれでも対応)
+  const toMs = (v) => { if (!v) return 0; if (typeof v === 'number') return v; if (v.seconds) return v.seconds * 1000; if (v.toMillis) return v.toMillis(); const t = new Date(v).getTime(); return isNaN(t) ? 0 : t; };
+  const startMs = toMs(lot.workStartTime) || toMs(lot.entryAt) || toMs(lot.createdAt);
+
+  // 予測完了時刻 (ETA)
+  const remainingSec = remainingTasks * avgTaskTime;
+  const etaMs = Date.now() + remainingSec * 1000;
+
+  // 標準予定時刻 (targetTime ベースで純粋に算出された理想完了時刻)
+  const standardDurationSec = lot.steps.reduce((s, st) => s + (st.targetTime || 60), 0) * (lot.quantity || 1);
+  const standardEtaMs = startMs ? startMs + standardDurationSec * 1000 : etaMs;
+
+  // 遅延判定: ETA が標準予定より 30分以上後なら warning, 1時間以上後なら critical
+  const delayMs = etaMs - standardEtaMs;
+  let delayLevel = 'ontime';
+  if (delayMs > 60 * 60 * 1000) delayLevel = 'critical';
+  else if (delayMs > 30 * 60 * 1000) delayLevel = 'warning';
+  else if (delayMs < -10 * 60 * 1000) delayLevel = 'ahead';
+
+  // 完了済みなら ETA は完了時刻、遅延なし
+  const isCompleted = lot.status === 'completed' || lot.location === 'completed';
+  if (isCompleted) {
+    delayLevel = 'completed';
+  }
+
+  return {
+    totalTasks, completedCount, progressPct, remainingTasks,
+    avgTaskTime, startMs, etaMs, standardEtaMs, delayMs, delayLevel,
+    isCompleted, isProcessing: lot.status === 'processing',
+  };
 };
 
-// --- Block Gauge Preset Values ---
-const BLOCK_GAUGE_PRESETS = [
-  1.0, 1.001, 1.002, 1.003, 1.004, 1.005, 1.006, 1.007, 1.008, 1.009,
-  1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09,
-  1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
-  2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
-  20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0
-];
+// 時刻を HH:MM 形式で
+const formatHHMM = (ms) => {
+  if (!ms) return '--:--';
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+};
+
+// --- Measurement Utilities ---
+// 数式評価 (セキュリティ強化版)
+// - 変数 ID は英数字・アンダースコアのみ許可
+// - 置換後の式は許可文字 + e/E (指数表記) のみ
+// - new Function は使わず、自前 RPN 評価でサンドボックス化
+// (evaluateFormula, evalArith, BLOCK_GAUGE_PRESETS は ./measurement-utils.js に移動)
 
 const calculateMeasurementResult = (values, config) => {
   const entries = config.inputs.map(inp => ({ id: inp.id, val: Number(values[inp.id]) })).filter(e => !isNaN(e.val) && values[e.id] !== '' && values[e.id] != null);
@@ -208,24 +329,50 @@ const calculateMeasurementResult = (values, config) => {
 };
 
 const calculateSingleResult = (values, relevantInputs, calc) => {
+  // 入力ID + 「前の計算結果のID」両方を受け取れるように
+  // values オブジェクトには通常入力に加えて、計算済みの calcId → result も入っている前提
   const entries = relevantInputs.map(inp => ({ id: inp.id, val: Number(values[inp.id]) })).filter(e => !isNaN(e.val) && values[e.id] !== '' && values[e.id] != null);
+  if (calc.method === 'formula') {
+    // 数式は relevantInputs に依存しない (values に全てが入っているため)
+    return evaluateFormula(calc.formula, values);
+  }
   if (entries.length === 0) return null;
   const nums = entries.map(e => e.val);
   switch (calc.method) {
     case 'max-min': return Math.max(...nums) - Math.min(...nums);
     case 'sum': return nums.reduce((a, b) => a + b, 0);
     case 'average': return nums.reduce((a, b) => a + b, 0) / nums.length;
-    case 'formula': return evaluateFormula(calc.formula, values);
+    case 'abs-max': return Math.max(...nums.map(n => Math.abs(n)));
+    case 'diff': {
+      // 2点間の差: 入力 ID 順で最初と最後の差
+      if (nums.length < 2) return null;
+      return nums[0] - nums[nums.length - 1];
+    }
     case 'group-max-min': {
+      // 各グループ内の最大-最小 → さらに最大
       const groups = {};
       entries.forEach(e => {
         const inp = relevantInputs.find(i => i.id === e.id);
-        const groupKey = inp?.group || e.id.replace(/[0-9]/g, '');
-        if (!groups[groupKey]) groups[groupKey] = [];
-        groups[groupKey].push(e.val);
+        const key = groupKeyFor(inp || { id: e.id });
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(e.val);
       });
       const groupMaxMins = Object.values(groups).map(g => Math.max(...g) - Math.min(...g));
       return Math.max(...groupMaxMins);
+    }
+    case 'rows-diff': {
+      // 通りの差: 各グループの平均値同士の差 (グループ平均 max - グループ平均 min)
+      // 例: A グループ平均 50.02, B グループ平均 50.05 → 0.03
+      const groups = {};
+      entries.forEach(e => {
+        const inp = relevantInputs.find(i => i.id === e.id);
+        const key = groupKeyFor(inp || { id: e.id });
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(e.val);
+      });
+      const groupAvgs = Object.values(groups).map(g => g.reduce((a, b) => a + b, 0) / g.length);
+      if (groupAvgs.length < 2) return null; // グループが1つしかない場合は計算不可
+      return Math.max(...groupAvgs) - Math.min(...groupAvgs);
     }
     default: return null;
   }
@@ -378,7 +525,7 @@ const DEFAULT_VOICE_COMMANDS = [
   { id: 'yes', label: 'はい（確認）', keywords: 'はい,うん,OK,オーケー,そう,イエス,yes', description: '確認・肯定の応答' },
   { id: 'no', label: 'いいえ（否定）', keywords: 'いいえ,いや,ダメ,違う,ノー,no', description: '否定の応答' },
   { id: 'complete', label: '完了', keywords: '完了,かんりょう,終わり,おわり,done', description: '現在の作業を完了' },
-  { id: 'interrupt', label: '中断・不具合', keywords: '中断,ちゅうだん,止め,やめ,ストップ,stop', description: '不具合報告を開く' },
+  { id: 'interrupt', label: '中断（一時停止）', keywords: '中断,ちゅうだん,止め,やめ,ストップ,stop', description: '作業時間の計測を一時停止/再開' },
   { id: 'next', label: '次へ', keywords: '次,つぎ,next', description: '次の工程/台に進む' },
   { id: 'measurement', label: '測定入力', keywords: '測定入力,測定開始,そくてい', description: '測定の音声入力を開始' },
   { id: 'sequential', label: '通常モード', keywords: '通常,じゅんじょ,順序,ノーマル', description: '通常（順序）モードを選択' },
@@ -411,7 +558,41 @@ const isNextCmd = (text) => { const t = normalizeVoiceText(text); if (/次工程
 const isNextStepCmd = (text) => { const t = normalizeVoiceText(text); return /次工程|次の工程|つぎこうてい|つぎのこうてい/i.test(t); };
 const isCancelCmd = (text) => { const t = normalizeVoiceText(text); return /キャンセル|取り消し|とりけし|cancel/i.test(t); };
 
-const calculateMeasurementResults = (values, config) => {
+// 同ロット内の他工程の測定結果を1つのオブジェクトにまとめる (cross-step 参照用)
+// 戻り値: { [入力ID または 計算ID]: 値 } — 現在の工程と ID 衝突する場合は現工程優先
+// ID 衝突を避けたい場合は `stepタイトル_変数名` の形式でも引けるよう、両方の形式を入れる
+const collectCrossStepValues = (lot, currentStepId) => {
+  if (!lot || !lot.steps || !lot.measurementResults) return {};
+  const out = {};
+  lot.steps.forEach(step => {
+    if (!step || step.id === currentStepId) return; // 現工程は除外
+    const cfg = step.measurementConfig;
+    if (!cfg) return;
+    // この工程の最新の input values (unit 0 を採用)
+    const inputVals = lot.measurementResults[`${step.id}-0-values`]
+      || lot.measurementResults[`${step.id}-values`]
+      || {};
+    // この工程の計算結果
+    const resultData = lot.measurementResults[`${step.id}-0`]
+      || lot.measurementResults[`${step.id}-result`];
+    const calcResults = resultData?.calcResults || [];
+    Object.entries(inputVals).forEach(([k, v]) => {
+      const num = Number(v);
+      if (!Number.isFinite(num)) return;
+      if (out[k] === undefined) out[k] = num; // 衝突時は先勝ち
+    });
+    calcResults.forEach(cr => {
+      if (cr?.id && Number.isFinite(cr.result)) {
+        if (out[cr.id] === undefined) out[cr.id] = cr.result;
+      }
+    });
+  });
+  return out;
+};
+
+// 計算チェーン: 計算は順番に評価され、前の計算結果は後続の計算で変数として使える。
+// extraValues に他工程の計算結果を渡すと、数式参照で利用可能。
+const calculateMeasurementResults = (values, config, extraValues = {}) => {
   const calculations = config.calculations || [{
     id: 'default',
     label: '計算結果',
@@ -423,15 +604,71 @@ const calculateMeasurementResults = (values, config) => {
     unit: config.unit
   }];
 
+  // 累積コンテキスト: 通常入力 + 他工程結果 + 計算済みの値
+  const ctx = { ...extraValues, ...values };
+
   return calculations.map(calc => {
-    const relevantInputs = calc.inputIds?.length > 0
-      ? config.inputs.filter(inp => calc.inputIds.includes(inp.id))
-      : config.inputs;
-    const result = calculateSingleResult(values, relevantInputs, calc);
-    const isOk = result !== null
-      ? result >= (calc.toleranceLower ?? -Infinity) && result <= (calc.toleranceUpper ?? Infinity)
-      : null;
-    return { ...calc, result, isOk };
+    // inputIds に含まれる ID は「通常入力 ID」または「同工程の前の計算 ID」の両方を許可
+    let relevantInputs;
+    if (calc.inputIds?.length > 0) {
+      // 通常入力からマッチするもの
+      const inputMatches = config.inputs.filter(inp => calc.inputIds.includes(inp.id));
+      // 計算 ID からマッチするもの (前に計算済みのみ)
+      const calcMatches = calc.inputIds
+        .filter(id => !config.inputs.some(inp => inp.id === id) && ctx[id] !== undefined)
+        .map(id => ({ id, label: id })); // 仮想入力として扱う
+      relevantInputs = [...inputMatches, ...calcMatches];
+    } else {
+      relevantInputs = config.inputs;
+    }
+    const result = calculateSingleResult(ctx, relevantInputs, calc);
+    // この計算結果を次の計算で参照可能にする
+    if (result !== null && !isNaN(result)) {
+      ctx[calc.id] = result;
+    }
+    // 公差判定:
+    // - toleranceEnabled === false → 判定なし (記録のみ)
+    // - nominal がある場合: 範囲 = nominal + [toleranceLower, toleranceUpper]
+    // - nominal が無い場合: 既存挙動 (公差を絶対値として扱う)
+    const toleranceEnabled = calc.toleranceEnabled !== false; // 未指定 or true で判定ON (後方互換)
+    const nominal = Number.isFinite(Number(calc.nominal)) ? Number(calc.nominal) : 0;
+    let isOk = null;
+    let lowerLimit = null, upperLimit = null;
+    if (result !== null && toleranceEnabled) {
+      lowerLimit = nominal + (calc.toleranceLower ?? -Infinity);
+      upperLimit = nominal + (calc.toleranceUpper ?? Infinity);
+      isOk = result >= lowerLimit && result <= upperLimit;
+    }
+    return { ...calc, result, isOk, nominal, toleranceEnabled, lowerLimit, upperLimit };
+  });
+};
+
+// 矢印比較を評価: 2つの値 (入力 or 計算結果) を比較し、1つの矢印を 1箇所に表示
+// 戻り値: arrows ごとに { pos, dir: 'up'|'down'|'equal'|null, valA, valB, diff, label }
+// pos は { x, y } in % (表示位置)
+const evaluateArrows = (config, values, calcResults, extraValues = {}) => {
+  const arrows = config?.arrows || [];
+  if (arrows.length === 0) return [];
+  // 全ての参照可能な値を統合
+  const calcMap = {};
+  (calcResults || []).forEach(cr => { if (cr?.id) calcMap[cr.id] = cr.result; });
+  const allValues = { ...extraValues, ...values, ...calcMap };
+
+  return arrows.map(arr => {
+    const valA = Number(allValues[arr.sourceA]);
+    const valB = Number(allValues[arr.sourceB]);
+    // 表示位置: 1つ。明示指定があればそれ、なければデフォルト中央
+    const pos = arr.position || { x: 50, y: 50 };
+    if (!Number.isFinite(valA) || !Number.isFinite(valB)) {
+      return { ...arr, pos, valA, valB, dir: null, diff: null };
+    }
+    const threshold = Number(arr.threshold) || 0;
+    const diff = valA - valB;
+    let dir;
+    if (Math.abs(diff) <= threshold) dir = 'equal';
+    else if (diff > 0) dir = 'up';   // A > B → ↗
+    else dir = 'down';                // A < B → ↘
+    return { ...arr, pos, valA, valB, dir, diff };
   });
 };
 
@@ -572,13 +809,7 @@ const MEASUREMENT_LAYOUTS = {
   'custom': { label: 'カスタム', inputs: [] }
 };
 
-const CALCULATION_METHODS = [
-  { value: 'max-min', label: '最大-最小', desc: '入力値の最大と最小の差' },
-  { value: 'sum', label: '合計', desc: '全入力値の合計 (例: ブロックゲージ+ダイヤルゲージ)' },
-  { value: 'average', label: '平均', desc: '入力値の平均' },
-  { value: 'group-max-min', label: 'グループ別最大差', desc: 'グループ(A,B,C,D)内の最大差→最大' },
-  { value: 'formula', label: 'カスタム数式', desc: '自由な計算式 例: (b+c)/2+d/2' }
-];
+// (CALCULATION_METHODS は ./measurement-utils.js に移動)
 
 // --- Mock Data ---
 const DEMO_STEPS = [
@@ -754,9 +985,21 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
       {...touchProps}
       className={`${styleClass} ${borderClass} ${draggedLotId === lot.id ? 'opacity-50' : 'opacity-100'} group`}
     >
-      <div className="absolute top-1 right-1 flex gap-1 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button onClick={(e)=>{e.stopPropagation(); onEdit(lot);}} className="p-1 bg-white rounded border hover:bg-blue-50 text-slate-500"><Pencil className="w-3 h-3"/></button>
-        <button onClick={(e)=>{e.stopPropagation(); onDelete(lot.id);}} className="p-1 bg-white rounded border hover:bg-red-50 text-red-400"><Trash2 className="w-3 h-3"/></button>
+      {/* タブレット対応: hover では消える → 常時 [⋮] メニューで編集/削除アクセス */}
+      <div className="absolute top-1 right-1 flex gap-1 z-20">
+        <details className="relative" onClick={(e) => e.stopPropagation()}>
+          <summary className="p-1 bg-white/90 rounded border hover:bg-blue-50 text-slate-500 cursor-pointer list-none min-w-[24px] min-h-[24px] flex items-center justify-center" title="メニュー">⋮</summary>
+          <div className="absolute right-0 top-full mt-0.5 bg-white rounded-lg shadow-xl border border-slate-200 py-1 w-32 z-30">
+            <button onClick={(e)=>{e.stopPropagation(); onEdit(lot);}} className="w-full px-3 py-2 text-xs font-bold text-slate-700 hover:bg-blue-50 flex items-center gap-2"><Pencil className="w-3.5 h-3.5"/> 編集</button>
+            <button onClick={(e)=>{
+              e.stopPropagation();
+              // 二段階確認: 削除対象を明示
+              const confirmMsg = `以下のロットを削除しますか？\n\n型式: ${lot.model || '-'}\n指図: ${lot.orderNo || '-'}\n台数: ${lot.quantity || 1}台\n\n※ この操作は取り消せません。完了済みデータを残したい場合は履歴タブから個別に削除してください。`;
+              if (!confirm(confirmMsg)) return;
+              onDelete(lot.id);
+            }} className="w-full px-3 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50 flex items-center gap-2 border-t border-slate-100"><Trash2 className="w-3.5 h-3.5"/> 削除</button>
+          </div>
+        </details>
       </div>
 
       <div className="px-1.5 py-1">
@@ -775,6 +1018,28 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
              <span className={`text-xs font-mono ${lot.status === 'processing' ? 'text-blue-600 font-bold' : 'text-slate-400'}`}>{timeDisplay}</span>
           </div>
         )}
+        {/* 進行中・一時停止ロットの 進捗% + 次工程 + ETA + 遅延表示 */}
+        {(lot.status === 'processing' || lot.status === 'paused') && variant !== 'simple' && (() => {
+          const p = computeLotProgress(lot);
+          if (!p) return null;
+          const cls = p.delayLevel === 'critical' ? 'text-rose-700 font-black' : p.delayLevel === 'warning' ? 'text-amber-700 font-bold' : p.delayLevel === 'ahead' ? 'text-emerald-700 font-bold' : 'text-blue-700 font-bold';
+          const label = p.delayLevel === 'critical' ? '⚠️遅延' : p.delayLevel === 'warning' ? '遅れ' : p.delayLevel === 'ahead' ? '前倒し' : '予定通り';
+          // 次工程: 現在進行中の工程 (currentStepIndex)、もしくは未完了の最初の工程
+          const currentStepIdx = lot.currentStepIndex ?? 0;
+          const currentStepTitle = lot.steps?.[currentStepIdx]?.title || '-';
+          return (
+            <div className={`text-[10px] mt-0.5 leading-tight space-y-0.5 ${cls}`}>
+              <div className="flex items-center justify-between">
+                <span className="font-black text-xs">{p.progressPct}%</span>
+                <span className="truncate max-w-[60%]" title={currentStepTitle}>▶ {currentStepTitle}</span>
+              </div>
+              <div className="flex items-center justify-between text-slate-600 font-medium">
+                <span>{formatHHMM(p.startMs)}〜{formatHHMM(p.etaMs)}</span>
+                <span className={cls}>{label}</span>
+              </div>
+            </div>
+          );
+        })()}
         {variant !== 'simple' && (lot.workerId || lot.mapZoneId) && (
           <div className="w-full bg-slate-100 h-1 rounded-full overflow-hidden mt-0.5">
             <div className={`h-full transition-all ${lot.status === 'completed' ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{ width: `${lot.status === 'completed' ? 100 : progress}%` }} />
@@ -1010,6 +1275,149 @@ const IndirectWorkModal = ({ categories, activeIndirect, onStart, onStop, onClos
 };
 
 // --- Daily Summary Modal ---
+// ===========================
+// シフト引継ぎモーダル
+// 終業時に呼び出し、当日の作業サマリー + 引継ぎメモ入力 → ノートとして共有
+// ===========================
+const ShiftHandoverModal = ({ lots, indirectWork, currentUserName, workers, saveData, onClose }) => {
+  const today = new Date();
+  const todayStr = today.toISOString().split('T')[0];
+  const todayMs = today.setHours(0,0,0,0);
+  const [memo, setMemo] = useState('');
+  const myWorkerId = workers.find(w => w.name === currentUserName)?.id;
+
+  // 自分が今日触ったロット
+  const myLots = useMemo(() => {
+    return lots.filter(lot => {
+      // 自分が担当 OR tasks に自分のworkerNameがある
+      if (lot.workerId === myWorkerId) return true;
+      const tasks = Object.values(lot.tasks || {});
+      if (tasks.some(t => t.workerName === currentUserName || t.workerId === myWorkerId)) return true;
+      return false;
+    });
+  }, [lots, myWorkerId, currentUserName]);
+
+  // 完了/進行中/未完了の分類
+  const todayCompleted = myLots.filter(l => {
+    if (!(l.status === 'completed' || l.location === 'completed')) return false;
+    const t = (typeof l.updatedAt === 'number') ? l.updatedAt : (l.updatedAt?.seconds ? l.updatedAt.seconds * 1000 : 0);
+    return t >= todayMs;
+  });
+  const inProgress = myLots.filter(l => l.status === 'processing' || l.status === 'paused');
+  const incomplete = myLots.filter(l => !(l.status === 'completed' || l.location === 'completed') && l.status !== 'processing' && l.status !== 'paused');
+
+  // 自分の今日の合計作業時間
+  const totalMyWork = useMemo(() => {
+    let sec = 0;
+    lots.forEach(lot => {
+      Object.values(lot.tasks || {}).forEach(t => {
+        if (!t || t.status !== 'completed') return;
+        if (t.workerName !== currentUserName && t.workerId !== myWorkerId) return;
+        sec += (t.duration || 0);
+      });
+    });
+    return sec;
+  }, [lots, currentUserName, myWorkerId]);
+
+  const indirectToday = (indirectWork || []).filter(w => {
+    if (w.workerName !== currentUserName) return false;
+    return (w.startTime || 0) >= todayMs;
+  });
+  const indirectSec = indirectToday.reduce((s, w) => s + (w.duration || 0), 0);
+
+  const handleSave = () => {
+    if (!memo.trim() && inProgress.length === 0 && incomplete.length === 0) {
+      if (!confirm('引継ぎ事項が空です。このまま登録しますか？')) return;
+    }
+    // ノートとして共有 (isPersonal: false で全員に見える)
+    const noteId = `handover_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+    const inProgressList = inProgress.map(l => `・${l.model} (${l.orderNo}) ${l.status === 'paused' ? '⏸️一時停止' : '▶️作業中'}`).join('\n');
+    const content = [
+      `📋 ${currentUserName} の引継ぎ (${todayStr})`,
+      `本日の実績: 完了 ${todayCompleted.length}件 / 進行中 ${inProgress.length}件 / 未着手 ${incomplete.length}件`,
+      `合計作業時間: 直接 ${(totalMyWork/3600).toFixed(1)}時間 + 間接 ${(indirectSec/3600).toFixed(1)}時間`,
+      inProgressList ? `\n■ 引継ぎ対象 (進行中・一時停止):\n${inProgressList}` : '',
+      memo.trim() ? `\n■ 引継ぎメモ:\n${memo.trim()}` : '',
+    ].filter(Boolean).join('\n');
+    saveData('notes', noteId, {
+      content,
+      author: currentUserName,
+      isPersonal: false,
+      isHandover: true,
+      handoverDate: todayStr,
+      createdAt: Date.now(),
+    });
+    alert('引継ぎを保存しました。次のシフトの担当者がノートで確認できます。');
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-blue-700 text-white p-4 flex justify-between items-center shrink-0">
+          <h2 className="font-bold flex items-center gap-2 text-lg"><FileText className="w-5 h-5"/> シフト引継ぎ</h2>
+          <button onClick={onClose} className="hover:bg-white/20 rounded p-1"><X className="w-5 h-5"/></button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {/* 本日のサマリー */}
+          <div>
+            <div className="text-xs font-bold text-slate-500 mb-2">本日の実績 ({currentUserName})</div>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
+                <div className="text-[10px] text-emerald-600 font-bold">完了</div>
+                <div className="text-2xl font-black text-emerald-700">{todayCompleted.length}</div>
+              </div>
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-center">
+                <div className="text-[10px] text-blue-600 font-bold">進行中・一時停止</div>
+                <div className="text-2xl font-black text-blue-700">{inProgress.length}</div>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-center">
+                <div className="text-[10px] text-slate-500 font-bold">合計時間</div>
+                <div className="text-2xl font-black text-slate-700 font-mono">{((totalMyWork + indirectSec)/3600).toFixed(1)}h</div>
+              </div>
+            </div>
+          </div>
+
+          {/* 引継ぎ対象 */}
+          {inProgress.length > 0 && (
+            <div>
+              <div className="text-xs font-bold text-slate-500 mb-2">引継ぎ対象 (進行中・一時停止のロット)</div>
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-1">
+                {inProgress.map(l => (
+                  <div key={l.id} className="flex items-center gap-2 text-sm">
+                    {l.status === 'paused' ? <Pause className="w-4 h-4 text-amber-600"/> : <PlayCircle className="w-4 h-4 text-blue-600"/>}
+                    <span className="font-bold">{l.model}</span>
+                    <span className="text-slate-500 text-xs">({l.orderNo})</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${l.status === 'paused' ? 'bg-amber-200 text-amber-800' : 'bg-blue-200 text-blue-800'}`}>
+                      {l.status === 'paused' ? '一時停止' : '作業中'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 引継ぎメモ */}
+          <div>
+            <label className="block text-xs font-bold text-slate-500 mb-1">引継ぎメモ (任意)</label>
+            <textarea
+              value={memo}
+              onChange={e => setMemo(e.target.value)}
+              className="w-full border rounded-lg p-3 h-32 text-sm"
+              placeholder="例: ロット123 の Step3 で気になる点あり、明日確認お願いします"
+            />
+            <p className="text-[10px] text-slate-400 mt-1">保存すると共有ノートに登録され、次のシフトの担当者が「ノート」タブで確認できます。</p>
+          </div>
+        </div>
+        <div className="border-t p-4 flex justify-end gap-2 shrink-0">
+          <button onClick={onClose} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg font-bold">キャンセル</button>
+          <button onClick={handleSave} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-black flex items-center gap-2 shadow-md"><Save className="w-4 h-4"/> 保存して引継ぎ</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, settings, saveData, onClose }) => {
   const today = new Date().toISOString().split('T')[0];
   const [tab, setTab] = useState('daily'); // 'daily' | 'analysis'
@@ -1547,7 +1955,7 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
   );
 };
 
-const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSaveLayouts, comboPresets = [] }) => {
+const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSaveLayouts, comboPresets = [], builtInOverrides = {}, hiddenBuiltIns = [] }) => {
   const [name, setName] = useState(template?.name || '');
   const [steps, setSteps] = useState(template?.steps || []);
   const [title, setTitle] = useState('');
@@ -1619,7 +2027,16 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   };
 
   const saveDrawing = () => { if(canvasRef.current) { const newImg = canvasRef.current.toDataURL('image/jpeg', 0.8); const n = [...images]; n[activeImgIdx] = newImg; setImages(n); } setIsDrawingMode(false); };
-  const handleImageUpload = async (e) => { const file = e.target.files?.[0]; if (file) { const img = await resizeImage(file); setImages(prev => [...prev, img]); setActiveImgIdx(images.length); } };
+  const handleImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const img = await resizeImage(file);
+      // Cloud Storage にアップロードして URL を取得（小さい画像は base64 維持）
+      const finalImg = await uploadImageToStorage(img, 'template-images');
+      setImages(prev => [...prev, finalImg]);
+      setActiveImgIdx(images.length);
+    }
+  };
   const handlePdfUpload = async (e) => { const file = e.target.files?.[0]; if (file) { try { const base64 = await getBase64(file); setPdfData(base64); alert('PDF添付'); } catch { alert('PDFエラー'); } } };
   const toggleListening = () => { const SR = (window).SpeechRecognition || (window).webkitSpeechRecognition; if (!SR) return alert('非対応'); const r = new SR(); r.lang = 'ja-JP'; r.onresult = (e) => setDescription(p => p + e.results[0][0].transcript); r.start(); };
   const addStep = () => { if (!title) return alert('工程名入力'); const newStep = { id: editingStepId || generateId(), title, description, type, targetTime, images, pdfData, ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}) }; if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); } resetInput(); };
@@ -1627,10 +2044,17 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const editStep = (s) => { setEditingStepId(s.id); setTitle(s.title); setDescription(s.description); setType(s.type); setTargetTime(s.targetTime); setImages(s.images || []); setPdfData(s.pdfData || null); setMeasurementConfig(s.measurementConfig || null); };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
   const moveStep = (index, direction) => { const newSteps = [...steps]; if (direction === 'up' && index > 0) { [newSteps[index-1], newSteps[index]] = [newSteps[index], newSteps[index-1]]; } else if (direction === 'down' && index < steps.length-1) { [newSteps[index+1], newSteps[index]] = [newSteps[index], newSteps[index+1]]; } setSteps(newSteps); };
-  const handleSave = () => { 
+  const handleSave = () => {
     if (!name.trim()) return alert('テンプレート名を入力してください');
     if (steps.length === 0) return alert('少なくとも1つの工程を追加してください');
-    onSave({ id: template?.id, name, steps }); 
+    // 1MB 上限警告 (Firestore document サイズ ~ 1MB)
+    try {
+      const approxSize = JSON.stringify(steps).length;
+      if (approxSize > 900_000) {
+        if (!confirm(`このテンプレートのデータ量が ${(approxSize / 1024).toFixed(0)} KB と大きく、保存に失敗するリスクがあります（Firestore 1MB 上限）。\n\n対策: 画像を削減/圧縮してください。\n\nこのまま保存しますか？`)) return;
+      }
+    } catch {}
+    onSave({ id: template?.id, name, steps });
   };
 
   return (
@@ -1656,7 +2080,15 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
         </div>
       )}
       <div className="bg-white p-4 border-b flex justify-between items-center">
-        <div className="flex items-center gap-2 flex-1"><button onClick={onCancel} className="p-2 hover:bg-slate-100 rounded-full"><ArrowRight className="w-5 h-5 rotate-180"/></button><input value={name} onChange={e => setName(e.target.value)} placeholder="テンプレート名" className="text-lg font-bold border-none focus:ring-0 w-full"/></div>
+        <div className="flex items-center gap-2 flex-1"><button onClick={() => {
+          // 未保存変更があれば確認
+          const initName = template?.name || '';
+          const initSteps = JSON.stringify(template?.steps || []);
+          const curSteps = JSON.stringify(steps);
+          const isDirty = (name !== initName) || (curSteps !== initSteps);
+          if (isDirty && !confirm('保存していない変更があります。破棄して戻りますか？')) return;
+          onCancel();
+        }} className="p-2 hover:bg-slate-100 rounded-full" title="戻る"><ArrowRight className="w-5 h-5 rotate-180"/></button><input value={name} onChange={e => setName(e.target.value)} placeholder="テンプレート名" className="text-lg font-bold border-none focus:ring-0 w-full"/></div>
         {/* Fixed: button type explicitly set to button */}
         <button type="button" onClick={handleSave} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-blue-700 z-50 relative"><Save className="w-4 h-4"/> 保存</button>
       </div>
@@ -1674,12 +2106,37 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
               const updateInput = (idx, patch) => { const ni = [...measurementConfig.inputs]; ni[idx] = { ...ni[idx], ...patch }; setMeasurementConfig({ ...measurementConfig, inputs: ni }); };
               const updateCalc = (cIdx, patch) => { const nc = [...mcCalcs]; nc[cIdx] = { ...nc[cIdx], ...patch }; setMeasurementConfig({ ...measurementConfig, calculations: nc }); };
               const removeCalc = (cIdx) => { const nc = mcCalcs.filter((_, i) => i !== cIdx); setMeasurementConfig({ ...measurementConfig, calculations: nc }); };
-              const addCalc = () => { if (mcCalcs.length >= 10) return; const nc = [...mcCalcs, { id: `calc${mcCalcs.length + 1}`, label: `計算${mcCalcs.length + 1}`, method: 'max-min', formula: '', inputIds: [], toleranceUpper: 0.05, toleranceLower: -0.05, unit: 'mm' }]; setMeasurementConfig({ ...measurementConfig, calculations: nc }); };
-              const allLayouts = { ...MEASUREMENT_LAYOUTS, ...Object.fromEntries(Object.entries(customLayouts).map(([k, v]) => [`custom_${k}`, v])) };
+              const addCalc = () => { if (mcCalcs.length >= MAX_CALCULATIONS) return; const nc = [...mcCalcs, { id: `calc${mcCalcs.length + 1}`, label: `計算${mcCalcs.length + 1}`, method: 'max-min', formula: '', inputIds: [], toleranceUpper: 0.05, toleranceLower: -0.05, unit: 'mm' }]; setMeasurementConfig({ ...measurementConfig, calculations: nc }); };
+              // 組み込みプリセットはオーバーライド適用＋非表示除外
+              const effectiveBuiltIns = Object.fromEntries(
+                Object.entries(MEASUREMENT_LAYOUTS)
+                  .filter(([k]) => k === 'custom' || !hiddenBuiltIns.includes(k))
+                  .map(([k, v]) => [k, builtInOverrides[k] || v])
+              );
+              const allLayouts = { ...effectiveBuiltIns, ...Object.fromEntries(Object.entries(customLayouts).map(([k, v]) => [`custom_${k}`, v])) };
               const handleApplyLayout = (lay) => {
                 if (lay === 'custom') { setMeasurementConfig({ ...measurementConfig, layout: lay }); return; }
                 const preset = allLayouts[lay];
-                if (preset) setMeasurementConfig({ ...measurementConfig, layout: lay, inputs: [...preset.inputs.map(inp => ({ ...inp, inputType: inp.inputType || 'number', presetValues: inp.presetValues || [], comboPresetId: inp.comboPresetId || '' }))] });
+                if (preset) {
+                  const next = {
+                    ...measurementConfig,
+                    layout: lay,
+                    inputs: [...preset.inputs.map(inp => ({ ...inp, inputType: inp.inputType || 'number', presetValues: inp.presetValues || [], comboPresetId: inp.comboPresetId || '' }))]
+                  };
+                  // calculations はプリセットに登録されていれば上書き確認
+                  if (preset.calculations && preset.calculations.length > 0) {
+                    const hasExistingCalcs = (mcCalcs.length > 0) && mcCalcs.some(c => c.label || (c.inputIds && c.inputIds.length > 0) || c.formula);
+                    if (hasExistingCalcs) {
+                      if (confirm('既存の計算設定があります。プリセットの計算設定で上書きしますか？\n（OK=上書き、キャンセル=既存を保持）')) {
+                        next.calculations = preset.calculations.map(c => ({ ...c }));
+                      }
+                    } else {
+                      next.calculations = preset.calculations.map(c => ({ ...c }));
+                    }
+                  }
+                  if (preset.diagramImage) next.diagramImage = preset.diagramImage;
+                  setMeasurementConfig(next);
+                }
               };
               const handleSaveAsPreset = () => {
                 const presetName = prompt('プリセット名を入力してください:');
@@ -1717,7 +2174,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                   <div className="flex gap-1">
                     <select value={measurementConfig.layout} onChange={e => handleApplyLayout(e.target.value)} className="flex-1 border rounded p-1.5 text-sm">
                       <optgroup label="組み込みプリセット">
-                        {Object.entries(MEASUREMENT_LAYOUTS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                        {Object.entries(effectiveBuiltIns).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
                       </optgroup>
                       {Object.keys(customLayouts).length > 0 && (
                         <optgroup label="カスタムプリセット">
@@ -1831,7 +2288,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="text-[10px] font-bold text-slate-500">計算設定 ({mcCalcs.length}件)</label>
-                    <button onClick={addCalc} disabled={mcCalcs.length >= 10} className="mt-2 w-full py-2 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"><Plus className="w-4 h-4"/> 計算を追加</button>
+                    <button onClick={addCalc} disabled={mcCalcs.length >= MAX_CALCULATIONS} className="mt-2 w-full py-2 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"><Plus className="w-4 h-4"/> 計算を追加</button>
                   </div>
                   <div className="space-y-2 max-h-64 overflow-y-auto">
                     {mcCalcs.map((calc, cIdx) => (
@@ -1846,12 +2303,88 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                             {CALCULATION_METHODS.map(m => <option key={m.value} value={m.value}>{m.label} - {m.desc}</option>)}
                           </select>
                         </div>
-                        {calc.method === 'formula' && (
-                          <div>
-                            <label className="block text-[10px] text-slate-400">数式 (変数名はID)</label>
-                            <input value={calc.formula || ''} onChange={e => updateCalc(cIdx, { formula: e.target.value })} className="w-full border rounded p-1 text-[11px] font-mono" placeholder="例: (b+c)/2+d/2"/>
-                          </div>
-                        )}
+                        {calc.method === 'formula' && (() => {
+                          // 使える変数を収集
+                          const myInputs = measurementConfig.inputs || [];
+                          const priorCalcs = mcCalcs.slice(0, cIdx);
+                          const otherSteps = (steps || []).filter(s => s.id !== editingStepId && s.measurementConfig && (s.measurementConfig.inputs?.length || s.measurementConfig.calculations?.length));
+                          const insertVar = (id) => {
+                            const cur = calc.formula || '';
+                            // 既存の式末尾が演算子/カッコでなければ + を挟む
+                            const needsOp = cur && !/[+\-*/(\s]$/.test(cur);
+                            updateCalc(cIdx, { formula: cur + (needsOp ? '+' : '') + id });
+                          };
+                          return (
+                            <div>
+                              <label className="block text-[10px] text-slate-400">数式</label>
+                              <input value={calc.formula || ''} onChange={e => updateCalc(cIdx, { formula: e.target.value })} className="w-full border rounded p-1 text-[11px] font-mono" placeholder="例: (b+c)/2+d/2"/>
+                              <details className="mt-1" open>
+                                <summary className="text-[10px] text-blue-600 cursor-pointer font-bold list-none flex items-center gap-1">▶ 使える変数 (タップで数式に挿入)</summary>
+                                <div className="mt-1 space-y-1.5 bg-slate-50 p-2 rounded border max-h-48 overflow-y-auto">
+                                  {/* 現工程の入力 */}
+                                  <div>
+                                    <div className="text-[9px] font-bold text-teal-700 mb-0.5">現工程の入力 ({myInputs.length})</div>
+                                    <div className="flex flex-wrap gap-1">
+                                      {myInputs.map(inp => (
+                                        <button type="button" key={inp.id} onClick={() => insertVar(inp.id)} className="text-[9px] bg-white border border-teal-300 text-teal-700 px-1.5 py-0.5 rounded hover:bg-teal-100 font-mono">
+                                          {inp.id}{inp.label && inp.label !== inp.id ? ` (${inp.label})` : ''}
+                                        </button>
+                                      ))}
+                                      {myInputs.length === 0 && <span className="text-[9px] text-slate-400">なし</span>}
+                                    </div>
+                                  </div>
+                                  {/* 同工程の前の計算 */}
+                                  {priorCalcs.length > 0 && (
+                                    <div>
+                                      <div className="text-[9px] font-bold text-indigo-700 mb-0.5">同工程の前の計算 ({priorCalcs.length})</div>
+                                      <div className="flex flex-wrap gap-1">
+                                        {priorCalcs.map(c => (
+                                          <button type="button" key={c.id} onClick={() => insertVar(c.id)} className="text-[9px] bg-white border border-indigo-300 text-indigo-700 px-1.5 py-0.5 rounded hover:bg-indigo-100 font-mono">
+                                            {c.id}{c.label && c.label !== c.id ? ` (${c.label})` : ''}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {/* 他工程の入力・計算結果 */}
+                                  {otherSteps.length > 0 && (
+                                    <div>
+                                      <div className="text-[9px] font-bold text-amber-700 mb-0.5">他工程の入力・計算結果 (同ロット内)</div>
+                                      <div className="space-y-1">
+                                        {otherSteps.map(s => {
+                                          const ins = s.measurementConfig?.inputs || [];
+                                          const cls = s.measurementConfig?.calculations || [];
+                                          return (
+                                            <div key={s.id} className="bg-white p-1 rounded border border-amber-100">
+                                              <div className="text-[9px] text-amber-700 font-bold">→ {s.title}</div>
+                                              <div className="flex flex-wrap gap-1 mt-0.5">
+                                                {ins.map(inp => (
+                                                  <button type="button" key={inp.id} onClick={() => insertVar(inp.id)} className="text-[9px] bg-amber-50 border border-amber-200 text-amber-700 px-1.5 py-0.5 rounded hover:bg-amber-100 font-mono">
+                                                    {inp.id}
+                                                  </button>
+                                                ))}
+                                                {cls.map(c => (
+                                                  <button type="button" key={c.id} onClick={() => insertVar(c.id)} className="text-[9px] bg-amber-100 border border-amber-400 text-amber-800 px-1.5 py-0.5 rounded hover:bg-amber-200 font-mono font-bold" title="計算結果">
+                                                    Σ {c.id}{c.label ? ` (${c.label})` : ''}
+                                                  </button>
+                                                ))}
+                                              </div>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  )}
+                                  <div className="text-[9px] text-slate-500 pt-1 border-t">
+                                    ・ボタンを押すと数式末尾に追加されます<br/>
+                                    ・直接タイピングでも入力可能<br/>
+                                    ・ID 衝突時は現工程の入力が優先されます
+                                  </div>
+                                </div>
+                              </details>
+                            </div>
+                          );
+                        })()}
                         <div>
                           <label className="block text-[10px] text-slate-400">対象入力 (空=全て)</label>
                           <div className="flex flex-wrap gap-1 mt-0.5">
@@ -1869,15 +2402,156 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                             })}
                           </div>
                         </div>
-                        <div className="grid grid-cols-3 gap-1">
-                          <div><label className="block text-[10px] text-slate-400">上限公差</label><input type="number" step="0.001" value={calc.toleranceUpper} onChange={e => updateCalc(cIdx, { toleranceUpper: Number(e.target.value) })} className="w-full border rounded p-1 text-[11px] text-right"/></div>
-                          <div><label className="block text-[10px] text-slate-400">下限公差</label><input type="number" step="0.001" value={calc.toleranceLower} onChange={e => updateCalc(cIdx, { toleranceLower: Number(e.target.value) })} className="w-full border rounded p-1 text-[11px] text-right"/></div>
-                          <div><label className="block text-[10px] text-slate-400">単位</label><select value={calc.unit} onChange={e => updateCalc(cIdx, { unit: e.target.value })} className="w-full border rounded p-1 text-[11px]"><option value="mm">mm</option><option value="μm">μm</option><option value="°">°</option></select></div>
+                        {/* 公差判定 (ON/OFF + 基準値 + 上限/下限) */}
+                        <div className="space-y-1">
+                          <label className="flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={calc.toleranceEnabled !== false}
+                              onChange={e => updateCalc(cIdx, { toleranceEnabled: e.target.checked })}
+                              className="w-3.5 h-3.5 accent-teal-600"
+                            />
+                            <span className="text-[10px] font-bold text-slate-600">公差判定 (OFFで記録のみ・OK/NG判定なし)</span>
+                          </label>
+                          <div className={`grid grid-cols-4 gap-1 ${calc.toleranceEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
+                            <div>
+                              <label className="block text-[10px] text-slate-400">基準値</label>
+                              <input
+                                type="number"
+                                step="any"
+                                value={calc.nominal ?? ''}
+                                onChange={e => updateCalc(cIdx, { nominal: e.target.value === '' ? null : Number(e.target.value) })}
+                                placeholder="(0)"
+                                className="w-full border rounded p-1 text-[11px] text-right font-mono"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-slate-400">上限公差</label>
+                              <input
+                                type="number"
+                                step="0.001"
+                                value={calc.toleranceUpper}
+                                onChange={e => updateCalc(cIdx, { toleranceUpper: Number(e.target.value) })}
+                                className="w-full border rounded p-1 text-[11px] text-right"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-slate-400">下限公差</label>
+                              <input
+                                type="number"
+                                step="0.001"
+                                value={calc.toleranceLower}
+                                onChange={e => updateCalc(cIdx, { toleranceLower: Number(e.target.value) })}
+                                className="w-full border rounded p-1 text-[11px] text-right"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-slate-400">単位</label>
+                              <select value={calc.unit} onChange={e => updateCalc(cIdx, { unit: e.target.value })} className="w-full border rounded p-1 text-[11px]">
+                                <option value="mm">mm</option>
+                                <option value="μm">μm</option>
+                                <option value="°">°</option>
+                              </select>
+                            </div>
+                          </div>
+                          {calc.toleranceEnabled !== false && (
+                            <div className="text-[9px] text-slate-500 italic">
+                              判定範囲: {(Number(calc.nominal) || 0) + Number(calc.toleranceLower || 0)} ～ {(Number(calc.nominal) || 0) + Number(calc.toleranceUpper || 0)} {calc.unit}
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))}
                   </div>
                 </div>
+                {/* 矢印比較設定 */}
+                {(() => {
+                  const mcArrows = measurementConfig.arrows || [];
+                  const updateArrow = (aIdx, patch) => { const na = [...mcArrows]; na[aIdx] = { ...na[aIdx], ...patch }; setMeasurementConfig({ ...measurementConfig, arrows: na }); };
+                  const removeArrow = (aIdx) => { const na = mcArrows.filter((_, i) => i !== aIdx); setMeasurementConfig({ ...measurementConfig, arrows: na }); };
+                  const addArrow = () => { const idx = mcArrows.length + 1; setMeasurementConfig({ ...measurementConfig, arrows: [...mcArrows, { id: `arr${idx}`, label: `矢印${idx}`, sourceA: '', sourceB: '', position: null, threshold: 0 }] }); };
+                  return (
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-2">
+                      <div className="flex justify-between items-center mb-1.5">
+                        <label className="text-[10px] font-bold text-amber-800 flex items-center gap-1">↗↘ 矢印比較 ({mcArrows.length}件)
+                          <span className="text-[9px] font-normal text-amber-600">— 2つの値を比較して大→↗ / 小→↘ を画像に表示</span>
+                        </label>
+                        <button type="button" onClick={addArrow} className="bg-amber-500 hover:bg-amber-600 text-white px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1"><Plus className="w-3 h-3"/> 矢印を追加</button>
+                      </div>
+                      <div className="space-y-2">
+                        {mcArrows.map((ar, aIdx) => {
+                          const inputA = measurementConfig.inputs.find(i => i.id === ar.sourceA);
+                          const inputB = measurementConfig.inputs.find(i => i.id === ar.sourceB);
+                          let defaultPos = { x: 50, y: 50 };
+                          if (inputA && inputB) defaultPos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
+                          else if (inputA) defaultPos = { x: inputA.x, y: inputA.y };
+                          else if (inputB) defaultPos = { x: inputB.x, y: inputB.y };
+                          const posX = ar.position?.x ?? defaultPos.x;
+                          const posY = ar.position?.y ?? defaultPos.y;
+                          const setPos = (patch) => updateArrow(aIdx, { position: { x: posX, y: posY, ...patch } });
+                          return (
+                            <div key={aIdx} className="bg-white rounded p-2 border space-y-1.5">
+                              <div className="flex items-center gap-1">
+                                <input value={ar.label} onChange={e => updateArrow(aIdx, { label: e.target.value })} className="flex-1 border rounded px-1 py-0.5 text-[11px] font-bold" placeholder="ラベル (例: 左右の通り)"/>
+                                <button type="button" onClick={() => removeArrow(aIdx)} className="text-red-400 hover:text-red-600"><X className="w-3 h-3"/></button>
+                              </div>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                <div>
+                                  <label className="block text-[10px] text-emerald-700 font-bold mb-0.5">比較元 A</label>
+                                  <select value={ar.sourceA} onChange={e => updateArrow(aIdx, { sourceA: e.target.value })} className="w-full border rounded p-1 text-[11px]">
+                                    <option value="">-- 選択 --</option>
+                                    <optgroup label="入力ポイント">
+                                      {measurementConfig.inputs.map(inp => <option key={inp.id} value={inp.id}>{inp.id}{inp.label && inp.label !== inp.id ? ` (${inp.label})` : ''}</option>)}
+                                    </optgroup>
+                                    <optgroup label="計算結果">
+                                      {mcCalcs.map(c => <option key={c.id} value={c.id}>Σ {c.id}{c.label ? ` (${c.label})` : ''}</option>)}
+                                    </optgroup>
+                                  </select>
+                                </div>
+                                <div>
+                                  <label className="block text-[10px] text-rose-700 font-bold mb-0.5">比較元 B</label>
+                                  <select value={ar.sourceB} onChange={e => updateArrow(aIdx, { sourceB: e.target.value })} className="w-full border rounded p-1 text-[11px]">
+                                    <option value="">-- 選択 --</option>
+                                    <optgroup label="入力ポイント">
+                                      {measurementConfig.inputs.map(inp => <option key={inp.id} value={inp.id}>{inp.id}{inp.label && inp.label !== inp.id ? ` (${inp.label})` : ''}</option>)}
+                                    </optgroup>
+                                    <optgroup label="計算結果">
+                                      {mcCalcs.map(c => <option key={c.id} value={c.id}>Σ {c.id}{c.label ? ` (${c.label})` : ''}</option>)}
+                                    </optgroup>
+                                  </select>
+                                </div>
+                              </div>
+                              {(ar.sourceA && ar.sourceB) && (
+                                <div className="bg-amber-50 border border-amber-200 rounded p-1.5 space-y-1">
+                                  <div className="flex items-center justify-between">
+                                    <label className="text-[10px] font-bold text-amber-800">矢印の表示位置</label>
+                                    {ar.position && <button type="button" onClick={() => updateArrow(aIdx, { position: null })} className="text-[9px] text-blue-600 hover:underline">A・B中央へリセット</button>}
+                                  </div>
+                                  <div className="flex items-center gap-1 text-[10px]">
+                                    <span className="text-slate-600 font-bold w-3">X:</span>
+                                    <input type="range" min="0" max="100" value={Math.round(posX)} onChange={e => setPos({ x: Number(e.target.value) })} className="flex-1 h-1 accent-amber-500"/>
+                                    <span className="w-10 text-right font-mono">{Math.round(posX)}%</span>
+                                  </div>
+                                  <div className="flex items-center gap-1 text-[10px]">
+                                    <span className="text-slate-600 font-bold w-3">Y:</span>
+                                    <input type="range" min="0" max="100" value={Math.round(posY)} onChange={e => setPos({ y: Number(e.target.value) })} className="flex-1 h-1 accent-amber-500"/>
+                                    <span className="w-10 text-right font-mono">{Math.round(posY)}%</span>
+                                  </div>
+                                </div>
+                              )}
+                              <div className="flex items-center gap-1.5 text-[10px]">
+                                <label className="text-slate-500 font-bold">許容差:</label>
+                                <input type="number" step="0.001" value={ar.threshold} onChange={e => updateArrow(aIdx, { threshold: e.target.value })} className="w-20 border rounded p-0.5 text-[10px] text-right"/>
+                                <span className="text-slate-400 text-[9px]">差がこの値以下なら ↔</span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        {mcArrows.length === 0 && <div className="text-[10px] text-amber-700 text-center py-2">「+ 矢印を追加」で 2点の比較を設定できます (例: 左の通り vs 右の通り)</div>}
+                      </div>
+                    </div>
+                  );
+                })()}
                 {/* Preview */}
                 <div>
                   <label className="block text-[10px] font-bold text-slate-500 mb-1">プレビュー</label>
@@ -1915,7 +2589,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   );
 };
 
-const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData, lot, comboPresets = [], voiceAssistantActive = false }) => {
+const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData, lot, comboPresets = [], voiceAssistantActive = false, splitLayout = false }) => {
   const [activeInputIdx, setActiveInputIdx] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [voiceTranscript, setVoiceTranscript] = useState('');
@@ -1925,11 +2599,27 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
   const inputs = config?.inputs || [];
   const activeInput = inputs[activeInputIdx];
 
+  // 現在の工程ID を特定 (lot.steps から measurementConfig === config の step を探す)
+  const currentStepId = useMemo(() => {
+    if (!lot?.steps || !config) return null;
+    const found = lot.steps.find(s => s.measurementConfig === config || s.measurementConfig?.layout === config.layout);
+    return found?.id || null;
+  }, [lot, config]);
+
+  // 同ロット内 他工程の測定結果を変数として利用可能に
+  const crossStepValues = useMemo(() => collectCrossStepValues(lot, currentStepId), [lot, currentStepId]);
+
   // Multi-calculation results (backward compatible)
   const calcResults = useMemo(() => {
     if (!config) return [];
-    return calculateMeasurementResults(values, config);
-  }, [values, config]);
+    return calculateMeasurementResults(values, config, crossStepValues);
+  }, [values, config, crossStepValues]);
+
+  // 矢印比較
+  const arrowResults = useMemo(() => {
+    if (!config) return [];
+    return evaluateArrows(config, values, calcResults, crossStepValues);
+  }, [config, values, calcResults, crossStepValues]);
 
   // Legacy single result for backward compat
   const result = useMemo(() => {
@@ -2013,8 +2703,10 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
 
   if (!config || !inputs.length) return <div className="text-slate-400 text-center p-8">測定設定がありません</div>;
 
+  // splitLayout=true: 左に測定画面 (8割)、右に計算結果 (2割)
   return (
-    <div className="flex flex-col h-full">
+    <div className={splitLayout ? 'flex flex-row h-full gap-3' : 'flex flex-col h-full'}>
+      <div className={splitLayout ? 'flex-[4] flex flex-col min-w-0' : 'flex flex-col flex-1'}>
       {/* Visual Layout Area */}
       <div className="relative bg-white rounded-xl border border-slate-200 shadow-sm flex-1 min-h-[300px] overflow-hidden" style={config.diagramImage ? { backgroundImage: `url(${config.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}}>
         {!config.diagramImage && config.layout === 'circle-4point' && (
@@ -2032,7 +2724,7 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
           const isFilled = isCombobox ? (val !== '' && val != null) : (val !== '' && val != null && !isNaN(Number(val)));
           return (
             <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)', zIndex: isActive ? 20 : 10 }}>
-              <span className="text-[10px] font-bold text-slate-500 mb-0.5 bg-white/80 px-1 rounded whitespace-nowrap">{inp.label}</span>
+              <span className={`${splitLayout ? 'text-[10px]' : 'text-[9px]'} font-bold text-slate-500 mb-0.5 bg-white/80 px-1 rounded whitespace-nowrap`}>{inp.label}</span>
               {isCombobox ? (
                 <div className="flex flex-col items-center gap-0.5">
                   <select
@@ -2041,7 +2733,7 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
                     onChange={e => handleInputChange(inp.id, e.target.value)}
                     onFocus={() => setActiveInputIdx(idx)}
                     onKeyDown={e => handleKeyDown(e, idx)}
-                    className={`w-24 h-8 text-center text-sm font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
+                    className={`${splitLayout ? 'w-20 h-7 text-xs' : 'w-16 h-6 text-[11px]'} text-center font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
                   >
                     <option value="">--</option>
                     {comboValues.map((pv, pi) => <option key={pi} value={pv}>{pv}</option>)}
@@ -2051,8 +2743,8 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
                     value={val ?? ''}
                     onChange={e => handleInputChange(inp.id, e.target.value)}
                     onFocus={() => setActiveInputIdx(idx)}
-                    placeholder="直接入力"
-                    className={`w-24 h-6 text-center text-[10px] font-mono rounded border shadow-sm outline-none ${isActive ? 'border-blue-300 bg-white' : 'border-slate-200 bg-slate-50'}`}
+                    placeholder="直接"
+                    className={`${splitLayout ? 'w-20 h-7' : 'w-20 h-7'} text-center text-[11px] font-mono rounded border-2 shadow-sm outline-none ${isActive ? 'border-blue-300 bg-white' : 'border-slate-200 bg-slate-50'}`}
                   />
                 </div>
               ) : (
@@ -2060,16 +2752,41 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
                   ref={el => { inputRefs.current[inp.id] = el; }}
                   type="number"
                   step="any"
+                  inputMode="decimal"
+                  enterKeyHint="next"
                   value={val ?? ''}
                   onChange={e => handleInputChange(inp.id, e.target.value)}
                   onFocus={() => setActiveInputIdx(idx)}
                   onKeyDown={e => handleKeyDown(e, idx)}
-                  className={`w-20 h-8 text-center text-sm font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
+                  className={`${splitLayout ? 'w-24 h-11 text-base' : 'w-20 h-10 text-sm'} min-h-[44px] text-center font-mono font-bold rounded border-2 shadow-sm outline-none transition-all ${isActive ? 'border-blue-500 ring-2 ring-blue-200 bg-white' : isFilled ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}
                 />
               )}
               {pastStats && (
-                <span className="text-[8px] text-slate-400 mt-0.5 whitespace-nowrap bg-white/80 px-0.5 rounded">
-                  前回:{pastStats.last?.toFixed(3)} | 平均:{pastStats.avg?.toFixed(3)} (N={pastStats.count})
+                <span className="text-[10px] text-slate-600 mt-0.5 whitespace-nowrap bg-white/90 px-1 rounded font-medium">
+                  前:{pastStats.last?.toFixed(3)} 平均:{pastStats.avg?.toFixed(3)}
+                </span>
+              )}
+            </div>
+          );
+        })}
+        {/* 矢印比較表示: 1矢印を pos に表示。大小で ↗/↘/↔ 切替 */}
+        {arrowResults.map((ar, idx) => {
+          if (!ar.pos || !ar.dir) return null;
+          const isUp = ar.dir === 'up';
+          const isEqual = ar.dir === 'equal';
+          const arrowChar = isEqual ? '↔' : (isUp ? '↗' : '↘');
+          const color = isEqual ? 'text-slate-600' : isUp ? 'text-emerald-600' : 'text-rose-600';
+          const bg = isEqual ? 'bg-slate-100' : isUp ? 'bg-emerald-100' : 'bg-rose-100';
+          const border = isEqual ? 'border-slate-300' : isUp ? 'border-emerald-400' : 'border-rose-400';
+          return (
+            <div key={idx} className="absolute pointer-events-none z-30 flex flex-col items-center" style={{ left: `${ar.pos.x}%`, top: `${ar.pos.y}%`, transform: 'translate(-50%, -50%)' }}>
+              <div className={`${color} ${bg} ${border} font-black text-3xl px-2 py-0.5 rounded-full shadow-lg border-2 ${!isEqual ? 'animate-pulse' : ''}`} style={{ lineHeight: 1 }}>
+                {arrowChar}
+              </div>
+              {ar.label && <span className="text-[9px] font-bold text-slate-700 bg-white/90 px-1 rounded mt-0.5 whitespace-nowrap shadow-sm">{ar.label}</span>}
+              {ar.diff !== null && !isEqual && (
+                <span className={`text-[9px] font-mono font-bold mt-0.5 px-1 rounded ${isUp ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'} whitespace-nowrap`}>
+                  差: {ar.diff > 0 ? '+' : ''}{ar.diff.toFixed(4)}
                 </span>
               )}
             </div>
@@ -2077,57 +2794,89 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
         })}
       </div>
 
-      {/* Multi-Calculation Results Display */}
-      <div className="mt-3 space-y-2">
-        {calcResults.map((cr, crIdx) => {
-          const methodLabel = CALCULATION_METHODS.find(m => m.value === cr.method)?.label || cr.method;
-          return (
-            <div key={cr.id || crIdx} className="bg-white rounded-xl border border-slate-200 p-3 shadow-sm">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Calculator className="w-4 h-4 text-slate-500"/>
-                  <span className="text-sm font-bold text-slate-700">{cr.label} ({methodLabel}):</span>
-                  <span className="text-xl font-mono font-black text-slate-800">
-                    {cr.result !== null ? cr.result.toFixed(4) : '---'}
-                  </span>
-                  <span className="text-sm text-slate-500">{cr.unit}</span>
-                </div>
-                {cr.result !== null && cr.isOk !== null && (
-                  <span className={`px-3 py-1 rounded-full text-sm font-bold ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
-                    {cr.isOk ? 'OK' : 'NG'}
-                  </span>
-                )}
-              </div>
-              <div className="text-[10px] text-slate-400 mt-1">
-                公差: {cr.toleranceLower} ~ {cr.toleranceUpper} {cr.unit}
-                {cr.inputIds?.length > 0 && <span className="ml-2">対象: {cr.inputIds.join(', ')}</span>}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Voice Input */}
-      <div className="mt-3 flex items-center gap-3">
+      {/* Voice Input (常に測定パネル直下) */}
+      <div className="mt-2 flex items-center gap-2">
         {voiceAssistantActive ? (
-          <button disabled className="flex-1 py-3 rounded-xl font-bold text-lg flex items-center justify-center gap-2 bg-blue-100 text-blue-400 border border-blue-200 cursor-not-allowed">
-            <Bot className="w-5 h-5"/> 音声アシスタント制御中
+          <button disabled className="flex-1 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 bg-blue-100 text-blue-400 border border-blue-200 cursor-not-allowed">
+            <Bot className="w-4 h-4"/> 音声アシスタント制御中
           </button>
         ) : (
-          <button onClick={startVoice} className={`flex-1 py-3 rounded-xl font-bold text-lg flex items-center justify-center gap-2 transition-all ${isListening ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-500/30' : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'}`}>
-            {isListening ? <><Mic className="w-5 h-5"/> 音声認識中...</> : <><Mic className="w-5 h-5"/> 音声入力</>}
+          <button onClick={startVoice} className={`flex-1 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all ${isListening ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-500/30' : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'}`}>
+            {isListening ? <><Mic className="w-4 h-4"/> 音声認識中...</> : <><Mic className="w-4 h-4"/> 音声入力</>}
           </button>
         )}
         {isListening && voiceTranscript && (
-          <div className="text-sm text-slate-500 bg-slate-50 px-3 py-2 rounded border flex-1 truncate">{voiceTranscript}</div>
+          <div className="text-xs text-slate-500 bg-slate-50 px-2 py-1 rounded border flex-1 truncate">{voiceTranscript}</div>
         )}
+      </div>
+      </div>{/* end left (測定パネル+音声入力) */}
+
+      {/* 計算結果エリア: splitLayout 時は右サイドバー (2割幅)、それ以外は下に配置 */}
+      <div className={splitLayout ? 'flex-1 flex flex-col gap-1 overflow-y-auto min-w-[180px] max-w-[280px]' : 'mt-2 space-y-1'}>
+        {splitLayout && <div className="text-[10px] font-bold text-slate-500 px-1">計算結果</div>}
+        {calcResults.map((cr, crIdx) => (
+          <div key={cr.id || crIdx} className={splitLayout
+            ? `bg-white rounded-lg border ${cr.isOk === false ? 'border-rose-300' : cr.isOk === true ? 'border-emerald-300' : 'border-slate-200'} px-2 py-1.5 shadow-sm`
+            : 'bg-white rounded-lg border border-slate-200 px-2 py-1 shadow-sm flex items-center justify-between gap-2'
+          }>
+            {(() => {
+              // 範囲表示テキストを生成 (基準値 + 公差判定ON/OFF を反映)
+              const fmt = (v) => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
+              const hasNominal = cr.nominal !== undefined && cr.nominal !== 0;
+              let rangeText;
+              if (cr.toleranceEnabled === false) {
+                rangeText = '判定なし';
+              } else if (hasNominal) {
+                const upStr = cr.toleranceUpper >= 0 ? `+${fmt(cr.toleranceUpper)}` : fmt(cr.toleranceUpper);
+                const lowStr = cr.toleranceLower >= 0 ? `+${fmt(cr.toleranceLower)}` : fmt(cr.toleranceLower);
+                rangeText = `${fmt(cr.nominal)} (${upStr}/${lowStr})`;
+              } else {
+                rangeText = `[${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}]`;
+              }
+              return splitLayout ? (
+                <>
+                  <div className="flex items-center justify-between gap-1 mb-0.5">
+                    <span className="text-[10px] font-bold text-slate-700 truncate">{cr.label}</span>
+                    {cr.result !== null && cr.isOk !== null && (
+                      <span className={`px-1.5 py-0 rounded text-[9px] font-black shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                        {cr.isOk ? 'OK' : 'NG'}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-baseline gap-0.5">
+                    <span className="text-lg font-mono font-black text-slate-800">{cr.result !== null ? cr.result.toFixed(cr.precision ?? 4) : '---'}</span>
+                    <span className="text-[9px] text-slate-500">{cr.unit}</span>
+                  </div>
+                  <div className="text-[8px] text-slate-400 mt-0.5">{rangeText}</div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                    <span className="text-xs font-bold text-slate-700 truncate">{cr.label}</span>
+                    <span className="text-base font-mono font-black text-slate-800 shrink-0">
+                      {cr.result !== null ? cr.result.toFixed(cr.precision ?? 4) : '---'}
+                    </span>
+                    <span className="text-[10px] text-slate-500 shrink-0">{cr.unit}</span>
+                    <span className="text-[9px] text-slate-400 shrink-0">{rangeText}</span>
+                  </div>
+                  {cr.result !== null && cr.isOk !== null && (
+                    <span className={`px-2 py-0.5 rounded text-xs font-bold shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                      {cr.isOk ? 'OK' : 'NG'}
+                    </span>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        ))}
       </div>
     </div>
   );
 };
 
 const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [] }) => {
-  const [executionType, setExecutionType] = useState('initial');
+  // 前回モードを復元 (lot.executionType があれば優先)
+  const [executionType, setExecutionType] = useState(lot.executionType || 'initial');
   const [currentStepIdx, setCurrentStepIdx] = useState(lot.currentStepIndex || 0);
   const [currentUnitIdx, setCurrentUnitIdx] = useState(lot.currentUnitIndex || 0);
   const totalUnits = lot.quantity || 1;
@@ -2138,6 +2887,8 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     (n.stepTitle && n.stepTitle === stepTitle && !n.model)
   );
   const lotNotes = sharedNotes.filter(n => n.model && n.model === lot.model && !n.stepTitle);
+  // 共有ノートバナー dismissal トリガー (localStorage 更新を再描画反映)
+  const [lotNoteBannerDismissed, setLotNoteBannerDismissed] = useState(0);
   const [tasks, setTasks] = useState(lot.tasks || {});
   const tasksRef = useRef(lot.tasks || {});
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
@@ -2156,6 +2907,8 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   
   // Interruptions (Defects/Monitoring)
   const [interruptions, setInterruptions] = useState(lot.interruptions || []);
+  // 測定画面メイン拡大表示トグル（測定タイプの工程のみで使用）
+  const [measurementFullscreen, setMeasurementFullscreen] = useState(false);
   const [showDefectModal, setShowDefectModal] = useState(false);
   const [defectLabel, setDefectLabel] = useState('');
   const [defectCauseProcess, setDefectCauseProcess] = useState('');
@@ -2221,7 +2974,22 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   const [activeCustomTaskKey, setActiveCustomTaskKey] = useState(null);
 
   // Voice Assistant
-  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(() => {
+    try { return localStorage.getItem('voiceEnabled') === '1'; } catch { return false; }
+  });
+  // localStorage 永続化
+  useEffect(() => {
+    try { localStorage.setItem('voiceEnabled', voiceEnabled ? '1' : '0'); } catch {}
+  }, [voiceEnabled]);
+
+  // アンマウント時のクリーンアップ (pendingUndo タイマー漏れ防止)
+  useEffect(() => {
+    return () => {
+      if (pendingUndoTimerRef.current) clearTimeout(pendingUndoTimerRef.current);
+      if (pendingUndoCountdownRef.current) clearInterval(pendingUndoCountdownRef.current);
+      try { window.speechSynthesis?.cancel?.(); } catch {}
+    };
+  }, []);
   const [voiceStatus, setVoiceStatus] = useState('');
   const [voiceBarOpen, setVoiceBarOpen] = useState(false);
   const voiceActiveRef = useRef(false);
@@ -2294,33 +3062,48 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   }, []);
 
   // Timer Tick (Global & Interruption)
+  // 注意: 1秒ごとの再描画コストを抑えるため、不要な setState は避ける
+  // 別モーダル長時間滞在時にデータが失われないよう、60秒に1回 totalWorkTime を Firestore へ自動 flush
+  const lastFlushTimeRef = useRef(Date.now());
   useEffect(() => {
     let interval;
     const now = Date.now();
 
-    const hasActiveInterruption = interruptions.some(i => i.status === 'active');
-    if ((executionType === 'sequential' && isTimerRunning) || executionType === 'custom' || hasActiveInterruption) {
+    const hasActiveNonBreakInterruption = interruptions.some(i => i.status === 'active' && i.type !== 'break');
+    if ((executionType === 'sequential' && isTimerRunning) || executionType === 'custom' || hasActiveNonBreakInterruption) {
        if (!startTime) setStartTime(now);
        interval = setInterval(() => {
          const currentNow = Date.now();
 
-         // Main Timer (Sequential)
+         // Main Timer (Sequential): 計測中のみ更新
          if (executionType === 'sequential' && isTimerRunning) {
              const start = startTime || currentNow;
-             setElapsed((lot.totalWorkTime || 0) + (currentNow - start));
+             const newElapsed = (lot.totalWorkTime || 0) + (currentNow - start);
+             setElapsed(newElapsed);
+             // 60秒に1回 Firestore へ書き戻し (リロード時のデータ消失防止)
+             if (currentNow - lastFlushTimeRef.current >= 60_000) {
+               lastFlushTimeRef.current = currentNow;
+               try { onSave({ totalWorkTime: newElapsed, measurementResults }); } catch {}
+             }
          }
 
-         // Update Interruption durations
-         setInterruptions(prev => prev.map(i => {
-             if (i.status === 'active') {
-                 return { ...i, duration: Math.floor((currentNow - i.startTime) / 1000) };
-             }
-             return i;
-         }));
+         // Interruption durations: 進行中のものがある場合のみ map (新オブジェクト生成を最小化)
+         if (hasActiveNonBreakInterruption) {
+           setInterruptions(prev => {
+             let changed = false;
+             const next = prev.map(i => {
+               if (i.status === 'active' && i.type !== 'break') {
+                 const d = Math.floor((currentNow - i.startTime) / 1000);
+                 if (i.duration !== d) { changed = true; return { ...i, duration: d }; }
+               }
+               return i;
+             });
+             return changed ? next : prev;
+           });
+         }
 
-         // Custom Tasks: use functional update to avoid stale closure
+         // Custom Tasks: timerTick の inc だけで個別タスクの timer 表示を更新 (setTasks 全コピーは廃止)
          if (executionType === 'custom') {
-           setTasks(prev => ({...prev}));
            setTimerTick(prev => prev + 1);
          }
        }, 1000);
@@ -2329,16 +3112,19 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   }, [isTimerRunning, executionType, startTime, interruptions.length]);
 
   // --- Defect & Monitor Logic ---
-  const startInterruption = (type, label, causeProcess, photos) => {
+  // reportOnly=true: 記録だけ残し作業時間計測には影響しない (status='reported')
+  // reportOnly=false: 従来通り「対応中」として時間計測開始 (status='active')
+  const startInterruption = (type, label, causeProcess, photos, reportOnly = false) => {
       const curStep = localSteps[currentStepIdx] || localSteps[0];
+      const now = Date.now();
       const newInt = {
           id: generateId(),
           type,
           label,
-          timestamp: Date.now(),
-          startTime: Date.now(),
+          timestamp: now,
+          startTime: reportOnly ? null : now,
           duration: 0,
-          status: 'active',
+          status: reportOnly ? 'reported' : 'active',
           workerName: lot.workerId || '',
           stepInfo: curStep ? { stepId: curStep.id, title: curStep.title } : null,
           causeProcess: causeProcess || '',
@@ -2361,32 +3147,74 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       onSave({ interruptions: updated });
   };
 
-  // --- Break Logic ---
-  const isOnBreak = interruptions.some(i => i.type === 'break' && i.status === 'active');
-  const breakInterruption = interruptions.find(i => i.type === 'break' && i.status === 'active');
-  const breakDuration = breakInterruption?.duration || 0;
-
+  // --- Pause Logic (中断 = 作業時間計測の一時停止) ---
+  // 旧 break タイプの中断レコードに依存していた処理を、シンプルな isTimerRunning トグルへ変更。
+  // カスタム実行モードでも進行中の個別タスクをまとめて一時停止/再開できるように対応
+  const [customPaused, setCustomPaused] = useState(false);
+  const isOnBreak = executionType === 'sequential' ? !isTimerRunning : customPaused;
   const toggleBreak = () => {
-    if (isOnBreak) {
-      stopInterruption(breakInterruption.id);
+    if (executionType === 'sequential') {
+      if (isTimerRunning) handlePause(); else handleStart();
+      return;
+    }
+    // カスタム: 進行中(processing)のタスクをまとめて停止/再開
+    if (!customPaused) {
+      // 停止: 全ての processing タスクを paused 化、duration に経過秒を確定
+      const now = Date.now();
+      const newTasks = {};
+      Object.entries(tasks).forEach(([k, t]) => {
+        if (t?.status === 'processing' && t.startTime) {
+          const sec = Math.floor((now - t.startTime) / 1000);
+          newTasks[k] = { ...t, status: 'paused', duration: (t.duration || 0) + sec, startTime: null, pausedAt: now };
+        } else {
+          newTasks[k] = t;
+        }
+      });
+      setTasks(newTasks);
+      tasksRef.current = newTasks;
+      onSave({ tasks: newTasks });
+      setCustomPaused(true);
     } else {
-      startInterruption('break', '中断', '', []);
+      // 再開: pausedAt があったタスクを processing に戻し、startTime を Date.now() に
+      const now = Date.now();
+      const newTasks = {};
+      Object.entries(tasks).forEach(([k, t]) => {
+        if (t?.status === 'paused' && t.pausedAt) {
+          newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null };
+        } else {
+          newTasks[k] = t;
+        }
+      });
+      setTasks(newTasks);
+      tasksRef.current = newTasks;
+      onSave({ tasks: newTasks });
+      setCustomPaused(false);
     }
   };
 
   // --- Mode Switching ---
-  const switchToCustom = () => {
+  // モード切替時は実行中の音声フローを完全に停止する (voiceActiveRef も一旦 false に)
+  const stopVoiceFlow = () => {
     voiceRunningRef.current = false;
+    voiceActiveRef.current = false;
+    try { recognitionRef.current?.abort?.(); } catch {}
+    try { window.speechSynthesis?.cancel?.(); } catch {}
+  };
+  const switchToCustom = () => {
+    stopVoiceFlow();
     setExecutionType('custom');
+    onSave({ executionType: 'custom' });
     if (!isTimerRunning) handleStart();
   };
   const switchToSequential = () => {
-    voiceRunningRef.current = false;
+    stopVoiceFlow();
+    onSave({ executionType: 'sequential' });
     // カスタムで完了済みのタスクをスキップして、最初の未完了工程×台に飛ぶ
     let foundIncomplete = false;
     for (let sIdx = 0; sIdx < localSteps.length; sIdx++) {
       for (let uIdx = 0; uIdx < totalUnits; uIdx++) {
-        const t = tasks[`${sIdx}-${uIdx}`];
+        const step = localSteps[sIdx];
+        const t = (step?.id && tasks[`${step.id}-${uIdx}`]) || tasks[`${sIdx}-${uIdx}`];
         if (!t || t.status !== 'completed') {
           setCurrentStepIdx(sIdx);
           setCurrentUnitIdx(uIdx);
@@ -2408,15 +3236,23 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
   // --- Sequential Handlers ---
   const currentStep = localSteps[currentStepIdx];
-  const handleStart = () => { setIsTimerRunning(true); setStartTime(Date.now()); stepUnitStartRef.current = Date.now(); onSave({ status: 'processing', workStartTime: Date.now() }); };
-  const handlePause = () => { setIsTimerRunning(false); onSave({ status: 'paused', totalWorkTime: elapsed, workStartTime: null }); };
+  const handleStart = () => { setIsTimerRunning(true); setStartTime(Date.now()); stepUnitStartRef.current = Date.now(); onSave({ status: 'processing', workStartTime: Date.now(), measurementResults }); };
+  const handlePause = () => {
+    // setElapsed は非同期反映のため、その場で再計算して保存ズレ防止
+    const now = Date.now();
+    const computed = (lot.totalWorkTime || 0) + (startTime ? (now - startTime) : 0);
+    setIsTimerRunning(false);
+    setElapsed(computed);
+    onSave({ status: 'paused', totalWorkTime: computed, workStartTime: null, measurementResults });
+  };
   // stepUnitTimes: { "stepId-unitIdx": seconds } 各工程×各台の個別時間
   const [stepUnitTimes, setStepUnitTimes] = useState(lot.stepUnitTimes || {});
   const stepUnitStartRef = useRef(Date.now());
 
-  // カスタムで完了済みかチェック
+  // カスタムで完了済みかチェック (id ベース・index 両対応)
   const isTaskCompleted = (sIdx, uIdx) => {
-    const t = tasks[`${sIdx}-${uIdx}`];
+    const step = localSteps[sIdx];
+    const t = (step?.id && tasks[`${step.id}-${uIdx}`]) || tasks[`${sIdx}-${uIdx}`];
     return t && t.status === 'completed';
   };
 
@@ -2446,9 +3282,13 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     stepUnitStartRef.current = now;
 
     // カスタムモードのtasksにも完了を記録（モード切替時に整合性を保つ）
-    const taskKey = `${currentStepIdx}-${currentUnitIdx}`;
+    // step.id ベースのキーを正準とする (テンプレ並び替え時の不整合防止)
+    const taskKey = currentStep?.id ? `${currentStep.id}-${currentUnitIdx}` : `${currentStepIdx}-${currentUnitIdx}`;
+    const legacyKey = `${currentStepIdx}-${currentUnitIdx}`;
     if (!tasks[taskKey] || tasks[taskKey].status !== 'completed') {
       const newTasks = { ...tasks, [taskKey]: { status: 'completed', duration: unitDuration, startTime: null } };
+      // 旧 numeric キーが残っていたら削除（重複防止）
+      if (taskKey !== legacyKey && newTasks[legacyKey]) delete newTasks[legacyKey];
       setTasks(newTasks);
       tasksRef.current = newTasks;
     }
@@ -2813,7 +3653,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
       } else if (matchInterrupt(norm) || matchInterrupt(cmd)) {
         toggleBreak(); // 一時停止のみ（不具合報告は開かない）
-        await speakAsyncWithLog('中断しました。再開するときは中断ボタンを押してください');
+        await speakAsyncWithLog('作業を一時停止しました。再開するときは「再開」ボタンか、もう一度「中断」と発声してください');
         return;
 
       } else if (matchAllComplete(norm) || matchAllComplete(cmd)) {
@@ -2907,16 +3747,20 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           }
           // Confirmed (explicit yes or 5s timeout auto-confirm)
           currentValues[inp.id] = num;
-          // Update measurement results (per-step + per-unit for report)
+          // 統一キー方針: ${stepId}-${unitIdx}-values + ${stepId}-${unitIdx}
+          // 旧キー (${stepId}-values, ${stepId}-result, ${stepId}) は読み出し時 fallback でのみ使用
           const stepKey = step.id;
-          const newMR = { ...measurementResults };
-          newMR[`${stepKey}-values`] = currentValues;
-          const calcResults = calculateMeasurementResults(currentValues, config);
+          const crossVals = collectCrossStepValues(lot, step.id);
+          const calcResults = calculateMeasurementResults(currentValues, config, crossVals);
           const measData = { values: currentValues, calcResults, timestamp: Date.now() };
-          newMR[stepKey] = measData;
-          // Also store per-unit (unit 0 for sequential mode)
-          newMR[`${stepKey}-0`] = measData;
-          newMR[`${stepKey}-0-values`] = currentValues;
+          const newMR = {
+            ...measurementResults,
+            [`${stepKey}-0-values`]: currentValues,
+            [`${stepKey}-0`]: measData,
+          };
+          // 旧キーが既存データに残っている場合のみ更新（互換用）
+          if (measurementResults[`${stepKey}-values`] !== undefined) newMR[`${stepKey}-values`] = currentValues;
+          if (measurementResults[stepKey] !== undefined) newMR[stepKey] = measData;
           setMeasurementResults(newMR);
 
           if (i < inputs.length - 1) {
@@ -2933,7 +3777,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
     // All inputs done - announce results
     if (!voiceActiveRef.current) return;
-    const finalResults = calculateMeasurementResults(currentValues, config);
+    const finalResults = calculateMeasurementResults(currentValues, config, collectCrossStepValues(lot, step.id));
     if (finalResults.length > 0) {
       const announcements = finalResults.map(r => {
         const okng = r.isOk ? 'OK' : 'NG';
@@ -2965,12 +3809,67 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       setIsConfirming(true);
   };
 
-  const finalizeComplete = () => {
-      onSave({ status: 'completed', location: 'completed', totalWorkTime: elapsed, workStartTime: null, currentStepIndex: localSteps.length, stepTimes, stepUnitTimes, tasks: tasksRef.current, interruptions, measurementResults });
+  // 完了確定: 未完了がある場合は理由・責任者を必須化、completedAt も必ず立てる
+  const [showIncompleteGuard, setShowIncompleteGuard] = useState(false);
+  const [incompleteReason, setIncompleteReason] = useState('');
+  const [incompleteResponsible, setIncompleteResponsible] = useState('');
+
+  const finalizeComplete = (overrideMeta = null) => {
+      // overrideMeta: { reason, responsibleBy } を渡された場合は未完了確認済みとして処理
+      const completedAt = Date.now();
+      const skippedTasks = { ...tasksRef.current };
+      const meta = {};
+      if (overrideMeta) {
+          // 未完了タスクを 'skipped' として明示記録
+          localSteps.forEach((step, sIdx) => {
+              for (let u = 0; u < totalUnits; u++) {
+                  const key = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
+                  const t = skippedTasks[key] || tasksRef.current[`${sIdx}-${u}`];
+                  if (!t || (t.status !== 'completed' && t.status !== 'skipped')) {
+                      skippedTasks[key] = { status: 'skipped', duration: 0, skipReason: overrideMeta.reason, skipBy: overrideMeta.responsibleBy, skipAt: completedAt };
+                  }
+              }
+          });
+          meta.incompleteReason = overrideMeta.reason;
+          meta.incompleteResponsible = overrideMeta.responsibleBy;
+      }
+      onSave({
+          status: 'completed', location: 'completed',
+          totalWorkTime: elapsed, workStartTime: null,
+          currentStepIndex: localSteps.length,
+          stepTimes, stepUnitTimes,
+          tasks: skippedTasks,
+          interruptions, measurementResults,
+          completedAt,
+          ...meta
+      });
       onFinish();
   };
 
-  const handleNG = () => { setIsTimerRunning(false); onSave({ status: 'error', totalWorkTime: elapsed, workStartTime: null }); onClose(); };
+  // X ボタン: 作業中なら一時停止して保存してから閉じる
+  const [isClosing, setIsClosing] = useState(false);
+  const handleSafeClose = async () => {
+      if (isClosing) return;
+      try {
+          setIsClosing(true);
+          if (isTimerRunning) {
+              if (!confirm('作業中です。一時停止して閉じますか？\n（測定値や経過時間は保存されます）')) {
+                  setIsClosing(false);
+                  return;
+              }
+              setIsTimerRunning(false);
+              await onSave({ status: 'paused', totalWorkTime: elapsed, workStartTime: null, stepTimes, measurementResults });
+          } else {
+              // 計測中でなくても、未保存の測定値があるかもしれないので念のため保存
+              await onSave({ measurementResults });
+          }
+      } finally {
+          setIsClosing(false);
+          onClose();
+      }
+  };
+
+  // (handleNG は未使用。NG 報告は不具合報告モーダル経由で startInterruption('defect') を呼ぶ)
 
   // --- Custom Mode Handlers ---
   const isManualTaskRunning = useMemo(() => {
@@ -2983,8 +3882,22 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
   const [completedTaskMenu, setCompletedTaskMenu] = useState(null); // { key, stepIdx, unitIdx }
 
+  // タスクキー生成: 既存データとの互換のため、step.id ベースを優先しつつ数値index フォールバック
+  const getTaskKey = (stepIdx, unitIdx) => {
+    const step = localSteps[stepIdx];
+    if (step && step.id) {
+      // step.id ベースを正準キーとする
+      const idKey = `${step.id}-${unitIdx}`;
+      const idxKey = `${stepIdx}-${unitIdx}`;
+      // 既存データに数値キーがあって id キーが無ければ、数値キーを使う (旧データ互換)
+      if (tasks[idxKey] && !tasks[idKey]) return idxKey;
+      return idKey;
+    }
+    return `${stepIdx}-${unitIdx}`;
+  };
+
   const toggleTask = (stepIdx, unitIdx) => {
-    const key = `${stepIdx}-${unitIdx}`;
+    const key = getTaskKey(stepIdx, unitIdx);
     const newTasks = { ...tasks };
     const currentTask = tasks[key] || { status: 'waiting', duration: 0, startTime: null };
 
@@ -3176,8 +4089,9 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
               let completeCount = 0;
               let totalDur = 0;
               Array.from({length: lot.quantity}).forEach((_, uIdx) => {
-                  const t = tasks[`${idx}-${uIdx}`];
-                  if (t?.status === 'completed') { completeCount++; totalDur += t.duration; }
+                  // step.id ベースと numeric キー両方を確認 (互換性)
+                  const t = (step?.id && tasks[`${step.id}-${uIdx}`]) || tasks[`${idx}-${uIdx}`];
+                  if (t?.status === 'completed' || t?.status === 'skipped') { completeCount++; totalDur += (t.duration || 0); }
               });
               incompleteCount = lot.quantity - completeCount;
               duration = completeCount > 0 ? totalDur / completeCount : 0;
@@ -3197,9 +4111,12 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                 </div>
                 <div className="flex-1 overflow-y-auto p-6">
                     {totalIncomplete > 0 && (
-                        <div className="mb-6 bg-amber-50 border border-amber-200 p-4 rounded-lg flex gap-3 items-start animate-pulse">
-                            <AlertTriangle className="w-6 h-6 text-amber-600 shrink-0"/>
-                            <div><div className="font-bold text-amber-800">未完了の作業があります</div></div>
+                        <div className="mb-6 bg-rose-50 border-2 border-rose-300 p-4 rounded-lg flex gap-3 items-start animate-pulse">
+                            <AlertOctagon className="w-7 h-7 text-rose-600 shrink-0"/>
+                            <div className="flex-1">
+                                <div className="font-black text-rose-800 text-base">未完了の作業が {totalIncomplete} 件あります</div>
+                                <div className="text-rose-700 text-sm mt-1">このまま完了すると検査漏れになります。「戻る」で作業に戻り、すべて完了させてから確定してください。</div>
+                            </div>
                         </div>
                     )}
                     <div className="space-y-3">{summary.map((s, i) => (
@@ -3213,12 +4130,65 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                     ))}</div>
                 </div>
                 <div className="p-4 border-t bg-slate-50 flex justify-end gap-3">
-                    <button onClick={() => setIsConfirming(false)} className="px-4 py-2 text-slate-600 hover:bg-slate-200 rounded-lg font-bold">戻る</button>
-                    <button onClick={finalizeComplete} className="px-6 py-2 bg-emerald-600 text-white hover:bg-emerald-700 rounded-lg font-bold shadow-lg">確定</button>
+                    <button onClick={() => { setIsConfirming(false); if (!isTimerRunning) handleStart(); }} className="px-5 py-2.5 text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg font-bold min-h-[44px]">← 作業に戻る</button>
+                    {totalIncomplete > 0 ? (
+                      <button onClick={() => { setIncompleteReason(''); setIncompleteResponsible(currentUserName || ''); setShowIncompleteGuard(true); }} className="px-6 py-2.5 bg-rose-600 text-white hover:bg-rose-700 rounded-lg font-black shadow-lg min-h-[44px] flex items-center gap-2"><AlertTriangle className="w-5 h-5"/> 未完了のまま完了</button>
+                    ) : (
+                      <button onClick={() => finalizeComplete()} className="px-6 py-2.5 bg-emerald-600 text-white hover:bg-emerald-700 rounded-lg font-black shadow-lg min-h-[44px] flex items-center gap-2"><CheckCircle2 className="w-5 h-5"/> 完了確定</button>
+                    )}
                 </div>
             </div>
         </div>
       );
+  }
+
+  // 未完了強制完了ガード: 理由・責任者 必須
+  if (showIncompleteGuard) {
+    return (
+      <div data-fs="execution" className="fixed inset-0 z-[200] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden flex flex-col">
+          <div className="bg-rose-700 text-white p-4 flex items-center gap-3">
+            <AlertOctagon className="w-7 h-7 shrink-0"/>
+            <div>
+              <h2 className="text-lg font-black">未完了のまま完了します</h2>
+              <p className="text-sm opacity-90 mt-0.5">検査漏れを防ぐため、理由と責任者を必ず記録してください</p>
+            </div>
+          </div>
+          <div className="p-5 space-y-4">
+            <div className="bg-rose-50 border-2 border-rose-300 rounded-lg p-3">
+              <div className="font-bold text-rose-800 mb-1">⚠️ 重要: この記録は監査時に確認されます</div>
+              <div className="text-xs text-rose-700">未完了タスクは "skipped" 扱いで保存され、理由・責任者が CSV/Excel/PDF 出力に含まれます</div>
+            </div>
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1">理由 <span className="text-rose-600">*</span></label>
+              <select value={incompleteReason} onChange={e => setIncompleteReason(e.target.value)} className="w-full border-2 rounded-lg p-2 text-sm">
+                <option value="">-- 選択してください --</option>
+                <option value="欠品">欠品 (部品・治具不足)</option>
+                <option value="上工程戻し">上工程戻し (前工程に問題)</option>
+                <option value="不良で除外">不良で除外 (NG により対象外)</option>
+                <option value="工程変更">工程変更 (上長指示)</option>
+                <option value="納期優先">納期優先 (後日追検査)</option>
+                <option value="その他">その他 (下に記入)</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1">責任者 (上長/承認者) <span className="text-rose-600">*</span></label>
+              <input type="text" value={incompleteResponsible} onChange={e => setIncompleteResponsible(e.target.value)} placeholder="例: 山田 (主任)" className="w-full border-2 rounded-lg p-2 text-sm"/>
+            </div>
+          </div>
+          <div className="p-4 border-t bg-slate-50 flex justify-end gap-3">
+            <button onClick={() => setShowIncompleteGuard(false)} className="px-5 py-2.5 text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg font-bold min-h-[44px]">キャンセル</button>
+            <button
+              disabled={!incompleteReason || !incompleteResponsible.trim()}
+              onClick={() => { finalizeComplete({ reason: incompleteReason, responsibleBy: incompleteResponsible.trim() }); setShowIncompleteGuard(false); }}
+              className="px-6 py-2.5 bg-rose-600 text-white hover:bg-rose-700 disabled:bg-slate-300 disabled:cursor-not-allowed rounded-lg font-black shadow-lg min-h-[44px] flex items-center gap-2"
+            >
+              <AlertTriangle className="w-5 h-5"/> 未完了のまま完了
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   if (executionType === 'initial') {
@@ -3240,13 +4210,13 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
              </div>
            )}
            <div className="flex flex-col gap-4">
-             <button onClick={() => setExecutionType('sequential')} className="p-4 bg-blue-50 border-2 border-blue-200 rounded-xl hover:bg-blue-100 transition-colors text-left group">
+             <button onClick={() => { setExecutionType('sequential'); onSave({ executionType: 'sequential' }); }} className="p-4 bg-blue-50 border-2 border-blue-200 rounded-xl hover:bg-blue-100 transition-colors text-left group">
                <div className="font-bold text-blue-800 text-lg group-hover:underline">順序通りに進める (通常)</div>
-               <div className="text-sm text-slate-600 mt-1">手順書に従って、Step 1から順番に作業を行います。</div>
+               <div className="text-sm text-slate-600 mt-1">手順書に従って、Step 1から順番に作業を行います。<br/><span className="text-blue-600 font-bold">→ 初心者・1〜数台向け</span></div>
              </button>
-             <button onClick={() => setExecutionType('custom')} className="p-4 bg-emerald-50 border-2 border-emerald-200 rounded-xl hover:bg-emerald-100 transition-colors text-left group">
+             <button onClick={() => { setExecutionType('custom'); onSave({ executionType: 'custom' }); }} className="p-4 bg-emerald-50 border-2 border-emerald-200 rounded-xl hover:bg-emerald-100 transition-colors text-left group">
                <div className="font-bold text-emerald-800 text-lg group-hover:underline">自由に工程を選ぶ (カスタム)</div>
-               <div className="text-sm text-slate-600 mt-1">好きな工程を選んで作業できます。台数分のボタンが配置されます。</div>
+               <div className="text-sm text-slate-600 mt-1">工程×台数のマトリックスから好きな順序で作業できます。<br/><span className="text-emerald-600 font-bold">→ 多台数・並行作業向け</span></div>
              </button>
            </div>
            <button onClick={onClose} className="mt-6 text-slate-400 hover:text-slate-600">キャンセル</button>
@@ -3301,13 +4271,19 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                           <button onClick={()=>defectPhotoRef.current?.click()} className="w-16 h-16 border-2 border-dashed rounded flex items-center justify-center text-slate-400 hover:text-blue-500 hover:border-blue-300">
                             <Camera className="w-5 h-5"/>
                           </button>
-                          <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
+                          <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" capture="environment" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
                         </div>
                       </div>
                     </div>
-                    <div className="flex justify-end gap-2 mt-4">
-                        <button onClick={()=>{setShowDefectModal(false);setDefectLabel('');setDefectCauseProcess('');setDefectPhotos([]);}} className="px-4 py-2 text-slate-500">キャンセル</button>
-                        <button onClick={()=>startInterruption('defect', defectLabel, defectCauseProcess, defectPhotos)} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold">対応開始</button>
+                    <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 text-xs text-rose-700 mt-3">
+                      <div className="font-bold mb-1">📋 報告方法を選択</div>
+                      <div><span className="font-bold">報告のみ</span>: 不具合を記録するだけ。作業を続行 (タイマー停止なし)</div>
+                      <div><span className="font-bold">対応開始</span>: 今すぐ対処開始。作業時間を分離して計測</div>
+                    </div>
+                    <div className="flex justify-end gap-2 mt-4 flex-wrap">
+                        <button onClick={()=>{setShowDefectModal(false);setDefectLabel('');setDefectCauseProcess('');setDefectPhotos([]);}} className="px-4 py-2 text-slate-500 min-h-[44px]">キャンセル</button>
+                        <button onClick={()=>startInterruption('defect', defectLabel, defectCauseProcess, defectPhotos, true)} disabled={!defectLabel.trim()} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-bold min-h-[44px] disabled:opacity-40">📋 報告のみ</button>
+                        <button onClick={()=>startInterruption('defect', defectLabel, defectCauseProcess, defectPhotos, false)} disabled={!defectLabel.trim()} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold min-h-[44px] disabled:opacity-40">🚨 対応開始</button>
                     </div>
                 </div>
             </div>
@@ -3355,28 +4331,43 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                  <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
                    {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
                  </button>
-                 <button onClick={()=>setShowComplaintModal(true)} className="px-3 py-2 bg-purple-600 hover:bg-purple-700 rounded font-bold text-sm flex items-center gap-1"><Megaphone className="w-4 h-4"/> 気づき報告</button>
-                 <button onClick={()=>setShowDefectModal(true)} className="px-3 py-2 bg-rose-600 hover:bg-rose-700 rounded font-bold text-sm flex items-center gap-1"><AlertTriangle className="w-4 h-4"/> 不具合報告</button>
-                 <button onClick={toggleBreak} className={`px-3 py-2 ${isOnBreak ? 'bg-amber-500 hover:bg-amber-600 animate-pulse' : 'bg-amber-600 hover:bg-amber-700'} rounded font-bold text-sm flex items-center gap-1`}>
-                   <Coffee className="w-4 h-4"/> {isOnBreak ? `中断中 ${formatTime(breakDuration)}` : '中断'}
+                 <button onClick={()=>setShowComplaintModal(true)} className="px-3 py-2 bg-purple-600 hover:bg-purple-700 rounded font-bold text-sm flex items-center gap-1 min-h-[44px]"><Megaphone className="w-4 h-4"/> 気づき報告</button>
+                 <button onClick={()=>setShowDefectModal(true)} className="px-3 py-2 bg-rose-600 hover:bg-rose-700 rounded font-bold text-sm flex items-center gap-1 min-h-[44px]"><AlertTriangle className="w-4 h-4"/> 不具合報告</button>
+                 <button onClick={toggleBreak} className={`px-3 py-2 ${isOnBreak ? 'bg-emerald-500 hover:bg-emerald-600 animate-pulse' : 'bg-amber-600 hover:bg-amber-700'} rounded font-bold text-sm flex items-center gap-1 min-h-[44px]`} title={executionType === 'sequential' ? (isOnBreak ? '作業時間の計測を再開' : '作業時間の計測を一時停止') : (isOnBreak ? '全タスクを再開' : '進行中タスクをまとめて一時停止')}>
+                   {isOnBreak ? <><Play className="w-4 h-4"/> 再開</> : <><Pause className="w-4 h-4"/> {executionType === 'sequential' ? '中断' : 'まとめて中断'}</>}
                  </button>
-                 <button onClick={handleCompleteTrigger} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded font-bold text-sm">全作業完了</button>
-                 <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-full"><X className="w-6 h-6"/></button>
+                 {/* 「全作業完了」は誤タップ防止のため、サイズ・色・余白で他ボタンと差別化 */}
+                 <div className="ml-2 pl-2 border-l border-white/20 flex items-center gap-2">
+                   <button onClick={handleCompleteTrigger} className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 ring-2 ring-emerald-300/50 rounded-lg font-black text-sm shadow-lg flex items-center gap-2 min-h-[44px]"><CheckCircle2 className="w-5 h-5"/> 全作業完了</button>
+                   <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-2.5 hover:bg-white/10 rounded-full min-h-[44px] min-w-[44px] flex items-center justify-center"><X className="w-6 h-6"/></button>
+                 </div>
              </div>
           </div>
           
-          {/* 共有ノート警告バナー */}
-          {lotNotes.length > 0 && (
-            <div className="bg-amber-50 border-b border-amber-300 px-4 py-2 flex items-start gap-2 shrink-0">
-              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5"/>
-              <div className="flex-1">
-                <div className="text-xs font-bold text-amber-700 mb-0.5">この型式に関する共有情報があります</div>
-                {lotNotes.map(n => (
-                  <div key={n.id} className="text-xs text-amber-800 mb-0.5">• {n.content} <span className="text-amber-500">— {n.author}</span></div>
-                ))}
+          {/* 共有ノート警告バナー (読了で 24h サプレス) */}
+          {(() => {
+            const dismissedKey = `lotNoteDismiss_${lot.id}`;
+            const isDismissed = (() => { try { const ts = Number(localStorage.getItem(dismissedKey)); return ts && (Date.now() - ts) < 24 * 60 * 60 * 1000; } catch { return false; } })();
+            if (lotNotes.length === 0 || isDismissed) return null;
+            return (
+              <div className="bg-amber-50 border-b border-amber-300 px-4 py-2 flex items-start gap-2 shrink-0">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5"/>
+                <div className="flex-1">
+                  <div className="text-xs font-bold text-amber-700 mb-0.5">この型式に関する共有情報があります</div>
+                  {lotNotes.map(n => (
+                    <div key={n.id} className="text-xs text-amber-800 mb-0.5">• {n.content} <span className="text-amber-500">— {n.author}</span></div>
+                  ))}
+                </div>
+                <button
+                  onClick={() => { try { localStorage.setItem(dismissedKey, String(Date.now())); } catch {}; setLotNoteBannerDismissed(prev => prev + 1); }}
+                  className="text-xs bg-amber-100 hover:bg-amber-200 text-amber-800 px-2 py-1 rounded font-bold border border-amber-300 shrink-0 min-h-[28px]"
+                  title="24時間 表示しません"
+                >
+                  ✓ 読了
+                </button>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           <div className="flex-1 flex overflow-hidden">
             <div className="flex-1 overflow-auto p-6 bg-slate-50 pb-4">
@@ -3418,25 +4409,51 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                         )}
                         <div className="grid grid-cols-5 md:grid-cols-8 lg:grid-cols-10 gap-2">
                            {Array.from({ length: lot.quantity }).map((_, uIdx) => {
-                             const key = `${sIdx}-${uIdx}`;
-                             const task = tasks[key] || { status: 'waiting', duration: 0 };
+                             // step.id ベースを優先しつつ numeric にフォールバック (互換性)
+                             const idKey = step?.id ? `${step.id}-${uIdx}` : null;
+                             const numKey = `${sIdx}-${uIdx}`;
+                             const key = (idKey && tasks[idKey]) ? idKey : numKey;
+                             const task = tasks[key] || tasks[numKey] || { status: 'waiting', duration: 0 };
                              const isNG = task.status === 'ng' || task.status === 'reworking';
                              const reworks = task.reworks || [];
                              return (
                                <div key={uIdx} className="flex flex-col gap-1">
                                  {/* メインボタン（通常 or NG表示） */}
-                                 <button onClick={() => toggleTask(sIdx, uIdx)} className={`h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNG ? 'bg-red-600 text-white' : getTaskStatusColor(task.status)} ${!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch ? 'opacity-30 cursor-not-allowed' : ''}`} disabled={isNG || (!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch)}>
-                                   <span className="text-sm font-bold">#{uIdx+1}</span>
-                                   {isNG ? (
-                                     <>
-                                       <span className="text-xs font-black bg-white/20 px-1.5 rounded">NG</span>
-                                       <span className="text-xs font-mono mt-0.5">{formatTime(task.duration)}</span>
-                                     </>
-                                   ) : (
-                                     <span className="text-sm font-mono font-bold mt-1">{formatTime(task.status === 'processing' && task.startTime ? task.duration + Math.floor((Date.now() - task.startTime) / 1000) : task.duration)}</span>
+                                 <div className="relative">
+                                   <button onClick={() => {
+                                     if (!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch) {
+                                       alert('別の手動作業を実行中です。先にその作業を完了するか、「まとめて開始」を使ってください。');
+                                       return;
+                                     }
+                                     if (isNG) return;
+                                     toggleTask(sIdx, uIdx);
+                                   }} title={!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch ? '別の手動作業を実行中です' : ''} className={`w-full h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNG ? 'bg-red-600 text-white' : getTaskStatusColor(task.status)} ${!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch ? 'opacity-30' : ''}`}>
+                                     <span className="text-sm font-bold">#{uIdx+1}</span>
+                                     {isNG ? (
+                                       <>
+                                         <span className="text-xs font-black bg-white/20 px-1.5 rounded">NG</span>
+                                         <span className="text-xs font-mono mt-0.5">{formatTime(task.duration)}</span>
+                                       </>
+                                     ) : (
+                                       <span className="text-sm font-mono font-bold mt-1">{formatTime(task.status === 'processing' && task.startTime ? task.duration + Math.floor((Date.now() - task.startTime) / 1000) : task.duration)}</span>
+                                     )}
+                                     {task.status === 'processing' && <span className="absolute top-1 right-1 w-2 h-2 bg-white rounded-full animate-ping"/>}
+                                   </button>
+                                   {/* 1タップNG: processing/completed のとき左下に直接 NG マーク可能 */}
+                                   {(task.status === 'processing' || task.status === 'completed') && (
+                                     <button
+                                       onClick={(e) => {
+                                         e.stopPropagation();
+                                         if (!confirm(`#${uIdx+1} を NG にしますか？`)) return;
+                                         handleTaskMenuAction('ng', key);
+                                       }}
+                                       className="absolute bottom-1 left-1 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-black px-1.5 py-0.5 border border-red-700 shadow ring-1 ring-white/30"
+                                       title="1タップで NG にする"
+                                     >
+                                       NG
+                                     </button>
                                    )}
-                                   {task.status === 'processing' && <span className="absolute top-1 right-1 w-2 h-2 bg-white rounded-full animate-ping"/>}
-                                 </button>
+                                 </div>
                                  {/* 修正作業ボタン群（NG時 or 修正履歴あり） */}
                                  {(isNG || reworks.length > 0) && reworks.map((rw, rIdx) => (
                                    <button key={rIdx} onClick={() => {
@@ -3470,23 +4487,45 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             <div className="w-96 bg-white border-l border-slate-200 flex flex-col p-6 overflow-y-auto shrink-0">
                <h3 className="font-bold text-slate-800 text-lg mb-4 border-b pb-2">工程詳細 <span className="text-sm font-normal text-slate-500">— 機番 #{displayUnitIdx + 1} {lot.unitSerialNumbers?.[displayUnitIdx] ? `(${lot.unitSerialNumbers[displayUnitIdx]})` : ''}</span></h3>
                {displayStep.type === 'measurement' && displayStep.measurementConfig ? (
-                 <MeasurementInputPanel
-                   config={displayStep.measurementConfig}
-                   values={measurementResults[`${displayStep.id}-${displayUnitIdx}-values`] || measurementResults[`${displayStep.id}-values`] || {}}
-                   onChange={(newValues) => {
-                     const unitKey = `${displayStep.id}-${displayUnitIdx}`;
-                     const resultVal = calculateMeasurementResult(newValues, displayStep.measurementConfig);
-                     const calcResults = calculateMeasurementResults(newValues, displayStep.measurementConfig);
-                     const newResults = { ...measurementResults, [`${unitKey}-values`]: newValues, [unitKey]: { values: newValues, result: resultVal, calcResults, timestamp: Date.now() } };
-                     setMeasurementResults(newResults);
-                     onSave({ measurementResults: newResults });
-                   }}
-                   onComplete={null}
-                   pastData={lots ? getPastMeasurementData(lots, lot.model, displayStep.id) : []}
-                   lot={lot}
-                   comboPresets={comboPresets}
-                   voiceAssistantActive={voiceEnabled}
-                 />
+                 <div className="flex flex-col gap-2">
+                   <div className="bg-slate-50 rounded-lg border border-slate-200 p-2 shrink-0">
+                     <div className="flex items-start gap-2">
+                       {displayStep.images && displayStep.images.length > 0 && (
+                         <img src={displayStep.images[0]} className="w-16 h-16 object-contain rounded border border-slate-200 shrink-0 cursor-pointer" alt="参考" onClick={() => setMeasurementFullscreen(true)}/>
+                       )}
+                       <div className="flex-1 min-w-0">
+                         <div className="flex items-center gap-1 mb-0.5 flex-wrap">
+                           <span className="text-[9px] font-bold text-slate-500">注意事項</span>
+                           {displayStep.pdfData && <button onClick={() => setShowPdf(true)} className="bg-orange-100 text-orange-700 text-[9px] font-bold px-1 rounded hover:bg-orange-200">PDF</button>}
+                         </div>
+                         <div className="text-[11px] text-slate-700 whitespace-pre-wrap leading-snug">{displayStep.description || <span className="text-slate-400 italic">（なし）</span>}</div>
+                       </div>
+                     </div>
+                   </div>
+                   <div className="flex justify-end shrink-0">
+                     <button onClick={() => setMeasurementFullscreen(true)} className="bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg text-xs font-black flex items-center gap-1 shadow-md ring-1 ring-teal-400/40">
+                       <Maximize2 className="w-3.5 h-3.5"/> 測定画面を最大化
+                     </button>
+                   </div>
+                   <MeasurementInputPanel
+                     config={displayStep.measurementConfig}
+                     values={measurementResults[`${displayStep.id}-${displayUnitIdx}-values`] || measurementResults[`${displayStep.id}-values`] || {}}
+                     onChange={(newValues) => {
+                       const unitKey = `${displayStep.id}-${displayUnitIdx}`;
+                       const resultVal = calculateMeasurementResult(newValues, displayStep.measurementConfig);
+                       const crossVals = collectCrossStepValues(lot, displayStep.id);
+                       const calcResults = calculateMeasurementResults(newValues, displayStep.measurementConfig, crossVals);
+                       const newResults = { ...measurementResults, [`${unitKey}-values`]: newValues, [unitKey]: { values: newValues, result: resultVal, calcResults, timestamp: Date.now() } };
+                       setMeasurementResults(newResults);
+                       onSave({ measurementResults: newResults });
+                     }}
+                     onComplete={null}
+                     pastData={lots ? getPastMeasurementData(lots, lot.model, displayStep.id) : []}
+                     lot={lot}
+                     comboPresets={comboPresets}
+                     voiceAssistantActive={voiceEnabled}
+                   />
+                 </div>
                ) : (
                  <>
                    <div className="bg-slate-100 rounded-xl overflow-hidden mb-4 border border-slate-200 aspect-video flex items-center justify-center">
@@ -3510,7 +4549,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           </div>
           
           {/* Voice & Interruptions Bottom Bar (non-overlapping, compact) */}
-          {(voiceEnabled || interruptions.some(i => i.status === 'active')) && (
+          {(voiceEnabled || interruptions.some(i => i.status === 'active' && i.type !== 'break')) && (
             <div className="shrink-0 border-t border-slate-200">
               {/* Voice: thin single-line bar with expand toggle */}
               {voiceEnabled && (
@@ -3541,7 +4580,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                           {activeCustomTaskKey ? (
                             <>
                               <div className="text-slate-300"><span className="text-emerald-300 font-bold">「完了」</span> 作業完了 / <span className="text-emerald-300 font-bold">「次」</span> 次へ</div>
-                              <div className="text-slate-300"><span className="text-rose-300 font-bold">「中断」</span> 不具合報告</div>
+                              <div className="text-slate-300"><span className="text-amber-300 font-bold">「中断」</span> 作業時間の一時停止/再開</div>
                             </>
                           ) : (
                             <>
@@ -3565,18 +4604,21 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                 </div>
               )}
               {/* Active Interruptions Footer */}
-              {interruptions.some(i => i.status === 'active') && (
+              {interruptions.some(i => i.status === 'active' && i.type !== 'break') && (
                 <div className="bg-slate-900/90 text-white p-3 flex items-center gap-4">
                     <span className="text-xs font-bold bg-white/20 px-2 py-1 rounded">進行中の割り込み</span>
                     <div className="flex-1 flex gap-3 overflow-x-auto">
-                        {interruptions.filter(i => i.status === 'active').map(i => (
-                            <div key={i.id} className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm font-bold ${i.type === 'defect' ? 'bg-rose-600' : i.type === 'break' ? 'bg-amber-600' : 'bg-indigo-600'}`}>
-                                {i.type === 'defect' ? <AlertTriangle className="w-3 h-3"/> : i.type === 'break' ? <Coffee className="w-3 h-3"/> : <Eye className="w-3 h-3"/>}
+                        {interruptions.filter(i => i.status === 'active' && i.type !== 'break').map(i => (
+                            <div key={i.id} className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm font-bold ${i.type === 'defect' ? 'bg-rose-600' : i.type === 'complaint' ? 'bg-purple-600' : 'bg-indigo-600'}`}>
+                                {i.type === 'defect' ? <AlertTriangle className="w-3 h-3"/> : i.type === 'complaint' ? <Megaphone className="w-3 h-3"/> : <Eye className="w-3 h-3"/>}
                                 {i.label} <span className="font-mono">{formatTime(i.duration)}</span>
-                                <button onClick={() => stopInterruption(i.id)} className="ml-2 hover:text-slate-200"><CheckCircle2 className="w-4 h-4"/></button>
+                                <button onClick={() => stopInterruption(i.id)} className="ml-2 hover:text-slate-200" title="完了"><CheckCircle2 className="w-4 h-4"/></button>
                             </div>
                         ))}
                     </div>
+                    <button onClick={() => setShowDefectModal(true)} className="bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-2 py-1 rounded flex items-center gap-1 shrink-0" title="別の不具合を追加">
+                      <Plus className="w-3 h-3"/> 不具合追加
+                    </button>
                 </div>
               )}
             </div>
@@ -3590,6 +4632,63 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           )}
           {completedTaskMenuModal}
         </div>
+
+        {/* 測定画面 最大化モーダル (カスタム実行モード) */}
+        {measurementFullscreen && (() => {
+          const activeStep = localSteps[displayStepIdx] || currentStep;
+          if (!activeStep || activeStep.type !== 'measurement' || !activeStep.measurementConfig) return null;
+          const activeUnitIdx = displayUnitIdx;
+          return (
+            <div className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
+              <div className="bg-slate-800 text-white p-3 flex justify-between items-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <Ruler className="w-5 h-5 text-teal-400"/>
+                  <div>
+                    <div className="text-base font-bold">{activeStep.title}</div>
+                    <div className="text-[10px] text-slate-300 mt-0.5">測定画面 最大化表示 — {lot.model} #{lot.serialNo} ・{displayUnitIdx + 1}台目</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {activeStep.description && (
+                    <details className="relative">
+                      <summary className="cursor-pointer bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1 list-none"><FileText className="w-3.5 h-3.5"/> 注意事項</summary>
+                      <div className="absolute right-0 top-full mt-1 bg-white text-slate-800 rounded-lg shadow-2xl p-3 w-80 max-h-64 overflow-y-auto z-10">
+                        <div className="text-[10px] font-bold text-slate-500 mb-1">作業内容 / 注意事項</div>
+                        <div className="text-xs whitespace-pre-wrap leading-relaxed">{activeStep.description}</div>
+                      </div>
+                    </details>
+                  )}
+                  {activeStep.pdfData && (
+                    <button onClick={() => setShowPdf(true)} className="bg-orange-500 hover:bg-orange-600 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><FileText className="w-3.5 h-3.5"/> PDF</button>
+                  )}
+                  <button onClick={() => setMeasurementFullscreen(false)} className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><Minimize2 className="w-3.5 h-3.5"/> 閉じる</button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-hidden p-3 bg-slate-100">
+                <MeasurementInputPanel
+                  splitLayout={true}
+                  config={activeStep.measurementConfig}
+                  values={measurementResults[`${activeStep.id}-${activeUnitIdx}-values`] || measurementResults[`${activeStep.id}-values`] || {}}
+                  onChange={(newValues) => {
+                    const unitKey = `${activeStep.id}-${activeUnitIdx}`;
+                    const resultVal = calculateMeasurementResult(newValues, activeStep.measurementConfig);
+                    const crossVals = collectCrossStepValues(lot, activeStep.id);
+                    const calcResults = calculateMeasurementResults(newValues, activeStep.measurementConfig, crossVals);
+                    const measData = { values: newValues, result: resultVal, calcResults, timestamp: Date.now() };
+                    const newResults = { ...measurementResults, [`${unitKey}-values`]: newValues, [unitKey]: measData };
+                    setMeasurementResults(newResults);
+                    onSave({ measurementResults: newResults });
+                  }}
+                  onComplete={null}
+                  pastData={lots ? getPastMeasurementData(lots, lot.model, activeStep.id) : []}
+                  lot={lot}
+                  comboPresets={comboPresets}
+                  voiceAssistantActive={voiceEnabled}
+                />
+              </div>
+            </div>
+          );
+        })()}
       </div>
     );
   }
@@ -3598,9 +4697,10 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   return (
     <div data-fs="execution" className="fixed inset-0 z-50 bg-slate-900/90 backdrop-blur-sm flex items-center justify-center p-4">
       {showPdf && currentStep.pdfData ? (
-        <div className="fixed inset-0 z-[60] bg-black/95 flex flex-col p-4">
+        <div className="fixed inset-0 z-[310] bg-black/95 flex flex-col p-4">
           <div className="flex justify-between items-center text-white mb-2"><span className="font-bold">参考資料</span><button onClick={()=>setShowPdf(false)}><X className="w-8 h-8"/></button></div>
-          <iframe src={currentStep.pdfData} className="flex-1 bg-white rounded-lg"/>
+          {/* embed: タブレットでネイティブ PDF ビューアー利用、iframe より触りやすい */}
+          <embed src={currentStep.pdfData} type="application/pdf" className="flex-1 bg-white rounded-lg w-full"/>
         </div>
       ) : null}
 
@@ -3634,13 +4734,19 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                   <button onClick={()=>defectPhotoRef.current?.click()} className="w-16 h-16 border-2 border-dashed rounded flex items-center justify-center text-slate-400 hover:text-blue-500 hover:border-blue-300">
                     <Camera className="w-5 h-5"/>
                   </button>
-                  <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
+                  <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" capture="environment" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
                 </div>
               </div>
             </div>
-            <div className="flex justify-end gap-2 mt-4">
-              <button onClick={()=>{setShowDefectModal(false);setDefectLabel('');setDefectCauseProcess('');setDefectPhotos([]);}} className="px-4 py-2 text-slate-500">キャンセル</button>
-              <button onClick={()=>startInterruption('defect', defectLabel, defectCauseProcess, defectPhotos)} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold">対応開始</button>
+            <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 text-xs text-rose-700 mt-3">
+              <div className="font-bold mb-1">📋 報告方法を選択</div>
+              <div><span className="font-bold">報告のみ</span>: 不具合を記録するだけ。作業を続行 (タイマー停止なし)</div>
+              <div><span className="font-bold">対応開始</span>: 今すぐ対処開始。作業時間を分離して計測</div>
+            </div>
+            <div className="flex justify-end gap-2 mt-4 flex-wrap">
+              <button onClick={()=>{setShowDefectModal(false);setDefectLabel('');setDefectCauseProcess('');setDefectPhotos([]);}} className="px-4 py-2 text-slate-500 min-h-[44px]">キャンセル</button>
+              <button onClick={()=>startInterruption('defect', defectLabel, defectCauseProcess, defectPhotos, true)} disabled={!defectLabel.trim()} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-bold min-h-[44px] disabled:opacity-40">📋 報告のみ</button>
+              <button onClick={()=>startInterruption('defect', defectLabel, defectCauseProcess, defectPhotos, false)} disabled={!defectLabel.trim()} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold min-h-[44px] disabled:opacity-40">🚨 対応開始</button>
             </div>
           </div>
         </div>
@@ -3654,28 +4760,60 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
               {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
             </button>
-            <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-full"><X className="w-6 h-6"/></button>
+            <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-2 hover:bg-white/10 rounded-full"><X className="w-6 h-6"/></button>
           </div>
         </div>
         <div className="flex-1 flex overflow-hidden">
           <div className="flex-1 bg-slate-100 p-4 flex flex-col relative overflow-y-auto">
              {currentStep.type === 'measurement' && currentStep.measurementConfig ? (
-               <MeasurementInputPanel
-                 config={currentStep.measurementConfig}
-                 values={measurementResults[`${currentStep.id}-0-values`] || measurementResults[`${currentStep.id}-values`] || {}}
-                 onChange={(newValues) => {
-                   const resultVal = calculateMeasurementResult(newValues, currentStep.measurementConfig);
-                   const calcResults = calculateMeasurementResults(newValues, currentStep.measurementConfig);
-                   const measData = { values: newValues, result: resultVal, calcResults, timestamp: Date.now() };
-                   const newResults = { ...measurementResults, [`${currentStep.id}-values`]: newValues, [`${currentStep.id}-result`]: measData, [`${currentStep.id}-0-values`]: newValues, [`${currentStep.id}-0`]: measData };
-                   setMeasurementResults(newResults);
-                 }}
-                 onComplete={() => handleNext()}
-                 pastData={lots ? getPastMeasurementData(lots, lot.model, currentStep.id) : []}
-                 lot={lot}
-                 comboPresets={comboPresets}
-                 voiceAssistantActive={voiceEnabled}
-               />
+               <div className="flex flex-col h-full gap-2">
+                 {/* 詳細・注意事項（測定タイプでも常に表示） */}
+                 <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-3 shrink-0 max-h-[36%] overflow-y-auto">
+                   <div className="flex items-start gap-3">
+                     {currentStep.images && currentStep.images.length > 0 && (
+                       <img src={currentStep.images[0]} className="w-24 h-24 object-contain rounded border border-slate-200 shrink-0 cursor-pointer" alt="参考" onClick={() => setMeasurementFullscreen(true)}/>
+                     )}
+                     <div className="flex-1 min-w-0">
+                       <div className="flex items-center gap-2 mb-1 flex-wrap">
+                         <span className="text-[10px] font-bold text-slate-500">作業内容 / 注意事項</span>
+                         {currentStep.type === 'danger' && <span className="bg-red-100 text-red-700 text-[10px] font-bold px-1.5 py-0.5 rounded flex items-center gap-0.5"><AlertOctagon className="w-2.5 h-2.5"/> 危険</span>}
+                         {currentStep.type === 'important' && <span className="bg-amber-100 text-amber-700 text-[10px] font-bold px-1.5 py-0.5 rounded flex items-center gap-0.5"><AlertTriangle className="w-2.5 h-2.5"/> 重要</span>}
+                         {currentStep.pdfData && <button onClick={() => setShowPdf(true)} className="bg-orange-100 text-orange-700 text-[10px] font-bold px-1.5 py-0.5 rounded hover:bg-orange-200 flex items-center gap-0.5"><FileText className="w-2.5 h-2.5"/> PDF</button>}
+                       </div>
+                       <div className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">{currentStep.description || <span className="text-slate-400 italic">（詳細・注意事項なし）</span>}</div>
+                     </div>
+                   </div>
+                 </div>
+                 <div className="flex justify-end shrink-0">
+                   <button onClick={() => setMeasurementFullscreen(true)} className="bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 rounded-lg text-sm font-black flex items-center gap-2 shadow-md ring-1 ring-teal-400/40 min-h-[40px]">
+                     <Maximize2 className="w-4 h-4"/> 測定画面を最大化
+                   </button>
+                 </div>
+                 <div className="flex-1 min-h-0 overflow-y-auto">
+                   <MeasurementInputPanel
+                     config={currentStep.measurementConfig}
+                     values={measurementResults[`${currentStep.id}-0-values`] || measurementResults[`${currentStep.id}-values`] || {}}
+                     onChange={(newValues) => {
+                       const resultVal = calculateMeasurementResult(newValues, currentStep.measurementConfig);
+                       const crossVals = collectCrossStepValues(lot, currentStep.id);
+                       const calcResults = calculateMeasurementResults(newValues, currentStep.measurementConfig, crossVals);
+                       const measData = { values: newValues, result: resultVal, calcResults, timestamp: Date.now() };
+                       // 統一キー方針: ${id}-${unit}-values と ${id}-${unit}
+                       const newResults = { ...measurementResults, [`${currentStep.id}-0-values`]: newValues, [`${currentStep.id}-0`]: measData };
+                       // 旧キーがあれば互換維持
+                       if (measurementResults[`${currentStep.id}-values`] !== undefined) newResults[`${currentStep.id}-values`] = newValues;
+                       if (measurementResults[`${currentStep.id}-result`] !== undefined) newResults[`${currentStep.id}-result`] = measData;
+                       setMeasurementResults(newResults);
+                       onSave({ measurementResults: newResults });
+                     }}
+                     onComplete={() => handleNext()}
+                     pastData={lots ? getPastMeasurementData(lots, lot.model, currentStep.id) : []}
+                     lot={lot}
+                     comboPresets={comboPresets}
+                     voiceAssistantActive={voiceEnabled}
+                   />
+                 </div>
+               </div>
              ) : (
                <>
                  <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm flex items-center justify-center overflow-hidden relative">
@@ -3704,10 +4842,10 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                 <button onClick={handleCompleteTrigger} className="w-full py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold flex items-center justify-center gap-2"><Check className="w-5 h-5"/> 全作業完了</button></> )}
              </div>
              <div className="mt-8 border-t pt-6 space-y-2">
-               <button onClick={()=>setShowDefectModal(true)} className="w-full py-3 border-2 border-rose-100 text-rose-500 hover:bg-rose-50 rounded-xl font-bold flex items-center justify-center gap-2"><AlertOctagon className="w-5 h-5"/> 不適合報告 (NG)</button>
+               <button onClick={()=>setShowDefectModal(true)} className="w-full py-3 border-2 border-rose-100 text-rose-500 hover:bg-rose-50 rounded-xl font-bold flex items-center justify-center gap-2"><AlertTriangle className="w-5 h-5"/> 不具合報告</button>
                <button onClick={()=>setShowComplaintModal(true)} className="w-full py-2 border-2 border-purple-100 text-purple-500 hover:bg-purple-50 rounded-xl font-bold flex items-center justify-center gap-2 text-sm"><Megaphone className="w-4 h-4"/> 気づき報告</button>
-               <button onClick={toggleBreak} className={`w-full py-3 ${isOnBreak ? 'bg-amber-500 text-white animate-pulse' : 'border-2 border-amber-100 text-amber-500 hover:bg-amber-50'} rounded-xl font-bold flex items-center justify-center gap-2`}>
-                 <Coffee className="w-5 h-5"/> {isOnBreak ? `中断中 ${formatTime(breakDuration)}` : '中断'}
+               <button onClick={toggleBreak} className={`w-full py-3 ${isOnBreak ? 'bg-emerald-500 text-white animate-pulse' : 'border-2 border-amber-100 text-amber-500 hover:bg-amber-50'} rounded-xl font-bold flex items-center justify-center gap-2`} title={isOnBreak ? '作業時間の計測を再開' : '作業時間の計測を一時停止'}>
+                 {isOnBreak ? <><Play className="w-5 h-5"/> 再開</> : <><Pause className="w-5 h-5"/> 中断</>}
                </button>
              </div>
           </div>
@@ -3738,6 +4876,79 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
         )}
         <div className="h-2 bg-slate-100"><div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${((currentStepIdx + (lot.status==='completed'?1:0)) / localSteps.length) * 100}%` }} /></div>
       </div>
+
+      {/* 中断中 (一時停止) のフルスクリーンオーバーレイ — 順序実行モード */}
+      {isOnBreak && !measurementFullscreen && (
+        <div onClick={toggleBreak} className="fixed inset-0 z-[150] bg-amber-900/40 backdrop-blur-sm flex items-center justify-center cursor-pointer">
+          <div className="bg-amber-500 text-white px-8 py-6 rounded-2xl shadow-2xl ring-4 ring-amber-300/50 text-center animate-pulse">
+            <div className="flex items-center justify-center gap-3 mb-2"><Pause className="w-10 h-10"/></div>
+            <div className="text-2xl font-black mb-1">作業を一時停止しています</div>
+            <div className="text-sm opacity-90">タップで再開 / または右上の「再開」ボタンを押してください</div>
+            <div className="mt-3 text-xs bg-white/20 inline-block px-3 py-1 rounded-full">経過時間: {formatTime(Math.floor(elapsed / 1000))}</div>
+          </div>
+        </div>
+      )}
+
+      {/* 測定画面 最大化モーダル (測定タイプの工程のみ) */}
+      {measurementFullscreen && (() => {
+        const activeStep = executionType === 'sequential' ? currentStep : (localSteps[displayStepIdx] || currentStep);
+        if (!activeStep || activeStep.type !== 'measurement' || !activeStep.measurementConfig) return null;
+        const activeUnitIdx = executionType === 'sequential' ? 0 : displayUnitIdx;
+        return (
+          <div className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
+            <div className="bg-slate-800 text-white p-3 flex justify-between items-center shrink-0">
+              <div className="flex items-center gap-3">
+                <Ruler className="w-5 h-5 text-teal-400"/>
+                <div>
+                  <div className="text-base font-bold">{activeStep.title}</div>
+                  <div className="text-[10px] text-slate-300 mt-0.5">測定画面 最大化表示 — {lot.model} #{lot.serialNo}{executionType === 'custom' && ` ・${displayUnitIdx + 1}台目`}</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {activeStep.description && (
+                  <details className="relative">
+                    <summary className="cursor-pointer bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1 list-none"><FileText className="w-3.5 h-3.5"/> 注意事項</summary>
+                    <div className="absolute right-0 top-full mt-1 bg-white text-slate-800 rounded-lg shadow-2xl p-3 w-80 max-h-64 overflow-y-auto z-10">
+                      <div className="text-[10px] font-bold text-slate-500 mb-1">作業内容 / 注意事項</div>
+                      <div className="text-xs whitespace-pre-wrap leading-relaxed">{activeStep.description}</div>
+                    </div>
+                  </details>
+                )}
+                {activeStep.pdfData && (
+                  <button onClick={() => setShowPdf(true)} className="bg-orange-500 hover:bg-orange-600 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><FileText className="w-3.5 h-3.5"/> PDF</button>
+                )}
+                <button onClick={() => setMeasurementFullscreen(false)} className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><Minimize2 className="w-3.5 h-3.5"/> 閉じる</button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-hidden p-3 bg-slate-100">
+              <MeasurementInputPanel
+                splitLayout={true}
+                config={activeStep.measurementConfig}
+                values={measurementResults[`${activeStep.id}-${activeUnitIdx}-values`] || measurementResults[`${activeStep.id}-values`] || {}}
+                onChange={(newValues) => {
+                  const unitKey = `${activeStep.id}-${activeUnitIdx}`;
+                  const resultVal = calculateMeasurementResult(newValues, activeStep.measurementConfig);
+                  const crossVals = collectCrossStepValues(lot, activeStep.id);
+                  const calcResults = calculateMeasurementResults(newValues, activeStep.measurementConfig, crossVals);
+                  const measData = { values: newValues, result: resultVal, calcResults, timestamp: Date.now() };
+                  const newResults = { ...measurementResults, [`${unitKey}-values`]: newValues, [unitKey]: measData };
+                  if (executionType === 'sequential') {
+                    newResults[`${activeStep.id}-values`] = newValues;
+                    newResults[`${activeStep.id}-result`] = measData;
+                  }
+                  setMeasurementResults(newResults);
+                  onSave({ measurementResults: newResults });
+                }}
+                onComplete={executionType === 'sequential' ? () => { setMeasurementFullscreen(false); handleNext(); } : null}
+                pastData={lots ? getPastMeasurementData(lots, lot.model, activeStep.id) : []}
+                lot={lot}
+                comboPresets={comboPresets}
+                voiceAssistantActive={voiceEnabled}
+              />
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };
@@ -4522,13 +5733,21 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
         const avg = times.reduce((a,b)=>a+b,0) / times.length;
         const variance = times.reduce((a,b)=>a + Math.pow(b-avg, 2), 0) / (times.length - 1);
         const stdDev = Math.sqrt(variance);
-        
+
         const usl = target * (1 + targetTolerance/100);
         const lsl = target * (1 - targetTolerance/100);
-        
-        const cpu = (usl - avg) / (3 * stdDev);
-        const cpl = (avg - lsl) / (3 * stdDev);
-        const cpk = Math.min(cpu, cpl);
+
+        // stdDev 0 (全データ同一値) のゼロ除算/Infinity 回避
+        let cpk;
+        if (!Number.isFinite(stdDev) || stdDev === 0) {
+            // 完全に揃っているか、計算不能。USL/LSL 範囲内なら 999、外なら 0 として表示用に正規化
+            cpk = (avg >= lsl && avg <= usl) ? 999 : 0;
+        } else {
+            const cpu = (usl - avg) / (3 * stdDev);
+            const cpl = (avg - lsl) / (3 * stdDev);
+            cpk = Math.min(cpu, cpl);
+            if (!Number.isFinite(cpk)) cpk = 0;
+        }
 
         // Histogram buckets
         const min = Math.min(...times);
@@ -4681,6 +5900,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
   };
 
   const handleDefectExcel = async () => {
+    const ExcelJS = await loadExcelJS();
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('不具合分析');
     const thin = { style: 'thin', color: { argb: 'FF000000' } };
@@ -4778,7 +5998,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  {currentUserName === '管理者' && <button onClick={()=>setActiveMode('worker-eval')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='worker-eval' ? 'bg-white shadow text-amber-600' : 'text-slate-500 hover:text-slate-700'}`}><Users className="w-4 h-4"/> 作業者評価</button>}
               </div>
               <div className="flex gap-1 border rounded-lg overflow-hidden">
-                <button onClick={()=>{ const wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet('分析データ'); ws.addRow(['型式','平均時間(s)','目標時間(s)','標準偏差','Cpk','サンプル数']); analysisData.forEach(r=>ws.addRow([r.model,r.avg.toFixed(1),r.target,r.stdDev.toFixed(1),r.cpk.toFixed(2),r.count])); ws.getRow(1).font={bold:true,color:{argb:'FFFFFFFF'}}; ws.getRow(1).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF2563EB'}}; wb.xlsx.writeBuffer().then(buf=>{const blob=new Blob([buf],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='analysis_'+new Date().toISOString().slice(0,10)+'.xlsx'; a.click();}); }} className="px-3 py-1.5 text-xs font-bold bg-emerald-600 text-white hover:bg-emerald-700 flex items-center gap-1"><FileSpreadsheet className="w-3 h-3"/> Excel</button>
+                <button onClick={async ()=>{ const ExcelJS = await loadExcelJS(); const wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet('分析データ'); ws.addRow(['型式','平均時間(s)','目標時間(s)','標準偏差','Cpk','サンプル数']); analysisData.forEach(r=>ws.addRow([r.model,r.avg.toFixed(1),r.target,r.stdDev.toFixed(1),r.cpk.toFixed(2),r.count])); ws.getRow(1).font={bold:true,color:{argb:'FFFFFFFF'}}; ws.getRow(1).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF2563EB'}}; wb.xlsx.writeBuffer().then(buf=>{const blob=new Blob([buf],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='analysis_'+new Date().toISOString().slice(0,10)+'.xlsx'; a.click();}); }} className="px-3 py-1.5 text-xs font-bold bg-emerald-600 text-white hover:bg-emerald-700 flex items-center gap-1"><FileSpreadsheet className="w-3 h-3"/> Excel</button>
                 <button onClick={() => {
                   const pw = window.open('', '_blank');
                   if (!pw) { alert('ポップアップがブロックされています'); return; }
@@ -5642,7 +6862,13 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
  
          // 2. 監視・不具合イベントの出力 (ワークNoは「全体」扱い)
          if (lot.interruptions && lot.interruptions.length > 0) {
-             lot.interruptions.forEach(i => {
+             lot.interruptions.filter(i => i.type !== 'break').forEach(i => {
+                 const labelText = i.type === 'monitoring' ? `監視: ${i.label}`
+                   : i.type === 'complaint' ? `気づき: ${i.label}`
+                   : `不具合対応: ${i.label}`;
+                 const categoryText = i.type === 'monitoring' ? '監視作業'
+                   : i.type === 'complaint' ? '気づき報告'
+                   : '不具合対応';
                  rows.push([
                      lot.id,
                      '全体', // Work No
@@ -5651,11 +6877,11 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                      lot.entryAt ? formatDateSafe(lot.entryAt) : '-',
                      workStartTimeStr,
                      formatDateSafe(lot.updatedAt),
-                     i.type === 'monitoring' ? `監視: ${i.label}` : `不具合対応: ${i.label}`,
+                     labelText,
                      '0', // 目標なし
                      i.duration,
                      '-',
-                     i.type === 'monitoring' ? '監視作業' : '不具合対応'
+                     categoryText
                  ]);
              });
          }
@@ -5670,6 +6896,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
    };
 
   const handleExportExcel = async () => {
+    const ExcelJS = await loadExcelJS();
     const workbook = new ExcelJS.Workbook();
     const ws = workbook.addWorksheet('完了ロット一覧');
     const headers = [
@@ -5711,13 +6938,14 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
             }
         });
         if (lot.interruptions && lot.interruptions.length > 0) {
-            lot.interruptions.forEach(i => {
+            lot.interruptions.filter(i => i.type !== 'break').forEach(i => {
                 ws.addRow([
                     lot.id, '全体', lot.model, lot.orderNo, lot.quantity, lot.status, zoneName,
                     workers.find(w => w.id === lot.workerId)?.name || '未割当',
                     lot.entryAt ? formatDateSafe(lot.entryAt) : '-', workStartTimeStr, formatDateSafe(lot.updatedAt),
-                    i.type === 'monitoring' ? `監視: ${i.label}` : `不具合対応: ${i.label}`,
-                    '0', i.duration, '-', i.type === 'monitoring' ? '監視作業' : '不具合対応'
+                    i.type === 'monitoring' ? `監視: ${i.label}` : i.type === 'complaint' ? `気づき: ${i.label}` : `不具合対応: ${i.label}`,
+                    '0', i.duration, '-',
+                    i.type === 'monitoring' ? '監視作業' : i.type === 'complaint' ? '気づき報告' : '不具合対応'
                 ]);
             });
         }
@@ -5829,6 +7057,597 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
    );
  };
  
+// ===========================
+// 測定設定 View - レイアウトプリセットの新規登録/編集/削除 (組み込みプリセット含む)
+// ===========================
+const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], templates = [] }) => {
+  const customLayouts = settings?.customLayouts || {};
+  const builtInOverrides = settings?.builtInOverrides || {};
+  const hiddenBuiltIns = settings?.hiddenBuiltIns || [];
+
+  // 組み込みプリセットの実際の表示値（オーバーライド適用）
+  const effectiveBuiltIns = useMemo(() => {
+    const out = {};
+    Object.entries(MEASUREMENT_LAYOUTS).forEach(([k, v]) => {
+      if (k === 'custom') return;
+      if (hiddenBuiltIns.includes(k)) return;
+      out[k] = builtInOverrides[k] || v;
+    });
+    return out;
+  }, [builtInOverrides, hiddenBuiltIns]);
+
+  // 編集対象: { kind: 'new'|'custom'|'builtin', key }
+  const [editTarget, setEditTarget] = useState(null);
+  const [draftLabel, setDraftLabel] = useState('');
+  const [draftInputs, setDraftInputs] = useState([]);
+  const [draftDiagram, setDraftDiagram] = useState(null);
+  const [draftCalcs, setDraftCalcs] = useState([]);
+  const [draftArrows, setDraftArrows] = useState([]);
+
+  const initialCalc = (idx = 1) => ({
+    id: `calc${idx}`, label: `計算${idx}`, method: 'max-min',
+    formula: '', inputIds: [],
+    toleranceUpper: 0.05, toleranceLower: -0.05, unit: 'mm',
+    nominal: null, toleranceEnabled: true
+  });
+  const initialArrow = (idx = 1) => ({
+    id: `arr${idx}`, label: `矢印${idx}`,
+    sourceA: '', sourceB: '',
+    position: null, // null なら A・B 中央
+    threshold: 0
+  });
+
+  const startNew = () => {
+    setEditTarget({ kind: 'new', key: null });
+    setDraftLabel('');
+    setDraftInputs([{ id: 'p1', label: 'P1', x: 50, y: 50, inputType: 'number', presetValues: [], comboPresetId: '' }]);
+    setDraftDiagram(null);
+    setDraftCalcs([initialCalc(1)]);
+    setDraftArrows([]);
+  };
+
+  const startEdit = (kind, key) => {
+    const src = kind === 'custom' ? customLayouts[key] : effectiveBuiltIns[key];
+    if (!src) return;
+    setEditTarget({ kind, key });
+    setDraftLabel(src.label || '');
+    setDraftInputs((src.inputs || []).map(inp => ({
+      id: inp.id, label: inp.label, x: inp.x, y: inp.y,
+      inputType: inp.inputType || 'number',
+      presetValues: inp.presetValues || [],
+      comboPresetId: inp.comboPresetId || ''
+    })));
+    setDraftDiagram(src.diagramImage || null);
+    setDraftCalcs((src.calculations && src.calculations.length > 0)
+      ? src.calculations.map(c => ({ ...c }))
+      : [initialCalc(1)]);
+    setDraftArrows((src.arrows || []).map(a => ({ ...a })));
+  };
+
+  const cancelEdit = () => {
+    setEditTarget(null); setDraftLabel(''); setDraftInputs([]); setDraftDiagram(null); setDraftCalcs([]); setDraftArrows([]);
+  };
+
+  const saveDraft = () => {
+    if (!draftLabel.trim()) { alert('プリセット名を入力してください'); return; }
+    if (draftInputs.length === 0) { alert('入力ポイントを1つ以上追加してください'); return; }
+    const presetData = {
+      label: draftLabel.trim(),
+      inputs: draftInputs.map(inp => ({
+        id: inp.id, label: inp.label, x: inp.x, y: inp.y,
+        inputType: inp.inputType || 'number',
+        presetValues: inp.presetValues || [],
+        comboPresetId: inp.comboPresetId || ''
+      })),
+      calculations: draftCalcs.map(c => ({
+        id: c.id, label: c.label, method: c.method,
+        formula: c.formula || '', inputIds: c.inputIds || [],
+        toleranceUpper: Number(c.toleranceUpper) || 0,
+        toleranceLower: Number(c.toleranceLower) || 0,
+        unit: c.unit || 'mm',
+        nominal: c.nominal === null || c.nominal === undefined || c.nominal === '' ? null : Number(c.nominal),
+        toleranceEnabled: c.toleranceEnabled !== false
+      })),
+      arrows: draftArrows.filter(a => a.sourceA && a.sourceB).map(a => ({
+        id: a.id, label: a.label || '',
+        sourceA: a.sourceA, sourceB: a.sourceB,
+        position: a.position, // { x, y } または null
+        threshold: Number(a.threshold) || 0
+      })),
+      ...(draftDiagram ? { diagramImage: draftDiagram } : {})
+    };
+    if (editTarget.kind === 'builtin') {
+      // 既存テンプレートの中で同じレイアウトキーを使っている工程を数える
+      const affectedTemplates = (templates || []).filter(t =>
+        (t.steps || []).some(s => s.measurementConfig && s.measurementConfig.layout === editTarget.key)
+      );
+      if (affectedTemplates.length > 0) {
+        const names = affectedTemplates.map(t => `・${t.name}`).slice(0, 5).join('\n');
+        const more = affectedTemplates.length > 5 ? `\n…他${affectedTemplates.length - 5}件` : '';
+        if (!confirm(`このプリセットを使用している ${affectedTemplates.length} 個のテンプレートに影響します。\n\n${names}${more}\n\n続行しますか？`)) return;
+      }
+      const newOverrides = { ...builtInOverrides, [editTarget.key]: presetData };
+      saveSettings({ builtInOverrides: newOverrides });
+    } else {
+      const key = editTarget.kind === 'new' ? generateId() : editTarget.key;
+      const newLayouts = { ...customLayouts, [key]: presetData };
+      saveSettings({ customLayouts: newLayouts });
+    }
+    cancelEdit();
+  };
+
+  const deleteCustom = (key) => {
+    if (!confirm(`カスタムプリセット「${customLayouts[key]?.label}」を削除しますか？`)) return;
+    const newLayouts = { ...customLayouts };
+    delete newLayouts[key];
+    saveSettings({ customLayouts: newLayouts });
+  };
+
+  const hideBuiltIn = (key) => {
+    if (!confirm(`組み込みプリセット「${effectiveBuiltIns[key]?.label}」を一覧から非表示にしますか？\n（再表示はリセットボタンから行えます）`)) return;
+    const newHidden = [...hiddenBuiltIns, key];
+    saveSettings({ hiddenBuiltIns: newHidden });
+  };
+
+  const resetBuiltIn = (key) => {
+    if (!confirm(`組み込みプリセット「${MEASUREMENT_LAYOUTS[key]?.label}」をデフォルトに戻しますか？`)) return;
+    const newOverrides = { ...builtInOverrides };
+    delete newOverrides[key];
+    saveSettings({ builtInOverrides: newOverrides });
+  };
+
+  const restoreAllHidden = () => {
+    if (!confirm('非表示にした組み込みプリセットをすべて再表示しますか？')) return;
+    saveSettings({ hiddenBuiltIns: [] });
+  };
+
+  const updateInput = (idx, patch) => {
+    const next = [...draftInputs];
+    next[idx] = { ...next[idx], ...patch };
+    setDraftInputs(next);
+  };
+  const removeInput = (idx) => setDraftInputs(draftInputs.filter((_, i) => i !== idx));
+  const addInput = () => setDraftInputs([
+    ...draftInputs,
+    { id: `p${draftInputs.length + 1}`, label: `P${draftInputs.length + 1}`, x: 50, y: 50, inputType: 'number', presetValues: [], comboPresetId: '' }
+  ]);
+
+  const updateCalc = (idx, patch) => {
+    const next = [...draftCalcs];
+    next[idx] = { ...next[idx], ...patch };
+    setDraftCalcs(next);
+  };
+  const removeCalc = (idx) => setDraftCalcs(draftCalcs.filter((_, i) => i !== idx));
+  const addCalc = () => {
+    if (draftCalcs.length >= MAX_CALCULATIONS) return;
+    setDraftCalcs([...draftCalcs, initialCalc(draftCalcs.length + 1)]);
+  };
+
+  const handleDiagramUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const img = await resizeImage(file);
+    setDraftDiagram(img);
+    e.target.value = '';
+  };
+
+  // 編集モード
+  if (editTarget !== null) {
+    const titleText = editTarget.kind === 'new' ? 'プリセット新規登録'
+      : editTarget.kind === 'builtin' ? '組み込みプリセット編集'
+      : 'プリセット編集';
+    return (
+      <div className="p-6 max-w-6xl mx-auto h-full overflow-y-auto">
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="font-bold text-lg flex items-center gap-2"><Ruler className="w-5 h-5 text-teal-600"/> {titleText}</h3>
+            <div className="flex gap-2">
+              {editTarget.kind === 'builtin' && builtInOverrides[editTarget.key] && (
+                <button onClick={() => { resetBuiltIn(editTarget.key); cancelEdit(); }} className="px-4 py-2 text-amber-600 hover:bg-amber-50 rounded font-bold text-sm border border-amber-200">デフォルトに戻す</button>
+              )}
+              <button onClick={cancelEdit} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded font-bold text-sm">キャンセル</button>
+              <button onClick={saveDraft} className="px-6 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded font-bold text-sm flex items-center gap-1"><Save className="w-4 h-4"/> 保存</button>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs font-bold text-slate-500 mb-1">プリセット名</label>
+              <input value={draftLabel} onChange={e => setDraftLabel(e.target.value)} className="w-full border rounded p-2" placeholder="例: 円形5点測定" />
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* 左: 入力ポイント編集 */}
+              <div className="bg-teal-50 border border-teal-200 rounded-lg p-3">
+                <div className="flex justify-between items-center mb-2">
+                  <label className="text-xs font-bold text-teal-700">入力ポイント ({draftInputs.length}点)</label>
+                  <button onClick={addInput} className="bg-teal-500 hover:bg-teal-600 text-white px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1"><Plus className="w-3 h-3"/> 追加</button>
+                </div>
+                <div className="max-h-[420px] overflow-y-auto space-y-2 pr-1">
+                  {draftInputs.map((inp, idx) => (
+                    <div key={idx} className="bg-white rounded p-2 border space-y-1">
+                      <div className="flex items-center gap-1 text-xs">
+                        <input value={inp.id} onChange={e => updateInput(idx, { id: e.target.value })} className="w-14 border rounded px-1 py-0.5 text-xs" placeholder="ID"/>
+                        <input value={inp.label} onChange={e => updateInput(idx, { label: e.target.value })} className="flex-1 border rounded px-1 py-0.5 text-xs" placeholder="ラベル"/>
+                        <select value={inp.inputType || 'number'} onChange={e => updateInput(idx, { inputType: e.target.value })} className="w-24 border rounded px-1 py-0.5 text-[10px]">
+                          <option value="number">数値入力</option>
+                          <option value="combobox">選択式</option>
+                        </select>
+                        <button onClick={() => removeInput(idx)} className="text-red-400 hover:text-red-600"><X className="w-3 h-3"/></button>
+                      </div>
+                      <div className="flex items-center gap-2 text-[10px] text-slate-500">
+                        <span>X:</span>
+                        <input type="range" min="0" max="100" value={Math.round(inp.x)} onChange={e => updateInput(idx, { x: Number(e.target.value) })} className="flex-1 h-1 accent-teal-500"/>
+                        <span className="w-8 text-right">{Math.round(inp.x)}%</span>
+                        <span>Y:</span>
+                        <input type="range" min="0" max="100" value={Math.round(inp.y)} onChange={e => updateInput(idx, { y: Number(e.target.value) })} className="flex-1 h-1 accent-teal-500"/>
+                        <span className="w-8 text-right">{Math.round(inp.y)}%</span>
+                      </div>
+                      {inp.inputType === 'combobox' && (
+                        <div className="flex items-center gap-1 pt-1 border-t border-slate-100">
+                          <span className="text-[10px] text-slate-500 font-bold">プリセット:</span>
+                          <select value={inp.comboPresetId || ''} onChange={e => updateInput(idx, { comboPresetId: e.target.value })} className="flex-1 border rounded px-1 py-0.5 text-[10px]">
+                            <option value="">-- 選択 --</option>
+                            {comboPresets.map(cp => <option key={cp.id} value={cp.id}>{cp.name} ({cp.values?.length || 0}件)</option>)}
+                          </select>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {draftInputs.length === 0 && <div className="text-[10px] text-slate-400 text-center py-4">「+ 追加」で入力ポイントを追加してください</div>}
+                </div>
+              </div>
+
+              {/* 右: プレビュー + 図面 */}
+              <div className="space-y-3">
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <label className="block text-xs font-bold text-slate-500 mb-2">プレビュー</label>
+                  <div className="relative w-full h-72 bg-white border rounded overflow-hidden" style={draftDiagram ? { backgroundImage: `url(${draftDiagram})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}}>
+                    {draftInputs.map((inp, idx) => (
+                      <div key={idx} className="absolute bg-teal-500 text-white text-[10px] font-bold rounded-full w-7 h-7 flex items-center justify-center shadow-md" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }} title={inp.label}>
+                        {inp.label?.slice(0, 3) || (idx + 1)}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <label className="block text-xs font-bold text-slate-500 mb-2">測定図面画像 (任意)</label>
+                  <div className="flex gap-2">
+                    <label className="flex-1 cursor-pointer py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[11px] font-bold rounded flex items-center justify-center gap-1 border"><ImageIcon className="w-3 h-3"/> 画像を選択<input type="file" className="hidden" accept="image/*" onChange={handleDiagramUpload}/></label>
+                    {draftDiagram && <button onClick={() => setDraftDiagram(null)} className="py-1.5 px-3 bg-red-50 hover:bg-red-100 text-red-500 text-[11px] font-bold rounded flex items-center gap-1 border border-red-200"><Trash2 className="w-3 h-3"/> 削除</button>}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 計算設定 */}
+            <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3">
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-xs font-bold text-indigo-700 flex items-center gap-1"><Calculator className="w-3 h-3"/> 計算設定 ({draftCalcs.length}件)</label>
+                <button onClick={addCalc} disabled={draftCalcs.length >= MAX_CALCULATIONS} className="bg-indigo-500 hover:bg-indigo-600 text-white px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed"><Plus className="w-3 h-3"/> 計算を追加</button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {draftCalcs.map((calc, cIdx) => (
+                  <div key={cIdx} className="bg-white rounded p-2 border space-y-1.5">
+                    <div className="flex items-center gap-1">
+                      <input value={calc.label} onChange={e => updateCalc(cIdx, { label: e.target.value })} className="flex-1 border rounded px-1 py-0.5 text-xs font-bold" placeholder="ラベル"/>
+                      {draftCalcs.length > 1 && <button onClick={() => removeCalc(cIdx)} className="text-red-400 hover:text-red-600"><X className="w-3 h-3"/></button>}
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-400 font-bold">計算方法</label>
+                      <select value={calc.method} onChange={e => updateCalc(cIdx, { method: e.target.value })} className="w-full border rounded p-1 text-[11px]">
+                        {CALCULATION_METHODS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                      </select>
+                      <p className="text-[9px] text-slate-400 mt-0.5">{CALCULATION_METHODS.find(m => m.value === calc.method)?.desc}</p>
+                    </div>
+                    {calc.method === 'formula' && (() => {
+                      const priorCalcs = draftCalcs.slice(0, cIdx);
+                      const insertVar = (id) => {
+                        const cur = calc.formula || '';
+                        const needsOp = cur && !/[+\-*/(\s]$/.test(cur);
+                        updateCalc(cIdx, { formula: cur + (needsOp ? '+' : '') + id });
+                      };
+                      return (
+                        <div>
+                          <label className="block text-[10px] text-slate-400 font-bold">数式</label>
+                          <input value={calc.formula || ''} onChange={e => updateCalc(cIdx, { formula: e.target.value })} className="w-full border rounded p-1 text-[11px] font-mono" placeholder="例: (b+c)/2+d/2"/>
+                          <details className="mt-1" open>
+                            <summary className="text-[10px] text-blue-600 cursor-pointer font-bold list-none">▶ 使える変数 (タップで挿入)</summary>
+                            <div className="mt-1 space-y-1.5 bg-slate-50 p-2 rounded border max-h-40 overflow-y-auto">
+                              <div>
+                                <div className="text-[9px] font-bold text-teal-700 mb-0.5">プリセットの入力 ({draftInputs.length})</div>
+                                <div className="flex flex-wrap gap-1">
+                                  {draftInputs.map(inp => (
+                                    <button type="button" key={inp.id} onClick={() => insertVar(inp.id)} className="text-[9px] bg-white border border-teal-300 text-teal-700 px-1.5 py-0.5 rounded hover:bg-teal-100 font-mono">
+                                      {inp.id}{inp.label && inp.label !== inp.id ? ` (${inp.label})` : ''}
+                                    </button>
+                                  ))}
+                                  {draftInputs.length === 0 && <span className="text-[9px] text-slate-400">なし</span>}
+                                </div>
+                              </div>
+                              {priorCalcs.length > 0 && (
+                                <div>
+                                  <div className="text-[9px] font-bold text-indigo-700 mb-0.5">この前の計算結果 ({priorCalcs.length})</div>
+                                  <div className="flex flex-wrap gap-1">
+                                    {priorCalcs.map(c => (
+                                      <button type="button" key={c.id} onClick={() => insertVar(c.id)} className="text-[9px] bg-white border border-indigo-300 text-indigo-700 px-1.5 py-0.5 rounded hover:bg-indigo-100 font-mono">
+                                        Σ {c.id}{c.label && c.label !== c.id ? ` (${c.label})` : ''}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              <div className="text-[9px] text-slate-500 pt-1 border-t">
+                                ボタンタップで数式末尾に追加。他工程の参照は <span className="font-bold">工程テンプレート編集画面</span> から行ってください (プリセット側では現プリセット内のみ参照可能)
+                              </div>
+                            </div>
+                          </details>
+                        </div>
+                      );
+                    })()}
+                    <div>
+                      <label className="block text-[10px] text-slate-400 font-bold">対象入力 (空=全て)</label>
+                      <div className="flex flex-wrap gap-1 mt-0.5">
+                        {draftInputs.map(inp => {
+                          const selected = (calc.inputIds || []).includes(inp.id);
+                          return (
+                            <button key={inp.id} onClick={() => {
+                              const ids = calc.inputIds || [];
+                              const newIds = selected ? ids.filter(id => id !== inp.id) : [...ids, inp.id];
+                              updateCalc(cIdx, { inputIds: newIds });
+                            }} className={`text-[9px] px-1.5 py-0.5 rounded border ${selected ? 'bg-indigo-500 text-white border-indigo-500' : 'bg-white text-slate-500 border-slate-200'}`}>
+                              {inp.label || inp.id}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={calc.toleranceEnabled !== false}
+                          onChange={e => updateCalc(cIdx, { toleranceEnabled: e.target.checked })}
+                          className="w-3.5 h-3.5 accent-indigo-600"
+                        />
+                        <span className="text-[10px] font-bold text-slate-600">公差判定 (OFFで記録のみ)</span>
+                      </label>
+                      <div className={`grid grid-cols-4 gap-1 ${calc.toleranceEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
+                        <div>
+                          <label className="block text-[10px] text-slate-400 font-bold">基準値</label>
+                          <input type="number" step="any" value={calc.nominal ?? ''} onChange={e => updateCalc(cIdx, { nominal: e.target.value === '' ? null : Number(e.target.value) })} placeholder="(0)" className="w-full border rounded p-1 text-[11px] text-right font-mono"/>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400 font-bold">公差上(+)</label>
+                          <input type="number" step="0.001" value={calc.toleranceUpper} onChange={e => updateCalc(cIdx, { toleranceUpper: e.target.value })} className="w-full border rounded p-1 text-[11px] text-right font-mono"/>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400 font-bold">公差下(-)</label>
+                          <input type="number" step="0.001" value={calc.toleranceLower} onChange={e => updateCalc(cIdx, { toleranceLower: e.target.value })} className="w-full border rounded p-1 text-[11px] text-right font-mono"/>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400 font-bold">単位</label>
+                          <input value={calc.unit || ''} onChange={e => updateCalc(cIdx, { unit: e.target.value })} className="w-full border rounded p-1 text-[11px] text-center" placeholder="mm"/>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {draftCalcs.length === 0 && <div className="col-span-full text-[10px] text-slate-400 text-center py-4">「+ 計算を追加」で計算設定を追加してください</div>}
+              </div>
+            </div>
+
+            {/* 矢印比較設定 */}
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-xs font-bold text-amber-800 flex items-center gap-1">↗↘ 矢印比較 ({draftArrows.length}件)
+                  <span className="text-[9px] font-normal text-amber-600">— 2つの値を比較して大きい方に ↗ / 小さい方に ↘ を測定画像上に表示</span>
+                </label>
+                <button onClick={() => setDraftArrows([...draftArrows, initialArrow(draftArrows.length + 1)])} className="bg-amber-500 hover:bg-amber-600 text-white px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1"><Plus className="w-3 h-3"/> 矢印を追加</button>
+              </div>
+              <div className="space-y-2">
+                {draftArrows.map((ar, aIdx) => {
+                  const updateArrow = (patch) => {
+                    const nx = [...draftArrows]; nx[aIdx] = { ...nx[aIdx], ...patch }; setDraftArrows(nx);
+                  };
+                  const removeArrow = () => setDraftArrows(draftArrows.filter((_, i) => i !== aIdx));
+                  const inputA = draftInputs.find(i => i.id === ar.sourceA);
+                  const inputB = draftInputs.find(i => i.id === ar.sourceB);
+                  // デフォルト位置: A と B の中央 (両方が入力ならその中点)、なければ 50,50
+                  let defaultPos = { x: 50, y: 50 };
+                  if (inputA && inputB) defaultPos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
+                  else if (inputA) defaultPos = { x: inputA.x, y: inputA.y };
+                  else if (inputB) defaultPos = { x: inputB.x, y: inputB.y };
+                  const posX = ar.position?.x ?? defaultPos.x;
+                  const posY = ar.position?.y ?? defaultPos.y;
+                  const setPos = (patch) => updateArrow({ position: { x: posX, y: posY, ...patch } });
+                  return (
+                    <div key={aIdx} className="bg-white rounded p-2 border space-y-2">
+                      <div className="flex items-center gap-1">
+                        <input value={ar.label} onChange={e => updateArrow({ label: e.target.value })} className="flex-1 border rounded px-1 py-0.5 text-xs font-bold" placeholder="ラベル (例: 左右の通り)"/>
+                        <button onClick={removeArrow} className="text-red-400 hover:text-red-600"><X className="w-3 h-3"/></button>
+                      </div>
+                      {/* 比較する2つの値 */}
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-[10px] text-emerald-700 font-bold mb-0.5">比較元 A</label>
+                          <select value={ar.sourceA} onChange={e => updateArrow({ sourceA: e.target.value })} className="w-full border rounded p-1 text-[11px]">
+                            <option value="">-- 選択 --</option>
+                            <optgroup label="入力ポイント">
+                              {draftInputs.map(inp => <option key={inp.id} value={inp.id}>{inp.id}{inp.label && inp.label !== inp.id ? ` (${inp.label})` : ''}</option>)}
+                            </optgroup>
+                            <optgroup label="計算結果">
+                              {draftCalcs.map(c => <option key={c.id} value={c.id}>Σ {c.id}{c.label ? ` (${c.label})` : ''}</option>)}
+                            </optgroup>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-rose-700 font-bold mb-0.5">比較元 B</label>
+                          <select value={ar.sourceB} onChange={e => updateArrow({ sourceB: e.target.value })} className="w-full border rounded p-1 text-[11px]">
+                            <option value="">-- 選択 --</option>
+                            <optgroup label="入力ポイント">
+                              {draftInputs.map(inp => <option key={inp.id} value={inp.id}>{inp.id}{inp.label && inp.label !== inp.id ? ` (${inp.label})` : ''}</option>)}
+                            </optgroup>
+                            <optgroup label="計算結果">
+                              {draftCalcs.map(c => <option key={c.id} value={c.id}>Σ {c.id}{c.label ? ` (${c.label})` : ''}</option>)}
+                            </optgroup>
+                          </select>
+                        </div>
+                      </div>
+                      <div className="text-[9px] text-slate-500 bg-slate-50 rounded p-1.5">
+                        ・A &gt; B → <span className="text-emerald-700 font-black">↗</span> (A側が高い)
+                        ・A &lt; B → <span className="text-rose-700 font-black">↘</span> (B側が高い)
+                        ・許容差以下 → <span className="text-slate-700 font-black">↔</span> (同等)
+                      </div>
+                      {/* 矢印の表示位置 (1箇所) */}
+                      {(ar.sourceA && ar.sourceB) && (
+                        <div className="bg-amber-50 border border-amber-200 rounded p-1.5 space-y-1">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[10px] font-bold text-amber-800">矢印の表示位置</label>
+                            {ar.position && <button onClick={() => updateArrow({ position: null })} className="text-[9px] text-blue-600 hover:underline">A・B の中央にリセット</button>}
+                          </div>
+                          <div className="flex items-center gap-1 text-[10px]">
+                            <span className="text-slate-600 font-bold w-3">X:</span>
+                            <input type="range" min="0" max="100" value={Math.round(posX)} onChange={e => setPos({ x: Number(e.target.value) })} className="flex-1 h-1 accent-amber-500"/>
+                            <input type="number" value={Math.round(posX)} onChange={e => setPos({ x: Number(e.target.value) })} className="w-12 border rounded px-1 py-0 text-[10px] text-right"/>
+                            <span className="text-slate-400">%</span>
+                          </div>
+                          <div className="flex items-center gap-1 text-[10px]">
+                            <span className="text-slate-600 font-bold w-3">Y:</span>
+                            <input type="range" min="0" max="100" value={Math.round(posY)} onChange={e => setPos({ y: Number(e.target.value) })} className="flex-1 h-1 accent-amber-500"/>
+                            <input type="number" value={Math.round(posY)} onChange={e => setPos({ y: Number(e.target.value) })} className="w-12 border rounded px-1 py-0 text-[10px] text-right"/>
+                            <span className="text-slate-400">%</span>
+                          </div>
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2 text-[10px]">
+                        <label className="text-slate-500 font-bold">許容差:</label>
+                        <input type="number" step="0.001" value={ar.threshold} onChange={e => updateArrow({ threshold: e.target.value })} className="w-20 border rounded p-0.5 text-[10px] text-right"/>
+                        <span className="text-slate-400">差がこの値以下なら ↔</span>
+                      </div>
+                      {/* プレビュー: 実画面と同じアスペクト比 (4:3) */}
+                      {(ar.sourceA && ar.sourceB) && (
+                        <div>
+                          <div className="text-[9px] text-slate-500 font-bold mb-0.5">プレビュー (A &gt; B 想定で ↗ を表示)</div>
+                          <div className="relative w-full bg-white border rounded overflow-hidden" style={{ aspectRatio: '4 / 3', ...(draftDiagram ? { backgroundImage: `url(${draftDiagram})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}) }}>
+                            {/* 入力ポイント (薄く) */}
+                            {draftInputs.map((inp, idx) => {
+                              const isA = inp.id === ar.sourceA;
+                              const isB = inp.id === ar.sourceB;
+                              return (
+                                <div key={idx} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
+                                  <div className={`w-2 h-2 rounded-full ${isA ? 'bg-emerald-500 ring-2 ring-emerald-300' : isB ? 'bg-rose-500 ring-2 ring-rose-300' : 'bg-teal-400 opacity-40'}`}/>
+                                  {(isA || isB) && <span className={`text-[8px] font-bold ${isA ? 'text-emerald-700' : 'text-rose-700'} bg-white/80 px-0.5 rounded mt-0.5 whitespace-nowrap`}>{isA ? 'A' : 'B'}: {inp.label || inp.id}</span>}
+                                </div>
+                              );
+                            })}
+                            {/* 矢印 (1つだけ) */}
+                            <div className="absolute z-20 flex flex-col items-center" style={{ left: `${posX}%`, top: `${posY}%`, transform: 'translate(-50%, -50%)' }}>
+                              <div className="text-emerald-600 bg-emerald-100 font-black text-xl px-2 py-0 rounded-full shadow border-2 border-white" style={{ lineHeight: 1 }}>↗</div>
+                              {ar.label && <span className="text-[8px] font-bold text-slate-700 bg-white/90 px-1 rounded mt-0.5 whitespace-nowrap shadow-sm">{ar.label}</span>}
+                            </div>
+                          </div>
+                          <div className="text-[9px] text-slate-400 mt-0.5">※ 実際は A,B の値で ↗/↘/↔ が切り替わります</div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {draftArrows.length === 0 && <div className="text-[10px] text-amber-700 text-center py-2">「+ 矢印を追加」で 2つの値を比較できる矢印を追加できます (例: 左の通り vs 右の通り)</div>}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // リスト表示
+  const renderPresetCard = (kind, k, v) => {
+    const isOverridden = kind === 'builtin' && !!builtInOverrides[k];
+    const palette = kind === 'builtin'
+      ? { border: 'border-blue-200', bg: 'bg-blue-50', hover: 'hover:border-blue-400', textBold: 'text-blue-800', textSub: 'text-blue-600', dot: 'bg-blue-500' }
+      : { border: 'border-teal-200', bg: 'bg-teal-50', hover: 'hover:border-teal-400', textBold: 'text-teal-800', textSub: 'text-teal-600', dot: 'bg-teal-500' };
+    return (
+      <div key={`${kind}_${k}`} className={`border ${palette.border} ${palette.bg} rounded-lg p-3 flex items-center gap-3 ${palette.hover} transition-colors`}>
+        <div className="flex-1 cursor-pointer min-w-0" onClick={() => startEdit(kind, k)}>
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className={`font-bold ${palette.textBold} truncate`}>{v.label}</div>
+            {kind === 'builtin' && <span className="text-[9px] bg-blue-200 text-blue-800 px-1.5 py-0.5 rounded font-bold">組み込み</span>}
+            {isOverridden && <span className="text-[9px] bg-amber-200 text-amber-800 px-1.5 py-0.5 rounded font-bold">編集済み</span>}
+          </div>
+          <div className={`text-xs ${palette.textSub} mt-0.5`}>
+            {v.inputs?.length || 0}点
+            {v.calculations?.length > 0 && ` ・計算${v.calculations.length}件`}
+            {v.diagramImage && ' ・図面付き'}
+          </div>
+        </div>
+        <div className="relative w-24 h-16 bg-white border rounded overflow-hidden hidden md:block" style={v.diagramImage ? { backgroundImage: `url(${v.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}}>
+          {(v.inputs || []).map((inp, idx) => (
+            <div key={idx} className={`absolute ${palette.dot} rounded-full w-1.5 h-1.5`} style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}/>
+          ))}
+        </div>
+        <button onClick={() => startEdit(kind, k)} className="p-2 text-slate-400 hover:text-teal-600 bg-white rounded" title="編集"><Pencil className="w-4 h-4"/></button>
+        {kind === 'custom' ? (
+          <button onClick={() => deleteCustom(k)} className="p-2 text-slate-400 hover:text-rose-600 bg-white rounded" title="削除"><Trash2 className="w-4 h-4"/></button>
+        ) : (
+          <button onClick={() => hideBuiltIn(k)} className="p-2 text-slate-400 hover:text-rose-600 bg-white rounded" title="一覧から非表示"><Trash2 className="w-4 h-4"/></button>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto h-full overflow-y-auto space-y-4">
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+        <div className="flex justify-between items-center mb-4">
+          <div>
+            <h3 className="font-bold text-lg flex items-center gap-2"><Ruler className="w-5 h-5 text-teal-600"/> 測定設定 — レイアウトプリセット</h3>
+            <p className="text-xs text-slate-500 mt-1">工程の測定タイプで使用するレイアウトを管理します。組み込みプリセットも編集・非表示にできます。</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {hiddenBuiltIns.length > 0 && (
+              <button onClick={restoreAllHidden} className="bg-amber-100 hover:bg-amber-200 text-amber-700 border border-amber-200 px-3 py-2 rounded font-bold text-xs flex items-center gap-1"><RefreshCw className="w-3.5 h-3.5"/> 非表示({hiddenBuiltIns.length})を復元</button>
+            )}
+            <button onClick={startNew} className="bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 rounded font-bold text-sm flex items-center gap-2 shadow-sm"><Plus className="w-4 h-4"/> 新規登録</button>
+          </div>
+        </div>
+
+        {/* カスタムプリセット */}
+        <div className="mb-6">
+          <div className="text-xs font-bold text-slate-500 mb-2 flex items-center gap-1"><Layers className="w-3 h-3"/> カスタムプリセット ({Object.keys(customLayouts).length}件)</div>
+          {Object.keys(customLayouts).length === 0 ? (
+            <div className="text-center py-6 text-slate-400 text-sm border-2 border-dashed border-slate-200 rounded-lg">
+              カスタムプリセットはまだありません。「新規登録」から作成できます。
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {Object.entries(customLayouts).map(([k, v]) => renderPresetCard('custom', k, v))}
+            </div>
+          )}
+        </div>
+
+        {/* 組み込みプリセット (編集・非表示可能) */}
+        <div>
+          <div className="text-xs font-bold text-slate-500 mb-2 flex items-center gap-1"><ShieldCheck className="w-3 h-3"/> 組み込みプリセット ({Object.keys(effectiveBuiltIns).length}件)</div>
+          {Object.keys(effectiveBuiltIns).length === 0 ? (
+            <div className="text-center py-6 text-slate-400 text-sm border-2 border-dashed border-slate-200 rounded-lg space-y-3">
+              <div>すべての組み込みプリセットが非表示です。</div>
+              {hiddenBuiltIns.length > 0 && (
+                <button onClick={restoreAllHidden} className="bg-amber-100 hover:bg-amber-200 text-amber-700 border border-amber-200 px-4 py-2 rounded font-bold text-xs inline-flex items-center gap-1"><RefreshCw className="w-3.5 h-3.5"/> 非表示({hiddenBuiltIns.length})を全て復元</button>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {Object.entries(effectiveBuiltIns).map(([k, v]) => renderPresetCard('builtin', k, v))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
  const TemplatesView = ({ editingTemplate, setEditingTemplate, handleSaveTemplate, workers, saveData, deleteData, templates, handleExcelImport, handleExcelDownload, handleBackupExport, handleBackupImport, excelInputRef, backupInputRef, settings, saveSettings, mapZones }) => {
   const [newProcessOpt, setNewProcessOpt] = useState('');
   const defectProcessOptions = settings?.defectProcessOptions || DEFAULT_DEFECT_PROCESS_OPTIONS;
@@ -5890,9 +7709,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
 
   return (
    <div data-fs="settings" className="p-8 max-w-5xl mx-auto space-y-6 h-full flex flex-col overflow-y-auto">
-     {editingTemplate ? (
-       <TemplateEditor template={editingTemplate} onSave={handleSaveTemplate} onCancel={() => setEditingTemplate(null)} customLayouts={settings?.customLayouts || {}} onSaveLayouts={(layouts) => saveSettings({ customLayouts: layouts })} comboPresets={settings?.comboPresets || []} />
-     ) : (
        <>
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Settings className="w-5 h-5" /> 作業者マスタ</h3>
@@ -5904,25 +7720,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
              {workers.map(w => (<div key={w.id} className="bg-slate-50 border px-3 py-1.5 rounded-full flex items-center gap-2 text-sm">{w.name}<button onClick={() => deleteData('workers', w.id)} className="text-slate-400 hover:text-rose-500"><Trash2 className="w-3 h-3" /></button></div>))}
            </div>
          </div>
-         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-           <div className="flex justify-between items-center mb-4">
-             <h3 className="font-bold text-lg flex items-center gap-2"><ClipboardList className="w-5 h-5" /> 工程テンプレート管理</h3>
-             <div className="flex gap-2">
-               <label className="text-xs flex items-center gap-1 cursor-pointer bg-green-50 text-green-700 px-3 py-2 rounded border border-green-200 hover:bg-green-100"><FileUp className="w-4 h-4"/> Excel取込<input type="file" ref={excelInputRef} accept=".xlsx" onChange={handleExcelImport} className="hidden"/></label>
-               <button onClick={handleBackupExport} className="text-xs flex items-center gap-1 bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><DownloadCloud className="w-4 h-4"/> バックアップ</button>
-               <label className="text-xs flex items-center gap-1 cursor-pointer bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><RefreshCw className="w-4 h-4"/> 復元<input type="file" ref={backupInputRef} accept=".json" onChange={handleBackupImport} className="hidden"/></label>
-             </div>
-           </div>
-           <button onClick={() => setEditingTemplate({ id: '', name: '', steps: [] })} className="w-full py-3 border-2 border-dashed border-slate-300 rounded-lg text-slate-500 hover:border-blue-500 font-bold mb-4">+ 新規テンプレート作成</button>
-           <div className="flex-1 overflow-y-auto space-y-3">
-             {templates.map(t => (
-               <div key={t.id} className="border rounded-lg p-4 flex justify-between items-center group hover:border-blue-300 transition-colors cursor-pointer" onClick={() => setEditingTemplate(t)}>
-                 <div><div className="font-bold text-slate-800 group-hover:text-blue-600">{t.name}</div><div className="text-xs text-slate-500 mt-1">全 {t.steps?.length || 0} 工程</div></div>
-                 <div className="flex items-center gap-2"><button onClick={(e) => { e.stopPropagation(); handleExcelDownload(t); }} className="p-2 text-slate-400 hover:text-emerald-600 bg-slate-50 rounded" title="Excel出力"><FileSpreadsheet className="w-4 h-4"/></button><button onClick={(e) => { e.stopPropagation(); setEditingTemplate({ ...t, id: '', name: t.name + ' (コピー)', steps: t.steps?.map(s => ({...s, id: generateId()})) || [] }); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="複製"><Copy className="w-4 h-4"/></button><button onClick={(e) => { e.stopPropagation(); setEditingTemplate(t); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="編集"><Pencil className="w-4 h-4"/></button><button onClick={(e) => { e.stopPropagation(); deleteData('templates', t.id); }} className="p-2 text-slate-400 hover:text-rose-600 bg-slate-50 rounded" title="削除"><Trash2 className="w-4 h-4" /></button></div>
-               </div>
-             ))}
-           </div>
-         </div>
+         {/* 工程テンプレート管理は専用タブに移動 */}
 
          {/* 間接作業ジャンルマスタ */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
@@ -5982,9 +7780,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
            </div>
          </div>
 
-         {/* 気づき・不満の報告オプション */}
+         {/* 気づき・改善提案の報告オプション */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-           <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Megaphone className="w-5 h-5 text-purple-500" /> 気づき・不満の報告オプション</h3>
+           <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Megaphone className="w-5 h-5 text-purple-500" /> 気づき・改善提案の選択肢マスタ</h3>
            <p className="text-xs text-slate-500 mb-3">作業中に気づきや改善提案を報告する際のカテゴリを設定します。(1行1項目)</p>
            <textarea
              value={complaintOptionsText}
@@ -6260,19 +8058,22 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
            <button onClick={handleSaveZoneSettings} className="bg-blue-600 text-white px-6 py-3 rounded-lg font-bold shadow-lg hover:bg-blue-700 flex items-center gap-2"><Save className="w-5 h-5" /> 全設定を保存する</button>
          </div>
        </>
-     )}
    </div>
  );
 };
 
 // --- Completed History View ---
-const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId }) => {
+const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '' }) => {
   const [viewMode, setViewMode] = useState('grid');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedZoneFilter, setSelectedZoneFilter] = useState('all');
   const [sortOrder, setSortOrder] = useState('entry_asc');
+  const [onlyMine, setOnlyMine] = useState(false);
+  // 担当者絞り込み (管理者/代理作業者向け): '' = 全員, 'me' = 自分のみ, workerId = 指定作業者
+  const [workerFilter, setWorkerFilter] = useState('');
 
   const mapZones = settings?.mapZones || INITIAL_MAP_ZONES;
+  const myWorkerId = useMemo(() => workers?.find(w => w.name === currentUserName)?.id || null, [workers, currentUserName]);
 
   const activeLots = useMemo(() => {
     return lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
@@ -6280,6 +8081,14 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
 
   const filteredLots = useMemo(() => {
     let result = activeLots;
+    if (workerFilter === 'me' && myWorkerId) {
+      result = result.filter(l => l.workerId === myWorkerId);
+    } else if (workerFilter && workerFilter !== '' && workerFilter !== 'me') {
+      result = result.filter(l => l.workerId === workerFilter);
+    } else if (onlyMine && myWorkerId) {
+      // 旧 onlyMine 互換
+      result = result.filter(l => l.workerId === myWorkerId);
+    }
     if (selectedZoneFilter !== 'all') {
       result = result.filter(l => l.mapZoneId === selectedZoneFilter);
     }
@@ -6291,7 +8100,7 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
       );
     }
     return result;
-  }, [activeLots, selectedZoneFilter, searchQuery]);
+  }, [activeLots, selectedZoneFilter, searchQuery, onlyMine, myWorkerId, workerFilter]);
 
   const sortedLots = useMemo(() => {
     return [...filteredLots].sort((a, b) => {
@@ -6335,6 +8144,14 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
               className="text-sm outline-none w-32 md:w-48 font-bold text-slate-700"
             />
           </div>
+          {/* 担当者絞り込み: 自分のみ / 全員 / 指定作業者 を選択可能 (管理者・代理作業向け) */}
+          <select value={workerFilter || (onlyMine ? 'me' : '')} onChange={(e) => { setWorkerFilter(e.target.value); setOnlyMine(e.target.value === 'me'); }} className="bg-white border rounded-lg px-2 py-1.5 text-sm font-bold text-slate-700 shadow-sm">
+            <option value="">担当: 全員</option>
+            {myWorkerId && <option value="me">自分のみ ({currentUserName})</option>}
+            <optgroup label="作業者で絞り込み">
+              {workers.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </optgroup>
+          </select>
         </div>
         <div className="flex bg-slate-100 rounded p-1">
           <button onClick={() => setViewMode('grid')} className={`p-1.5 rounded ${viewMode === 'grid' ? 'bg-white shadow text-blue-600' : 'text-slate-400 hover:text-slate-600'}`} title="グリッド表示"><LayoutGrid className="w-5 h-5" /></button>
@@ -6616,6 +8433,8 @@ const EditMeasurementModal = ({ lot, onClose, onSave }) => {
 const ReportPreview = ({ lot, workers, onClose }) => {
   const [customReportNo, setCustomReportNo] = useState(lot.orderNo || '');
   const [reportMode, setReportMode] = useState('table'); // 'table' or 'visual'
+  // ビジュアル成績表のページ構成: 'compact' = 1ページ詰め込み、'standard' = 2列・自然改ページ、'spread' = 1台ずつ
+  const [pageLayout, setPageLayout] = useState('standard');
   const toMs = (val) => {
     if (!val) return 0;
     if (typeof val === 'number') return val;
@@ -6665,12 +8484,23 @@ const ReportPreview = ({ lot, workers, onClose }) => {
     .print-page { position: relative; width: 210mm; min-height: 297mm; padding: 15mm 5mm 15mm 5mm; margin-bottom: 20px; background: white; box-shadow: 0 0 10px rgba(0,0,0,0.1); overflow: hidden; color: #000; }
     .print-page-no { position: absolute; right: 5mm; top: 5mm; font-size: 10px; font-family: monospace; }
     .print-report-no { position: absolute; right: 5mm; bottom: 5mm; font-size: 10px; }
+    /* ビジュアル成績表のレイアウト */
+    .visual-report { padding: 0; }
+    .visual-report.compact .unit-card { font-size: 9px; }
+    .visual-report.compact .unit-diagram { aspect-ratio: 4/3; max-height: 80mm; }
+    .visual-report.compact .unit-calc { font-size: 8px; padding: 1mm 2mm; }
+    .visual-report.spread .unit-card { page-break-inside: avoid; }
+    .page-break { page-break-before: always; }
     @media print {
-      @page { size: A4 portrait; margin: 0; }
+      @page { size: A4 portrait; margin: 8mm 6mm; }
       body { margin: 0; padding: 0; background: white; }
-      .print-pages { margin: 0 auto; width: 100%; max-width: 210mm; }
-      .print-page { box-shadow: none; margin-bottom: 0; page-break-after: always; }
+      .print-pages { margin: 0; width: 100%; max-width: none; }
+      .print-page { box-shadow: none; margin-bottom: 0; padding: 0; min-height: auto; width: auto; page-break-after: always; }
       .print-page:last-child { page-break-after: auto; }
+      .visual-report .meas-step { page-break-inside: avoid; }
+      .visual-report.compact .meas-step + .meas-step { margin-top: 4mm; }
+      .visual-report.standard .meas-step:not(:first-child) { page-break-before: always; }
+      .visual-report.spread .unit-card { page-break-after: always; }
       .no-print { display: none !important; }
     }
   `;
@@ -6691,6 +8521,7 @@ const ReportPreview = ({ lot, workers, onClose }) => {
   };
 
   const handleExcel = async () => {
+    const ExcelJS = await loadExcelJS();
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('検査成績表', { pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
     const totalCols = 2 + displayQuantity;
@@ -6833,6 +8664,13 @@ const ReportPreview = ({ lot, workers, onClose }) => {
           <div className="flex bg-slate-700 rounded-lg p-0.5">
             <button onClick={() => setReportMode('table')} className={`px-3 py-1.5 rounded text-xs font-bold transition-all ${reportMode === 'table' ? 'bg-white text-slate-800 shadow' : 'text-slate-300 hover:text-white'}`}>テーブル</button>
             <button onClick={() => setReportMode('visual')} className={`px-3 py-1.5 rounded text-xs font-bold transition-all ${reportMode === 'visual' ? 'bg-white text-slate-800 shadow' : 'text-slate-300 hover:text-white'}`}>ビジュアル</button>
+            {reportMode === 'visual' && (
+              <div className="flex items-center gap-1 ml-2 bg-slate-700 rounded p-0.5">
+                <button onClick={() => setPageLayout('compact')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'compact' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>1ページ詰込</button>
+                <button onClick={() => setPageLayout('standard')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'standard' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>標準 (工程ごと改ページ)</button>
+                <button onClick={() => setPageLayout('spread')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'spread' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>1台1ページ</button>
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-2 bg-slate-700 p-1 rounded px-3">
             <span className="text-xs font-bold text-slate-300">帳票番号:</span>
@@ -6850,7 +8688,7 @@ const ReportPreview = ({ lot, workers, onClose }) => {
         <style>{PRINT_STYLES}</style>
         {reportMode === 'visual' ? (
           /* ===== ビジュアルモード: 測定ダイアグラム表示 ===== */
-          <div className="max-w-5xl mx-auto space-y-6" id="report-preview-content">
+          <div className={`visual-report ${pageLayout} max-w-5xl mx-auto space-y-${pageLayout === 'compact' ? '2' : '6'}`} id="report-preview-content">
             {/* ヘッダーカード */}
             <div className="bg-white rounded-xl shadow-lg p-6">
               <div className="flex justify-between items-start mb-4">
@@ -6876,25 +8714,51 @@ const ReportPreview = ({ lot, workers, onClose }) => {
               const config = step.measurementConfig;
               const inputs = config?.inputs || [];
               const calcs = config?.calculations || [{ id: 'default', label: '計算結果', method: config?.calculation, toleranceUpper: config?.toleranceUpper, toleranceLower: config?.toleranceLower, unit: config?.unit }];
+              const arrows = config?.arrows || [];
+              const gridCols = pageLayout === 'compact' ? 'grid-cols-2 md:grid-cols-3' : pageLayout === 'spread' ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2';
+              const cellPad = pageLayout === 'compact' ? 'p-2 gap-2' : 'p-5 gap-5';
 
               return (
-                <div key={step.id} className="bg-white rounded-xl shadow-lg overflow-hidden">
-                  <div className="bg-blue-600 text-white px-5 py-3 font-bold flex items-center gap-2">
-                    <Ruler className="w-5 h-5" /> {step.title}
-                    {step.description && <span className="text-blue-200 text-sm font-normal ml-2">— {step.description}</span>}
+                <div key={step.id} className="meas-step bg-white rounded-xl shadow-lg overflow-hidden">
+                  <div className={`bg-blue-600 text-white ${pageLayout === 'compact' ? 'px-3 py-1.5 text-sm' : 'px-5 py-3'} font-bold flex items-center gap-2`}>
+                    <Ruler className="w-4 h-4" /> {step.title}
+                    {step.description && pageLayout !== 'compact' && <span className="text-blue-200 text-sm font-normal ml-2">— {step.description}</span>}
                   </div>
 
                   {/* ユニット別のダイアグラム＋結果カード */}
-                  <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-5">
+                  <div className={`grid ${gridCols} ${cellPad}`}>
                     {Array.from({ length: lot.quantity || 1 }).map((_, unitIdx) => {
                       const meas = getMeasForUnit(step.id, unitIdx);
                       const measValues = meas?.values || {};
                       const measCalcResults = meas?.calcResults || [];
+                      // 矢印を実測値から評価
+                      const arrowResults = (arrows || []).map(arr => {
+                        const calcMap = {};
+                        measCalcResults.forEach(cr => { if (cr?.id) calcMap[cr.id] = cr.result; });
+                        const allValues = { ...measValues, ...calcMap };
+                        const valA = Number(allValues[arr.sourceA]);
+                        const valB = Number(allValues[arr.sourceB]);
+                        const inputA = inputs.find(i => i.id === arr.sourceA);
+                        const inputB = inputs.find(i => i.id === arr.sourceB);
+                        let pos = arr.position;
+                        if (!pos) {
+                          if (inputA && inputB) pos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
+                          else pos = { x: 50, y: 50 };
+                        }
+                        if (!Number.isFinite(valA) || !Number.isFinite(valB)) return { ...arr, pos, dir: null };
+                        const threshold = Number(arr.threshold) || 0;
+                        const diff = valA - valB;
+                        let dir;
+                        if (Math.abs(diff) <= threshold) dir = 'equal';
+                        else if (diff > 0) dir = 'up';
+                        else dir = 'down';
+                        return { ...arr, pos, dir, diff };
+                      });
 
                       return (
-                        <div key={unitIdx} className="border rounded-xl overflow-hidden bg-slate-50">
+                        <div key={unitIdx} className="unit-card border rounded-xl overflow-hidden bg-slate-50">
                           {/* ユニットヘッダー */}
-                          <div className="bg-slate-700 text-white px-4 py-2 text-sm font-bold flex justify-between items-center">
+                          <div className={`bg-slate-700 text-white ${pageLayout === 'compact' ? 'px-2 py-1 text-xs' : 'px-4 py-2 text-sm'} font-bold flex justify-between items-center`}>
                             <span>#{unitIdx + 1} {lot.unitSerialNumbers?.[unitIdx] || ''}</span>
                             {measCalcResults.length > 0 && (
                               <span className={`px-2 py-0.5 rounded text-xs font-bold ${measCalcResults.every(c => c.isOk) ? 'bg-emerald-500' : 'bg-rose-500'}`}>
@@ -6904,7 +8768,7 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                           </div>
 
                           {/* ダイアグラムエリア */}
-                          <div className="relative bg-white aspect-[4/3] min-h-[200px] overflow-hidden"
+                          <div className={`unit-diagram relative bg-white aspect-[4/3] ${pageLayout === 'compact' ? 'min-h-[120px]' : 'min-h-[200px]'} overflow-hidden`}
                             style={config?.diagramImage ? {
                               backgroundImage: `url(${config.diagramImage})`,
                               backgroundSize: 'contain',
@@ -6919,31 +8783,48 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                             {inputs.map(inp => {
                               const val = measValues[inp.id];
                               const isFilled = val != null && val !== '';
+                              const valFontSize = pageLayout === 'compact' ? 'text-[9px]' : 'text-sm';
+                              const valBox = pageLayout === 'compact' ? 'h-5 px-1' : 'h-7 px-2';
+                              const labelSize = pageLayout === 'compact' ? 'text-[7px]' : 'text-[9px]';
                               return (
                                 <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
-                                  <span className="text-[9px] font-bold text-slate-500 mb-0.5 bg-white/90 px-1 rounded whitespace-nowrap">{inp.label}</span>
-                                  <div className={`w-18 h-7 flex items-center justify-center text-sm font-mono font-bold rounded border-2 px-2 ${isFilled ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-300 bg-slate-100 text-slate-400'}`}>
+                                  <span className={`${labelSize} font-bold text-slate-500 mb-0.5 bg-white/90 px-1 rounded whitespace-nowrap`}>{inp.label}</span>
+                                  <div className={`${valBox} flex items-center justify-center ${valFontSize} font-mono font-bold rounded border-2 ${isFilled ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-300 bg-slate-100 text-slate-400'}`}>
                                     {isFilled ? Number(val).toFixed(3) : '---'}
                                   </div>
+                                </div>
+                              );
+                            })}
+                            {/* 矢印表示 */}
+                            {arrowResults.filter(a => a.dir).map((ar, ai) => {
+                              const isUp = ar.dir === 'up';
+                              const isEq = ar.dir === 'equal';
+                              const ch = isEq ? '↔' : isUp ? '↗' : '↘';
+                              const color = isEq ? 'text-slate-600 bg-slate-100 border-slate-300' : isUp ? 'text-emerald-700 bg-emerald-100 border-emerald-400' : 'text-rose-700 bg-rose-100 border-rose-400';
+                              const fontSize = pageLayout === 'compact' ? 'text-lg' : 'text-2xl';
+                              return (
+                                <div key={ai} className="absolute flex flex-col items-center z-20" style={{ left: `${ar.pos.x}%`, top: `${ar.pos.y}%`, transform: 'translate(-50%, -50%)' }}>
+                                  <div className={`${color} ${fontSize} font-black px-1.5 rounded-full shadow border-2`} style={{ lineHeight: 1 }}>{ch}</div>
+                                  {ar.label && <span className={`${pageLayout === 'compact' ? 'text-[7px]' : 'text-[9px]'} font-bold text-slate-700 bg-white/90 px-1 rounded mt-0.5 whitespace-nowrap shadow-sm`}>{ar.label}</span>}
                                 </div>
                               );
                             })}
                           </div>
 
                           {/* 計算結果 */}
-                          <div className="border-t bg-white px-4 py-3 space-y-2">
+                          <div className={`unit-calc border-t bg-white ${pageLayout === 'compact' ? 'px-2 py-1.5 space-y-0.5' : 'px-4 py-3 space-y-2'}`}>
                             {calcs.map((calc, ci) => {
                               const cr = measCalcResults.find(c => c.id === calc.id) || measCalcResults[ci];
                               return (
                                 <div key={calc.id || ci} className="flex items-center justify-between">
-                                  <div className="text-xs">
+                                  <div className={pageLayout === 'compact' ? 'text-[10px]' : 'text-xs'}>
                                     <span className="font-bold text-slate-700">{calc.label || '計算結果'}</span>
-                                    <span className="text-slate-400 ml-2">{calc.toleranceLower != null ? `${calc.toleranceLower}~${calc.toleranceUpper}` : ''} {calc.unit || ''}</span>
+                                    {pageLayout !== 'compact' && <span className="text-slate-400 ml-2">{calc.toleranceLower != null ? `${calc.toleranceLower}~${calc.toleranceUpper}` : ''} {calc.unit || ''}</span>}
                                   </div>
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-lg font-mono font-black text-slate-800">{cr?.result != null ? cr.result.toFixed(4) : '---'}</span>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className={`${pageLayout === 'compact' ? 'text-sm' : 'text-lg'} font-mono font-black text-slate-800`}>{cr?.result != null ? cr.result.toFixed(4) : '---'}</span>
                                     {cr?.result != null && (
-                                      <span className={`px-2 py-0.5 rounded text-xs font-bold ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                                      <span className={`${pageLayout === 'compact' ? 'text-[9px] px-1' : 'text-xs px-2'} py-0.5 rounded font-bold ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
                                         {cr.isOk ? 'OK' : 'NG'}
                                       </span>
                                     )}
@@ -7153,6 +9034,231 @@ const ReportPreview = ({ lot, workers, onClose }) => {
   );
 };
 
+// ===========================
+// 全体進捗ビュー: ガントチャート風タイムライン + サマリー + 遅延アラート
+// ===========================
+const ProgressOverviewView = ({ lots, workers, settings }) => {
+  const [tickN, setTickN] = useState(0);
+  // リアルタイム更新 (10秒ごと)
+  useEffect(() => {
+    const id = setInterval(() => setTickN(n => n + 1), 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  // 今日の範囲 (昼勤想定で 6:00-22:00、はみ出る場合は自動拡張)
+  const now = Date.now();
+  const today = new Date(); today.setHours(0,0,0,0);
+  const todayMs = today.getTime();
+  const startOfShiftMs = todayMs + 6 * 60 * 60 * 1000;     // 6:00
+  const endOfShiftMs = todayMs + 22 * 60 * 60 * 1000;       // 22:00
+
+  const activeLots = useMemo(() => {
+    return lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
+  }, [lots]);
+
+  // 各ロットの進捗計算
+  const lotsWithProgress = useMemo(() => {
+    return activeLots.map(lot => ({
+      lot,
+      progress: computeLotProgress(lot),
+      worker: workers.find(w => w.id === lot.workerId),
+    })).filter(x => x.progress).sort((a, b) => {
+      // 遅延優先 → 進行中優先 → 開始時刻順
+      const order = { critical: 0, warning: 1, ontime: 2, ahead: 3, completed: 4 };
+      const da = order[a.progress.delayLevel] ?? 5;
+      const db = order[b.progress.delayLevel] ?? 5;
+      if (da !== db) return da - db;
+      return (b.progress.startMs || 0) - (a.progress.startMs || 0);
+    });
+  }, [activeLots, workers, tickN]);
+
+  // 今日完了したロット (サマリー用)
+  const todayCompletedCount = useMemo(() =>
+    lots.filter(l => {
+      if (l.status !== 'completed' && l.location !== 'completed') return false;
+      const t = (typeof l.updatedAt === 'number') ? l.updatedAt : (l.updatedAt?.seconds ? l.updatedAt.seconds * 1000 : 0);
+      return t >= todayMs && t <= todayMs + 86400000;
+    }).length, [lots, todayMs]);
+
+  // サマリー集計
+  const summary = useMemo(() => {
+    const inProgress = lotsWithProgress.filter(x => x.progress.isProcessing).length;
+    const delayed = lotsWithProgress.filter(x => x.progress.delayLevel === 'critical' || x.progress.delayLevel === 'warning').length;
+    const waiting = lotsWithProgress.filter(x => !x.progress.isProcessing && !x.progress.isCompleted).length;
+    return { inProgress, delayed, waiting, completed: todayCompletedCount, total: lotsWithProgress.length + todayCompletedCount };
+  }, [lotsWithProgress, todayCompletedCount]);
+
+  // タイムラインの x軸範囲を動的に決定 (作業中のロットの開始/予測完了に合わせる)
+  const timelineRange = useMemo(() => {
+    const starts = lotsWithProgress.map(x => x.progress.startMs).filter(Boolean);
+    const etas = lotsWithProgress.map(x => x.progress.etaMs).filter(Boolean);
+    const min = starts.length > 0 ? Math.min(...starts) : startOfShiftMs;
+    const max = etas.length > 0 ? Math.max(...etas, now) : endOfShiftMs;
+    // 8時間以上の場合は 8時間に圧縮、最低 4時間幅
+    const span = Math.max(max - min, 4 * 60 * 60 * 1000);
+    return { min: Math.min(min, startOfShiftMs), max: min + span, span };
+  }, [lotsWithProgress, now, startOfShiftMs, endOfShiftMs]);
+
+  // 時刻軸の目盛り (1時間ごと)
+  const timeMarks = useMemo(() => {
+    const marks = [];
+    const start = new Date(timelineRange.min); start.setMinutes(0, 0, 0);
+    let t = start.getTime();
+    if (t < timelineRange.min) t += 3600000;
+    while (t <= timelineRange.max) { marks.push(t); t += 3600000; }
+    return marks;
+  }, [timelineRange]);
+
+  // 作業者別 現在のステータス
+  const workerStatus = useMemo(() => {
+    return workers.map(w => {
+      const myLots = lotsWithProgress.filter(x => x.lot.workerId === w.id);
+      const active = myLots.find(x => x.progress.isProcessing);
+      return { worker: w, active, allLots: myLots };
+    }).filter(s => s.allLots.length > 0 || s.active);
+  }, [workers, lotsWithProgress]);
+
+  const delayBg = (level) => level === 'critical' ? 'bg-rose-500' : level === 'warning' ? 'bg-amber-500' : level === 'ahead' ? 'bg-emerald-500' : 'bg-blue-500';
+  const delayLabel = (level) => level === 'critical' ? '大幅遅延' : level === 'warning' ? '遅延気味' : level === 'ahead' ? '前倒し' : '予定通り';
+  const delayTextClass = (level) => level === 'critical' ? 'text-rose-600' : level === 'warning' ? 'text-amber-600' : level === 'ahead' ? 'text-emerald-600' : 'text-blue-600';
+
+  return (
+    <div className="p-4 max-w-screen-2xl mx-auto h-full overflow-y-auto space-y-4">
+      {/* サマリー */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div className="bg-white border-2 border-slate-200 rounded-xl p-3 text-center">
+          <div className="text-xs text-slate-500 font-bold">本日の対象</div>
+          <div className="text-3xl font-black text-slate-800 mt-1">{summary.total}</div>
+        </div>
+        <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-3 text-center">
+          <div className="text-xs text-blue-600 font-bold">進行中</div>
+          <div className="text-3xl font-black text-blue-700 mt-1 flex items-center justify-center gap-1"><Activity className="w-6 h-6 animate-pulse"/>{summary.inProgress}</div>
+        </div>
+        <div className="bg-slate-50 border-2 border-slate-200 rounded-xl p-3 text-center">
+          <div className="text-xs text-slate-500 font-bold">未着手</div>
+          <div className="text-3xl font-black text-slate-700 mt-1">{summary.waiting}</div>
+        </div>
+        <div className={`border-2 rounded-xl p-3 text-center ${summary.delayed > 0 ? 'bg-rose-50 border-rose-300 animate-pulse' : 'bg-slate-50 border-slate-200'}`}>
+          <div className={`text-xs font-bold ${summary.delayed > 0 ? 'text-rose-700' : 'text-slate-500'}`}>遅延</div>
+          <div className={`text-3xl font-black mt-1 flex items-center justify-center gap-1 ${summary.delayed > 0 ? 'text-rose-700' : 'text-slate-700'}`}>
+            {summary.delayed > 0 && <AlertTriangle className="w-6 h-6"/>}
+            {summary.delayed}
+          </div>
+        </div>
+        <div className="bg-emerald-50 border-2 border-emerald-200 rounded-xl p-3 text-center">
+          <div className="text-xs text-emerald-700 font-bold">本日完了</div>
+          <div className="text-3xl font-black text-emerald-700 mt-1 flex items-center justify-center gap-1"><CheckCircle2 className="w-6 h-6"/>{summary.completed}</div>
+        </div>
+      </div>
+
+      {/* タイムライン */}
+      <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
+        <div className="p-4 border-b">
+          <div className="flex items-center justify-between">
+            <h3 className="font-bold text-lg flex items-center gap-2"><Clock className="w-5 h-5 text-blue-600"/> ロット別タイムライン</h3>
+            <span className="text-xs text-slate-500">10秒ごとに自動更新 ・現在時刻: <span className="font-mono font-bold">{formatHHMM(now)}</span></span>
+          </div>
+        </div>
+        {lotsWithProgress.length === 0 ? (
+          <div className="p-12 text-center text-slate-400">
+            <Activity className="w-12 h-12 mx-auto mb-2 opacity-50"/>
+            <div>進行中のロットはありません</div>
+          </div>
+        ) : (
+          <div className="p-4">
+            {/* 時刻軸ヘッダー */}
+            <div className="flex items-center mb-2 text-xs text-slate-500 font-mono font-bold pl-[180px]">
+              <div className="flex-1 relative h-5">
+                {timeMarks.map((t, i) => {
+                  const left = ((t - timelineRange.min) / timelineRange.span) * 100;
+                  return <div key={i} className="absolute" style={{ left: `${left}%`, transform: 'translateX(-50%)' }}>{formatHHMM(t)}</div>;
+                })}
+              </div>
+            </div>
+            {/* 各ロットの行 */}
+            <div className="space-y-1.5 max-h-[60vh] overflow-y-auto pr-2">
+              {lotsWithProgress.map(({ lot, progress, worker }) => {
+                const startPct = progress.startMs ? Math.max(0, ((progress.startMs - timelineRange.min) / timelineRange.span) * 100) : 0;
+                const nowPct = Math.max(0, ((now - timelineRange.min) / timelineRange.span) * 100);
+                const etaPct = Math.min(100, ((progress.etaMs - timelineRange.min) / timelineRange.span) * 100);
+                const standardEtaPct = Math.min(100, ((progress.standardEtaMs - timelineRange.min) / timelineRange.span) * 100);
+                const actualWidth = Math.max(0, nowPct - startPct);
+                const projectedWidth = Math.max(0, etaPct - nowPct);
+                const isStarted = progress.startMs && progress.completedCount > 0;
+                return (
+                  <div key={lot.id} className={`flex items-center group hover:bg-slate-50 rounded-lg p-1 ${progress.delayLevel === 'critical' ? 'bg-rose-50' : ''}`}>
+                    {/* 左ラベル */}
+                    <div className="w-[180px] shrink-0 pr-3">
+                      <div className="font-bold text-sm text-slate-800 truncate">{lot.model}</div>
+                      <div className="text-[10px] text-slate-500 truncate">指図 {lot.orderNo} ・{lot.quantity}台 ・{worker?.name || '未割当'}</div>
+                    </div>
+                    {/* バー */}
+                    <div className="flex-1 relative h-10 bg-slate-100 rounded">
+                      {/* 標準予定時刻マーカー */}
+                      {progress.standardEtaMs > 0 && progress.startMs && (
+                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-400" style={{ left: `${standardEtaPct}%` }} title={`標準予定 ${formatHHMM(progress.standardEtaMs)}`}/>
+                      )}
+                      {/* 実績バー (開始 → 現在) */}
+                      {isStarted && (
+                        <div className={`absolute top-1.5 bottom-1.5 ${delayBg(progress.delayLevel)} rounded-l opacity-90`} style={{ left: `${startPct}%`, width: `${actualWidth}%` }}>
+                          <div className="text-[10px] text-white font-bold px-1.5 truncate leading-9">{progress.progressPct}% ({progress.completedCount}/{progress.totalTasks})</div>
+                        </div>
+                      )}
+                      {/* 予測バー (現在 → ETA) */}
+                      {!progress.isCompleted && progress.remainingTasks > 0 && (
+                        <div className={`absolute top-2 bottom-2 ${delayBg(progress.delayLevel)} opacity-30 rounded-r`} style={{ left: `${Math.max(startPct, nowPct)}%`, width: `${projectedWidth}%` }}/>
+                      )}
+                      {/* 現在時刻ライン */}
+                      <div className="absolute top-0 bottom-0 w-0.5 bg-blue-600 z-10" style={{ left: `${nowPct}%` }} title={`現在 ${formatHHMM(now)}`}>
+                        <div className="absolute -top-1 -left-1 w-2 h-2 rounded-full bg-blue-600 animate-pulse"/>
+                      </div>
+                    </div>
+                    {/* 右情報 */}
+                    <div className="w-[140px] shrink-0 pl-3 text-[10px] font-mono text-right">
+                      <div className={`font-black text-xs ${delayTextClass(progress.delayLevel)}`}>{delayLabel(progress.delayLevel)}</div>
+                      <div className="text-slate-500">開始 {formatHHMM(progress.startMs)}</div>
+                      <div className="text-slate-700 font-bold">予測 {formatHHMM(progress.etaMs)}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 作業者別ステータス */}
+      <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
+        <div className="p-4 border-b">
+          <h3 className="font-bold text-lg flex items-center gap-2"><Users className="w-5 h-5 text-purple-600"/> 作業者ステータス</h3>
+        </div>
+        <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          {workerStatus.length === 0 && <div className="col-span-full text-slate-400 text-center py-6">割り当て中の作業者はいません</div>}
+          {workerStatus.map(({ worker, active, allLots }) => (
+            <div key={worker.id} className={`border rounded-lg p-3 ${active ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="flex items-center justify-between mb-2">
+                <div className="font-bold flex items-center gap-1"><User className="w-4 h-4"/> {worker.name}</div>
+                {active && <span className="text-[10px] font-bold bg-emerald-500 text-white px-2 py-0.5 rounded-full animate-pulse">作業中</span>}
+              </div>
+              {active ? (
+                <div className="text-xs space-y-0.5">
+                  <div className="font-bold text-slate-700">{active.lot.model} ({active.lot.orderNo})</div>
+                  <div className="text-slate-500">進捗: {active.progress.progressPct}% ({active.progress.completedCount}/{active.progress.totalTasks})</div>
+                  <div className="text-slate-500">予測完了: <span className="font-mono font-bold text-slate-700">{formatHHMM(active.progress.etaMs)}</span></div>
+                </div>
+              ) : (
+                <div className="text-xs text-slate-500">
+                  担当 {allLots.length} 件 (待機中)
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLot }) => {
   const completedLots = lots.filter(l => l.location === 'completed' || l.status === 'completed');
   const [viewMode, setViewMode] = useState('grid');
@@ -7165,6 +9271,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
   const [filterStartDate, setFilterStartDate] = useState(() => { const d = new Date(); d.setMonth(d.getMonth() - 1); return d.toISOString().slice(0, 10); });
   const [filterEndDate, setFilterEndDate] = useState(getTodayStr());
   const [searchQuery, setSearchQuery] = useState('');
+  const [filterWorker, setFilterWorker] = useState('');
+  const [filterDefect, setFilterDefect] = useState('all'); // 'all' | 'with' | 'without'
 
   const toMs = (val) => { if (!val) return 0; if (typeof val === 'number') return val; if (val.seconds) return val.seconds * 1000 + (val.nanoseconds || 0) / 1e6; if (val.toMillis) return val.toMillis(); const t = new Date(val).getTime(); return isNaN(t) ? 0 : t; };
 
@@ -7175,10 +9283,25 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
     if (filterStartDate) start = new Date(filterStartDate).getTime();
     if (filterEndDate) { const endDate = new Date(filterEndDate); endDate.setHours(23, 59, 59, 999); end = endDate.getTime(); }
     const lowerQuery = searchQuery.toLowerCase();
-    return completedLots.filter(lot => { const ts = toMs(lot.updatedAt || lot.createdAt); return ts >= start && ts <= end && (!searchQuery || (lot.orderNo && lot.orderNo.toLowerCase().includes(lowerQuery)) || (lot.model && lot.model.toLowerCase().includes(lowerQuery))); });
-  }, [completedLots, filterStartDate, filterEndDate, searchQuery]);
+    return completedLots.filter(lot => {
+      const ts = toMs(lot.updatedAt || lot.createdAt);
+      if (ts < start || ts > end) return false;
+      if (searchQuery && !((lot.orderNo && lot.orderNo.toLowerCase().includes(lowerQuery)) || (lot.model && lot.model.toLowerCase().includes(lowerQuery)))) return false;
+      if (filterWorker && lot.workerId !== filterWorker) return false;
+      if (filterDefect !== 'all') {
+        const hasDefect = (lot.interruptions || []).some(i => i.type === 'defect');
+        if (filterDefect === 'with' && !hasDefect) return false;
+        if (filterDefect === 'without' && hasDefect) return false;
+      }
+      return true;
+    });
+  }, [completedLots, filterStartDate, filterEndDate, searchQuery, filterWorker, filterDefect]);
 
-  const sortedCompletedLots = useMemo(() => [...filteredCompletedLots].sort((a, b) => toMs(b.updatedAt || b.createdAt) - toMs(a.updatedAt || a.createdAt)), [filteredCompletedLots]);
+  const allSortedCompletedLots = useMemo(() => [...filteredCompletedLots].sort((a, b) => toMs(b.updatedAt || b.createdAt) - toMs(a.updatedAt || a.createdAt)), [filteredCompletedLots]);
+  // 表示上限 (パフォーマンス対策、ユーザは「もっと見る」で拡張可能)
+  const [displayLimit, setDisplayLimit] = useState(100);
+  const sortedCompletedLots = useMemo(() => allSortedCompletedLots.slice(0, displayLimit), [allSortedCompletedLots, displayLimit]);
+  const hasMore = allSortedCompletedLots.length > displayLimit;
 
   const downloadCSV = () => {
     const headers = ['完了日時', '型式', '指図番号', 'ユニットNo', 'カテゴリ', '検査項目', '結果', '作業者', '実績時間(秒)', '目標時間(秒)', '達成率(%)'];
@@ -7272,6 +9395,15 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
             <Search className="w-4 h-4 text-slate-400" />
             <input type="text" placeholder="指図・型式で検索..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="text-sm outline-none w-32 md:w-48 font-bold text-slate-700" />
           </div>
+          <select value={filterWorker} onChange={(e) => setFilterWorker(e.target.value)} className="bg-white border rounded-lg px-2 py-1.5 text-sm font-bold text-slate-700 shadow-sm">
+            <option value="">作業者: 全員</option>
+            {workers.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+          </select>
+          <select value={filterDefect} onChange={(e) => setFilterDefect(e.target.value)} className="bg-white border rounded-lg px-2 py-1.5 text-sm font-bold text-slate-700 shadow-sm">
+            <option value="all">不具合: 全て</option>
+            <option value="with">不具合あり</option>
+            <option value="without">不具合なし</option>
+          </select>
         </div>
         <div className="flex items-center gap-2">
           <div className="flex bg-slate-100 rounded p-1">
@@ -7306,10 +9438,32 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                 <div className="text-xs font-mono text-slate-600 flex items-center gap-1">
                   <Clock className="w-3 h-3" /> {formatTime(lot.tasks ? Object.values(lot.tasks).reduce((s, t) => s + (t.status === 'completed' ? (t.duration || 0) : 0), 0) : Math.floor((lot.totalWorkTime || 0) / 1000))}
                 </div>
-                <div className="text-xs text-slate-400 mt-auto pt-3 border-t">{lot.updatedAt ? new Date(toMs(lot.updatedAt)).toLocaleString() : '-'}</div>
+                <div className="text-xs text-slate-400 mt-auto pt-3 border-t flex items-center justify-between gap-2">
+                  <span>{lot.updatedAt ? new Date(toMs(lot.updatedAt)).toLocaleString() : '-'}</span>
+                  {(() => {
+                    // 完了から30分以内ならロットを未完了に戻すボタンを表示
+                    const completedTs = toMs(lot.updatedAt);
+                    const within30 = completedTs && (Date.now() - completedTs) < 30 * 60 * 1000;
+                    if (!within30) return null;
+                    return (
+                      <button onClick={(e) => {
+                        e.stopPropagation();
+                        if (!confirm(`このロット（${lot.model} / ${lot.orderNo}）を未完了に戻しますか？\n再度作業ができるようになります。`)) return;
+                        saveData('lots', lot.id, { status: 'paused', location: lot.mapZoneId || 'arrival', completedAt: null });
+                      }} className="text-xs bg-amber-100 text-amber-700 hover:bg-amber-200 px-2 py-0.5 rounded font-bold flex items-center gap-1 shrink-0" title="完了から30分以内なら未完了に戻せます"><RotateCcw className="w-3 h-3"/> 戻す</button>
+                    );
+                  })()}
+                </div>
               </div>
             ))}
             {sortedCompletedLots.length === 0 && <div className="col-span-full text-center py-20 text-slate-400">表示するデータがありません</div>}
+            {hasMore && (
+              <div className="col-span-full text-center py-4">
+                <button onClick={() => setDisplayLimit(prev => prev + 100)} className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold shadow-sm">
+                  もっと見る (残り {allSortedCompletedLots.length - displayLimit} 件)
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           <div className="bg-white rounded-lg shadow border overflow-hidden">
@@ -7366,6 +9520,15 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const [isConnected, setIsConnected] = useState(false);
    const [syncStatus, setSyncStatus] = useState('idle');
    const [errorMsg, setErrorMsg] = useState(null);
+   // ネットワーク状態 (オフライン時に作業者へ通知)
+   const [isOnline, setIsOnline] = useState(() => typeof navigator !== 'undefined' ? navigator.onLine : true);
+   useEffect(() => {
+     const onOnline = () => setIsOnline(true);
+     const onOffline = () => setIsOnline(false);
+     window.addEventListener('online', onOnline);
+     window.addEventListener('offline', onOffline);
+     return () => { window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); };
+   }, []);
       
    // State: App Data
    const [lots, setLots] = useState([]);
@@ -7377,6 +9540,113 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    // State: Break Alert
    const [showBreakAlert, setShowBreakAlert] = useState(null);
    const [announceBanner, setAnnounceBanner] = useState(null);
+
+   // === 不具合発生時のスマホ/ブラウザ通知 ===
+   // 個人ごとに「通知を受ける」ON/OFF (localStorage 永続化)
+   const [defectNotifyEnabled, setDefectNotifyEnabled] = useState(() => {
+     try {
+       return localStorage.getItem('defectNotifyEnabled') === '1'
+         && typeof Notification !== 'undefined'
+         && Notification.permission === 'granted';
+     } catch { return false; }
+   });
+
+   const enableDefectNotifications = async () => {
+     if (typeof Notification === 'undefined') {
+       alert('このブラウザは通知に対応していません。\nスマホで使う場合: Chrome/Safari の最新版でアクセスしてください。');
+       return;
+     }
+     if (Notification.permission === 'denied') {
+       alert('通知がブロックされています。\nブラウザの設定から「通知を許可」してください。');
+       return;
+     }
+     try {
+       const perm = await Notification.requestPermission();
+       if (perm === 'granted') {
+         localStorage.setItem('defectNotifyEnabled', '1');
+         setDefectNotifyEnabled(true);
+         try {
+           new Notification('🔔 通知をONにしました', {
+             body: '不具合が発生したら、この端末に通知します。',
+             icon: '/favicon.svg'
+           });
+         } catch {}
+       }
+     } catch (e) { console.warn('Notification permission error', e); }
+   };
+
+   const disableDefectNotifications = () => {
+     localStorage.setItem('defectNotifyEnabled', '0');
+     setDefectNotifyEnabled(false);
+   };
+
+   // 既知の不具合 ID 追跡 (新規発生のみ通知)
+   const knownDefectIdsRef = useRef(null);
+   useEffect(() => {
+     // 全ロットから defect interruption を抽出
+     const allDefects = [];
+     lots.forEach(lot => {
+       (lot.interruptions || []).forEach(i => {
+         if (i.type === 'defect') {
+           allDefects.push({
+             id: i.id,
+             label: i.label,
+             timestamp: i.timestamp || i.startTime || 0,
+             workerName: i.workerName,
+             causeProcess: i.causeProcess,
+             stepInfo: i.stepInfo,
+             lotModel: lot.model,
+             lotOrderNo: lot.orderNo,
+             lotId: lot.id,
+           });
+         }
+       });
+     });
+
+     // 初回ロード時は既知 ID として登録するだけ (起動時に過去全件を再通知しない)
+     if (knownDefectIdsRef.current === null) {
+       knownDefectIdsRef.current = new Set(allDefects.map(d => d.id));
+       return;
+     }
+
+     // 新規 defect を検出
+     const newDefects = allDefects.filter(d => !knownDefectIdsRef.current.has(d.id));
+     newDefects.forEach(d => {
+       knownDefectIdsRef.current.add(d.id);
+
+       // 90秒以内に発生したものだけ通知 (古いデータ遡及防止)
+       if (Date.now() - d.timestamp > 90000) return;
+
+       // 自分が報告した不具合は通知しない
+       if (d.workerName && d.workerName === currentUserName) return;
+
+       const title = `🚨 不具合発生: ${d.lotModel || '?'} (${d.lotOrderNo || '?'})`;
+       const body = `${d.label || '不具合'}\n担当: ${d.workerName || '不明'}${d.causeProcess ? ` ・原因工程: ${d.causeProcess}` : ''}${d.stepInfo?.title ? `\n工程: ${d.stepInfo.title}` : ''}`;
+
+       // ① ブラウザ/スマホ通知
+       if (defectNotifyEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+         try {
+           const n = new Notification(title, {
+             body,
+             icon: '/favicon.svg',
+             tag: `defect-${d.id}`,
+             requireInteraction: true,
+             vibrate: [200, 100, 200],
+           });
+           n.onclick = () => { window.focus(); n.close(); };
+         } catch (e) { console.warn('Notification show failed', e); }
+       }
+
+       // ② 全員のアプリ画面に赤バナー (3分間表示)
+       setAnnounceBanner({
+         id: `defect-${d.id}`,
+         title,
+         content: body,
+         _defect: true,
+       });
+       setTimeout(() => setAnnounceBanner(prev => prev?.id === `defect-${d.id}` ? null : prev), 180000);
+     });
+   }, [lots, defectNotifyEnabled, currentUserName]);
 
    // State: UI
    const [viewMode, setViewMode] = useState('dashboard');
@@ -7404,6 +9674,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const [indirectWork, setIndirectWork] = useState([]);
    const [showIndirectModal, setShowIndirectModal] = useState(false);
    const [showDailySummary, setShowDailySummary] = useState(false);
+   const [showShiftHandover, setShowShiftHandover] = useState(false);
    const [activeIndirect, setActiveIndirect] = useState(null); // { id, category, startTime }
 
    // お知らせ通知タイマー
@@ -7438,20 +9709,36 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      if (!FIREBASE_CONFIG.apiKey) return;
      const app = initializeApp(FIREBASE_CONFIG);
      const auth = getAuth(app);
-     const firestore = getFirestore(app);
+     // オフライン永続化を有効化 (倉庫など電波弱でも作業継続可能、復旧時に自動同期)
+     // 複数タブ対応: 同じデバイスで複数タブを開いてもキャッシュ共有される
+     let firestore;
+     try {
+       firestore = initializeFirestore(app, {
+         localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+       });
+     } catch (e) {
+       // 既に initialize 済み or IndexedDB 不可 (シークレットモード等) の場合は通常 fallback
+       console.warn('Firestore persistence unavailable, falling back', e?.message);
+       firestore = getFirestore(app);
+     }
      setDb(firestore);
  
      const initAuth = async () => {
-       // Check if using user-defined config
-       const isUserConfig = USER_DEFINED_CONFIG.apiKey && USER_DEFINED_CONFIG.apiKey.length > 0;
-       
-       if (isUserConfig) {
-           // Force anonymous sign-in for user projects (avoids canvas token mismatch)
-           await signInAnonymously(auth);
-       } else if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-            await signInWithCustomToken(auth, __initial_auth_token);
-       } else {
-            await signInAnonymously(auth);
+       try {
+         // Check if using user-defined config
+         const isUserConfig = USER_DEFINED_CONFIG.apiKey && USER_DEFINED_CONFIG.apiKey.length > 0;
+
+         if (isUserConfig) {
+             // Force anonymous sign-in for user projects (avoids canvas token mismatch)
+             await signInAnonymously(auth);
+         } else if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+              await signInWithCustomToken(auth, __initial_auth_token);
+         } else {
+              await signInAnonymously(auth);
+         }
+       } catch (e) {
+         console.error('Auth failed', e);
+         setErrorMsg(`認証に失敗しました: ${e.message || e.code || '不明なエラー'}\nネットワーク接続を確認するか、ページを再読み込みしてください。`);
        }
      };
      initAuth();
@@ -7468,8 +9755,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      const getPath = (colName) => collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', colName);
  
      const unsubs = [
-       onSnapshot(getPath('lots'), { includeMetadataChanges: true }, (snap) => {
-           const data = snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => b.createdAt - a.createdAt);
+       // active ロットのみ常時リアルタイム購読 (作業中・待機中・処理中)
+       // 完了ロットは限定件数のみ。Firestore の課金とロード時間を抑える
+       onSnapshot(query(getPath('lots'), orderBy('createdAt', 'desc'), limit(500)), { includeMetadataChanges: true }, (snap) => {
+           const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setLots(data);
          }),
        onSnapshot(getPath('templates'), { includeMetadataChanges: true }, (snap) => {
@@ -7551,6 +9840,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      return obj;
    };
 
+   // 直近の失敗 payload を保持して再試行可能にする
+   const lastFailedPayloadRef = useRef(null);
+
    const saveData = async (col, id, data) => {
      if (!user || !db) {
          setErrorMsg("Not authenticated. Cannot save data.");
@@ -7562,23 +9854,51 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
        await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', col, id), { ...cleanUndefined(data), updatedAt: serverTimestamp() }, { merge: true });
        setSyncStatus('idle');
-     } catch (e) { 
-         console.error(e); 
-         setSyncStatus('error'); 
+       lastFailedPayloadRef.current = null;
+     } catch (e) {
+         console.error(e);
+         setSyncStatus('error');
          setErrorMsg(e.message || "Unknown error during save");
+         lastFailedPayloadRef.current = { kind: 'doc', col, id, data };
      }
    };
 
-   
+   const retryLastSave = async () => {
+     const p = lastFailedPayloadRef.current;
+     if (!p) { setSyncStatus('idle'); return; }
+     if (p.kind === 'doc') return saveData(p.col, p.id, p.data);
+     if (p.kind === 'settings') return saveSettings(p.data);
+     if (p.kind === 'delete') return deleteData(p.col, p.id);
+   };
 
    const saveSettings = async (newSettings) => {
      if (!user || !db) return;
-     await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), newSettings, { merge: true });
+     try {
+       setSyncStatus('syncing');
+       await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), newSettings, { merge: true });
+       setSyncStatus('idle');
+       lastFailedPayloadRef.current = null;
+     } catch (e) {
+       console.error(e);
+       setSyncStatus('error');
+       setErrorMsg(e.message || '設定の保存に失敗しました');
+       lastFailedPayloadRef.current = { kind: 'settings', data: newSettings };
+     }
    };
- 
+
    const deleteData = async (col, id) => {
      if (!user || !db) return;
-     await deleteDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', col, id));
+     try {
+       setSyncStatus('syncing');
+       await deleteDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', col, id));
+       setSyncStatus('idle');
+       lastFailedPayloadRef.current = null;
+     } catch (e) {
+       console.error(e);
+       setSyncStatus('error');
+       setErrorMsg(e.message || '削除に失敗しました');
+       lastFailedPayloadRef.current = { kind: 'delete', col, id };
+     }
    };
  
    // --- Worker Management ---
@@ -7597,6 +9917,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      if (!file) return;
 
      try {
+         const ExcelJS = await loadExcelJS();
          const wb = new ExcelJS.Workbook();
          await wb.xlsx.load(file);
          const ws = wb.getWorksheet(1);
@@ -7705,6 +10026,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const handleExcelDownload = async (template) => {
      if (!template || !template.steps) return;
      try {
+       const ExcelJS = await loadExcelJS();
        const wb = new ExcelJS.Workbook();
        const ws = wb.addWorksheet(template.name || 'テンプレート');
 
@@ -7888,6 +10210,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
    // === Excel一括登録: テンプレートダウンロード ===
    const handleLotExcelDownload = async () => {
+     const ExcelJS = await loadExcelJS();
      const wb = new ExcelJS.Workbook();
      const ws = wb.addWorksheet('入荷登録');
      const headers = ['型式', '指図番号', '台数', 'テンプレートID', '優先度', '納期', '入庫日時', '機番1', '機番2', '機番3', '機番4', '機番5', '機番6', '機番7', '機番8', '機番9', '機番10'];
@@ -7922,9 +10245,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      ws.columns = headers.map((h, i) => ({ width: i < 7 ? 18 : 12 }));
      // 注意書き
      ws.addRow([]);
-     ws.addRow(['※ 優先度: 通常 or 急ぎ']);
-     ws.addRow(['※ 入庫日時: 空欄の場合は現在日時が設定されます']);
-     ws.addRow(['※ テンプレートIDは「テンプレート一覧」シートを参照']);
+     ws.addRow(['※ 優先度: 「通常」または「急ぎ」（空欄は通常扱い）']);
+     ws.addRow(['※ 納期: yyyy-mm-dd 形式（空欄可）']);
+     ws.addRow(['※ 入庫日時: yyyy-mm-dd HH:MM 形式 / 空欄可（空欄=取込実行時刻）']);
+     ws.addRow(['※ 機番1〜10: 台数分のみ入力。空欄は #1, #2... 自動採番']);
+     ws.addRow(['※ テンプレートID: 「テンプレート一覧」シートからコピペ']);
+     ws.addRow(['※ 既存ロットは指図番号で上書き / 作業中ロットはスキップ']);
 
      const buf = await wb.xlsx.writeBuffer();
      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
@@ -7940,6 +10266,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      if (!file) return;
      e.target.value = '';
      try {
+       const ExcelJS = await loadExcelJS();
        const wb = new ExcelJS.Workbook();
        const buf = await file.arrayBuffer();
        await wb.xlsx.load(buf);
@@ -8058,8 +10385,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
         await saveData('lots', lotId, { location: 'arrival', mapZoneId: null, workerId: null });
      }
    };
-   // タッチD&D用にグローバル公開
-   useEffect(() => { window.__handleMoveLot = handleMoveLot; return () => { delete window.__handleMoveLot; }; });
+   // タッチD&D用にグローバル公開（依存配列を付けて毎レンダー登録解除を防止）
+   useEffect(() => {
+     window.__handleMoveLot = handleMoveLot;
+     return () => { if (window.__handleMoveLot === handleMoveLot) delete window.__handleMoveLot; };
+   }, [handleMoveLot]);
  
    const handleDropOnMap = (e) => {
        e.preventDefault();
@@ -8126,17 +10456,48 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            <button onClick={() => setShowBreakAlert(null)} className="bg-white/20 hover:bg-white/30 rounded-full p-1"><X className="w-6 h-6" /></button>
          </div>
        )}
-       {/* お知らせ通知バナー */}
+       {/* お知らせ/不具合 通知バナー (不具合は赤、それ以外は紫) */}
        {announceBanner && (
-         <div className="absolute top-0 left-0 right-0 bg-purple-600 text-white z-[100] p-4 flex justify-between items-center shadow-lg animate-pulse">
+         <div className={`absolute top-0 left-0 right-0 ${announceBanner._defect ? 'bg-rose-600' : 'bg-purple-600'} text-white z-[100] p-4 flex justify-between items-center shadow-lg animate-pulse`}>
            <div className="flex items-center gap-3">
-             <Megaphone className="w-6 h-6 shrink-0"/>
+             {announceBanner._defect ? <AlertTriangle className="w-6 h-6 shrink-0"/> : <Megaphone className="w-6 h-6 shrink-0"/>}
              <div>
                <div className="text-lg font-black">{announceBanner.title}</div>
-               {announceBanner.content && <div className="text-sm opacity-90">{announceBanner.content}</div>}
+               {announceBanner.content && <div className="text-sm opacity-90 whitespace-pre-wrap">{announceBanner.content}</div>}
              </div>
            </div>
            <button onClick={() => setAnnounceBanner(null)} className="bg-white/20 hover:bg-white/30 rounded-full p-2 shrink-0"><X className="w-6 h-6" /></button>
+         </div>
+       )}
+       {/* オフラインバナー (倉庫の電波弱でも作業継続可能・復旧時に自動同期) */}
+       {!isOnline && (
+         <div className="fixed top-0 left-0 right-0 z-[450] bg-amber-500 text-white px-4 py-2 flex items-center justify-center gap-2 text-sm font-bold shadow-lg">
+           <WifiOff className="w-4 h-4"/> オフライン中 — 作業は続けられます。電波が戻ると自動で同期されます。
+         </div>
+       )}
+       {/* 認証/接続エラーバナー */}
+       {errorMsg && (
+         <div className="fixed top-0 left-0 right-0 z-[500] bg-rose-600 text-white px-4 py-3 flex items-start gap-3 shadow-lg">
+           <AlertCircle className="w-5 h-5 shrink-0 mt-0.5"/>
+           <div className="flex-1 text-sm whitespace-pre-wrap">{errorMsg}</div>
+           <button onClick={() => window.location.reload()} className="bg-white text-rose-700 px-3 py-1 rounded font-bold text-xs hover:bg-rose-50 flex items-center gap-1"><RefreshCw className="w-3 h-3"/> 再読み込み</button>
+           <button onClick={() => setErrorMsg(null)} className="hover:bg-white/20 rounded p-1"><X className="w-4 h-4"/></button>
+         </div>
+       )}
+       {/* 保存状態インジケーター (右下フローティング) */}
+       {syncStatus === 'syncing' && (
+         <div className="fixed bottom-4 right-4 z-[400] bg-blue-600/95 text-white px-3 py-1.5 rounded-lg shadow-lg flex items-center gap-2 text-xs font-bold pointer-events-none">
+           <Loader2 className="w-3.5 h-3.5 animate-spin"/> 保存中...
+         </div>
+       )}
+       {syncStatus === 'error' && (
+         <div className="fixed bottom-4 right-4 z-[400] bg-rose-600/95 text-white px-3 py-2 rounded-lg shadow-lg flex items-center gap-2 text-xs font-bold">
+           <AlertCircle className="w-4 h-4"/>
+           <span>保存失敗</span>
+           {lastFailedPayloadRef.current && (
+             <button onClick={retryLastSave} className="bg-white text-rose-700 px-2 py-0.5 rounded font-black hover:bg-rose-50 flex items-center gap-1"><RefreshCw className="w-3 h-3"/> 再試行</button>
+           )}
+           <button onClick={() => setSyncStatus('idle')} className="hover:bg-white/20 rounded p-0.5"><X className="w-3.5 h-3.5"/></button>
          </div>
        )}
        <header data-fs="header" className="h-14 bg-slate-800 text-white flex items-center justify-between px-6 shadow-md z-50 shrink-0">
@@ -8163,10 +10524,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            <div className="flex bg-slate-200 p-1 rounded-lg">
               {[
                 { id: 'main', label: '現場マップ', icon: MapIcon },
+                { id: 'progress', label: '全体進捗', icon: Activity },
                 { id: 'inspection', label: '検査リスト', icon: ListChecks },
                 { id: 'analysis', label: '分析', icon: BarChart3 },
                 { id: 'history', label: '完了履歴', icon: CheckSquare },
                 { id: 'template-mgr', label: '工程テンプレート', icon: ClipboardList },
+                { id: 'measurement-settings', label: '測定設定', icon: Ruler },
                 { id: 'templates', label: 'マスタ設定', icon: Settings },
               ].map(tab => (
                 <button 
@@ -8185,6 +10548,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              <button onClick={() => setShowDailySummary(true)} className="bg-teal-600 hover:bg-teal-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="日次集計">
                <Clock className="w-3.5 h-3.5" /> 日次集計
              </button>
+             <button onClick={() => setShowShiftHandover(true)} className="bg-blue-700 hover:bg-blue-800 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="シフト引継ぎ (本日の実績+引継ぎメモを共有ノートに保存)">
+               <ArrowRight className="w-3.5 h-3.5" /> 引継ぎ
+             </button>
              <button onClick={() => setShowNoteModal(true)} className="relative bg-slate-600 hover:bg-slate-500 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="個人ノート">
                <FileText className="w-3.5 h-3.5" /> ノート
                {notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length > 0 && <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length}</span>}
@@ -8192,6 +10558,15 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              <button onClick={() => setShowAnnouncementModal(true)} className="relative bg-purple-600 hover:bg-purple-500 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="お知らせ">
                <Megaphone className="w-3.5 h-3.5" /> お知らせ
                {(() => { const unread = announcements.filter(a => (a.mode || 'confirm') === 'confirm' && !(a.confirmedBy || []).includes(currentUserName)).length; return unread > 0 ? <span className="absolute -top-1 -right-1 bg-red-500 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{unread}</span> : null; })()}
+             </button>
+             {/* 不具合通知トグル: 押した端末に不具合発生時の通知が届く */}
+             <button
+               onClick={defectNotifyEnabled ? disableDefectNotifications : enableDefectNotifications}
+               className={`relative px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ${defectNotifyEnabled ? 'bg-rose-600 hover:bg-rose-700 text-white ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-500 text-white'}`}
+               title={defectNotifyEnabled ? '不具合通知ON: タップでOFF' : '不具合通知OFF: タップしてONにする (この端末に通知が届きます)'}
+             >
+               {defectNotifyEnabled ? <BellRing className="w-3.5 h-3.5"/> : <Bell className="w-3.5 h-3.5"/>}
+               {defectNotifyEnabled ? '通知ON' : '通知'}
              </button>
              <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 shadow-sm">
                <Plus className="w-4 h-4" /> 入荷登録
@@ -8210,13 +10585,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              {viewMode === 'map-only' && <MapOnlyView onBack={() => setViewMode('dashboard')} lots={lots} workers={workers} templates={templates} handleMoveLot={handleMoveLot} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} setExecutionLotId={setExecutionLotId} settings={settings} handleImageUpload={handleImageUpload} saveSettings={saveSettings} mapZones={settings.mapZones} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
            </div>
          )}
-         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} />}
+         {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} />}
+         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} />}
          {activeTab === 'history' && <HistoryView lots={lots} workers={workers} templates={templates} saveData={saveData} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
          {activeTab === 'template-mgr' && (
            editingTemplate ? (
              <div className="p-4 h-full flex flex-col overflow-hidden">
-               <TemplateEditor template={editingTemplate} onSave={handleSaveTemplate} onCancel={() => setEditingTemplate(null)} customLayouts={settings?.customLayouts || {}} onSaveLayouts={(layouts) => saveSettings({ customLayouts: layouts })} comboPresets={settings?.comboPresets || []} />
+               <TemplateEditor template={editingTemplate} onSave={handleSaveTemplate} onCancel={() => setEditingTemplate(null)} customLayouts={settings?.customLayouts || {}} onSaveLayouts={(layouts) => saveSettings({ customLayouts: layouts })} comboPresets={settings?.comboPresets || []} builtInOverrides={settings?.builtInOverrides || {}} hiddenBuiltIns={settings?.hiddenBuiltIns || []} />
              </div>
            ) : (
              <div className="p-8 max-w-5xl mx-auto space-y-6 h-full overflow-y-auto">
@@ -8247,6 +10623,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              </div>
            )
          )}
+         {activeTab === 'measurement-settings' && <MeasurementSettingsView settings={settings} saveSettings={saveSettings} comboPresets={settings?.comboPresets || []} templates={templates} />}
          {activeTab === 'templates' && <TemplatesView editingTemplate={editingTemplate} setEditingTemplate={setEditingTemplate} handleSaveTemplate={handleSaveTemplate} workers={workers} saveData={saveData} deleteData={deleteData} templates={templates} handleExcelImport={handleExcelImport} handleExcelDownload={handleExcelDownload} handleBackupExport={handleBackupExport} handleBackupImport={handleBackupImport} excelInputRef={excelInputRef} backupInputRef={backupInputRef} settings={settings} saveSettings={saveSettings} mapZones={settings.mapZones} />}
        </main>
        
@@ -8273,6 +10650,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        />}
        {/* Daily Summary Modal */}
        {showDailySummary && <DailySummaryModal lots={lots} indirectWork={indirectWork} currentUserName={currentUserName} workers={workers} settings={settings} saveData={saveData} onClose={() => setShowDailySummary(false)} />}
+       {showShiftHandover && <ShiftHandoverModal lots={lots} indirectWork={indirectWork} currentUserName={currentUserName} workers={workers} saveData={saveData} onClose={() => setShowShiftHandover(false)} />}
 
        {showNoteModal && <NoteModal notes={notes} templates={templates} workers={workers} selectedWorker={selectedWorker} saveData={saveData} deleteData={deleteData} onClose={() => setShowNoteModal(false)} currentUserName={currentUserName} />}
 
@@ -8303,8 +10681,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              <div className="flex justify-between items-center mb-6">
                <h2 className="text-xl font-bold flex items-center gap-2"><Package className="w-6 h-6" /> {editingLot ? 'ロット情報編集' : '新規ロット登録'}</h2>
                <div className="flex gap-2">
-                 <button onClick={handleLotExcelDownload} className="bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-1.5 rounded text-xs font-bold flex items-center gap-1"><Download className="w-3.5 h-3.5"/> Excel雛形</button>
-                 <label className="bg-amber-600 hover:bg-amber-700 text-white px-2 py-1.5 rounded text-xs font-bold flex items-center gap-1 cursor-pointer"><Upload className="w-3.5 h-3.5"/> Excel取込<input type="file" ref={lotExcelInputRef} accept=".xlsx" onChange={handleLotExcelUpload} className="hidden"/></label>
+                 <button onClick={handleLotExcelDownload} className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded text-sm font-bold flex items-center gap-1.5 min-h-[40px] shadow-sm"><Download className="w-4 h-4"/> Excel雛形</button>
+                 <label className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-2 rounded text-sm font-bold flex items-center gap-1.5 min-h-[40px] cursor-pointer shadow-sm"><Upload className="w-4 h-4"/> Excel取込<input type="file" ref={lotExcelInputRef} accept=".xlsx" onChange={handleLotExcelUpload} className="hidden"/></label>
                </div>
              </div>
              <form onSubmit={(e) => {
@@ -8364,11 +10742,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                {/* 機番入力 */}
                <div>
                   <label className="block text-sm font-bold text-slate-700 mb-1">機番 (台数分)</label>
-                  <div className="space-y-1 max-h-40 overflow-y-auto border rounded p-2 bg-slate-50">
+                  <div className="space-y-1 max-h-72 overflow-y-auto border rounded p-2 bg-slate-50">
                     {Array.from({ length: lotFormQty }).map((_, i) => (
                       <div key={i} className="flex items-center gap-2">
                         <span className="text-xs text-slate-400 w-8 text-right shrink-0">#{i+1}</span>
-                        <input name={`serial_${i}`} defaultValue={editingLot?.unitSerialNumbers?.[i] || ''} placeholder={`機番 ${i+1}`} className="flex-1 border rounded px-2 py-1 text-sm bg-white" />
+                        <input name={`serial_${i}`} defaultValue={editingLot?.unitSerialNumbers?.[i] || ''} placeholder={`機番 ${i+1}`} inputMode="text" autoComplete="off" onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); const inputs = e.target.form?.querySelectorAll('input[name^="serial_"]'); const next = inputs?.[i+1]; if (next) next.focus(); } }} className="flex-1 border rounded px-2 py-1 text-sm bg-white" />
                       </div>
                     ))}
                   </div>
