@@ -9350,11 +9350,50 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                       }
 
                       // 測定項目: 生データ行 + 計算結果行
+                      const cfg = step.measurementConfig;
+                      const previewArrows = cfg?.arrows || [];
                       return (
                         <React.Fragment key={step.id}>
                           {/* 測定項目ヘッダー */}
                           <tr className="bg-blue-50">
                             <td colSpan={2 + displayQuantity} className="border border-black p-1 font-bold text-[8px] pl-2">📐 {step.title} {step.description ? `— ${step.description}` : ''}</td>
+                          </tr>
+                          {/* 測定設定プレビュー (ドット+ラベルのみ・値は無い・読み手の位置把握用) */}
+                          <tr>
+                            <td colSpan={2 + displayQuantity} className="border border-black p-1 bg-white">
+                              <div className="relative w-full mx-auto" style={{
+                                aspectRatio: '4 / 3',
+                                maxHeight: '60mm',
+                                maxWidth: '160mm',
+                                ...(cfg?.diagramImage ? { backgroundImage: `url(${cfg.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {})
+                              }}>
+                                {!cfg?.diagramImage && cfg?.layout === 'circle-4point' && (
+                                  <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+                                    <circle cx="50" cy="50" r="35" fill="none" stroke="#94a3b8" strokeWidth="0.5" strokeDasharray="2,2"/>
+                                  </svg>
+                                )}
+                                {measInputs.map(inp => (
+                                  <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
+                                    <div className={`w-2 h-2 rounded-full border border-white shadow ${inp.inputType === 'combobox' ? 'bg-amber-500' : 'bg-teal-500'}`}/>
+                                    <span className="text-[7px] font-bold text-slate-700 mt-0.5 bg-white/90 px-0.5 rounded leading-none">{inp.label}</span>
+                                  </div>
+                                ))}
+                                {/* 矢印比較の位置 (実測値ではなく設定上の位置のみ) */}
+                                {previewArrows.map((ar, ai) => {
+                                  const inputA = measInputs.find(i => i.id === ar.sourceA);
+                                  const inputB = measInputs.find(i => i.id === ar.sourceB);
+                                  let pos = ar.position;
+                                  if (!pos && inputA && inputB) pos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
+                                  if (!pos) pos = { x: 50, y: 50 };
+                                  return (
+                                    <div key={ai} className="absolute flex flex-col items-center" style={{ left: `${pos.x}%`, top: `${pos.y}%`, transform: 'translate(-50%, -50%)' }}>
+                                      <div className="text-amber-700 bg-amber-50 border border-amber-300 text-[10px] font-black px-1 rounded-full leading-none">↔</div>
+                                      {ar.label && <span className="text-[6px] font-bold text-amber-700 bg-white/90 px-0.5 rounded mt-0.5 leading-none">{ar.label}</span>}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </td>
                           </tr>
                           {/* 生データ行: 各入力項目 */}
                           {measInputs.map(inp => (
