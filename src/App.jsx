@@ -8823,7 +8823,9 @@ const ReportPreview = ({ lot, workers, onClose }) => {
     .visual-report.compact .unit-card { font-size: 9px; }
     .visual-report.compact .unit-diagram { aspect-ratio: 4/3; max-height: 80mm; }
     .visual-report.compact .unit-calc { font-size: 8px; padding: 1mm 2mm; }
+    /* spread: 1台/A4 (8:2 横並び・診断図を大きく) */
     .visual-report.spread .unit-card { page-break-inside: avoid; }
+    .visual-report.spread .unit-diagram { aspect-ratio: 4/3; max-height: 180mm; }
     /* a4-row: 横並び (診断図 80% + 計算 20%) ・A4 1枚優先・はみ出したら改ページ */
     .visual-report.a4-row .unit-card { font-size: 9px; page-break-inside: avoid; }
     .visual-report.a4-row .unit-diagram { aspect-ratio: 4/3; max-height: 60mm; }
@@ -9098,12 +9100,16 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                         return { ...arr, pos, dir, diff };
                       });
 
+                      // 8:2 ビジュアル横並びを使うモード:
+                      //  - a4-row: 詰め込み (小さい診断図、複数ユニットを1ページに)
+                      //  - spread: 1台/A4 (診断図を大きく、1ユニットでページ占有)
                       const isA4Row = pageLayout === 'a4-row';
-                      // a4-row: 横並び [診断図 8 : 計算 2]、それ以外は縦積み
+                      const isSpread = pageLayout === 'spread';
+                      const isHoriz = isA4Row || isSpread;
                       return (
-                        <div key={unitIdx} className={`unit-card border rounded-xl overflow-hidden bg-slate-50 ${isA4Row ? 'flex flex-col' : ''}`}>
+                        <div key={unitIdx} className={`unit-card border rounded-xl overflow-hidden bg-slate-50 ${isHoriz ? 'flex flex-col' : ''}`}>
                           {/* ユニットヘッダー */}
-                          <div className={`bg-slate-700 text-white ${pageLayout === 'compact' || isA4Row ? 'px-2 py-1 text-xs' : 'px-4 py-2 text-sm'} font-bold flex justify-between items-center`}>
+                          <div className={`bg-slate-700 text-white ${pageLayout === 'compact' || isA4Row ? 'px-2 py-1 text-xs' : isSpread ? 'px-4 py-2 text-base' : 'px-4 py-2 text-sm'} font-bold flex justify-between items-center`}>
                             <span>#{unitIdx + 1} {lot.unitSerialNumbers?.[unitIdx] || ''}</span>
                             {measCalcResults.length > 0 && (
                               <span className={`px-2 py-0.5 rounded text-xs font-bold ${measCalcResults.every(c => c.isOk) ? 'bg-emerald-500' : 'bg-rose-500'}`}>
@@ -9112,9 +9118,9 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                             )}
                           </div>
 
-                          <div className={isA4Row ? 'flex flex-row' : ''}>
+                          <div className={isHoriz ? 'flex flex-row' : ''}>
                           {/* ダイアグラムエリア */}
-                          <div className={`unit-diagram relative bg-white ${isA4Row ? 'w-4/5 aspect-[4/3]' : `aspect-[4/3] ${pageLayout === 'compact' ? 'min-h-[120px]' : 'min-h-[200px]'}`} overflow-hidden`}
+                          <div className={`unit-diagram relative bg-white ${isHoriz ? 'w-4/5 aspect-[4/3]' : `aspect-[4/3] ${pageLayout === 'compact' ? 'min-h-[120px]' : 'min-h-[200px]'}`} overflow-hidden`}
                             style={config?.diagramImage ? {
                               backgroundImage: `url(${config.diagramImage})`,
                               backgroundSize: 'contain',
@@ -9129,9 +9135,10 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                             {inputs.map(inp => {
                               const val = measValues[inp.id];
                               const isFilled = val != null && val !== '';
-                              const valFontSize = (pageLayout === 'compact' || isA4Row) ? 'text-[9px]' : 'text-sm';
-                              const valBox = (pageLayout === 'compact' || isA4Row) ? 'h-5 px-1' : 'h-7 px-2';
-                              const labelSize = (pageLayout === 'compact' || isA4Row) ? 'text-[7px]' : 'text-[9px]';
+                              // spread (1台/A4): 診断図が大きいので文字も大きく
+                              const valFontSize = isSpread ? 'text-base' : (pageLayout === 'compact' || isA4Row) ? 'text-[9px]' : 'text-sm';
+                              const valBox = isSpread ? 'h-9 px-3' : (pageLayout === 'compact' || isA4Row) ? 'h-5 px-1' : 'h-7 px-2';
+                              const labelSize = isSpread ? 'text-xs' : (pageLayout === 'compact' || isA4Row) ? 'text-[7px]' : 'text-[9px]';
                               return (
                                 <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
                                   <span className={`${labelSize} font-bold text-slate-500 mb-0.5 bg-white/90 px-1 rounded whitespace-nowrap`}>{inp.label}</span>
@@ -9147,35 +9154,38 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                               const isEq = ar.dir === 'equal';
                               const ch = isEq ? '↔' : isUp ? '↗' : '↘';
                               const color = isEq ? 'text-slate-600 bg-slate-100 border-slate-300' : isUp ? 'text-emerald-700 bg-emerald-100 border-emerald-400' : 'text-rose-700 bg-rose-100 border-rose-400';
-                              const fontSize = (pageLayout === 'compact' || isA4Row) ? 'text-lg' : 'text-2xl';
+                              const fontSize = isSpread ? 'text-4xl' : (pageLayout === 'compact' || isA4Row) ? 'text-lg' : 'text-2xl';
                               return (
                                 <div key={ai} className="absolute flex flex-col items-center z-20" style={{ left: `${ar.pos.x}%`, top: `${ar.pos.y}%`, transform: 'translate(-50%, -50%)' }}>
                                   <div className={`${color} ${fontSize} font-black px-1.5 rounded-full shadow border-2`} style={{ lineHeight: 1 }}>{ch}</div>
-                                  {ar.label && <span className={`${(pageLayout === 'compact' || isA4Row) ? 'text-[7px]' : 'text-[9px]'} font-bold text-slate-700 bg-white/90 px-1 rounded mt-0.5 whitespace-nowrap shadow-sm`}>{ar.label}</span>}
+                                  {ar.label && <span className={`${isSpread ? 'text-xs' : (pageLayout === 'compact' || isA4Row) ? 'text-[7px]' : 'text-[9px]'} font-bold text-slate-700 bg-white/90 px-1 rounded mt-0.5 whitespace-nowrap shadow-sm`}>{ar.label}</span>}
                                 </div>
                               );
                             })}
                           </div>
 
                           {/* 計算結果 — a4-row: 右に 20%、それ以外: 下に */}
-                          <div className={`unit-calc bg-white ${isA4Row ? 'w-1/5 border-l px-2 py-1.5 space-y-1 overflow-hidden' : `border-t ${pageLayout === 'compact' ? 'px-2 py-1.5 space-y-0.5' : 'px-4 py-3 space-y-2'}`}`}>
+                          <div className={`unit-calc bg-white ${isHoriz ? `w-1/5 border-l ${isSpread ? 'px-3 py-3 space-y-2' : 'px-2 py-1.5 space-y-1'} overflow-hidden` : `border-t ${pageLayout === 'compact' ? 'px-2 py-1.5 space-y-0.5' : 'px-4 py-3 space-y-2'}`}`}>
                             {calcs.map((calc, ci) => {
                               const cr = measCalcResults.find(c => c.id === calc.id) || measCalcResults[ci];
-                              if (isA4Row) {
-                                // a4-row: 縦並びの計算カード (右パネル内で縦に積む)
+                              if (isHoriz) {
+                                // 8:2 横並び時: 縦並びの計算カード (右パネル内で縦に積む)
+                                const cardSizes = isSpread
+                                  ? { label: 'text-sm', value: 'text-2xl', badge: 'text-xs px-1.5', unit: 'text-xs', tol: 'text-[10px]', pad: 'px-2 py-1.5' }
+                                  : { label: 'text-[9px]', value: 'text-sm', badge: 'text-[8px] px-1', unit: 'text-[7px]', tol: 'text-[7px]', pad: 'px-1.5 py-1' };
                                 return (
-                                  <div key={calc.id || ci} className={`rounded border ${cr?.isOk === false ? 'border-rose-300 bg-rose-50/40' : cr?.isOk ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200'} px-1.5 py-1`}>
+                                  <div key={calc.id || ci} className={`rounded border ${cr?.isOk === false ? 'border-rose-300 bg-rose-50/40' : cr?.isOk ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200'} ${cardSizes.pad}`}>
                                     <div className="flex items-center justify-between gap-1 mb-0.5">
-                                      <span className="text-[9px] font-bold text-slate-700 truncate">{calc.label || '計算結果'}</span>
+                                      <span className={`${cardSizes.label} font-bold text-slate-700 truncate`}>{calc.label || '計算結果'}</span>
                                       {cr?.result != null && cr?.isOk != null && (
-                                        <span className={`text-[8px] font-black px-1 rounded shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{cr.isOk ? 'OK' : 'NG'}</span>
+                                        <span className={`${cardSizes.badge} font-black rounded shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{cr.isOk ? 'OK' : 'NG'}</span>
                                       )}
                                     </div>
                                     <div className="flex items-baseline gap-0.5">
-                                      <span className="text-sm font-mono font-black text-slate-800">{cr?.result != null ? cr.result.toFixed(cr?.precision ?? 4) : '---'}</span>
-                                      <span className="text-[7px] text-slate-500">{calc.unit || ''}</span>
+                                      <span className={`${cardSizes.value} font-mono font-black text-slate-800`}>{cr?.result != null ? cr.result.toFixed(cr?.precision ?? 4) : '---'}</span>
+                                      <span className={`${cardSizes.unit} text-slate-500`}>{calc.unit || ''}</span>
                                     </div>
-                                    <div className="text-[7px] text-slate-400">{calc.toleranceLower != null ? `${calc.toleranceLower}~${calc.toleranceUpper}` : ''}</div>
+                                    <div className={`${cardSizes.tol} text-slate-400`}>{calc.toleranceLower != null ? `${calc.toleranceLower}~${calc.toleranceUpper}` : ''}</div>
                                   </div>
                                 );
                               }
