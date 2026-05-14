@@ -2435,7 +2435,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                             />
                             <span className="text-[10px] font-bold text-slate-600">公差判定 (OFFで記録のみ・OK/NG判定なし)</span>
                           </label>
-                          <div className={`grid grid-cols-4 gap-1 ${calc.toleranceEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
+                          <div className={`grid grid-cols-3 gap-1 ${calc.toleranceEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
                             <div>
                               <label className="block text-[10px] text-slate-400">基準値</label>
                               <input
@@ -2467,12 +2467,31 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                                 className="w-full border rounded p-1 text-[11px] text-right"
                               />
                             </div>
+                          </div>
+                          {/* 表示設定: 単位 + 桁数 (公差判定OFFでも有効) */}
+                          <div className="grid grid-cols-2 gap-1">
                             <div>
                               <label className="block text-[10px] text-slate-400">単位</label>
                               <select value={calc.unit} onChange={e => updateCalc(cIdx, { unit: e.target.value })} className="w-full border rounded p-1 text-[11px]">
                                 <option value="mm">mm</option>
                                 <option value="μm">μm</option>
                                 <option value="°">°</option>
+                              </select>
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-slate-400">表示桁数 (小数点以下)</label>
+                              <select
+                                value={calc.precision ?? 3}
+                                onChange={e => updateCalc(cIdx, { precision: Number(e.target.value) })}
+                                className="w-full border rounded p-1 text-[11px]"
+                              >
+                                <option value={0}>0桁 (整数)</option>
+                                <option value={1}>1桁 (X.X)</option>
+                                <option value={2}>2桁 (X.XX)</option>
+                                <option value={3}>3桁 (X.XXX)</option>
+                                <option value={4}>4桁 (X.XXXX)</option>
+                                <option value={5}>5桁</option>
+                                <option value={6}>6桁</option>
                               </select>
                             </div>
                           </div>
@@ -3881,7 +3900,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     if (finalResults.length > 0) {
       const announcements = finalResults.map(r => {
         const okng = r.isOk ? 'OK' : 'NG';
-        return `${r.label}、${r.result?.toFixed(3)}${r.unit}、判定${okng}`;
+        return `${r.label}、${r.result?.toFixed(r.precision ?? 3)}${r.unit}、判定${okng}`;
       }).join('。');
       setVoiceStatus(`🎤 結果発表中...`);
       await speakAsyncWithLog(`計算結果。${announcements}。次工程に進みますか？`);
@@ -7419,7 +7438,8 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
     id: `calc${idx}`, label: `計算${idx}`, method: 'max-min',
     formula: '', inputIds: [],
     toleranceUpper: 0.05, toleranceLower: -0.05, unit: 'mm',
-    nominal: null, toleranceEnabled: true
+    nominal: null, toleranceEnabled: true,
+    precision: 3
   });
   const initialArrow = (idx = 1) => ({
     id: `arr${idx}`, label: `矢印${idx}`,
@@ -7477,7 +7497,8 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
         toleranceLower: Number(c.toleranceLower) || 0,
         unit: c.unit || 'mm',
         nominal: c.nominal === null || c.nominal === undefined || c.nominal === '' ? null : Number(c.nominal),
-        toleranceEnabled: c.toleranceEnabled !== false
+        toleranceEnabled: c.toleranceEnabled !== false,
+        precision: Number.isFinite(Number(c.precision)) ? Number(c.precision) : 3
       })),
       arrows: draftArrows.filter(a => a.sourceA && a.sourceB).map(a => ({
         id: a.id, label: a.label || '',
@@ -7743,7 +7764,7 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
                         />
                         <span className="text-[10px] font-bold text-slate-600">公差判定 (OFFで記録のみ)</span>
                       </label>
-                      <div className={`grid grid-cols-4 gap-1 ${calc.toleranceEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
+                      <div className={`grid grid-cols-3 gap-1 ${calc.toleranceEnabled === false ? 'opacity-40 pointer-events-none' : ''}`}>
                         <div>
                           <label className="block text-[10px] text-slate-400 font-bold">基準値</label>
                           <input type="number" step="any" value={calc.nominal ?? ''} onChange={e => updateCalc(cIdx, { nominal: e.target.value === '' ? null : Number(e.target.value) })} placeholder="(0)" className="w-full border rounded p-1 text-[11px] text-right font-mono"/>
@@ -7756,9 +7777,23 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
                           <label className="block text-[10px] text-slate-400 font-bold">公差下(-)</label>
                           <input type="number" step="0.001" value={calc.toleranceLower} onChange={e => updateCalc(cIdx, { toleranceLower: e.target.value })} className="w-full border rounded p-1 text-[11px] text-right font-mono"/>
                         </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1">
                         <div>
                           <label className="block text-[10px] text-slate-400 font-bold">単位</label>
                           <input value={calc.unit || ''} onChange={e => updateCalc(cIdx, { unit: e.target.value })} className="w-full border rounded p-1 text-[11px] text-center" placeholder="mm"/>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400 font-bold">表示桁数</label>
+                          <select value={calc.precision ?? 3} onChange={e => updateCalc(cIdx, { precision: Number(e.target.value) })} className="w-full border rounded p-1 text-[11px]">
+                            <option value={0}>0桁 (整数)</option>
+                            <option value={1}>1桁</option>
+                            <option value={2}>2桁</option>
+                            <option value={3}>3桁</option>
+                            <option value={4}>4桁</option>
+                            <option value={5}>5桁</option>
+                            <option value={6}>6桁</option>
+                          </select>
                         </div>
                       </div>
                     </div>
@@ -8739,7 +8774,7 @@ const EditMeasurementModal = ({ lot, onClose, onSave }) => {
                               <td key={i} className="p-2 text-center font-mono font-bold">
                                 {cr && cr.result != null ? (
                                   <span className={cr.isOk ? 'text-green-700' : 'text-red-600'}>
-                                    {cr.result.toFixed(3)} <span className="text-[10px]">{cr.isOk ? 'OK' : 'NG'}</span>
+                                    {cr.result.toFixed(cr.precision ?? 3)} <span className="text-[10px]">{cr.isOk ? 'OK' : 'NG'}</span>
                                   </span>
                                 ) : '-'}
                               </td>
@@ -9343,7 +9378,7 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                                     {pageLayout !== 'compact' && <span className="text-slate-400 ml-2">{calc.toleranceLower != null ? `${calc.toleranceLower}~${calc.toleranceUpper}` : ''} {calc.unit || ''}</span>}
                                   </div>
                                   <div className="flex items-center gap-1.5">
-                                    <span className={`${pageLayout === 'compact' ? 'text-sm' : 'text-lg'} font-mono font-black text-slate-800`}>{cr?.result != null ? cr.result.toFixed(4) : '---'}</span>
+                                    <span className={`${pageLayout === 'compact' ? 'text-sm' : 'text-lg'} font-mono font-black text-slate-800`}>{cr?.result != null ? cr.result.toFixed(cr?.precision ?? 4) : '---'}</span>
                                     {cr?.result != null && (
                                       <span className={`${pageLayout === 'compact' ? 'text-[9px] px-1' : 'text-xs px-2'} py-0.5 rounded font-bold ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
                                         {cr.isOk ? 'OK' : 'NG'}
