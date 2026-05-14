@@ -8857,8 +8857,8 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
         {(calcResults || []).length === 0 && <div className="text-[8px] text-slate-400 px-1">未計算</div>}
         {(() => {
           const list = calcResults || [];
-          const single = list.slice(0, 6);   // 先頭6個: 横並び (ラベル / 値 / OK)
-          const doubled = list.slice(6);     // 7個目以降: 2列に縦並びカード (ラベル/値の上下)
+          // 6個以下なら1列横並び、7個以上なら全部 2列カード
+          const useTwoCols = list.length >= 7;
           const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
           const buildRange = cr => {
             const hasNominal = cr.nominal !== undefined && cr.nominal !== 0;
@@ -8870,7 +8870,7 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
             }
             return `${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}`;
           };
-          // 1列用 (横並び・コンパクト)
+          // 1列用 (横並び)
           const renderRow = (cr, ci) => {
             const rangeText = buildRange(cr);
             const rowBg = cr.isOk === false ? 'bg-rose-50' : cr.isOk ? 'bg-emerald-50' : '';
@@ -8909,16 +8909,14 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
               </div>
             );
           };
-          return (
-            <>
-              <div>{single.map(renderRow)}</div>
-              {doubled.length > 0 && (
-                <div className="grid grid-cols-2 gap-1 mt-0.5 pt-0.5 border-t border-slate-300">
-                  {doubled.map(renderCard)}
-                </div>
-              )}
-            </>
-          );
+          if (useTwoCols) {
+            return (
+              <div className="grid grid-cols-2 gap-1">
+                {list.map(renderCard)}
+              </div>
+            );
+          }
+          return <div>{list.map(renderRow)}</div>;
         })()}
       </div>
     </div>
