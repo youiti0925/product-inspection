@@ -8857,18 +8857,22 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
         {(calcResults || []).length === 0 && <div className="text-[8px] text-slate-400 px-1">未計算</div>}
         {(() => {
           const list = calcResults || [];
-          const single = list.slice(0, 6);   // 先頭6個は1列
-          const doubled = list.slice(6);     // 7個目以降は2列
-          const renderRow = (cr, ci) => {
+          const single = list.slice(0, 6);   // 先頭6個: 横並び (ラベル / 値 / OK)
+          const doubled = list.slice(6);     // 7個目以降: 2列に縦並びカード (ラベル/値の上下)
+          const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
+          const buildRange = cr => {
             const hasNominal = cr.nominal !== undefined && cr.nominal !== 0;
-            const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
-            let rangeText;
-            if (cr.toleranceEnabled === false) rangeText = '判定なし';
-            else if (hasNominal) {
+            if (cr.toleranceEnabled === false) return '判定なし';
+            if (hasNominal) {
               const upStr = cr.toleranceUpper >= 0 ? `+${fmt(cr.toleranceUpper)}` : fmt(cr.toleranceUpper);
               const lowStr = cr.toleranceLower >= 0 ? `+${fmt(cr.toleranceLower)}` : fmt(cr.toleranceLower);
-              rangeText = `${fmt(cr.nominal)}${upStr}/${lowStr}`;
-            } else rangeText = `${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}`;
+              return `${fmt(cr.nominal)}${upStr}/${lowStr}`;
+            }
+            return `${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}`;
+          };
+          // 1列用 (横並び・コンパクト)
+          const renderRow = (cr, ci) => {
+            const rangeText = buildRange(cr);
             const rowBg = cr.isOk === false ? 'bg-rose-50' : cr.isOk ? 'bg-emerald-50' : '';
             return (
               <div key={cr.id || ci} className={`flex items-center gap-1 px-1 py-0.5 border-b border-slate-200 text-[8px] ${rowBg}`}>
@@ -8888,12 +8892,29 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
               </div>
             );
           };
+          // 2列用 (縦並びカード・ラベル幅確保)
+          const renderCard = (cr, ci) => {
+            const rangeText = buildRange(cr);
+            const bg = cr.isOk === false ? 'bg-rose-50 border-rose-200' : cr.isOk ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-200';
+            return (
+              <div key={cr.id || ci} className={`px-1 py-0.5 border ${bg} rounded text-[8px]`}>
+                <div className="font-bold text-slate-700 leading-tight break-words" title={cr.label || '計算結果'}>{cr.label || '計算結果'}</div>
+                <div className="text-[6px] text-slate-400 leading-tight">{rangeText}</div>
+                <div className="flex items-baseline justify-between gap-1 mt-0.5">
+                  <span className="font-mono font-black text-[10px] text-slate-800 truncate">{cr.result != null ? cr.result.toFixed(cr.precision ?? 3) : '---'}<span className="text-[6px] text-slate-500 ml-0.5">{cr.unit || ''}</span></span>
+                  {cr.result != null && cr.isOk != null && (
+                    <span className={`text-[7px] font-black px-1 rounded shrink-0 ${cr.isOk ? 'bg-emerald-200 text-emerald-800' : 'bg-rose-200 text-rose-800'}`}>{cr.isOk ? 'OK' : 'NG'}</span>
+                  )}
+                </div>
+              </div>
+            );
+          };
           return (
             <>
               <div>{single.map(renderRow)}</div>
               {doubled.length > 0 && (
-                <div className="grid grid-cols-2 gap-x-1 mt-0.5 border-t border-slate-300 pt-0.5">
-                  {doubled.map(renderRow)}
+                <div className="grid grid-cols-2 gap-1 mt-0.5 pt-0.5 border-t border-slate-300">
+                  {doubled.map(renderCard)}
                 </div>
               )}
             </>
