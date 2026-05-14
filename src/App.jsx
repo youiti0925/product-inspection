@@ -8806,15 +8806,15 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
   });
 
   return (
-    <div className="flex flex-row gap-2 w-full" style={{ pageBreakInside: 'avoid' }}>
-      {/* 左 8割: 図 + 実測値 */}
+    <div className="flex flex-row gap-2 w-full items-start" style={{ pageBreakInside: 'avoid' }}>
+      {/* 左 8割: 図 + 実測値 (コンパクト) */}
       <div className="flex-[4] min-w-0">
         {unitLabel && <div className="text-[8px] font-bold text-slate-600 mb-0.5">{unitLabel}</div>}
         <div
           className="relative bg-white border border-slate-200 rounded mx-auto"
           style={{
             ...(imageAspect ? { aspectRatio: String(imageAspect) } : { aspectRatio: '1 / 1' }),
-            maxHeight: '120mm',
+            maxHeight: '70mm',
             width: '100%',
             ...(config?.diagramImage ? { backgroundImage: `url(${config.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {})
           }}
@@ -8850,37 +8850,43 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
           })}
         </div>
       </div>
-      {/* 右 2割: 計算結果 */}
-      <div className="flex-1 min-w-[140px] max-w-[180px] space-y-1">
-        <div className="text-[8px] font-bold text-slate-500 px-1">計算結果</div>
-        {(calcResults || []).length === 0 && <div className="text-[8px] text-slate-400 px-1 py-1">未計算</div>}
-        {(calcResults || []).map((cr, ci) => {
-          // 範囲表示テキスト
-          const hasNominal = cr.nominal !== undefined && cr.nominal !== 0;
-          const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
-          let rangeText;
-          if (cr.toleranceEnabled === false) rangeText = '判定なし';
-          else if (hasNominal) {
-            const upStr = cr.toleranceUpper >= 0 ? `+${fmt(cr.toleranceUpper)}` : fmt(cr.toleranceUpper);
-            const lowStr = cr.toleranceLower >= 0 ? `+${fmt(cr.toleranceLower)}` : fmt(cr.toleranceLower);
-            rangeText = `${fmt(cr.nominal)} (${upStr}/${lowStr})`;
-          } else rangeText = `[${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}]`;
-          return (
-            <div key={cr.id || ci} className={`rounded border px-1.5 py-1 ${cr.isOk === false ? 'border-rose-300 bg-rose-50/40' : cr.isOk ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200 bg-white'}`}>
-              <div className="flex items-center justify-between gap-1 mb-0.5">
-                <span className="text-[9px] font-bold text-slate-700 truncate">{cr.label || '計算結果'}</span>
-                {cr.result != null && cr.isOk != null && (
-                  <span className={`text-[8px] font-black px-1 rounded shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{cr.isOk ? 'OK' : 'NG'}</span>
-                )}
-              </div>
-              <div className="flex items-baseline gap-0.5">
-                <span className="text-sm font-mono font-black text-slate-800">{cr.result != null ? cr.result.toFixed(cr.precision ?? 4) : '---'}</span>
-                <span className="text-[7px] text-slate-500">{cr.unit || ''}</span>
-              </div>
-              <div className="text-[7px] text-slate-500 truncate">{rangeText}</div>
-            </div>
-          );
-        })}
+      {/* 右 2割: 計算結果 (1計算=1行のコンパクト表示) */}
+      <div className="flex-1 min-w-[150px] max-w-[200px]">
+        <div className="text-[8px] font-bold text-slate-500 mb-0.5 px-0.5">計算結果</div>
+        {(calcResults || []).length === 0 && <div className="text-[8px] text-slate-400 px-1">未計算</div>}
+        <table className="w-full text-[8px] border-collapse">
+          <tbody>
+            {(calcResults || []).map((cr, ci) => {
+              const hasNominal = cr.nominal !== undefined && cr.nominal !== 0;
+              const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
+              let rangeText;
+              if (cr.toleranceEnabled === false) rangeText = '判定なし';
+              else if (hasNominal) {
+                const upStr = cr.toleranceUpper >= 0 ? `+${fmt(cr.toleranceUpper)}` : fmt(cr.toleranceUpper);
+                const lowStr = cr.toleranceLower >= 0 ? `+${fmt(cr.toleranceLower)}` : fmt(cr.toleranceLower);
+                rangeText = `${fmt(cr.nominal)}${upStr}/${lowStr}`;
+              } else rangeText = `${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}`;
+              const rowBg = cr.isOk === false ? 'bg-rose-50' : cr.isOk ? 'bg-emerald-50' : '';
+              return (
+                <tr key={cr.id || ci} className={`border-b border-slate-200 ${rowBg}`}>
+                  <td className="px-1 py-0.5 truncate align-middle" style={{ maxWidth: '70px' }} title={cr.label || '計算結果'}>
+                    <div className="font-bold text-slate-700 truncate">{cr.label || '計算結果'}</div>
+                    <div className="text-[6px] text-slate-400 truncate">{rangeText}</div>
+                  </td>
+                  <td className="px-0.5 py-0.5 text-right align-middle whitespace-nowrap">
+                    <span className="font-mono font-black text-[10px] text-slate-800">{cr.result != null ? cr.result.toFixed(cr.precision ?? 3) : '---'}</span>
+                    <span className="text-[6px] text-slate-500 ml-0.5">{cr.unit || ''}</span>
+                  </td>
+                  <td className="px-0.5 py-0.5 text-center align-middle">
+                    {cr.result != null && cr.isOk != null && (
+                      <span className={`text-[7px] font-black px-1 rounded ${cr.isOk ? 'bg-emerald-200 text-emerald-800' : 'bg-rose-200 text-rose-800'}`}>{cr.isOk ? 'OK' : 'NG'}</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );
