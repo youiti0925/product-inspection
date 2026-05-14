@@ -9132,18 +9132,6 @@ const ReportPreview = ({ lot, workers, onClose }) => {
           <Printer className="w-5 h-5" /> 成績表プレビュー
         </h2>
         <div className="flex items-center gap-3">
-          <div className="flex bg-slate-700 rounded-lg p-0.5">
-            <button onClick={() => setReportMode('table')} className={`px-3 py-1.5 rounded text-xs font-bold transition-all ${reportMode === 'table' ? 'bg-white text-slate-800 shadow' : 'text-slate-300 hover:text-white'}`}>テーブル</button>
-            <button onClick={() => setReportMode('visual')} className={`px-3 py-1.5 rounded text-xs font-bold transition-all ${reportMode === 'visual' ? 'bg-white text-slate-800 shadow' : 'text-slate-300 hover:text-white'}`}>ビジュアル</button>
-            {reportMode === 'visual' && (
-              <div className="flex items-center gap-1 ml-2 bg-slate-700 rounded p-0.5">
-                <button onClick={() => setPageLayout('compact')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'compact' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>1ページ詰込</button>
-                <button onClick={() => setPageLayout('standard')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'standard' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>標準 (工程ごと改ページ)</button>
-                <button onClick={() => setPageLayout('spread')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'spread' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>1台1ページ</button>
-                <button onClick={() => setPageLayout('a4-row')} className={`px-2 py-1 rounded text-[10px] font-bold ${pageLayout === 'a4-row' ? 'bg-blue-500 text-white' : 'text-slate-300'}`}>A4横並び (8:2)</button>
-              </div>
-            )}
-          </div>
           <div className="flex items-center gap-2 bg-slate-700 p-1 rounded px-3">
             <span className="text-xs font-bold text-slate-300">帳票番号:</span>
             <input type="text" value={customReportNo} onChange={(e) => setCustomReportNo(e.target.value)} className="bg-slate-800 text-white border border-slate-600 rounded px-2 py-0.5 text-sm w-40 focus:outline-none focus:border-blue-500" />
@@ -9409,48 +9397,20 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                 </div>
               </div>
             </div>
-            <div className="flex border border-black mb-2">
-              <div className="w-[30%] border-r border-black p-2 space-y-1 text-xs">
-                <div className="flex border-b border-gray-300 pb-1"><span className="font-bold w-12 bg-gray-100 text-center mr-1 shrink-0 text-[10px]">指図</span><span className="font-bold text-sm break-words">{lot.orderNo}</span></div>
-                <div className="flex border-b border-gray-300 pb-1"><span className="font-bold w-12 bg-gray-100 text-center mr-1 shrink-0 text-[10px]">型式</span><span className="break-words font-bold text-xs">{lot.model}</span></div>
-                <div className="flex"><span className="font-bold w-12 bg-gray-100 text-center mr-1 shrink-0 text-[10px]">台数</span><span className="text-[10px]">{lot.quantity || 1} 台</span></div>
-              </div>
-              <div className="w-[40%] border-r border-black p-2">
-                <div className="font-bold border-b border-black mb-2 text-center bg-gray-100 text-sm">備考欄</div>
-                <div className="text-[10px]">
-                  {defects && <div className="mb-2"><span className="font-bold text-red-600">【不具合事項】</span><div className="whitespace-pre-wrap ml-1 border border-red-200 p-1 bg-red-50">{defects}</div></div>}
-                </div>
-              </div>
-              <div className="w-[30%] p-2">
-                <div className="font-bold border-b border-black mb-2 text-center bg-gray-100 text-xs">機番一覧</div>
-                <div className="text-[9px] grid grid-cols-5 gap-1">
-                  {Array.from({ length: lot.quantity || 1 }).map((_, i) => (
-                    <div key={i} className="text-center">
-                      <span className="text-[7px] text-gray-400">#{i+1}</span>
-                      <div className="font-bold truncate">{lot.unitSerialNumbers?.[i] || ''}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+            {/* ヘッダー: 指図/型式/台数/機番/備考 を横一列 */}
+            <div className="flex border border-black mb-2 text-[10px] items-stretch">
+              <div className="border-r border-black flex items-center"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300">指図</span><span className="font-bold px-2">{lot.orderNo}</span></div>
+              <div className="border-r border-black flex items-center"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300">型式</span><span className="font-bold px-2">{lot.model}</span></div>
+              <div className="border-r border-black flex items-center"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300">台数</span><span className="px-2">{lot.quantity || 1}台</span></div>
+              <div className="border-r border-black flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">機番</span><span className="px-2 truncate font-mono">{(lot.unitSerialNumbers || []).join(' / ') || '-'}</span></div>
+              <div className="flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">備考</span><span className="px-2 truncate">{defects ? <span className="text-red-700 font-bold">{defects.replace(/\n/g, ' / ')}</span> : ''}</span></div>
             </div>
-            <table className="w-full border-collapse border border-black text-[10px] table-fixed">
-              <thead>
-                <tr className="bg-gray-100">
-                  <th className="border border-black p-1 whitespace-nowrap text-[8px]">検査項目</th>
-                  <th className="border border-black p-1 whitespace-nowrap text-[8px]">確認方法</th>
-                  {Array.from({ length: displayQuantity }).map((_, i) => (
-                    <th key={i} className="border border-black p-1 w-5 text-[7px]">
-                      <div>{i + 1}</div>
-                      {lot.unitSerialNumbers?.[i] && <div className="font-normal text-[6px] text-gray-500 truncate">{lot.unitSerialNumbers[i]}</div>}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
+            <table className="w-full border-collapse border border-black text-[10px]">
               <tbody>
                 {Object.entries(stepsByCategory).map(([cat, catSteps]) => (
                   <React.Fragment key={cat}>
                     <tr className="bg-gray-200">
-                      <td colSpan={2 + displayQuantity} className="border border-black p-1 font-bold text-left pl-2 text-[9px]">{cat}</td>
+                      <td className="border border-black p-1 font-bold text-left pl-2 text-[9px]">{cat}</td>
                     </tr>
                     {catSteps.map(step => {
                       const stepIdx = steps.findIndex(s => s.id === step.id);
@@ -9459,20 +9419,29 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                       const measCalcs = isMeas ? (step.measurementConfig.calculations || [{ id: 'default', label: '計算結果', method: step.measurementConfig.calculation, toleranceUpper: step.measurementConfig.toleranceUpper, toleranceLower: step.measurementConfig.toleranceLower, unit: step.measurementConfig.unit }]) : [];
 
                       if (!isMeas) {
-                        // 通常の検査項目: ✓/－
+                        // 通常の検査項目: 1行コンパクト (タイトル + 説明 + 全台の ✓/－ をインライン)
+                        const qty = lot.quantity || 1;
+                        const marks = Array.from({ length: qty }).map((_, i) => {
+                          const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${stepIdx}-${i}`];
+                          if (task?.status === 'completed') return '✓';
+                          if (task?.status === 'skipped') return '－';
+                          return '';
+                        });
+                        const allOk = marks.every(m => m === '✓' || m === '－');
                         return (
                           <tr key={step.id}>
-                            <td className="border border-black p-1 align-middle whitespace-nowrap text-[8px] font-bold">{step.title}</td>
-                            <td className="border border-black p-1 text-gray-600 align-middle text-[8px]">{step.description || ''}</td>
-                            {Array.from({ length: displayQuantity }).map((_, i) => {
-                              const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${stepIdx}-${i}`];
-                              let mark = '';
-                              if (i < (lot.quantity || 1)) {
-                                if (task?.status === 'completed') mark = '✓';
-                                else if (task?.status === 'skipped') mark = '－';
-                              }
-                              return <td key={i} className={`border border-black p-1 text-center align-middle ${i >= (lot.quantity || 1) ? 'bg-slate-100' : ''}`}><span className="text-[8px] font-bold">{mark}</span></td>;
-                            })}
+                            <td className="border border-black p-1 align-middle">
+                              <div className="flex items-center gap-2 text-[10px]">
+                                <span className="font-bold whitespace-nowrap">{step.title}</span>
+                                <span className="text-gray-600 flex-1 truncate">{step.description || ''}</span>
+                                <span className="flex gap-0.5 shrink-0 font-mono">
+                                  {marks.map((m, i) => (
+                                    <span key={i} className={`w-3 text-center font-bold ${m === '✓' ? 'text-emerald-700' : m === '－' ? 'text-slate-400' : 'text-rose-500'}`}>{m || '×'}</span>
+                                  ))}
+                                </span>
+                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded shrink-0 ${allOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{allOk ? 'OK' : '未'}</span>
+                              </div>
+                            </td>
                           </tr>
                         );
                       }
@@ -9483,20 +9452,19 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                         <React.Fragment key={step.id}>
                           {/* 測定項目ヘッダー */}
                           <tr className="bg-blue-50">
-                            <td colSpan={2 + displayQuantity} className="border border-black p-1 font-bold text-[9px] pl-2">📐 {step.title} {step.description ? `— ${step.description}` : ''}</td>
+                            <td className="border border-black p-1 font-bold text-[9px] pl-2">📐 {step.title} {step.description ? `— ${step.description}` : ''}</td>
                           </tr>
                           {/* 各ユニットを1行ずつ: 左にプレビュー+値、右に計算結果 */}
                           {Array.from({ length: lot.quantity || 1 }).map((_, unitIdx) => {
                             const meas = getMeasForUnit(step.id, unitIdx);
                             const measValues = meas?.values || {};
-                            // calcResults: 保存済みなら使う、無ければ measCalcs から仮の構造で
                             const calcResults = meas?.calcResults && meas.calcResults.length > 0
                               ? meas.calcResults
                               : measCalcs.map(c => ({ ...c, result: null, isOk: null }));
                             const unitLabel = (lot.quantity || 1) > 1 ? `#${unitIdx + 1} ${lot.unitSerialNumbers?.[unitIdx] || ''}` : '';
                             return (
                               <tr key={unitIdx}>
-                                <td colSpan={2 + displayQuantity} className="border border-black p-2 bg-white">
+                                <td className="border border-black p-2 bg-white">
                                   <TableReportDiagram config={cfg} measValues={measValues} calcResults={calcResults} unitLabel={unitLabel} />
                                 </td>
                               </tr>
