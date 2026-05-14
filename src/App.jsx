@@ -8960,7 +8960,7 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
 
 const ReportPreview = ({ lot, workers, onClose }) => {
   const [customReportNo, setCustomReportNo] = useState(lot.orderNo || '');
-  const [reportMode, setReportMode] = useState('table'); // 'table' or 'visual'
+  const [reportMode, setReportMode] = useState('table'); // 'table' | 'multi' | 'visual'
   // ビジュアル成績表のページ構成: 'compact' = 1ページ詰め込み、'standard' = 2列・自然改ページ、'spread' = 1台ずつ
   const [pageLayout, setPageLayout] = useState('standard');
   const toMs = (val) => {
@@ -9198,6 +9198,10 @@ const ReportPreview = ({ lot, workers, onClose }) => {
           <Printer className="w-5 h-5" /> 成績表プレビュー
         </h2>
         <div className="flex items-center gap-3">
+          <div className="flex bg-slate-700 rounded-lg p-0.5">
+            <button onClick={() => setReportMode('table')} className={`px-3 py-1.5 rounded text-xs font-bold transition-all ${reportMode === 'table' ? 'bg-white text-slate-800 shadow' : 'text-slate-300 hover:text-white'}`} title="1台分をプレビュー+計算結果でA4一枚 (台数分ページが続く)">1台/A4 (プレビュー)</button>
+            <button onClick={() => setReportMode('multi')} className={`px-3 py-1.5 rounded text-xs font-bold transition-all ${reportMode === 'multi' ? 'bg-white text-slate-800 shadow' : 'text-slate-300 hover:text-white'}`} title="全台の計算結果のみ・A4一枚に詰込">多台用 (結果のみ)</button>
+          </div>
           <div className="flex items-center gap-2 bg-slate-700 p-1 rounded px-3">
             <span className="text-xs font-bold text-slate-300">帳票番号:</span>
             <input type="text" value={customReportNo} onChange={(e) => setCustomReportNo(e.target.value)} className="bg-slate-800 text-white border border-slate-600 rounded px-2 py-0.5 text-sm w-40 focus:outline-none focus:border-blue-500" />
@@ -9212,7 +9216,125 @@ const ReportPreview = ({ lot, workers, onClose }) => {
       </div>
       <div className="flex-1 overflow-y-auto bg-gray-500 p-8">
         <style>{PRINT_STYLES}</style>
-        {reportMode === 'visual' ? (
+        {reportMode === 'multi' ? (
+          /* ===== 多台用モード: 計算結果テーブル (全台 × 全計算) を A4 1枚に詰込 ===== */
+          <div className="print-pages" id="report-preview-content">
+            <div className="print-page bg-white">
+              <div className="flex justify-between items-start mb-3">
+                <div>
+                  <div className="text-[10px] font-bold text-slate-500">製品検査</div>
+                  <h1 className="text-xl font-serif font-bold">製品検査チェックシート (多台用)</h1>
+                </div>
+                <div className="text-right text-[10px]">
+                  <div>完了: {toDateTimeJp(lot.updatedAt)}</div>
+                  <div>帳票: <span className="font-bold">{customReportNo}</span></div>
+                </div>
+              </div>
+              <div className="flex border border-black mb-2 text-[10px]">
+                <div className="border-r border-black flex items-center"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300">指図</span><span className="font-bold px-2">{lot.orderNo}</span></div>
+                <div className="border-r border-black flex items-center"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300">型式</span><span className="font-bold px-2">{lot.model}</span></div>
+                <div className="border-r border-black flex items-center"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300">台数</span><span className="px-2">{lot.quantity || 1}台</span></div>
+                <div className="border-r border-black flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">担当</span><span className="px-2 truncate">{worker}</span></div>
+                <div className="flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">備考</span><span className="px-2 truncate">{defects ? <span className="text-red-700 font-bold">{defects.replace(/\n/g, ' / ')}</span> : ''}</span></div>
+              </div>
+              {/* 大テーブル: 行=計算、列=機番 */}
+              <table className="w-full border-collapse border border-black text-[8px]">
+                <thead>
+                  <tr className="bg-gray-200">
+                    <th className="border border-black px-1 py-1 text-left" style={{ minWidth: '24mm' }}>工程</th>
+                    <th className="border border-black px-1 py-1 text-left" style={{ minWidth: '28mm' }}>計算</th>
+                    <th className="border border-black px-1 py-1 text-center" style={{ minWidth: '20mm' }}>規格 (公差)</th>
+                    {Array.from({ length: lot.quantity || 1 }).map((_, i) => (
+                      <th key={i} className="border border-black px-0.5 py-1 text-center" style={{ minWidth: '14mm' }}>
+                        <div className="font-bold">#{i+1}</div>
+                        <div className="font-normal text-[6px] text-slate-500 truncate">{lot.unitSerialNumbers?.[i] || ''}</div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {measSteps.length === 0 ? (
+                    <tr><td colSpan={3 + (lot.quantity || 1)} className="border border-black p-4 text-center text-slate-400">測定項目がありません</td></tr>
+                  ) : measSteps.flatMap(step => {
+                    const calcs = step.measurementConfig?.calculations || [{ id: 'default', label: '計算結果', toleranceLower: step.measurementConfig?.toleranceLower, toleranceUpper: step.measurementConfig?.toleranceUpper, unit: step.measurementConfig?.unit }];
+                    return calcs.map((calc, ci) => {
+                      const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
+                      const hasNominal = calc.nominal !== undefined && calc.nominal !== null && calc.nominal !== 0;
+                      let rangeText;
+                      if (calc.toleranceEnabled === false) rangeText = '判定なし';
+                      else if (hasNominal) {
+                        const upStr = calc.toleranceUpper >= 0 ? `+${fmt(calc.toleranceUpper)}` : fmt(calc.toleranceUpper);
+                        const lowStr = calc.toleranceLower >= 0 ? `+${fmt(calc.toleranceLower)}` : fmt(calc.toleranceLower);
+                        rangeText = `${fmt(calc.nominal)} (${upStr}/${lowStr})`;
+                      } else rangeText = `${fmt(calc.toleranceLower)}〜${fmt(calc.toleranceUpper)} ${calc.unit || ''}`;
+                      return (
+                        <tr key={`${step.id}_${calc.id || ci}`}>
+                          {ci === 0 && (
+                            <td rowSpan={calcs.length} className="border border-black px-1 py-0.5 font-bold align-top bg-blue-50 text-[8px]">{step.title}</td>
+                          )}
+                          <td className="border border-black px-1 py-0.5 font-bold text-slate-700">{calc.label || '計算結果'}</td>
+                          <td className="border border-black px-1 py-0.5 text-center text-slate-500 text-[7px]">{rangeText}</td>
+                          {Array.from({ length: lot.quantity || 1 }).map((_, i) => {
+                            const meas = getMeasForUnit(step.id, i);
+                            const cr = meas?.calcResults?.find(c => c.id === calc.id) || meas?.calcResults?.[ci];
+                            if (!cr || cr.result == null) return <td key={i} className="border border-black px-0.5 py-0.5 text-center text-slate-300">-</td>;
+                            const cellBg = cr.isOk === false ? 'bg-rose-50' : cr.isOk ? 'bg-emerald-50' : '';
+                            const textColor = cr.isOk === false ? 'text-rose-700' : cr.isOk ? 'text-emerald-700' : 'text-slate-700';
+                            return (
+                              <td key={i} className={`border border-black px-0.5 py-0.5 text-center ${cellBg}`}>
+                                <div className={`font-mono font-bold ${textColor}`}>{cr.result.toFixed(cr.precision ?? 3)}</div>
+                                {cr.isOk != null && <div className="text-[6px] font-bold">{cr.isOk ? 'OK' : 'NG'}</div>}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    });
+                  })}
+                  {/* 通常検査項目 (測定でない) */}
+                  {steps.filter(s => s.type !== 'measurement').length > 0 && (
+                    <>
+                      <tr className="bg-gray-100">
+                        <td colSpan={3 + (lot.quantity || 1)} className="border border-black px-1 py-0.5 font-bold text-[8px]">通常検査項目</td>
+                      </tr>
+                      {steps.filter(s => s.type !== 'measurement').map(step => {
+                        const stepIdx = steps.findIndex(s => s.id === step.id);
+                        return (
+                          <tr key={step.id}>
+                            <td colSpan={3} className="border border-black px-1 py-0.5 font-bold text-slate-700">{step.title}</td>
+                            {Array.from({ length: lot.quantity || 1 }).map((_, i) => {
+                              const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${stepIdx}-${i}`];
+                              let mark = '';
+                              if (task?.status === 'completed') mark = '✓';
+                              else if (task?.status === 'skipped') mark = '－';
+                              const color = mark === '✓' ? 'text-emerald-700' : mark === '－' ? 'text-slate-400' : 'text-rose-500';
+                              return (
+                                <td key={i} className="border border-black px-0.5 py-0.5 text-center">
+                                  <span className={`text-[10px] font-bold ${color}`}>{mark || '×'}</span>
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </>
+                  )}
+                </tbody>
+              </table>
+              <div className="mt-2 flex justify-between items-center text-[10px]">
+                <div>判定: <span className="text-base font-bold ml-2">合格</span></div>
+                <div className="flex gap-2">
+                  {['承認', '職長', '担当'].map((title, i) => (
+                    <div key={i} className="border border-black text-center">
+                      <div className="bg-gray-100 px-2 py-0.5 text-[9px] border-b border-black">{title}</div>
+                      <div className="h-10 w-14"></div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : reportMode === 'visual' ? (
           /* ===== ビジュアルモード: 測定ダイアグラム表示 ===== */
           <div className={`visual-report ${pageLayout} max-w-5xl mx-auto space-y-${pageLayout === 'compact' ? '2' : '6'}`} id="report-preview-content">
             {/* ヘッダーカード */}
