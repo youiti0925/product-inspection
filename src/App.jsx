@@ -8764,6 +8764,128 @@ const EditMeasurementModal = ({ lot, onClose, onSave }) => {
 };
 
 // --- ReportPreview: フルスクリーン成績表プレビュー (最終検査アプリ方式) ---
+// 成績表テーブルモード用: 設定プレビューと同じスタイルの図に実測値を載せる + 計算結果を右側に表示
+// 画像のアスペクト比は自前で検出してコンテナに適用 (設定プレビューと位置がずれない)
+const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
+  const [imageAspect, setImageAspect] = useState(null);
+  useEffect(() => {
+    if (!config?.diagramImage) { setImageAspect(null); return; }
+    const img = new Image();
+    img.onload = () => {
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) setImageAspect(img.naturalWidth / img.naturalHeight);
+    };
+    img.onerror = () => setImageAspect(null);
+    img.src = config.diagramImage;
+  }, [config?.diagramImage]);
+
+  const inputs = config?.inputs || [];
+  const arrows = config?.arrows || [];
+
+  // 矢印評価
+  const arrowResults = (arrows || []).map(arr => {
+    const calcMap = {};
+    (calcResults || []).forEach(cr => { if (cr?.id) calcMap[cr.id] = cr.result; });
+    const allValues = { ...measValues, ...calcMap };
+    const valA = Number(allValues[arr.sourceA]);
+    const valB = Number(allValues[arr.sourceB]);
+    const inputA = inputs.find(i => i.id === arr.sourceA);
+    const inputB = inputs.find(i => i.id === arr.sourceB);
+    let pos = arr.position;
+    if (!pos) {
+      if (inputA && inputB) pos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
+      else pos = { x: 50, y: 50 };
+    }
+    if (!Number.isFinite(valA) || !Number.isFinite(valB)) return { ...arr, pos, dir: null };
+    const threshold = Number(arr.threshold) || 0;
+    const diff = valA - valB;
+    let dir;
+    if (Math.abs(diff) <= threshold) dir = 'equal';
+    else if (diff > 0) dir = 'up';
+    else dir = 'down';
+    return { ...arr, pos, dir, diff };
+  });
+
+  return (
+    <div className="flex flex-row gap-2 w-full" style={{ pageBreakInside: 'avoid' }}>
+      {/* 左 8割: 図 + 実測値 */}
+      <div className="flex-[4] min-w-0">
+        {unitLabel && <div className="text-[8px] font-bold text-slate-600 mb-0.5">{unitLabel}</div>}
+        <div
+          className="relative bg-white border border-slate-200 rounded mx-auto"
+          style={{
+            ...(imageAspect ? { aspectRatio: String(imageAspect) } : { aspectRatio: '1 / 1' }),
+            maxHeight: '120mm',
+            width: '100%',
+            ...(config?.diagramImage ? { backgroundImage: `url(${config.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {})
+          }}
+        >
+          {!config?.diagramImage && config?.layout === 'circle-4point' && (
+            <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+              <circle cx="50" cy="50" r="35" fill="none" stroke="#94a3b8" strokeWidth="0.5" strokeDasharray="2,2"/>
+            </svg>
+          )}
+          {inputs.map(inp => {
+            const val = measValues?.[inp.id];
+            const isFilled = val != null && val !== '';
+            return (
+              <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
+                <span className="text-[8px] font-bold text-slate-600 mb-0.5 bg-white/90 px-0.5 rounded leading-none whitespace-nowrap">{inp.label}</span>
+                <div className={`text-[9px] font-mono font-bold rounded border px-1 py-0.5 whitespace-nowrap shadow-sm leading-none ${isFilled ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-300 bg-slate-100 text-slate-400'}`}>
+                  {isFilled ? Number(val).toFixed(3) : '---'}
+                </div>
+              </div>
+            );
+          })}
+          {arrowResults.filter(a => a.dir).map((ar, ai) => {
+            const isUp = ar.dir === 'up';
+            const isEq = ar.dir === 'equal';
+            const ch = isEq ? '↔' : isUp ? '↗' : '↘';
+            const color = isEq ? 'text-slate-700 bg-slate-100 border-slate-300' : isUp ? 'text-emerald-700 bg-emerald-100 border-emerald-400' : 'text-rose-700 bg-rose-100 border-rose-400';
+            return (
+              <div key={ai} className="absolute flex flex-col items-center z-20" style={{ left: `${ar.pos.x}%`, top: `${ar.pos.y}%`, transform: 'translate(-50%, -50%)' }}>
+                <div className={`${color} text-base font-black px-1 rounded-full shadow border leading-none`}>{ch}</div>
+                {ar.label && <span className="text-[7px] font-bold text-slate-700 bg-white/90 px-0.5 rounded mt-0.5 whitespace-nowrap shadow-sm">{ar.label}</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {/* 右 2割: 計算結果 */}
+      <div className="flex-1 min-w-[140px] max-w-[180px] space-y-1">
+        <div className="text-[8px] font-bold text-slate-500 px-1">計算結果</div>
+        {(calcResults || []).length === 0 && <div className="text-[8px] text-slate-400 px-1 py-1">未計算</div>}
+        {(calcResults || []).map((cr, ci) => {
+          // 範囲表示テキスト
+          const hasNominal = cr.nominal !== undefined && cr.nominal !== 0;
+          const fmt = v => (v == null || !Number.isFinite(v)) ? '?' : (v % 1 === 0 ? v.toString() : v.toFixed(4).replace(/\.?0+$/, ''));
+          let rangeText;
+          if (cr.toleranceEnabled === false) rangeText = '判定なし';
+          else if (hasNominal) {
+            const upStr = cr.toleranceUpper >= 0 ? `+${fmt(cr.toleranceUpper)}` : fmt(cr.toleranceUpper);
+            const lowStr = cr.toleranceLower >= 0 ? `+${fmt(cr.toleranceLower)}` : fmt(cr.toleranceLower);
+            rangeText = `${fmt(cr.nominal)} (${upStr}/${lowStr})`;
+          } else rangeText = `[${fmt(cr.toleranceLower)}〜${fmt(cr.toleranceUpper)}]`;
+          return (
+            <div key={cr.id || ci} className={`rounded border px-1.5 py-1 ${cr.isOk === false ? 'border-rose-300 bg-rose-50/40' : cr.isOk ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200 bg-white'}`}>
+              <div className="flex items-center justify-between gap-1 mb-0.5">
+                <span className="text-[9px] font-bold text-slate-700 truncate">{cr.label || '計算結果'}</span>
+                {cr.result != null && cr.isOk != null && (
+                  <span className={`text-[8px] font-black px-1 rounded shrink-0 ${cr.isOk ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{cr.isOk ? 'OK' : 'NG'}</span>
+                )}
+              </div>
+              <div className="flex items-baseline gap-0.5">
+                <span className="text-sm font-mono font-black text-slate-800">{cr.result != null ? cr.result.toFixed(cr.precision ?? 4) : '---'}</span>
+                <span className="text-[7px] text-slate-500">{cr.unit || ''}</span>
+              </div>
+              <div className="text-[7px] text-slate-500 truncate">{rangeText}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 const ReportPreview = ({ lot, workers, onClose }) => {
   const [customReportNo, setCustomReportNo] = useState(lot.orderNo || '');
   const [reportMode, setReportMode] = useState('table'); // 'table' or 'visual'
@@ -9349,86 +9471,31 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                         );
                       }
 
-                      // 測定項目: 生データ行 + 計算結果行
+                      // 測定項目: 各台分を [プレビュー(値オーバーレイ) | 計算結果] の 8:2 横並び1行
                       const cfg = step.measurementConfig;
-                      const previewArrows = cfg?.arrows || [];
                       return (
                         <React.Fragment key={step.id}>
                           {/* 測定項目ヘッダー */}
                           <tr className="bg-blue-50">
-                            <td colSpan={2 + displayQuantity} className="border border-black p-1 font-bold text-[8px] pl-2">📐 {step.title} {step.description ? `— ${step.description}` : ''}</td>
+                            <td colSpan={2 + displayQuantity} className="border border-black p-1 font-bold text-[9px] pl-2">📐 {step.title} {step.description ? `— ${step.description}` : ''}</td>
                           </tr>
-                          {/* 測定設定プレビュー (ドット+ラベルのみ・値は無い・読み手の位置把握用) */}
-                          <tr>
-                            <td colSpan={2 + displayQuantity} className="border border-black p-1 bg-white">
-                              <div className="relative w-full mx-auto" style={{
-                                aspectRatio: '4 / 3',
-                                maxHeight: '60mm',
-                                maxWidth: '160mm',
-                                ...(cfg?.diagramImage ? { backgroundImage: `url(${cfg.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {})
-                              }}>
-                                {!cfg?.diagramImage && cfg?.layout === 'circle-4point' && (
-                                  <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
-                                    <circle cx="50" cy="50" r="35" fill="none" stroke="#94a3b8" strokeWidth="0.5" strokeDasharray="2,2"/>
-                                  </svg>
-                                )}
-                                {measInputs.map(inp => (
-                                  <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
-                                    <div className={`w-2 h-2 rounded-full border border-white shadow ${inp.inputType === 'combobox' ? 'bg-amber-500' : 'bg-teal-500'}`}/>
-                                    <span className="text-[7px] font-bold text-slate-700 mt-0.5 bg-white/90 px-0.5 rounded leading-none">{inp.label}</span>
-                                  </div>
-                                ))}
-                                {/* 矢印比較の位置 (実測値ではなく設定上の位置のみ) */}
-                                {previewArrows.map((ar, ai) => {
-                                  const inputA = measInputs.find(i => i.id === ar.sourceA);
-                                  const inputB = measInputs.find(i => i.id === ar.sourceB);
-                                  let pos = ar.position;
-                                  if (!pos && inputA && inputB) pos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
-                                  if (!pos) pos = { x: 50, y: 50 };
-                                  return (
-                                    <div key={ai} className="absolute flex flex-col items-center" style={{ left: `${pos.x}%`, top: `${pos.y}%`, transform: 'translate(-50%, -50%)' }}>
-                                      <div className="text-amber-700 bg-amber-50 border border-amber-300 text-[10px] font-black px-1 rounded-full leading-none">↔</div>
-                                      {ar.label && <span className="text-[6px] font-bold text-amber-700 bg-white/90 px-0.5 rounded mt-0.5 leading-none">{ar.label}</span>}
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </td>
-                          </tr>
-                          {/* 生データ行: 各入力項目 */}
-                          {measInputs.map(inp => (
-                            <tr key={inp.id}>
-                              <td className="border border-black p-1 text-[7px] pl-3 text-gray-700">{inp.label}</td>
-                              <td className="border border-black p-1 text-[7px] text-gray-500">入力値</td>
-                              {Array.from({ length: displayQuantity }).map((_, i) => {
-                                if (i >= (lot.quantity || 1)) return <td key={i} className="border border-black p-1 bg-slate-100"></td>;
-                                const meas = getMeasForUnit(step.id, i);
-                                const val = meas?.values?.[inp.id];
-                                return <td key={i} className="border border-black p-1 text-center text-[7px] font-mono">{val != null ? Number(val).toFixed(3) : ''}</td>;
-                              })}
-                            </tr>
-                          ))}
-                          {/* 計算結果行 */}
-                          {measCalcs.map(calc => (
-                            <tr key={calc.id} className="bg-yellow-50">
-                              <td className="border border-black p-1 text-[7px] pl-3 font-bold text-blue-800">{calc.label || '計算結果'}</td>
-                              <td className="border border-black p-1 text-[7px] text-gray-500">
-                                {calc.toleranceLower != null && calc.toleranceUpper != null ? `${calc.toleranceLower}~${calc.toleranceUpper} ${calc.unit || ''}` : calc.unit || ''}
-                              </td>
-                              {Array.from({ length: displayQuantity }).map((_, i) => {
-                                if (i >= (lot.quantity || 1)) return <td key={i} className="border border-black p-1 bg-slate-100"></td>;
-                                const meas = getMeasForUnit(step.id, i);
-                                const cr = meas?.calcResults?.find(c => c.id === calc.id) || meas?.calcResults?.[0];
-                                if (!cr || cr.result == null) return <td key={i} className="border border-black p-1 text-center text-[7px]">-</td>;
-                                return (
-                                  <td key={i} className={`border border-black p-1 text-center text-[7px] font-bold ${cr.isOk ? 'text-green-700' : 'text-red-600 bg-red-50'}`}>
-                                    {cr.result.toFixed(3)}
-                                    <div className="text-[6px]">{cr.isOk ? 'OK' : 'NG'}</div>
-                                  </td>
-                                );
-                              })}
-                            </tr>
-                          ))}
+                          {/* 各ユニットを1行ずつ: 左にプレビュー+値、右に計算結果 */}
+                          {Array.from({ length: lot.quantity || 1 }).map((_, unitIdx) => {
+                            const meas = getMeasForUnit(step.id, unitIdx);
+                            const measValues = meas?.values || {};
+                            // calcResults: 保存済みなら使う、無ければ measCalcs から仮の構造で
+                            const calcResults = meas?.calcResults && meas.calcResults.length > 0
+                              ? meas.calcResults
+                              : measCalcs.map(c => ({ ...c, result: null, isOk: null }));
+                            const unitLabel = (lot.quantity || 1) > 1 ? `#${unitIdx + 1} ${lot.unitSerialNumbers?.[unitIdx] || ''}` : '';
+                            return (
+                              <tr key={unitIdx}>
+                                <td colSpan={2 + displayQuantity} className="border border-black p-2 bg-white">
+                                  <TableReportDiagram config={cfg} measValues={measValues} calcResults={calcResults} unitLabel={unitLabel} />
+                                </td>
+                              </tr>
+                            );
+                          })}
                         </React.Fragment>
                       );
                     })}
