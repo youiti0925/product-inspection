@@ -5103,35 +5103,27 @@ const BreakAlertSettings = ({ alerts, onChange }) => {
 // --- View Definitions (DashboardView Defined Here) ---
 
 const DashboardView = ({ onSetMode, lots, workers, handleMoveLot, saveData, setDraggedLotId, draggedLotId, setExecutionLotId, settings, templates, onEditLot, onDeleteLot, handleImageUpload, saveSettings, mapZones, currentUserName = '' }) => {
-  // 現場マップ開いた瞬間は入荷待ちを折りたたみ (作業者欄を見えやすく)
   const arrivalLots = lots.filter(l => l.location === 'arrival');
-  const [arrivalCollapsed, setArrivalCollapsed] = useState(true);
   return (
   <div data-fs="dashboard" className="grid grid-cols-12 gap-4 h-full overflow-hidden">
     <div className="col-span-3 flex flex-col gap-4 overflow-y-auto">
-      {arrivalCollapsed ? (
-        // 折りたたみ時: ヘッダーだけ表示 (押すと展開)
-        <button
-          type="button"
-          onClick={() => setArrivalCollapsed(false)}
-          className="bg-white border border-slate-300 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50 shadow-sm shrink-0"
-        >
-          <div className="flex items-center gap-2">
-            <Package className="w-5 h-5 text-slate-600"/>
-            <span className="font-bold text-slate-700">入荷待ち</span>
-            <span className="bg-slate-100 text-slate-600 text-xs font-bold px-2 py-0.5 rounded">{arrivalLots.length}件</span>
-          </div>
-          <ChevronDown className="w-4 h-4 text-slate-400"/>
-        </button>
-      ) : (
-        <ZoneList id="arrival" title="入荷待ち" icon={Package} color="bg-white" border="border-slate-300"
-          onClickHeader={() => setArrivalCollapsed(true)}
-          onDropLot={(id) => handleMoveLot(id, 'arrival')}>
-          {arrivalLots.map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot}
-            variant='dashboard-arrival'
-          />)}
-        </ZoneList>
-      )}
+      {/* 入荷待ち: 件数バッジ付きヘッダーのみ (現場マップ画面では場所を取らない) */}
+      {/* タップで元の arrival-planning ビュー (左に入荷待ち、右に作業者負荷) へ遷移 */}
+      <button
+        type="button"
+        onClick={() => onSetMode('arrival-planning')}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => { const id = e.dataTransfer.getData('lotId'); if (id) handleMoveLot(id, 'arrival'); }}
+        className="bg-white border border-slate-300 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50 hover:border-blue-300 shadow-sm shrink-0 transition-colors"
+        title="クリックで入荷計画ビュー (作業者負荷も見える) を開く"
+      >
+        <div className="flex items-center gap-2">
+          <Package className="w-5 h-5 text-slate-600"/>
+          <span className="font-bold text-slate-700">入荷待ち</span>
+          <span className="bg-slate-100 text-slate-600 text-xs font-bold px-2 py-0.5 rounded">{arrivalLots.length}件</span>
+        </div>
+        <span className="text-[10px] text-slate-400 flex items-center gap-1">タップで一覧 <ChevronRight className="w-3 h-3"/></span>
+      </button>
       <ZoneList id="buffer" title={`作業予定${currentUserName && !['フリー','管理者'].includes(currentUserName) ? ` (${currentUserName})` : ''}`} icon={Calendar} color="bg-amber-50" border="border-amber-200"
         onClickHeader={() => onSetMode('planning-execution')}
         onDropLot={(id) => handleMoveLot(id, 'buffer')}>
