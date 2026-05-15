@@ -5102,16 +5102,36 @@ const BreakAlertSettings = ({ alerts, onChange }) => {
 
 // --- View Definitions (DashboardView Defined Here) ---
 
-const DashboardView = ({ onSetMode, lots, workers, handleMoveLot, saveData, setDraggedLotId, draggedLotId, setExecutionLotId, settings, templates, onEditLot, onDeleteLot, handleImageUpload, saveSettings, mapZones, currentUserName = '' }) => (
+const DashboardView = ({ onSetMode, lots, workers, handleMoveLot, saveData, setDraggedLotId, draggedLotId, setExecutionLotId, settings, templates, onEditLot, onDeleteLot, handleImageUpload, saveSettings, mapZones, currentUserName = '' }) => {
+  // 現場マップ開いた瞬間は入荷待ちを折りたたみ (作業者欄を見えやすく)
+  const arrivalLots = lots.filter(l => l.location === 'arrival');
+  const [arrivalCollapsed, setArrivalCollapsed] = useState(true);
+  return (
   <div data-fs="dashboard" className="grid grid-cols-12 gap-4 h-full overflow-hidden">
     <div className="col-span-3 flex flex-col gap-4 overflow-y-auto">
-      <ZoneList id="arrival" title="入荷待ち" icon={Package} color="bg-white" border="border-slate-300" 
-        onClickHeader={() => onSetMode('arrival-planning')} 
-        onDropLot={(id) => handleMoveLot(id, 'arrival')}>
-        {lots.filter(l => l.location === 'arrival').map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} 
-          variant='dashboard-arrival' 
-        />)}
-      </ZoneList>
+      {arrivalCollapsed ? (
+        // 折りたたみ時: ヘッダーだけ表示 (押すと展開)
+        <button
+          type="button"
+          onClick={() => setArrivalCollapsed(false)}
+          className="bg-white border border-slate-300 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50 shadow-sm shrink-0"
+        >
+          <div className="flex items-center gap-2">
+            <Package className="w-5 h-5 text-slate-600"/>
+            <span className="font-bold text-slate-700">入荷待ち</span>
+            <span className="bg-slate-100 text-slate-600 text-xs font-bold px-2 py-0.5 rounded">{arrivalLots.length}件</span>
+          </div>
+          <ChevronDown className="w-4 h-4 text-slate-400"/>
+        </button>
+      ) : (
+        <ZoneList id="arrival" title="入荷待ち" icon={Package} color="bg-white" border="border-slate-300"
+          onClickHeader={() => setArrivalCollapsed(true)}
+          onDropLot={(id) => handleMoveLot(id, 'arrival')}>
+          {arrivalLots.map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot}
+            variant='dashboard-arrival'
+          />)}
+        </ZoneList>
+      )}
       <ZoneList id="buffer" title={`作業予定${currentUserName && !['フリー','管理者'].includes(currentUserName) ? ` (${currentUserName})` : ''}`} icon={Calendar} color="bg-amber-50" border="border-amber-200"
         onClickHeader={() => onSetMode('planning-execution')}
         onDropLot={(id) => handleMoveLot(id, 'buffer')}>
@@ -5136,7 +5156,8 @@ const DashboardView = ({ onSetMode, lots, workers, handleMoveLot, saveData, setD
       </div>
     </div>
   </div>
-);
+  );
+};
 
 const ArrivalPlanningView = ({ onBack, lots, workers, templates, handleMoveLot, saveData, setDraggedLotId, draggedLotId, handleAddWorker, onEditLot, onDeleteLot, mapZones }) => {
   const calculateWorkerLoad = (workerId) => {
@@ -8432,7 +8453,137 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
 };
 
 // --- Completed History View ---
-const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '' }) => {
+// 検査リストからロットを選択 → 担当者/エリア指定 → 作業開始 の多段フロー
+// - 使用者選択 = 特定の作業者 (管理者/フリー以外): 「自分で作業しますか?」確認 → 自分に割当 → エリア選択 → 作業開始確認
+// - 管理者/フリー: 「どの担当者?」選択 → 「エリアも指定?」(任意) → 作業開始確認
+const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, saveData, setExecutionLotId }) => {
+  const isWorkerMode = currentUserName && !['フリー', '管理者', ''].includes(currentUserName);
+  const myWorker = useMemo(() => workers.find(w => w.name === currentUserName), [workers, currentUserName]);
+
+  // フロー: 'confirm-self' | 'pick-worker' | 'pick-zone' | 'confirm-start'
+  const initialStep = isWorkerMode && myWorker ? 'confirm-self' : 'pick-worker';
+  const [step, setStep] = useState(initialStep);
+  const [selectedWorker, setSelectedWorker] = useState(myWorker || (lot.workerId ? workers.find(w => w.id === lot.workerId) : null));
+  const [selectedZone, setSelectedZone] = useState(lot.mapZoneId ? mapZones.find(z => z.id === lot.mapZoneId) : null);
+
+  const personalZones = (mapZones || []).filter(z => !z.isPersonal || z.name === selectedWorker?.name).concat(
+    (mapZones || []).filter(z => z.isPersonal && z.name !== selectedWorker?.name)
+  );
+  // 重複排除
+  const sortedZones = Array.from(new Map(personalZones.map(z => [z.id, z])).values());
+
+  const saveAndContinue = async (updateData, nextStep) => {
+    try {
+      await saveData('lots', lot.id, updateData);
+    } catch (e) {
+      alert('保存失敗: ' + (e.message || e));
+      return;
+    }
+    if (nextStep) setStep(nextStep);
+  };
+
+  const handleStartWork = () => {
+    setExecutionLotId(lot.id);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+        {/* ヘッダー: ロット情報 */}
+        <div className="border-b pb-3 mb-4">
+          <div className="text-xs text-slate-500 font-bold">作業対象</div>
+          <div className="text-xl font-bold text-slate-800">{lot.model} <span className="text-base font-normal text-slate-500">({lot.orderNo})</span></div>
+          <div className="text-xs text-slate-500">{lot.quantity}台 / 入荷: {lot.entryAt ? toDateShort(lot.entryAt) : '-'} / 納期: {lot.dueDate || '-'}</div>
+        </div>
+
+        {/* Step 1a: 担当者本人モード - 自分で作業確認 */}
+        {step === 'confirm-self' && (
+          <>
+            <h3 className="text-lg font-bold mb-2">作業確認</h3>
+            <p className="text-slate-700 mb-4">
+              <span className="text-blue-600 font-bold">{currentUserName}</span> さんで作業しますか？
+            </p>
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
+              <button onClick={() => setStep('pick-worker')} className="px-4 py-2 bg-slate-200 text-slate-700 rounded font-bold hover:bg-slate-300" title="別の作業者を選ぶ">いいえ・別の人</button>
+              <button onClick={async () => { await saveAndContinue({ workerId: myWorker.id, location: lot.location === 'arrival' ? 'planned' : lot.location }); setStep('pick-zone'); }} className="px-6 py-2 bg-emerald-600 text-white rounded font-bold shadow hover:bg-emerald-700">はい・進む</button>
+            </div>
+          </>
+        )}
+
+        {/* Step 1b: 担当者選択 (管理者・フリー or「別の人」選択時) */}
+        {step === 'pick-worker' && (
+          <>
+            <h3 className="text-lg font-bold mb-2">どの担当者に作業させますか？</h3>
+            <div className="grid grid-cols-2 gap-2 mb-4 max-h-72 overflow-y-auto">
+              {workers.map(w => (
+                <button key={w.id} type="button"
+                  onClick={() => setSelectedWorker(w)}
+                  className={`p-3 rounded-lg border-2 text-left font-bold transition-all ${selectedWorker?.id === w.id ? 'border-blue-500 bg-blue-50 ring-2 ring-blue-200' : 'border-slate-200 hover:border-blue-300 bg-white'}`}>
+                  <div className="flex items-center gap-2"><User className="w-4 h-4"/> {w.name}</div>
+                </button>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
+              <button onClick={async () => { if (!selectedWorker) return; await saveAndContinue({ workerId: selectedWorker.id, location: lot.location === 'arrival' ? 'planned' : lot.location }); setStep('pick-zone'); }} disabled={!selectedWorker} className="px-6 py-2 bg-emerald-600 disabled:bg-slate-300 text-white rounded font-bold shadow hover:bg-emerald-700">次へ</button>
+            </div>
+          </>
+        )}
+
+        {/* Step 2: エリア選択 */}
+        {step === 'pick-zone' && (
+          <>
+            <h3 className="text-lg font-bold mb-2">どのエリアに移動しますか？</h3>
+            <p className="text-xs text-slate-500 mb-2">「指定しない」を選ぶと、現在の場所のまま作業開始できます</p>
+            <div className="grid grid-cols-2 gap-2 mb-4 max-h-72 overflow-y-auto">
+              <button type="button" onClick={() => setSelectedZone(null)}
+                className={`p-3 rounded-lg border-2 text-left font-bold transition-all ${selectedZone === null ? 'border-slate-500 bg-slate-50 ring-2 ring-slate-200' : 'border-slate-200 hover:border-slate-300 bg-white'}`}>
+                <div className="flex items-center gap-2"><Ban className="w-4 h-4 text-slate-500"/> 指定しない</div>
+              </button>
+              {sortedZones.map(z => (
+                <button key={z.id} type="button"
+                  onClick={() => setSelectedZone(z)}
+                  className={`p-3 rounded-lg border-2 text-left font-bold transition-all ${selectedZone?.id === z.id ? 'border-blue-500 bg-blue-50 ring-2 ring-blue-200' : 'border-slate-200 hover:border-blue-300 bg-white'}`}>
+                  <div className="flex items-center gap-2"><MapPin className="w-4 h-4"/> {z.name}{z.isPersonal && z.name === selectedWorker?.name && <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 rounded">担当エリア</span>}</div>
+                </button>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setStep(initialStep)} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">戻る</button>
+              <button onClick={async () => {
+                if (selectedZone) {
+                  await saveAndContinue({ mapZoneId: selectedZone.id, location: selectedZone.id });
+                }
+                setStep('confirm-start');
+              }} className="px-6 py-2 bg-emerald-600 text-white rounded font-bold shadow hover:bg-emerald-700">次へ</button>
+            </div>
+          </>
+        )}
+
+        {/* Step 3: 作業開始確認 */}
+        {step === 'confirm-start' && (
+          <>
+            <h3 className="text-lg font-bold mb-2">そのまま作業を開始しますか？</h3>
+            <div className="bg-slate-50 rounded p-3 mb-4 text-sm space-y-1">
+              <div><span className="text-slate-500 font-bold w-16 inline-block">担当:</span> <span className="font-bold">{selectedWorker?.name || '未指定'}</span></div>
+              <div><span className="text-slate-500 font-bold w-16 inline-block">エリア:</span> <span className="font-bold">{selectedZone?.name || '指定なし (現在の場所のまま)'}</span></div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setStep('pick-zone')} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">戻る</button>
+              <button onClick={onClose} className="px-4 py-2 bg-slate-200 text-slate-700 rounded font-bold hover:bg-slate-300" title="作業は後で開始">割当だけ・閉じる</button>
+              <button onClick={handleStartWork} className="px-6 py-2 bg-blue-600 text-white rounded font-bold shadow hover:bg-blue-700 flex items-center gap-2"><Play className="w-4 h-4"/>作業開始</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '', saveData }) => {
+  const [assignmentLot, setAssignmentLot] = useState(null);
   const [viewMode, setViewMode] = useState('grid');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedZoneFilter, setSelectedZoneFilter] = useState('all');
@@ -8541,7 +8692,7 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                 const zoneName = mapZones.find(z => z.id === lot.mapZoneId)?.name || '';
                 const workerName = workers.find(w => w.id === lot.workerId)?.name || '';
                 return (
-                  <div key={lot.id} onClick={() => setExecutionLotId(lot.id)} className="bg-white border rounded-xl p-4 shadow-sm flex flex-col gap-2 hover:shadow-md transition-shadow cursor-pointer group relative">
+                  <div key={lot.id} onClick={() => setAssignmentLot(lot)} className="bg-white border rounded-xl p-4 shadow-sm flex flex-col gap-2 hover:shadow-md transition-shadow cursor-pointer group relative">
                     <div className="absolute top-1 right-1 flex gap-1 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button onClick={(e) => { e.stopPropagation(); onEditLot(lot); }} className="p-1 bg-white rounded border hover:bg-blue-50 text-slate-500"><Pencil className="w-3 h-3" /></button>
                       <button onClick={(e) => { e.stopPropagation(); onDeleteLot(lot.id); }} className="p-1 bg-white rounded border hover:bg-red-50 text-red-400"><Trash2 className="w-3 h-3" /></button>
@@ -8591,7 +8742,7 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                   {sortedLots.map(lot => {
                     const isPaused = Object.values(lot.tasks || {}).some(t => t.status === 'paused');
                     return (
-                      <tr key={lot.id} onClick={() => setExecutionLotId(lot.id)} className="hover:bg-blue-50 cursor-pointer transition-colors">
+                      <tr key={lot.id} onClick={() => setAssignmentLot(lot)} className="hover:bg-blue-50 cursor-pointer transition-colors">
                         <td className="p-3 font-bold text-slate-800">{lot.orderNo}</td>
                         <td className="p-3">
                           <div className="font-bold text-slate-700">{lot.model}</div>
@@ -8620,6 +8771,18 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
           )
         )}
       </div>
+      {/* ロット割当・作業開始モーダル */}
+      {assignmentLot && (
+        <LotAssignmentModal
+          lot={assignmentLot}
+          workers={workers}
+          mapZones={mapZones}
+          currentUserName={currentUserName}
+          saveData={saveData}
+          setExecutionLotId={setExecutionLotId}
+          onClose={() => setAssignmentLot(null)}
+        />
+      )}
     </div>
   );
 };
@@ -9731,6 +9894,23 @@ const ProgressOverviewView = ({ lots, workers, settings }) => {
     return { inProgress, delayed, waiting, completed: todayCompletedCount, total: lotsWithProgress.length + todayCompletedCount };
   }, [lotsWithProgress, todayCompletedCount]);
 
+  // 「全体感」サマリ: 進捗率・完了見込み・シフト終了予測
+  const overall = useMemo(() => {
+    const totalTasks = lotsWithProgress.reduce((acc, x) => acc + (x.progress.totalTasks || 0), 0);
+    const completedTasks = lotsWithProgress.reduce((acc, x) => acc + (x.progress.completedCount || 0), 0);
+    const overallPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+    // シフト終了 (22時) 時点の予測: 進行中ロットの ETA を最大とする
+    const latestEta = lotsWithProgress.reduce((max, x) => x.progress.etaMs > max ? x.progress.etaMs : max, 0);
+    const expectedFinishCount = lotsWithProgress.filter(x => x.progress.etaMs > 0 && x.progress.etaMs <= endOfShiftMs).length + todayCompletedCount;
+    const willMissCount = lotsWithProgress.filter(x => x.progress.etaMs > endOfShiftMs).length;
+    // 全体ステータス: 大幅遅延が1件でもあれば critical、遅延気味なら warning、前倒し多ければ ahead、それ以外 ontime
+    let level = 'ontime';
+    if (lotsWithProgress.some(x => x.progress.delayLevel === 'critical')) level = 'critical';
+    else if (lotsWithProgress.filter(x => x.progress.delayLevel === 'warning').length >= 2) level = 'warning';
+    else if (lotsWithProgress.filter(x => x.progress.delayLevel === 'ahead').length > lotsWithProgress.filter(x => x.progress.delayLevel === 'warning').length) level = 'ahead';
+    return { overallPct, totalTasks, completedTasks, latestEta, expectedFinishCount, willMissCount, level };
+  }, [lotsWithProgress, endOfShiftMs, todayCompletedCount]);
+
   // タイムラインの x軸範囲を動的に決定 (作業中のロットの開始/予測完了に合わせる)
   const timelineRange = useMemo(() => {
     const starts = lotsWithProgress.map(x => x.progress.startMs).filter(Boolean);
@@ -9767,6 +9947,49 @@ const ProgressOverviewView = ({ lots, workers, settings }) => {
 
   return (
     <div className="p-4 max-w-screen-2xl mx-auto h-full overflow-y-auto space-y-4">
+      {/* 全体感パネル: 一目で「今日の作業全体の状況」が分かる */}
+      <div className={`rounded-xl shadow-md p-4 border-2 ${overall.level === 'critical' ? 'bg-rose-50 border-rose-300' : overall.level === 'warning' ? 'bg-amber-50 border-amber-300' : overall.level === 'ahead' ? 'bg-emerald-50 border-emerald-300' : 'bg-blue-50 border-blue-200'}`}>
+        <div className="flex items-center justify-between flex-wrap gap-4">
+          {/* 左: ステータス + 全体進捗率 */}
+          <div className="flex items-center gap-4">
+            <div className={`w-16 h-16 rounded-full flex items-center justify-center font-black text-2xl shadow-lg shrink-0 ${overall.level === 'critical' ? 'bg-rose-500 text-white animate-pulse' : overall.level === 'warning' ? 'bg-amber-500 text-white' : overall.level === 'ahead' ? 'bg-emerald-500 text-white' : 'bg-blue-500 text-white'}`}>
+              {overall.level === 'critical' ? <AlertTriangle className="w-8 h-8"/> : overall.level === 'warning' ? <Clock className="w-8 h-8"/> : overall.level === 'ahead' ? <CheckCircle2 className="w-8 h-8"/> : <Activity className="w-8 h-8"/>}
+            </div>
+            <div>
+              <div className="text-xs font-bold text-slate-500">本日の全体状況</div>
+              <div className={`text-2xl font-black ${overall.level === 'critical' ? 'text-rose-700' : overall.level === 'warning' ? 'text-amber-700' : overall.level === 'ahead' ? 'text-emerald-700' : 'text-blue-700'}`}>
+                {overall.level === 'critical' ? '⚠ 大幅遅延あり' : overall.level === 'warning' ? '遅延気味' : overall.level === 'ahead' ? '前倒し進行中 ✓' : '予定通り'}
+              </div>
+              <div className="text-xs text-slate-600 mt-0.5">タスク進捗 <span className="font-bold">{overall.completedTasks}/{overall.totalTasks}</span> ({overall.overallPct}%)</div>
+            </div>
+          </div>
+          {/* 中央: 全体進捗バー (大きく) */}
+          <div className="flex-1 min-w-[200px] mx-4">
+            <div className="text-xs font-bold text-slate-600 mb-1">全体進捗</div>
+            <div className="h-6 bg-white rounded-full overflow-hidden border border-slate-200 shadow-inner">
+              <div className={`h-full transition-all flex items-center justify-end pr-2 text-xs font-black ${overall.level === 'critical' ? 'bg-gradient-to-r from-rose-400 to-rose-600 text-white' : overall.level === 'warning' ? 'bg-gradient-to-r from-amber-400 to-amber-600 text-white' : overall.level === 'ahead' ? 'bg-gradient-to-r from-emerald-400 to-emerald-600 text-white' : 'bg-gradient-to-r from-blue-400 to-blue-600 text-white'}`} style={{ width: `${overall.overallPct}%` }}>
+                {overall.overallPct >= 10 && `${overall.overallPct}%`}
+              </div>
+            </div>
+            <div className="text-[10px] text-slate-500 mt-1">本日完了 {summary.completed}件 / 進行中 {summary.inProgress}件 / 未着手 {summary.waiting}件</div>
+          </div>
+          {/* 右: シフト終了予測 */}
+          <div className="text-right">
+            <div className="text-xs font-bold text-slate-500">シフト終了 (22:00) までに</div>
+            <div className="flex items-baseline gap-1 justify-end mt-1">
+              <span className="text-3xl font-black text-emerald-700">{overall.expectedFinishCount}</span>
+              <span className="text-sm text-slate-600">/ {summary.total} 件完了見込み</span>
+            </div>
+            {overall.willMissCount > 0 && (
+              <div className="text-xs font-bold text-rose-600 mt-0.5">⚠ シフト内未完: <span className="text-base">{overall.willMissCount}</span> 件</div>
+            )}
+            {overall.latestEta > 0 && (
+              <div className="text-[10px] text-slate-500 mt-0.5">最終完了予測: <span className="font-mono font-bold">{formatHHMM(overall.latestEta)}</span></div>
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* サマリー */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <div className="bg-white border-2 border-slate-200 rounded-xl p-3 text-center">
@@ -11270,7 +11493,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            </div>
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} />}
-         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} />}
+         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} />}
          {activeTab === 'history' && <HistoryView lots={lots} workers={workers} templates={templates} saveData={saveData} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
          {activeTab === 'template-mgr' && (
