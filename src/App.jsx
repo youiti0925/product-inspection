@@ -17,7 +17,7 @@ import {
   Bot, Zap, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool,
   Bell, BellRing, Megaphone, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
   ListChecks, ArrowUpDown, Calculator, Ruler, MicOff, Printer, Coffee, ChevronDown,
-  Wrench, RotateCcw, XCircle, Pause, Minimize2
+  Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag
 } from 'lucide-react';
 
 // --- Firebase Imports (SDK v9) ---
@@ -25,6 +25,7 @@ import { initializeApp } from "firebase/app";
 import {
   getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot,
   serverTimestamp, query, orderBy, limit, where, getDocs, updateDoc,
+  deleteField,
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager
 } from "firebase/firestore";
 import {
@@ -137,6 +138,8 @@ const INITIAL_MAP_ZONES = [
   { id: 'zone_assembly_3', name: '第三組立エリア', x: 26, y: 50, w: 22, h: 40, color: 'bg-orange-50/80 border-orange-300' },
   { id: 'zone_comp_v2', name: '完品分割縦2', x: 50, y: 50, w: 22, h: 40, color: 'bg-emerald-50/80 border-emerald-300' },
   { id: 'zone_comp_h', name: '完品分割横', x: 74, y: 50, w: 22, h: 40, color: 'bg-emerald-50/80 border-emerald-300' },
+  // 未該当エリア (不良品・残ロット待ちなどの一時置き場)
+  { id: 'zone_unassigned', name: '未該当エリア', x: 2, y: 92, w: 96, h: 7, color: 'bg-slate-100/80 border-slate-400', isUnassigned: true },
 ];
 
 const DEFAULT_DEFECT_PROCESS_OPTIONS = ['前班', '設計', '調達', '機械'];
@@ -228,9 +231,312 @@ const formatDateSafe = (ts) => ts ? new Date(ts).toLocaleString() : '-';
 const resizeImage = (file) => new Promise((resolve) => { const r = new FileReader(); r.onload = (e) => { const i = new Image(); i.onload = () => { const c = document.createElement('canvas'); const MAX = 1000; let w=i.width; let h=i.height; if(w>h){if(w>MAX){h*=MAX/w;w=MAX}}else{if(h>MAX){w*=MAX/h;h=MAX}} c.width=w; c.height=h; const ctx=c.getContext('2d'); if(ctx){ctx.drawImage(i,0,0,w,h); resolve(c.toDataURL('image/jpeg', 0.7));}else resolve(i.src); }; i.src = e.target?.result; }; r.readAsDataURL(file); });
 const getBase64 = (file) => new Promise((resolve) => { const r = new FileReader(); r.readAsDataURL(file); r.onload = () => resolve(r.result); r.onerror = () => resolve(""); });
 
-const calculateLotEstimatedTime = (lot) => {
-  const perUnitTime = lot.steps.reduce((sum, step) => sum + (step.targetTime || 0), 0);
+// === 時間ソース一本化 (2026-05-31) ===
+// 「工程改善・目標時間最適化」タブが算出した較正値 (settings.customTargetTimes) を
+// 実際の目標時間として使うための単一ヘルパー。
+// 優先順位: 型式別較正値 (customTargetTimes[model_型式][category_title]) > step.targetTime (テンプレ既定)
+//
+// キー形式 (ProcessInsightsTab と一致させる):
+//   savedKey = `model_${model}`
+//   stepKey  = `${step.category || ''}_${step.title}`
+const targetTimeStepKey = (step) => `${step?.category || ''}_${step?.title || ''}`;
+const getEffectiveTargetTime = (step, model, customTargetTimes) => {
+  if (!step) return 0;
+  const fallback = step.targetTime || 0;
+  if (!model || !customTargetTimes) return fallback;
+  const calibrated = customTargetTimes[`model_${model}`]?.[targetTimeStepKey(step)];
+  return (typeof calibrated === 'number' && calibrated > 0) ? calibrated : fallback;
+};
+
+// ロットの推定総時間。customTargetTimes があれば型式別較正値を使う。
+const calculateLotEstimatedTime = (lot, customTargetTimes = null) => {
+  if (!lot?.steps || !Array.isArray(lot.steps)) return 0;
+  const perUnitTime = lot.steps.reduce((sum, step) => sum + getEffectiveTargetTime(step, lot.model, customTargetTimes), 0);
   return perUnitTime * (lot.quantity || 1);
+};
+
+// === 勤務時間マスタ ===
+// ユーザ会社の実態に合わせたデフォルト勤務スケジュール:
+//  - 8:30 始業 → 10:00 (休憩 10分) → 12:00 (休憩 45分) → 15:00 (休憩 15分) → 17:00 定時
+//  - 17:00 → 17:15 (休憩 15分) → 17:15 → 19:15 残業終わり
+// 実働: 8:30〜17:00 = 8.5h - 休憩 1.166h = 7.333h (定時)
+//       残業 17:15〜19:15 = 2h → 合計 9.333h (残業込み)
+const DEFAULT_WORK_SCHEDULE = {
+  dayStart: '08:30',
+  dayEnd: '17:00',           // 定時終わり
+  overtimeStart: '17:15',    // 残業開始 (定時終わり後の休憩明け)
+  overtimeEnd: '19:15',      // 残業終わり (=2時間残業を想定)
+  breaks: [
+    { start: '10:00', end: '10:10', name: '10時休憩' },
+    { start: '12:00', end: '12:45', name: '昼休憩' },
+    { start: '15:00', end: '15:15', name: '15時休憩' },
+    { start: '17:00', end: '17:15', name: '残業前休憩' },
+  ],
+  daysPerWeek: 5,
+  daysPerMonth: 20,
+  includeOvertimeInCapacity: false, // 負荷計算に残業時間を含めるか (デフォルトは定時のみ)
+};
+
+// "HH:MM" を当日 0:00 からの分数に変換
+const timeStrToMinutes = (str) => {
+  if (!str || typeof str !== 'string') return 0;
+  const [h, m] = str.split(':').map(Number);
+  if (isNaN(h) || isNaN(m)) return 0;
+  return h * 60 + m;
+};
+
+// 区間 [aStart, aEnd] と [bStart, bEnd] の重なり (分) を返す
+const overlapMinutes = (aStart, aEnd, bStart, bEnd) => {
+  const s = Math.max(aStart, bStart);
+  const e = Math.min(aEnd, bEnd);
+  return Math.max(0, e - s);
+};
+
+// 2つのタイムスタンプ間の「勤務時間内」だけの経過時間を秒で返す。
+// 会社外時間 (夜間/休憩中/土日) はカウントしない。
+//   schedule.daysPerWeek <= 5 の場合は土日除外
+//   includeOvertime=true で残業時間 (19:15まで) も含める
+const computeElapsedWorkSeconds = (startMs, endMs, schedule, includeOvertime = true) => {
+  if (!startMs || !endMs || endMs <= startMs) return 0;
+  const sch = { ...DEFAULT_WORK_SCHEDULE, ...(schedule || {}) };
+  const dayStartMin = timeStrToMinutes(sch.dayStart);
+  // 残業込みなら overtimeEnd まで、定時のみなら dayEnd まで
+  const dayEndMin = (includeOvertime && sch.overtimeEnd) ? timeStrToMinutes(sch.overtimeEnd) : timeStrToMinutes(sch.dayEnd);
+  const breaks = (sch.breaks || []).map(b => ({ start: timeStrToMinutes(b.start), end: timeStrToMinutes(b.end) }));
+  const excludeWeekend = (sch.daysPerWeek || 5) <= 5;
+
+  let totalSec = 0;
+  // 日付ループ
+  const startDate = new Date(startMs);
+  const endDate = new Date(endMs);
+  const cursor = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+  const lastDay = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+
+  while (cursor.getTime() <= lastDay.getTime()) {
+    const dow = cursor.getDay();
+    if (excludeWeekend && (dow === 0 || dow === 6)) {
+      cursor.setDate(cursor.getDate() + 1);
+      continue;
+    }
+    // この日の勤務時間レンジ (ms)
+    const dayWorkStart = new Date(cursor); dayWorkStart.setHours(0, dayStartMin, 0, 0);
+    const dayWorkEnd = new Date(cursor); dayWorkEnd.setHours(0, dayEndMin, 0, 0);
+    // 計測範囲との重なり
+    const overlapStart = Math.max(startMs, dayWorkStart.getTime());
+    const overlapEnd = Math.min(endMs, dayWorkEnd.getTime());
+    if (overlapEnd > overlapStart) {
+      let overlapMs = overlapEnd - overlapStart;
+      // 重なった範囲内の休憩を差し引く
+      for (const b of breaks) {
+        const breakStart = new Date(cursor); breakStart.setHours(0, b.start, 0, 0);
+        const breakEnd = new Date(cursor); breakEnd.setHours(0, b.end, 0, 0);
+        const bOverlap = Math.max(0, Math.min(overlapEnd, breakEnd.getTime()) - Math.max(overlapStart, breakStart.getTime()));
+        overlapMs -= bOverlap;
+      }
+      totalSec += Math.max(0, overlapMs) / 1000;
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return Math.floor(totalSec);
+};
+
+// 勤務スケジュールから「1 日の実働時間」を計算 (分単位)
+// 戻り値: { regularMinutes, overtimeMinutes, totalMinutes, regularHours, overtimeHours, totalHours }
+const computeWorkHours = (schedule) => {
+  const sch = { ...DEFAULT_WORK_SCHEDULE, ...(schedule || {}) };
+  const dayStart = timeStrToMinutes(sch.dayStart);
+  const dayEnd = timeStrToMinutes(sch.dayEnd);
+  const overtimeStart = timeStrToMinutes(sch.overtimeStart);
+  const overtimeEnd = timeStrToMinutes(sch.overtimeEnd);
+  const breaks = (sch.breaks || []).map(b => ({ start: timeStrToMinutes(b.start), end: timeStrToMinutes(b.end) }));
+
+  // 定時内の実働: dayStart 〜 dayEnd の総時間から、その期間と重なる休憩を引く
+  const regularSpan = Math.max(0, dayEnd - dayStart);
+  const regularBreakMin = breaks.reduce((acc, b) => acc + overlapMinutes(b.start, b.end, dayStart, dayEnd), 0);
+  const regularMinutes = Math.max(0, regularSpan - regularBreakMin);
+
+  // 残業時間の実働: overtimeStart 〜 overtimeEnd の総時間から、その期間と重なる休憩を引く
+  let overtimeMinutes = 0;
+  if (overtimeEnd > overtimeStart) {
+    const overtimeSpan = overtimeEnd - overtimeStart;
+    const overtimeBreakMin = breaks.reduce((acc, b) => acc + overlapMinutes(b.start, b.end, overtimeStart, overtimeEnd), 0);
+    overtimeMinutes = Math.max(0, overtimeSpan - overtimeBreakMin);
+  }
+
+  const totalMinutes = regularMinutes + overtimeMinutes;
+  return {
+    regularMinutes,
+    overtimeMinutes,
+    totalMinutes,
+    regularHours: regularMinutes / 60,
+    overtimeHours: overtimeMinutes / 60,
+    totalHours: totalMinutes / 60,
+  };
+};
+
+// 「分」を "Xh Ymin" 形式に整形
+const formatHoursMinutes = (totalMin) => {
+  const h = Math.floor(totalMin / 60);
+  const m = Math.round(totalMin % 60);
+  if (h === 0) return `${m}分`;
+  if (m === 0) return `${h}時間`;
+  return `${h}時間${m}分`;
+};
+
+// === 品質規格 / 型式オーバーライドの適用 (共通ヘルパー) ===
+// ロット作成・Excel 取込・編集 で共通利用するため切り出し。
+// 優先順位:
+//   1) modelStandardMap[model] にマッピングがあれば品質規格を適用 (overrides + conditions)
+//      - 規格内に templateId に一致するエントリがあればそれを使用
+//      - 一致するエントリが無ければ規格は適用せず legacy fallback へ
+//   2) なければ legacy measurementOverrides[model] を適用
+//   3) どちらも無ければ steps をそのまま返す
+// 戻り値: { steps: 加工後の steps, appliedStandard: ロットに焼き付けるスナップショット | null }
+
+// 規格の中の「テンプレートごと設定」一覧を取得 (新形式 + 旧形式の両方を吸収)
+//   新形式: qs.templates = [{ templateId, measurementOverrides, measurementConditions }, ...]
+//   旧形式: qs.templateId + qs.measurementOverrides + qs.measurementConditions (1 件のみ)
+const getQsTemplateEntries = (qs) => {
+  if (!qs) return [];
+  if (Array.isArray(qs.templates) && qs.templates.length > 0) {
+    return qs.templates.map(t => ({
+      templateId: t.templateId || '',
+      measurementOverrides: t.measurementOverrides || {},
+      measurementConditions: t.measurementConditions || {},
+    }));
+  }
+  if (qs.templateId) {
+    return [{
+      templateId: qs.templateId,
+      measurementOverrides: qs.measurementOverrides || {},
+      measurementConditions: qs.measurementConditions || {},
+    }];
+  }
+  return [];
+};
+
+const applyQualityStandardToSteps = (model, baseSteps, settings, templateId = null) => {
+  if (!model || !baseSteps) return { steps: baseSteps, appliedStandard: null };
+  let steps = baseSteps;
+  let appliedStandard = null;
+
+  // 時間ソース一本化: 型式別較正済み目標時間 (customTargetTimes) を step.targetTime へ焼き付け。
+  // どの規格パスを通っても適用されるよう、関数化して各 return 前に通す。
+  const applyCalibratedTargets = (stepsArr) => {
+    const ctt = settings?.customTargetTimes;
+    if (!ctt || !model || !ctt[`model_${model}`]) return stepsArr;
+    const modelCal = ctt[`model_${model}`];
+    return stepsArr.map(s => {
+      const cal = modelCal[`${s.category || ''}_${s.title || ''}`];
+      if (typeof cal === 'number' && cal > 0 && cal !== s.targetTime) {
+        return { ...s, targetTime: cal, targetTimeCalibrated: true };
+      }
+      return s;
+    });
+  };
+
+  // 1) 品質規格マスタを優先
+  const qsId = settings?.modelStandardMap?.[model];
+  const qs = qsId ? settings?.qualityStandards?.[qsId] : null;
+  if (qs) {
+    // 規格内に対象テンプレートに一致するエントリがあるか探す
+    const entries = getQsTemplateEntries(qs);
+    // templateId 指定時: 完全一致を探す → 無ければ「templateId 未指定」のエントリにフォールバック
+    // templateId 未指定時: 1 件だけのときに採用 (誤適用を避けるため、複数あるなら null)
+    let entry;
+    if (templateId) {
+      entry = entries.find(e => e.templateId === templateId)
+           || entries.find(e => !e.templateId); // 全テンプレ共通エントリがあれば使う
+    } else {
+      // templateId 未指定: 全テンプレ共通エントリを優先、無ければ 1件しかないときに採用
+      entry = entries.find(e => !e.templateId)
+           || (entries.length === 1 ? entries[0] : null);
+    }
+
+    if (entry) {
+      const qsOverrides = entry.measurementOverrides || {};
+      const qsConditions = entry.measurementConditions || {};
+      const qsDefaults = entry.defaultValues || {};  // 初期値プリセット (型式群で共有)
+      const qsChecklist = entry.checklistItemsByStep || {};  // 確認チェック上書き
+      steps = steps.map(s => {
+        let outStep = s;
+        // 確認チェック項目の上書き (測定/非測定どちらでも適用)
+        if (qsChecklist[s.id] && Array.isArray(qsChecklist[s.id])) {
+          outStep = { ...outStep, checklistItems: qsChecklist[s.id] };
+        }
+        if (!s.measurementConfig) return outStep;
+        let newCfg = s.measurementConfig;
+        const stepOv = qsOverrides[s.id];
+        if (stepOv) {
+          const newCalcs = (newCfg.calculations || []).map(c => {
+            const calcOv = stepOv[c.id];
+            if (!calcOv) return c;
+            return {
+              ...c,
+              ...(calcOv.nominal !== undefined ? { nominal: calcOv.nominal } : {}),
+              ...(calcOv.toleranceUpper !== undefined ? { toleranceUpper: calcOv.toleranceUpper } : {}),
+              ...(calcOv.toleranceLower !== undefined ? { toleranceLower: calcOv.toleranceLower } : {}),
+              ...(calcOv.toleranceEnabled !== undefined ? { toleranceEnabled: calcOv.toleranceEnabled } : {})
+            };
+          });
+          newCfg = { ...newCfg, calculations: newCalcs };
+        }
+        const cond = qsConditions[s.id];
+        if (cond && ((cond.params && cond.params.length > 0) || cond.note)) {
+          newCfg = { ...newCfg, conditionPreset: { params: cond.params || [], note: cond.note || '' } };
+        }
+        // 初期値プリセットを焼き付け (測定画面で「初期値を入力」ボタンとして使う)
+        const defaults = qsDefaults[s.id];
+        if (defaults && Object.keys(defaults).length > 0) {
+          newCfg = { ...newCfg, qsDefaultValues: { ...defaults } };
+        }
+        return { ...outStep, measurementConfig: newCfg };
+      });
+      appliedStandard = {
+        id: qs.id,
+        standardNo: qs.standardNo || '',
+        name: qs.name || '',
+        revision: qs.revision || '',
+        templateId: entry.templateId,
+        appliedAt: Date.now(),
+        source: 'qualityStandard',
+      };
+      return { steps: applyCalibratedTargets(steps), appliedStandard };
+    }
+    // 規格はあるがこのテンプレ用のエントリ無し → legacy にフォールバック
+  }
+
+  // 2) レガシー measurementOverrides
+  const overrides = settings?.measurementOverrides?.[model];
+  if (overrides && typeof overrides === 'object') {
+    steps = steps.map(s => {
+      const stepOv = overrides[s.id];
+      if (!stepOv || !s.measurementConfig) return s;
+      const newCalcs = (s.measurementConfig.calculations || []).map(c => {
+        const calcOv = stepOv[c.id];
+        if (!calcOv) return c;
+        return {
+          ...c,
+          ...(calcOv.nominal !== undefined ? { nominal: calcOv.nominal } : {}),
+          ...(calcOv.toleranceUpper !== undefined ? { toleranceUpper: calcOv.toleranceUpper } : {}),
+          ...(calcOv.toleranceLower !== undefined ? { toleranceLower: calcOv.toleranceLower } : {}),
+          ...(calcOv.toleranceEnabled !== undefined ? { toleranceEnabled: calcOv.toleranceEnabled } : {})
+        };
+      });
+      return { ...s, measurementConfig: { ...s.measurementConfig, calculations: newCalcs } };
+    });
+    appliedStandard = {
+      id: null,
+      standardNo: '(レガシーオーバーライド)',
+      name: '型式別オーバーライド',
+      revision: '',
+      appliedAt: Date.now(),
+      source: 'legacyOverride',
+    };
+  }
+
+  // 時間ソース一本化: 較正済み目標時間を焼き付け (規格なし/レガシーパス)
+  return { steps: applyCalibratedTargets(steps), appliedStandard };
 };
 
 // === 進捗・ETA・遅延の計算ヘルパー ===
@@ -266,16 +572,21 @@ const computeLotProgress = (lot) => {
   }
 
   // 開始時刻 (Firestore Timestamp / number / undefined どれでも対応)
+  // 「予測時間の開始」は 実際に作業を開始した時刻 (workStartTime) のみを使用する。
+  // 入荷時刻や登録時刻をフォールバックに使うと、まだ着手していないロットでも
+  // 過去の時刻が「開始」として表示されて紛らわしいため、未開始は 0 を返す。
   const toMs = (v) => { if (!v) return 0; if (typeof v === 'number') return v; if (v.seconds) return v.seconds * 1000; if (v.toMillis) return v.toMillis(); const t = new Date(v).getTime(); return isNaN(t) ? 0 : t; };
-  const startMs = toMs(lot.workStartTime) || toMs(lot.entryAt) || toMs(lot.createdAt);
+  const startMs = toMs(lot.workStartTime);
 
   // 予測完了時刻 (ETA)
   const remainingSec = remainingTasks * avgTaskTime;
   const etaMs = Date.now() + remainingSec * 1000;
 
   // 標準予定時刻 (targetTime ベースで純粋に算出された理想完了時刻)
+  // 未開始の場合は「今すぐ着手した場合の理想完了時刻」を採用する
   const standardDurationSec = lot.steps.reduce((s, st) => s + (st.targetTime || 60), 0) * (lot.quantity || 1);
-  const standardEtaMs = startMs ? startMs + standardDurationSec * 1000 : etaMs;
+  const standardStartMs = startMs || Date.now();
+  const standardEtaMs = standardStartMs + standardDurationSec * 1000;
 
   // 遅延判定: ETA が標準予定より 30分以上後なら warning, 1時間以上後なら critical
   const delayMs = etaMs - standardEtaMs;
@@ -304,6 +615,28 @@ const formatHHMM = (ms) => {
   return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 };
 
+// 「作業中」判定の共通化: lot.status === 'processing' か、カスタムモードで個別タスクが processing
+const checkLotProcessing = (lot) => {
+  if (!lot) return false;
+  if (lot.status === 'processing') return true;
+  const tasks = lot.tasks || {};
+  for (const k in tasks) {
+    if (tasks[k] && tasks[k].status === 'processing') return true;
+  }
+  return false;
+};
+
+// 停止理由カテゴリ → 色/絵文字 マッピング (4箇所で重複していたものを共通化)
+const PAUSE_REASON_COLOR_MAP = {
+  waiting_lot:      { bg: 'bg-amber-100',  border: 'border-amber-300',  text: 'text-amber-800',  emoji: '🟡' },
+  waiting_repair:   { bg: 'bg-orange-100', border: 'border-orange-300', text: 'text-orange-800', emoji: '🟠' },
+  paused:           { bg: 'bg-rose-100',   border: 'border-rose-300',   text: 'text-rose-800',   emoji: '🔴' },
+  waiting_parts:    { bg: 'bg-purple-100', border: 'border-purple-300', text: 'text-purple-800', emoji: '🟣' },
+  waiting_decision: { bg: 'bg-blue-100',   border: 'border-blue-300',   text: 'text-blue-800',   emoji: '🔵' },
+};
+const PAUSE_REASON_FALLBACK_COLOR = { bg: 'bg-slate-100', border: 'border-slate-300', text: 'text-slate-700', emoji: '⏸' };
+const getPauseReasonColor = (category) => PAUSE_REASON_COLOR_MAP[category] || PAUSE_REASON_FALLBACK_COLOR;
+
 // --- Measurement Utilities ---
 // 数式評価 (セキュリティ強化版)
 // - 変数 ID は英数字・アンダースコアのみ許可
@@ -327,7 +660,8 @@ const calculateMeasurementResult = (values, config) => {
         if (!groups[prefix]) groups[prefix] = [];
         groups[prefix].push(e.val);
       });
-      const groupMaxMins = Object.values(groups).map(g => Math.max(...g) - Math.min(...g));
+      const groupMaxMins = Object.values(groups).filter(g => g.length > 0).map(g => Math.max(...g) - Math.min(...g));
+      if (groupMaxMins.length === 0) return null; // 空グループ → null (Math.max([]) は -Infinity を返すため)
       return Math.max(...groupMaxMins);
     }
     default: return null;
@@ -363,7 +697,8 @@ const calculateSingleResult = (values, relevantInputs, calc) => {
         if (!groups[key]) groups[key] = [];
         groups[key].push(e.val);
       });
-      const groupMaxMins = Object.values(groups).map(g => Math.max(...g) - Math.min(...g));
+      const groupMaxMins = Object.values(groups).filter(g => g.length > 0).map(g => Math.max(...g) - Math.min(...g));
+      if (groupMaxMins.length === 0) return null; // 空グループ防止
       return Math.max(...groupMaxMins);
     }
     case 'rows-diff': {
@@ -659,6 +994,7 @@ const calculateMeasurementResults = (values, config, extraValues = {}) => {
 const evaluateArrows = (config, values, calcResults, extraValues = {}) => {
   const arrows = config?.arrows || [];
   if (arrows.length === 0) return [];
+  const inputs = config?.inputs || [];
   // 全ての参照可能な値を統合
   const calcMap = {};
   (calcResults || []).forEach(cr => { if (cr?.id) calcMap[cr.id] = cr.result; });
@@ -667,8 +1003,22 @@ const evaluateArrows = (config, values, calcResults, extraValues = {}) => {
   return arrows.map(arr => {
     const valA = Number(allValues[arr.sourceA]);
     const valB = Number(allValues[arr.sourceB]);
-    // 表示位置: 1つ。明示指定があればそれ、なければデフォルト中央
-    const pos = arr.position || { x: 50, y: 50 };
+    // 表示位置の決定 (優先順位):
+    //  1) 明示的に position が指定されていれば、それを使う
+    //  2) sourceA と sourceB が両方とも入力ポイント (inputs に存在) なら、その中点
+    //  3) どちらか一方だけ入力ポイントなら、その位置
+    //  4) どれも該当しなければ中央 (50, 50)
+    // ※ 以前は (1) → (4) しか無く、複数の矢印に position が無いと全部 (50, 50)
+    //    に重なって表示されていた (拡大測定画面で 1 本しか見えないバグ)。
+    let pos = arr.position;
+    if (!pos) {
+      const inputA = inputs.find(i => i.id === arr.sourceA);
+      const inputB = inputs.find(i => i.id === arr.sourceB);
+      if (inputA && inputB) pos = { x: (inputA.x + inputB.x) / 2, y: (inputA.y + inputB.y) / 2 };
+      else if (inputA) pos = { x: inputA.x, y: inputA.y };
+      else if (inputB) pos = { x: inputB.x, y: inputB.y };
+      else pos = { x: 50, y: 50 };
+    }
     if (!Number.isFinite(valA) || !Number.isFinite(valB)) {
       return { ...arr, pos, valA, valB, dir: null, diff: null };
     }
@@ -840,7 +1190,43 @@ const WorkerBadge = ({ id, workers }) => {
   );
 };
 
-const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData, setDraggedLotId, draggedLotId, variant = 'full', onEdit, onDelete, onMove }) => {
+// ロットカード表示項目のデフォルト (全てON)
+// settings.lotCardDisplay にユーザ設定を保存し、必要なら個別にOFFできる
+const DEFAULT_LOT_CARD_DISPLAY = {
+  orderNo: true,       // 指図番号
+  model: true,         // 型式
+  quantity: true,      // 台数
+  templateName: true,  // テンプレ名
+  entryTime: true,     // 入荷時刻
+  workerBadge: true,   // 担当者バッジ
+  elapsedTime: true,   // 経過/合計時間
+  progressPct: true,   // 進捗 %
+  nextStep: true,      // 次工程名
+  timeRange: true,     // 予測時間範囲 (開始〜ETA)
+  delayStatus: true,   // 遅延ラベル
+  progressBar: true,   // 下部の進捗バー
+};
+
+// アプリ全体で共有: 各 LotCard が個別に display を渡さなくても済む
+const LotCardDisplayContext = React.createContext(DEFAULT_LOT_CARD_DISPLAY);
+// 勤務スケジュール (停止理由などの経過時間を勤務時間内だけでカウントするため)
+const WorkScheduleContext = React.createContext(DEFAULT_WORK_SCHEDULE);
+
+// 停止理由の経過時間を勤務時間内ベースで HH:MM 形式に整形 (m分 or HhMm)
+const formatWorkElapsed = (startMs, schedule) => {
+  if (!startMs) return '';
+  const sec = computeElapsedWorkSeconds(startMs, Date.now(), schedule);
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m > 0 ? `${h}h${m}m` : `${h}h`;
+};
+
+const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData, setDraggedLotId, draggedLotId, variant = 'full', onEdit, onDelete, onMove, display: displayProp }) => {
+  const workSchedule = React.useContext(WorkScheduleContext);
+  const ctxDisplay = React.useContext(LotCardDisplayContext);
+  const display = { ...DEFAULT_LOT_CARD_DISPLAY, ...(ctxDisplay || {}), ...(displayProp || {}) };
   const touchRef = useRef({ timer: null, dragging: false, ghost: null, startX: 0, startY: 0 });
   const cardRef = useRef(null);
 
@@ -893,8 +1279,9 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
     if (!t.dragging) return;
     t.dragging = false;
     if (setDraggedLotId) setDraggedLotId(null);
-    // ドロップ先検出
-    const touch = e.changedTouches[0];
+    // ドロップ先検出 (touchcancel で changedTouches が空になる iOS Safari edge case に対応)
+    const touch = e.changedTouches?.[0];
+    if (!touch) return;
     const el = document.elementFromPoint(touch.clientX, touch.clientY);
     const zone = el?.closest?.('[data-drop-zone]');
     if (zone) {
@@ -914,9 +1301,10 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
     let interval;
     if (lot.status === 'processing' && lot.workStartTime) {
       setElapsed(Date.now() - lot.workStartTime);
+      // 5秒毎の更新で十分 (ダッシュボード/マップに何十枚も並ぶため、1秒だと総 re-render 負荷が大きい)
       interval = setInterval(() => {
         setElapsed(Date.now() - lot.workStartTime);
-      }, 1000);
+      }, 5000);
     } else {
       setElapsed(0);
     }
@@ -925,23 +1313,42 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
 
   const totalSeconds = Math.floor(((lot.totalWorkTime || 0) + elapsed) / 1000);
   const timeDisplay = formatTime(totalSeconds);
-  const currentStep = lot.steps?.[lot.currentStepIndex];
-  const stepName = currentStep ? currentStep.title : '完了';
-  
+  // currentStep は変数を取らず、必要な場所で直接参照する (旧 stepName 変数は未使用だったため削除)
+
+  // 共通の computeLotProgress を使用 (step.id ベースの新 key と古い数値 key の両方を見る + skipped も完了扱い)
   let progress = 0;
-  if (lot.tasks) {
-      const totalTasks = lot.steps.length * lot.quantity;
-      const completedTasks = Object.values(lot.tasks).filter(t => t.status === 'completed').length;
-      progress = totalTasks > 0 ? (completedTasks / totalTasks) * 100 : 0;
-  } else {
-      progress = lot.steps ? (lot.currentStepIndex / lot.steps.length) * 100 : 0;
+  {
+    const _p = computeLotProgress(lot);
+    if (_p) {
+      progress = _p.progressPct;
+    } else if (lot.steps && lot.steps.length > 0) {
+      progress = ((lot.currentStepIndex || 0) / lot.steps.length) * 100;
+    }
   }
   
   const templateName = templates?.find(t => t.id === lot.templateId)?.name || '';
   const zoneName = mapZones?.find(z => z.id === lot.mapZoneId)?.name || '';
   
-  const styleClass = `relative w-full cursor-grab active:cursor-grabbing mb-2 shadow-sm bg-white border transition-all rounded-xl`;
-  const borderClass = lot.status === 'processing' ? 'border-blue-500 ring-2 ring-blue-100' : lot.status === 'error' ? 'border-rose-400 bg-rose-50' : lot.status === 'completed' ? 'border-emerald-300 bg-emerald-50/50' : 'border-slate-200 hover:border-blue-400';
+  // 親ゾーンの overflow-hidden で ring がクリップされるため、独自 keyframe (lot-blink) で確実に点滅
+  //   processing: 強い CSS アニメーション (border-color + box-shadow + bg-color が同時に変化)
+  //   paused: amber枠 (静的)
+  const isLotProcessing = checkLotProcessing(lot);
+  const isLotPaused = !isLotProcessing && (Object.values(lot.tasks || {}).some(t => t.status === 'paused') || lot.status === 'paused');
+  // border 幅は状態で変える: processing は border-4 で確実に目立たせる
+  const baseBorderWidth = isLotProcessing ? 'border-4' : 'border-2';
+  // transition-all は外す (animate を妨げないように)
+  // mb-2 は親側で space-y で管理するため削除 (重複スペース回避)
+  const styleClass = `relative w-full cursor-grab active:cursor-grabbing shadow-md bg-white rounded-xl ${baseBorderWidth}`;
+  const borderClass = isLotProcessing ? 'border-blue-600'
+    : isLotPaused ? 'border-amber-500 !bg-amber-50'
+    : lot.status === 'error' ? 'border-rose-500 bg-rose-50'
+    : lot.status === 'completed' ? 'border-emerald-400 bg-emerald-50/60'
+    : 'border-slate-400 hover:border-blue-500 hover:shadow-lg transition-all';
+  // processing 中はインラインスタイルで強制アニメーション (CSS class 競合の影響を受けない)
+  const processingInlineStyle = isLotProcessing ? {
+    animation: 'lotBlink 1s ease-in-out infinite',
+    backgroundColor: 'rgb(219, 234, 254)', // 初期は blue-100
+  } : {};
 
   if (variant === 'dashboard-arrival') {
     return (
@@ -968,6 +1375,21 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
   }
 
   if (variant === 'dashboard-map') {
+    // コンパクト版でも 現状把握に必要な情報は全部残す:
+    //   ① 停止理由 (最重要・大きく表示)
+    //   ② 指図 / 型式 / 台数
+    //   ③ テンプレート名
+    //   ④ 進捗 + パーセンテージ + バー
+    const compactProg = computeLotProgress(lot);
+    const compactPct = compactProg?.progressPct ?? 0;
+    const compactTotal = compactProg?.totalTasks ?? 0;
+    const compactDone = compactProg?.completedCount ?? 0;
+
+    // 停止理由の色マップ (共通ヘルパー使用)
+    const pauseColor = lot.pauseReason?.category ? getPauseReasonColor(lot.pauseReason.category) : null;
+    // 停止理由の経過時間は勤務時間内のみカウント (会社外時間は除外)
+    const pauseElapsedDisplay = lot.pauseReason?.startTime ? formatWorkElapsed(lot.pauseReason.startTime, workSchedule) : '';
+
     return (
       <div ref={cardRef}
         draggable={lot.status !== 'completed'}
@@ -975,12 +1397,57 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
         onDragEnd={() => setDraggedLotId(null)}
         onClick={() => lot.mapZoneId && lot.status !== 'completed' && onOpenExecution(lot)}
         {...touchProps}
-        className={`${styleClass} ${borderClass} p-1.5 hover:scale-105 transition-transform`}
+        className={`${styleClass} ${borderClass} px-1.5 py-1 hover:scale-[1.02] transition-transform overflow-hidden`}
+        style={processingInlineStyle}
       >
-        <div className="flex flex-col">
-           <div className="text-[10px] text-slate-500 font-bold leading-none mb-0.5">{lot.orderNo}</div>
-           <div className="text-sm font-black text-slate-800 leading-tight truncate">{lot.model}</div>
-           {lot.status === 'processing' && <div className="mt-1 h-1 bg-blue-100 rounded overflow-hidden"><div className="h-full bg-blue-500 animate-pulse" style={{width: '100%'}}></div></div>}
+        {/* 作業中ロット用の発光オーバーレイ (上端の青いストライプが点滅・インラインアニメ) */}
+        {isLotProcessing && (
+          <div className="absolute top-0 left-0 right-0 h-1.5 bg-blue-500 pointer-events-none z-10" style={{ animation: 'lotStripeBlink 0.8s ease-in-out infinite' }}/>
+        )}
+        <div className="flex flex-col gap-1 leading-tight">
+           {/* ① 停止理由バッジ (大きめでハッキリ目立たせる - ユーザー指摘により拡大) */}
+           {lot.pauseReason && lot.pauseReason.category && pauseColor && (
+             <div className={`${pauseColor.bg} ${pauseColor.border} ${pauseColor.text} border-2 rounded px-2 py-1 inline-flex items-center gap-1.5 text-sm font-black w-fit max-w-full shadow-sm`} title={lot.pauseReason.note || lot.pauseReason.label}>
+               <span className="text-base leading-none shrink-0">{pauseColor.emoji}</span>
+               <span className="truncate">{lot.pauseReason.label}</span>
+               {lot.pauseReason.startTime && <span className="font-mono opacity-80 text-xs shrink-0">{pauseElapsedDisplay}</span>}
+             </div>
+           )}
+           {/* ② 指図 + 型式 + 台数 (作業中ドット付き) */}
+           <div className="flex items-baseline gap-1">
+             {isLotProcessing && (
+               <span className="relative inline-flex items-center justify-center shrink-0">
+                 <span className="absolute inline-flex h-3 w-3 rounded-full bg-blue-400 opacity-75 animate-ping"/>
+                 <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500"/>
+               </span>
+             )}
+             <span className="text-[11px] text-slate-500 font-bold shrink-0">{lot.orderNo}</span>
+             <span className="text-sm font-black text-slate-800 truncate min-w-0 flex-1" title={lot.model}>{lot.model}</span>
+             <span className="text-xs font-bold text-blue-600 shrink-0">{lot.quantity}台</span>
+           </div>
+           {/* ③ テンプレ名 + 進捗% (一行) */}
+           <div className="flex items-baseline gap-1">
+             {templateName && (
+               <span className="text-[11px] text-indigo-700 font-bold truncate min-w-0 flex-1 leading-tight" title={templateName}>
+                 <ClipboardList className="w-3 h-3 inline mr-0.5 align-text-bottom"/>{templateName}
+               </span>
+             )}
+             {compactTotal > 0 && (
+               <span className="flex items-baseline gap-1 shrink-0">
+                 <span className="text-[10px] text-slate-500 font-mono">{compactDone}/{compactTotal}</span>
+                 <span className={`font-mono font-black text-sm ${compactPct >= 100 ? 'text-emerald-600' : compactPct > 0 ? 'text-blue-600' : 'text-slate-400'}`}>{compactPct}%</span>
+               </span>
+             )}
+           </div>
+           {/* ④ 進捗バー */}
+           {compactTotal > 0 && (
+             <div className="h-1.5 bg-slate-100 rounded overflow-hidden">
+               <div
+                 className={`h-full transition-all ${compactPct >= 100 ? 'bg-emerald-500' : lot.status === 'processing' ? 'bg-blue-500' : 'bg-slate-400'}`}
+                 style={{ width: `${Math.min(100, compactPct)}%` }}
+               />
+             </div>
+           )}
         </div>
       </div>
     );
@@ -993,8 +1460,13 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
       onDragEnd={() => setDraggedLotId(null)}
       onClick={() => lot.mapZoneId && lot.status !== 'completed' && onOpenExecution(lot)}
       {...touchProps}
-      className={`${styleClass} ${borderClass} ${draggedLotId === lot.id ? 'opacity-50' : 'opacity-100'} group`}
+      className={`${styleClass} ${borderClass} ${draggedLotId === lot.id ? 'opacity-50' : ''} group overflow-hidden`}
+      style={processingInlineStyle}
     >
+      {/* 作業中ロット用の発光オーバーレイ (上端の青いストライプが点滅・インラインアニメ) */}
+      {isLotProcessing && (
+        <div className="absolute top-0 left-0 right-0 h-1.5 bg-blue-500 pointer-events-none z-10" style={{ animation: 'lotStripeBlink 0.8s ease-in-out infinite' }}/>
+      )}
       {/* タブレット対応: hover では消える → 常時 [⋮] メニューで編集/削除アクセス */}
       <div className="absolute top-1 right-1 flex gap-1 z-20">
         <details className="relative" onClick={(e) => e.stopPropagation()}>
@@ -1012,45 +1484,67 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
         </details>
       </div>
 
-      <div className="px-1.5 py-1">
-        <div className="flex items-baseline gap-1.5 flex-wrap leading-none">
-          <span className="font-black text-base text-slate-800">{lot.orderNo}</span>
-          <span className="font-bold text-base text-slate-700">{lot.model}</span>
-          <span className="text-sm font-bold text-slate-500 shrink-0 ml-auto">{lot.quantity}台</span>
-        </div>
-        <div className="flex items-baseline gap-1.5 leading-none mt-0.5">
-          {templateName && <span className="text-xs text-slate-600 font-medium truncate">{templateName}</span>}
-          {lot.entryAt && <span className="text-xs text-slate-500 shrink-0 ml-auto">{new Date(lot.entryAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</span>}
-        </div>
-        {(lot.workerId || lot.mapZoneId) && variant !== 'simple' && (
+      <div className="px-1.5 py-1 pr-8">{/* pr-8 で右上の ⋮ メニューと重ならないように */}
+        {/* 停止理由バッジ (一時停止中で明示的に理由が設定されている時のみ。経過時間は勤務時間内のみカウント) */}
+        {lot.pauseReason && lot.pauseReason.category && (() => {
+          const colorMap = getPauseReasonColor(lot.pauseReason.category);
+          const startTime = lot.pauseReason.startTime;
+          const elapsedDisplay = startTime ? formatWorkElapsed(startTime, workSchedule) : '';
+          return (
+            <div className={`mb-1 inline-flex items-center gap-1 ${colorMap.bg} ${colorMap.border} ${colorMap.text} border rounded px-1.5 py-0.5 text-[10px] font-bold`} title={(lot.pauseReason.note || lot.pauseReason.label) + ' (経過は勤務時間内のみ)'}>
+              <span>{colorMap.emoji}</span>
+              <span>{lot.pauseReason.label}</span>
+              {startTime && <span className="font-mono opacity-70">{elapsedDisplay}</span>}
+            </div>
+          );
+        })()}
+        {(display.orderNo || display.model || display.quantity) && (
+          <div className="flex items-baseline gap-1.5 flex-wrap leading-none">
+            {display.orderNo && <span className="font-black text-base text-slate-800">{lot.orderNo}</span>}
+            {display.model && <span className="font-bold text-base text-slate-700">{lot.model}</span>}
+            {display.quantity && <span className="text-sm font-bold text-slate-500 shrink-0 ml-auto">{lot.quantity}台</span>}
+          </div>
+        )}
+        {(display.templateName || display.entryTime) && (templateName || lot.entryAt) && (
+          <div className="flex items-baseline gap-1.5 leading-none mt-0.5">
+            {display.templateName && templateName && <span className="text-xs text-slate-600 font-medium truncate">{templateName}</span>}
+            {display.entryTime && lot.entryAt && <span className="text-xs text-slate-500 shrink-0 ml-auto">{new Date(lot.entryAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</span>}
+          </div>
+        )}
+        {(display.workerBadge || display.elapsedTime) && (lot.workerId || lot.mapZoneId) && variant !== 'simple' && (
           <div className="flex items-center justify-between leading-none mt-0.5">
-             <WorkerBadge id={lot.workerId} workers={workers} />
-             <span className={`text-xs font-mono ${lot.status === 'processing' ? 'text-blue-600 font-bold' : 'text-slate-400'}`}>{timeDisplay}</span>
+             {display.workerBadge ? <WorkerBadge id={lot.workerId} workers={workers} /> : <span/>}
+             {display.elapsedTime && <span className={`text-xs font-mono ${lot.status === 'processing' ? 'text-blue-600 font-bold' : 'text-slate-400'}`}>{timeDisplay}</span>}
           </div>
         )}
         {/* 進行中・一時停止ロットの 進捗% + 次工程 + ETA + 遅延表示 */}
-        {(lot.status === 'processing' || lot.status === 'paused') && variant !== 'simple' && (() => {
+        {(lot.status === 'processing' || lot.status === 'paused') && variant !== 'simple' && (display.progressPct || display.nextStep || display.timeRange || display.delayStatus) && (() => {
           const p = computeLotProgress(lot);
           if (!p) return null;
           const cls = p.delayLevel === 'critical' ? 'text-rose-700 font-black' : p.delayLevel === 'warning' ? 'text-amber-700 font-bold' : p.delayLevel === 'ahead' ? 'text-emerald-700 font-bold' : 'text-blue-700 font-bold';
           const label = p.delayLevel === 'critical' ? '⚠️遅延' : p.delayLevel === 'warning' ? '遅れ' : p.delayLevel === 'ahead' ? '前倒し' : '予定通り';
-          // 次工程: 現在進行中の工程 (currentStepIndex)、もしくは未完了の最初の工程
           const currentStepIdx = lot.currentStepIndex ?? 0;
           const currentStepTitle = lot.steps?.[currentStepIdx]?.title || '-';
+          const showLine1 = display.progressPct || display.nextStep;
+          const showLine2 = display.timeRange || display.delayStatus;
           return (
             <div className={`text-[10px] mt-0.5 leading-tight space-y-0.5 ${cls}`}>
-              <div className="flex items-center justify-between">
-                <span className="font-black text-xs">{p.progressPct}%</span>
-                <span className="truncate max-w-[60%]" title={currentStepTitle}>▶ {currentStepTitle}</span>
-              </div>
-              <div className="flex items-center justify-between text-slate-600 font-medium">
-                <span>{formatHHMM(p.startMs)}〜{formatHHMM(p.etaMs)}</span>
-                <span className={cls}>{label}</span>
-              </div>
+              {showLine1 && (
+                <div className="flex items-center justify-between">
+                  {display.progressPct ? <span className="font-black text-xs">{p.progressPct}%</span> : <span/>}
+                  {display.nextStep && <span className="truncate max-w-[60%]" title={currentStepTitle}>▶ {currentStepTitle}</span>}
+                </div>
+              )}
+              {showLine2 && (
+                <div className="flex items-center justify-between text-slate-600 font-medium">
+                  {display.timeRange ? <span>{formatHHMM(p.startMs)}〜{formatHHMM(p.etaMs)}</span> : <span/>}
+                  {display.delayStatus && <span className={cls}>{label}</span>}
+                </div>
+              )}
             </div>
           );
         })()}
-        {variant !== 'simple' && (lot.workerId || lot.mapZoneId) && (
+        {display.progressBar && variant !== 'simple' && (lot.workerId || lot.mapZoneId) && (
           <div className="w-full bg-slate-100 h-1 rounded-full overflow-hidden mt-0.5">
             <div className={`h-full transition-all ${lot.status === 'completed' ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{ width: `${lot.status === 'completed' ? 100 : progress}%` }} />
           </div>
@@ -1063,28 +1557,452 @@ const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData,
   );
 };
 
+// 進行中ロットの経過時間 (live workStartTime 加算込み) を返すヘルパー
+const getLotElapsedMs = (lot) => {
+  let elapsed = lot.totalWorkTime || 0;
+  if (lot.status === 'processing' && lot.workStartTime) {
+    elapsed += Date.now() - lot.workStartTime;
+  }
+  return elapsed;
+};
+
+// 作業者の予定/実績/進行中の時間を集計するヘルパー
+// === 未該当 / 未割当 判定 (現場マップ・作業予定・分析タブで使用) ===
+// 「マップの未該当エリア」「作業予定の未割当カラム」「分析タブの未割当グループ」は
+// 完全に同じロットを表示する必要がある。判定は一箇所に集約。
+//
+// === 「未該当」の正確な定義 (2026-05-30 修正) ===
+// 含まれる条件 (どちらか満たす):
+//   1) mapZoneId === 'zone_unassigned' (明示的に未該当へ移動)
+//   2) mapZoneId 未設定 AND workerId 未設定 (どこにも置かれてない真の未割当)
+//
+// ※ 旧定義に含まれていた `!workerId && location === 'planned'` は削除した:
+//    これだと「ゾーンに移動済みだが担当者未割当」のロットが未該当に居続けてしまい、
+//    現場マップ未該当→他ゾーンへの移動が機能しないバグの原因だった (ユーザー指摘 2026-05-30)。
+//    mapZoneId が他ゾーンに設定されていたら、もう未該当ではない。
+//
+// 除外:
+//   - 完了 (status='completed' or location='completed')
+//   - 入荷待ち (location='arrival')
+//   - 他ゾーンに配置済み (mapZoneId が zone_unassigned 以外に設定されている) ← 重要
+const isUnassignedLot = (l) => {
+  if (!l) return false;
+  if (l.status === 'completed' || l.location === 'completed') return false;
+  if (l.location === 'arrival') return false;
+  if (l.mapZoneId === 'zone_unassigned') return true;
+  // mapZoneId が他ゾーンに設定されている = 未該当ではない (他ゾーンに表示される)
+  if (l.mapZoneId) return false;
+  // ゾーン未設定 (どこにも置かれていない) かつ 作業者未割当 → 真の未該当
+  if (!l.workerId) return true;
+  return false;
+};
+
+// 予定(残): 未着手分 + 進行中の残り見込み
+// 実績(済): 完了分 + 進行中の経過時間
+const computeWorkerTimes = (lots, workerId) => {
+  const plannedLots = lots.filter(l => l.location === 'planned' && l.workerId === workerId);
+  const completedLots = lots.filter(l => l.location === 'completed' && l.workerId === workerId);
+
+  let notStartedSec = 0;
+  let inProgressRemainingSec = 0;
+  let inProgressElapsedSec = 0;
+  let inProgressCount = 0;
+  let processingCount = 0;
+
+  plannedLots.forEach(lot => {
+    const elapsedMs = getLotElapsedMs(lot);
+    const isInProgress = elapsedMs > 0 || lot.status === 'processing' || lot.status === 'paused';
+    if (isInProgress) {
+      inProgressCount += 1;
+      if (lot.status === 'processing') processingCount += 1;
+      const estimatedSec = calculateLotEstimatedTime(lot);
+      const elapsedSec = elapsedMs / 1000;
+      inProgressElapsedSec += elapsedSec;
+      inProgressRemainingSec += Math.max(0, estimatedSec - elapsedSec);
+    } else {
+      notStartedSec += calculateLotEstimatedTime(lot);
+    }
+  });
+
+  const completedSec = completedLots.reduce((acc, lot) => acc + (lot.totalWorkTime || 0) / 1000, 0);
+
+  return {
+    plannedRemainingSec: notStartedSec + inProgressRemainingSec,
+    actualDoneSec: completedSec + inProgressElapsedSec,
+    inProgressCount,
+    processingCount,
+    inProgressElapsedSec,
+    notStartedCount: plannedLots.length - inProgressCount,
+    completedCount: completedLots.length,
+  };
+};
+
+// === 作業順最適化エンジン (現実的なルール: 「他の台で並行」) ===
+// 物理的に正しいモデル:
+//   - テンプレ順は固定 (準備→測定準備→...→自動測定→片付けの順は意味がある)
+//   - 1台目が自動測定中 → 1台目は機械に占有されて触れない
+//   - 並行できるのは 他の台 (2台目以降) の上から順番の手動工程
+//   - 同じ台の手動と自動を並列するのは物理的に不可能
+//
+// 入力:
+//   steps         : テンプレートの工程配列 (元の順序を保持)
+//   completedLots : 同じテンプレートで完了済みのロット (実績データソース)
+//   opts          : { quantity, fallbackTargetTime }
+//
+// 出力 (parallelOpportunities):
+//   各自動工程 (N台目) ごとに、その時間内に並行可能な「他の台の上から順番の作業」を計算
+//   {
+//     stepStats: { [stepKey]: { step, avgSec, isAuto } }
+//     opportunities: [
+//       {
+//         autoStep, autoUnitIdx,         // どの台のどの自動工程
+//         autoDurationSec,                // 自動工程の所要時間
+//         parallelTasks: [               // この時間内にやれる別の台の作業 (上から順番)
+//           { step, unitIdx, durationSec }
+//         ],
+//         filledSec, utilizationPct,
+//       }
+//     ]
+//     sampleLotCount, hasEnoughData
+//   }
+const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
+  const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+  const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
+  const fallback = opts.fallbackTargetTime ?? 60;
+  const quantity = opts.quantity || 1;
+
+  // 1. 工程ごとの実績平均時間 (テンプレ順は保持)
+  const stepStats = {};
+  steps.forEach((step, idx) => {
+    const k = stepKeyOf(step, idx);
+    const durations = [];
+    completedLots.forEach(lot => {
+      const qty = lot.quantity || 1;
+      for (let u = 0; u < qty; u++) {
+        const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${idx}-${u}`];
+        if (t && (t.status === 'completed' || t.status === 'ng') && t.duration > 0) durations.push(t.duration);
+      }
+    });
+    const avg = durations.length > 0
+      ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
+      : (step.targetTime || fallback);
+    const sorted = [...durations].sort((a, b) => a - b);
+    const median = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : avg;
+    stepStats[k] = { step, idx, key: k, avgSec: avg, medianSec: median, sampleCount: durations.length, isAuto: isAutoStep(step) };
+  });
+
+  // 2. 実績ベース並列観測 (= 「実際に並行できた」ことが証明された組合せ)
+  //    過去に同じ自動工程中、別の台のどの工程が実際に並行実施されたか
+  //    ※ 重要: ここで観測されたペアだけが「物理的に可能」と確定する
+  //       (測定機を共有する工程は実際に並列できないので、観測ゼロのまま残る)
+  const parallelObservations = {};  // { autoStepKey: { manualStepKey: count } }
+  completedLots.forEach(lot => {
+    const qty = lot.quantity || 1;
+    steps.forEach((aStep, ai) => {
+      if (!isAutoStep(aStep)) return;
+      for (let au = 0; au < qty; au++) {
+        const at = lot.tasks?.[`${aStep.id}-${au}`] || lot.tasks?.[`${ai}-${au}`];
+        if (!at?.firstStartTime || !at?.endTime) continue;
+        const aStart = at.firstStartTime, aEnd = at.endTime;
+        steps.forEach((mStep, mi) => {
+          if (mi === ai || isAutoStep(mStep)) return;
+          for (let mu = 0; mu < qty; mu++) {
+            if (mu === au) continue;  // ★ 同じ台の手動は物理的に並列不可、除外
+            const mt = lot.tasks?.[`${mStep.id}-${mu}`] || lot.tasks?.[`${mi}-${mu}`];
+            if (!mt?.firstStartTime || !mt?.endTime) continue;
+            const overlap = Math.min(aEnd, mt.endTime) - Math.max(aStart, mt.firstStartTime);
+            if (overlap > 1000) {
+              const ak = stepKeyOf(aStep, ai);
+              const mk = stepKeyOf(mStep, mi);
+              if (!parallelObservations[ak]) parallelObservations[ak] = {};
+              parallelObservations[ak][mk] = (parallelObservations[ak][mk] || 0) + 1;
+            }
+          }
+        });
+      }
+    });
+  });
+
+  // 3. 並列候補の決定 (現実的)
+  //    候補に入る条件 (どちらか満たす):
+  //      (a) 過去実績で この自動工程との並行が観測されている (= 物理的に可能と証明済)
+  //      (b) テンプレで step.workResource が null/空 = 機械独立 (= 機械占有しないので並行可)
+  //          + step.parallelSafe === true (旧フラグも互換維持)
+  //    workResource が 'measurement-machine' などにセットされている工程は 機械を共有するので並列候補から除外。
+  //    タグが未設定の工程は「不明 → 安全側で除外」(過去実績で観測されていれば例外的に通る)
+  const opportunities = [];
+  steps.forEach((autoStep, autoIdx) => {
+    if (!isAutoStep(autoStep)) return;
+    const autoKey = stepKeyOf(autoStep, autoIdx);
+    const autoSec = stepStats[autoKey].avgSec;
+    // 自動工程の占有リソース (default 'measurement-machine' を想定)
+    const autoResource = autoStep.workResource || 'measurement-machine';
+
+    // この自動工程に対する候補手動工程
+    const observedPartners = parallelObservations[autoKey] || {};
+    const candidateManualSteps = steps
+      .map((s, i) => ({ step: s, idx: i }))
+      .filter(({ step, idx }) => !isAutoStep(step))
+      .filter(({ step, idx }) => {
+        const k = stepKeyOf(step, idx);
+        // (a) 実証済: 過去に並行観測あり → 物理的に可能と確認済
+        if (observedPartners[k] > 0) return true;
+        // (b1) 明示「機械独立」: workResource が null/空文字 = 機械を使わない → 並行可
+        //   ただしテンプレが古くて workResource フィールド自体が無い場合は判定不能 → 除外
+        if (step.workResource === null || step.workResource === '') return true;
+        // (b2) リソース競合チェック: 占有リソースが自動工程と異なる → 並行可
+        if (step.workResource && step.workResource !== autoResource) return true;
+        // (b3) 旧フラグ互換
+        if (step.parallelSafe === true) return true;
+        return false;
+      })
+      .map(({ step, idx }) => ({
+        step,
+        idx,
+        key: stepKeyOf(step, idx),
+        avgSec: stepStats[stepKeyOf(step, idx)].avgSec,
+        evidence: observedPartners[stepKeyOf(step, idx)] > 0 ? 'observed' :
+                  (step.workResource === null || step.workResource === '') ? 'machine-independent' :
+                  step.workResource && step.workResource !== autoResource ? 'different-resource' : 'flag',
+        observedCount: observedPartners[stepKeyOf(step, idx)] || 0,
+      }));
+
+    // 各台ごとに「他の台でこの時間内にやれる作業」を生成
+    // ルール: 他の台について、テンプレ順の先頭から走査して「並列可」のものだけ追加し、
+    //        「並列不可 (機械占有 etc)」にぶつかった瞬間に その台の探索を打ち切る。
+    //        理由: その不可工程をやらないと先に進めない (例: 測定準備をやらないと測定できない)。
+    //        これが「2台目の表順の上から攻める」の物理的に正しい実装。
+    const candidateKeys = new Set(candidateManualSteps.map(c => c.key));
+    const candidateMap = new Map(candidateManualSteps.map(c => [c.key, c]));
+    for (let autoUnit = 0; autoUnit < quantity; autoUnit++) {
+      const parallelTasks = [];
+      let filledSec = 0;
+      for (let otherUnit = 0; otherUnit < quantity; otherUnit++) {
+        if (otherUnit === autoUnit) continue;
+        // この otherUnit について、テンプレ順の先頭から走査
+        let blocked = false;
+        for (const step of steps) {
+          if (blocked) break;
+          if (isAutoStep(step)) {
+            // 他の台の自動工程に到達 = それ以降の工程は その自動を終わらせないと進めない → 打ち切り
+            blocked = true;
+            break;
+          }
+          const sIdx = steps.indexOf(step);
+          const sKey = stepKeyOf(step, sIdx);
+          if (!candidateKeys.has(sKey)) {
+            // 並列不可な工程に当たった = 機械占有等 → ここで打ち切り (後の工程は前段に依存)
+            blocked = true;
+            break;
+          }
+          // 並列可: この工程を提案リストに加える
+          const c = candidateMap.get(sKey);
+          if (filledSec + c.avgSec > autoSec * 1.1) {
+            // 時間枠オーバー → これは入らないが、まだ他に空きがあれば他の台で試す
+            break;
+          }
+          parallelTasks.push({
+            step: c.step,
+            unitIdx: otherUnit,
+            durationSec: c.avgSec,
+            stepKey: c.key,
+            evidence: c.evidence,
+            observedCount: c.observedCount,
+          });
+          filledSec += c.avgSec;
+        }
+        if (filledSec >= autoSec) break;  // 自動の時間を埋めきった
+      }
+      opportunities.push({
+        autoStep,
+        autoUnitIdx: autoUnit,
+        autoDurationSec: autoSec,
+        parallelTasks,
+        filledSec,
+        utilizationPct: autoSec > 0 ? Math.round((filledSec / autoSec) * 100) : 0,
+        hasCandidates: candidateManualSteps.length > 0,
+      });
+    }
+  });
+
+  // 想定時短: 並列化していなければ単純合計、並列化すれば「自動の時間 = 並列分」分得する
+  const totalManualSec = Object.values(stepStats).filter(s => !s.isAuto).reduce((a, s) => a + s.avgSec, 0) * quantity;
+  const totalAutoSec = Object.values(stepStats).filter(s => s.isAuto).reduce((a, s) => a + s.avgSec, 0) * quantity;
+  const serialTotal = totalManualSec + totalAutoSec;
+  const savedSec = opportunities.reduce((acc, op) => acc + op.filledSec, 0);
+  const optimalTotal = Math.max(0, serialTotal - savedSec);
+
+  return {
+    stepStats,
+    opportunities,            // ← 新: 自動工程ごとに「他の台でやれる作業」
+    parallelObservations,
+    serialTotalSec: serialTotal,
+    optimalTotalSec: optimalTotal,
+    timeSavedSec: savedSec,
+    timeSavedPercent: serialTotal > 0 ? Math.round((savedSec / serialTotal) * 100) : 0,
+    sampleLotCount: completedLots.length,
+    quantity,
+    autoCount: Object.values(stepStats).filter(s => s.isAuto).length,
+    manualCount: Object.values(stepStats).filter(s => !s.isAuto).length,
+    hasEnoughData: completedLots.length >= 3,
+  };
+};
+
+// === Gemini AI による作業順提案 (オプション) ===
+// VITE_GEMINI_API_KEY が設定されている場合のみ呼べる。analysis を JSON で投げて推奨順を取得
+const requestGeminiWorkOrder = async (analysis, modelName = 'gemini-2.5-flash') => {
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
+  if (!apiKey) throw new Error('VITE_GEMINI_API_KEY が設定されていません。.env に API キーを設定してください。');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  const stepsForAi = Object.values(analysis.stepStats).map(s => ({
+    key: s.key,
+    title: s.step.title,
+    category: s.step.category || '',
+    isAuto: s.isAuto,
+    avgSec: s.avgSec,
+    medianSec: s.medianSec,
+    sampleCount: s.sampleCount,
+    targetTime: s.step.targetTime || null,
+  }));
+  const parallelHints = analysis.parallelObservations;
+  const prompt = `製造現場の検査作業順を最適化してください。
+
+【物理ルール (厳守)】
+- テンプレ順は固定。並べ替えてはいけない。
+- 1台目が自動測定中の間、1台目自体は機械に占有されて触れない。
+- 並行できるのは「他の台 (2台目以降) の上から順番の手動工程」だけ。
+- 同じ台の手動と自動を並列するのは物理的に不可能。
+
+【工程一覧 (テンプレ順)】
+${JSON.stringify(stepsForAi, null, 2)}
+
+【実績ベースで並行観測された組合せ (回数)】
+${JSON.stringify(parallelHints, null, 2)}
+
+【現状】
+- ロット数: ${analysis.quantity || 1}台
+- 全工程シーケンシャル合計: ${analysis.serialTotalSec}秒
+- サンプルロット数: ${analysis.sampleLotCount}
+
+【要件】
+- 各自動工程について、それが実行中の他の台でやれる手動工程を提案する
+- 「N台目自動測定 (X分) → その間に M台目の Y, Z 工程をやる」の形
+- テンプレ順は変更しない
+
+JSON で次の形式で返してください:
+{
+  "opportunities": [
+    { "autoStepKey": "...", "autoUnitIdx": 0, "parallelTasks": [{ "stepKey": "...", "unitIdx": 1 }], "reason": "..." }
+  ],
+  "summary": "<全体的な改善ポイント (3行以内)>"
+}`;
+  const payload = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: 'application/json' },
+  };
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(`Gemini API エラー: HTTP ${res.status}`);
+  const j = await res.json();
+  const text = j.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から空のレスポンスが返りました');
+  return JSON.parse(text);
+};
+
+// === AI 深掘り分析: 改善ヒントタブ用の汎用分析 ===
+// データを Gemini に投げて、人間が気づきにくい洞察・優先アクションを抽出
+const requestGeminiDeepAnalysis = async (payload, modelName = 'gemini-2.5-flash') => {
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
+  if (!apiKey) throw new Error('VITE_GEMINI_API_KEY が設定されていません。.env に API キーを設定してください。');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  const prompt = `製造現場の検査アプリの時間取りデータを分析します。
+以下のデータから、現場改善に役立つ深い洞察と優先アクションを抽出してください。
+
+【1. 不要工程候補 (該当なし率高 / 形骸化検出)】
+${JSON.stringify(payload.removalCandidates || [], null, 2)}
+
+【2. 作業者スキル差 (同工程の作業者別時間差)】
+${JSON.stringify(payload.skillGaps || [], null, 2)}
+
+【3. 並列実績 (自動工程×手動工程の実証ペア)】
+${JSON.stringify(payload.parallelRanking || [], null, 2)}
+
+【4. 全体統計】
+${JSON.stringify(payload.stats || {}, null, 2)}
+
+【5. 型式別 不具合・気づき】
+${JSON.stringify(payload.modelIssues || {}, null, 2)}
+
+【要件】
+- 数字を表面的に見るだけでなく、相関や傾向を抽出してください
+- 「データの裏に隠れた本質的な問題」を提示してください
+- 「優先アクション (即実行できる)」を3つ以内で具体的に
+- 過度に一般化せず、データに根拠を持って書いてください
+- 日本語で。製造現場で使う言葉で
+
+JSON で次の形式で返してください:
+{
+  "topInsights": [
+    { "title": "<タイトル>", "evidence": "<データ根拠>", "implication": "<示唆/原因仮説>", "severity": "high|mid|low" }
+  ],
+  "priorityActions": [
+    { "action": "<具体アクション>", "expectedImpact": "<期待効果>", "effort": "<工数感>" }
+  ],
+  "hiddenIssues": [
+    { "issue": "<隠れた問題>", "detection": "<どう気付いたか>" }
+  ],
+  "summary": "<3行で全体総括>"
+}`;
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0.4 },
+  };
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`Gemini API エラー: HTTP ${res.status} - ${(await res.text()).slice(0, 200)}`);
+  const j = await res.json();
+  const text = j.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から空のレスポンスが返りました');
+  return JSON.parse(text);
+};
+
 const WorkerSummaryCard = ({ worker, lots }) => {
-  const plannedLots = lots.filter(l => l.location === 'planned' && l.workerId === worker.id);
-  const plannedTime = plannedLots.reduce((acc, lot) => acc + calculateLotEstimatedTime(lot), 0);
-  const completedLots = lots.filter(l => l.location === 'completed' && l.workerId === worker.id);
-  const completedTime = completedLots.reduce((acc, lot) => acc + (lot.totalWorkTime || 0)/1000, 0);
+  // 進行中ロットがあれば 5秒毎に再描画 (live workStartTime 加算用)
+  const [, setTick] = useState(0);
+  const hasProcessing = lots.some(l => l.workerId === worker.id && l.status === 'processing' && l.workStartTime);
+  useEffect(() => {
+    if (!hasProcessing) return;
+    const intv = setInterval(() => setTick(t => t + 1), 5000);
+    return () => clearInterval(intv);
+  }, [hasProcessing]);
+
+  const { plannedRemainingSec, actualDoneSec, inProgressCount, processingCount } = computeWorkerTimes(lots, worker.id);
 
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-3 shadow-sm flex flex-col gap-2">
-      <div className="flex items-center gap-2 border-b pb-2">
-         <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold">
-            <User className="w-5 h-5"/>
+      <div className="flex items-center justify-between gap-2 border-b pb-2">
+         <div className="flex items-center gap-2">
+           <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold">
+              <User className="w-5 h-5"/>
+           </div>
+           <span className="font-bold text-lg text-slate-800">{worker.name}</span>
          </div>
-         <span className="font-bold text-lg text-slate-800">{worker.name}</span>
+         {inProgressCount > 0 && (
+           <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${processingCount > 0 ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`} title="着手中のロット件数">
+             {processingCount > 0 && <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"/>}
+             進行中 {inProgressCount}件
+           </span>
+         )}
       </div>
       <div className="grid grid-cols-2 gap-2 text-center">
          <div className="bg-blue-50 rounded p-2">
             <div className="text-[10px] text-blue-500 font-bold mb-1">予定(残)</div>
-            <div className="text-base font-black text-blue-700 font-mono">{formatTime(plannedTime)}</div>
+            <div className="text-base font-black text-blue-700 font-mono">{formatTime(plannedRemainingSec)}</div>
          </div>
-         <div className="bg-emerald-50 rounded p-2">
-            <div className="text-[10px] text-emerald-500 font-bold mb-1">実績(済)</div>
-            <div className="text-base font-black text-emerald-700 font-mono">{formatTime(completedTime)}</div>
+         <div className={`rounded p-2 ${processingCount > 0 ? 'bg-emerald-100 ring-1 ring-emerald-300' : 'bg-emerald-50'}`}>
+            <div className="text-[10px] text-emerald-500 font-bold mb-1 flex items-center justify-center gap-1">
+              実績(済)
+              {processingCount > 0 && <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"/>}
+            </div>
+            <div className="text-base font-black text-emerald-700 font-mono">{formatTime(actualDoneSec)}</div>
          </div>
       </div>
     </div>
@@ -1126,7 +2044,14 @@ const ZoneList = ({ id, title, icon: Icon, color, border, children, onDropLot, o
 
 const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, setDraggedLotId, draggedLotId, onEditLot, onDeleteLot, setExecutionLotId, settings, handleImageUpload, saveSettings, mapZones, isDashboard = false }) => {
   const [isLayoutMode, setIsLayoutMode] = useState(false);
-  const [localZones, setLocalZones] = useState(mapZones);
+  // 既存設定に「未該当エリア」がなければレンダリング時に自動追加
+  // (不良/残ロット待ちなどの一時置き場として現場マップにも常時表示)
+  const ensureUnassignedZone = (zones) => {
+    const arr = zones || [];
+    if (arr.some(z => z.id === 'zone_unassigned' || z.isUnassigned)) return arr;
+    return [...arr, { id: 'zone_unassigned', name: '未該当エリア', x: 2, y: 92, w: 96, h: 7, color: 'bg-slate-100/80 border-slate-400', isUnassigned: true }];
+  };
+  const [localZones, setLocalZones] = useState(() => ensureUnassignedZone(mapZones));
   const mapRef = useRef(null);
 
   // エリアフィルター: localStorage から復元
@@ -1143,10 +2068,33 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
     });
   };
   const visibleZones = localZones.filter(z => !hiddenZones.includes(z.id));
-  const isFiltered = hiddenZones.length > 0;
+  // ダッシュボード mini-map も map-only ビューも、**常にタイル詰め配置をデフォルト**にする
+  // (ゾーン重なり問題を完全解消・隙間なし)
+  // レイアウト編集モード時のみ x,y,w,h を使った自由配置に切替
+  const isFiltered = true;
+  // ゾーン毎のロットを事前に索引化
+  // 未該当判定はモジュール先頭の isUnassignedLot を利用 (現場マップ・作業予定・分析タブで完全一致)
+  // ※ ローカル定義していたが、ビューごとに条件がズレて不一致が発生していたため一本化
+  const lotsByZoneId = useMemo(() => {
+    const map = new Map();
+    for (const l of lots) {
+      if (l.location === 'completed' || l.status === 'completed') continue;
+      if (l.location === 'arrival') continue;
+      // 未該当扱い
+      if (isUnassignedLot(l)) {
+        if (!map.has('zone_unassigned')) map.set('zone_unassigned', []);
+        map.get('zone_unassigned').push(l);
+        continue;
+      }
+      if (!l.mapZoneId) continue;
+      if (!map.has(l.mapZoneId)) map.set(l.mapZoneId, []);
+      map.get(l.mapZoneId).push(l);
+    }
+    return map;
+  }, [lots]);
 
   useEffect(() => {
-    setLocalZones(mapZones);
+    setLocalZones(ensureUnassignedZone(mapZones));
   }, [mapZones]);
 
   const handleZoneDragStart = (e, zoneId) => {
@@ -1186,6 +2134,29 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
                 <Upload className="w-3 h-3" /> 背景
                 <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
              </label>
+             {isLayoutMode && (
+               <button
+                 onClick={() => {
+                   if (localZones.length === 0) return;
+                   if (!confirm(`${localZones.length}件のエリアを自動でタイル詰め配置します。\n現在の位置・サイズは上書きされます。続行しますか？`)) return;
+                   const n = localZones.length;
+                   const cols = n <= 4 ? n : (n <= 8 ? 4 : Math.ceil(Math.sqrt(n)));
+                   const rows = Math.ceil(n / cols);
+                   const w = 100 / cols;
+                   const h = 100 / rows;
+                   setLocalZones(localZones.map((z, i) => ({
+                     ...z,
+                     x: (i % cols) * w,
+                     y: Math.floor(i / cols) * h,
+                     w, h,
+                   })));
+                 }}
+                 className="text-xs flex items-center gap-1 px-3 py-1 rounded border font-bold bg-blue-600 text-white border-blue-700 hover:bg-blue-700"
+                 title="全エリアを自動でタイル詰め配置 (重なり解消)"
+               >
+                 <LayoutGrid className="w-3 h-3"/> 自動タイル
+               </button>
+             )}
              <button onClick={() => isLayoutMode ? saveLayout() : setIsLayoutMode(true)} className={`text-xs flex items-center gap-1 px-3 py-1 rounded border font-bold transition-colors ${isLayoutMode ? 'bg-green-600 text-white border-green-700' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>
                {isLayoutMode ? <><Save className="w-3 h-3"/> レイアウト保存</> : <><LayoutGrid className="w-3 h-3"/> レイアウト編集</>}
              </button>
@@ -1196,7 +2167,7 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
             <span className="text-[10px] text-slate-500 font-bold mr-1">エリア:</span>
             {localZones.map(zone => {
               const isVisible = !hiddenZones.includes(zone.id);
-              const lotCount = lots.filter(l => l.mapZoneId === zone.id && l.location !== 'completed').length;
+              const lotCount = (lotsByZoneId.get(zone.id) || []).length;
               return (
                 <button key={zone.id} onClick={() => toggleZoneFilter(zone.id)}
                   className={`text-xs px-2.5 py-1 rounded-full font-bold border transition-all flex items-center gap-1 ${isVisible ? 'bg-blue-600 text-white border-blue-700 shadow-sm' : 'bg-white text-slate-400 border-slate-200 hover:border-slate-300'}`}
@@ -1215,7 +2186,8 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
   );
 
   return (
-    <div className={`rounded-xl border-2 border-blue-400 h-full shadow-lg relative bg-white overflow-hidden flex flex-col ${isDashboard ? 'cursor-pointer' : ''}`}>
+    // 外枠: dashboard モードは飾り枠あり (ダッシュボード内の1パネルなので)、map-only モードは枠なし (画面いっぱい)
+    <div className={`h-full relative bg-white overflow-hidden flex flex-col ${isDashboard ? 'rounded-xl border-2 border-blue-400 shadow-lg cursor-pointer' : ''}`}>
        {!isDashboard && headerContent}
        {isDashboard && (
          <div className="absolute top-2 left-2 z-30 bg-white/80 backdrop-blur px-3 py-1 rounded-full border shadow-sm pointer-events-none">
@@ -1223,34 +2195,147 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
          </div>
        )}
        <div ref={mapRef} onDragOver={(e) => e.preventDefault()} onDrop={handleMapDrop}
-         className={`flex-1 bg-slate-50 overflow-hidden ${isFiltered && !isLayoutMode ? 'grid gap-2 p-2' : 'relative'}`}
+         className={`flex-1 bg-slate-50 overflow-hidden flex flex-col ${isFiltered && !isLayoutMode ? '' : 'relative'}`}
          style={isFiltered && !isLayoutMode
-           ? { gridTemplateColumns: `repeat(auto-fit, minmax(${visibleZones.length === 1 ? '100%' : visibleZones.length === 2 ? '45%' : '280px'}, 1fr))` }
+           ? null
            : { backgroundImage: settings.mapImage ? `url(${settings.mapImage})` : 'radial-gradient(#cbd5e1 1px, transparent 1px)', backgroundSize: settings.mapImage ? 'contain' : '20px 20px', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' }
          }
        >
-         {(isFiltered && !isLayoutMode ? visibleZones : localZones).map(zone => (
+       {/* 通常ゾーン (未該当エリア以外) — グリッドで並べる or 自由配置 */}
+       <div
+         className={`${isFiltered && !isLayoutMode ? 'grid flex-1' : 'flex-1 relative'}`}
+         style={isFiltered && !isLayoutMode ? (() => {
+           // 未該当エリアを除いた通常ゾーンの数で列数を決定
+           const normalZones = visibleZones.filter(z => z.id !== 'zone_unassigned');
+           return {
+             gap: '0',
+             padding: '0',
+             gridTemplateColumns: `repeat(auto-fit, minmax(${normalZones.length === 1 ? '100%' : normalZones.length === 2 ? '50%' : '220px'}, 1fr))`,
+           };
+         })() : undefined}
+       >
+         {((isFiltered && !isLayoutMode ? visibleZones : localZones).filter(z => z.id !== 'zone_unassigned' || isLayoutMode)).map(zone => {
+           const zoneNameSize = settings?.mapZoneNameSize || 14; // px, default 14
+           const zoneLots = lotsByZoneId.get(zone.id) || [];
+           const zoneLotCount = zoneLots.length;
+           // このゾーンに関わる作業者を抽出 (アクティブ作業中 = 点滅, 担当中 (停止理由・待機) = 静的)
+           const activeWorkers = new Set();   // processing 中 → 点滅
+           const assignedWorkers = new Set(); // 担当だけ (停止理由・待機等) → 静的
+           zoneLots.forEach(l => {
+             const isProcessing = checkLotProcessing(l);
+             const worker = workers.find(w => w.id === l.workerId);
+             const wName = worker?.name || (zone.isPersonal ? zone.name : null);
+             if (!wName) return;
+             if (isProcessing) activeWorkers.add(wName);
+             else assignedWorkers.add(wName);
+           });
+           // 重複排除: active のみ表示優先 (assignedも兼ねている場合は active 側を採用)
+           const activeNames = Array.from(activeWorkers);
+           const assignedOnly = Array.from(assignedWorkers).filter(n => !activeWorkers.has(n));
+           return (
            <div key={zone.id} data-drop-zone={zone.id} draggable={isLayoutMode} onDragStart={(e) => handleZoneDragStart(e, zone.id)} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); e.stopPropagation(); const lotId = e.dataTransfer.getData('lotId'); if (lotId && !isLayoutMode) { handleMoveLot(lotId, zone.id); }}}
-             className={`border-2 rounded-lg flex flex-col overflow-hidden transition-all ${zone.color || 'bg-white/80 border-slate-300'} ${isLayoutMode ? 'absolute cursor-move border-dashed border-blue-500 z-50' : isFiltered ? 'min-h-[200px]' : 'absolute z-10'}`}
+             className={`border flex flex-col overflow-hidden transition-all ${zone.color || 'bg-white/80 border-slate-300'} ${isLayoutMode ? 'absolute cursor-move border-dashed border-blue-500 z-50 border-2 rounded-lg' : isFiltered ? 'min-h-[150px]' : 'absolute z-10 border-2 rounded-lg'}`}
              style={isLayoutMode || !isFiltered ? { left: `${zone.x}%`, top: `${zone.y}%`, width: `${zone.w}%`, height: `${zone.h}%` } : {}}
            >
-             <div className="bg-black/10 px-2 py-1 text-[10px] font-bold text-slate-700 truncate select-none flex justify-between shrink-0"><span>{zone.name}</span><span className="bg-white/50 px-1 rounded">{lots.filter(l => l.mapZoneId === zone.id && l.location !== 'completed').length}</span></div>
-             <div className="flex-1 overflow-y-auto p-1 space-y-1">
-               {lots.filter(l => l.mapZoneId === zone.id && l.location !== 'completed').map(lot => (
-                 <LotCard
-                   key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones}
-                   onOpenExecution={(l) => setExecutionLotId(l.id)}
-                   saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId}
-                   onEdit={onEditLot} onDelete={onDeleteLot}
-                   variant={isDashboard ? 'dashboard-map' : 'full'}
-                 />
-               ))}
-               {lots.filter(l => l.mapZoneId === zone.id && l.location !== 'completed').length === 0 && !isLayoutMode && !isDashboard && (<div className="h-full flex items-center justify-center text-black/10 text-[10px]">Drop Here</div>)}
+             <div className="bg-black/15 px-1.5 py-1 font-bold text-slate-800 select-none flex items-center justify-between shrink-0 gap-1 flex-wrap" style={{ fontSize: `${zoneNameSize}px` }}>
+               <span className="flex items-center gap-1.5 min-w-0 flex-1 flex-wrap">
+                 <span className="truncate">{zone.name}</span>
+                 {/* 作業中の作業者: 青地・白文字・点滅 */}
+                 {activeNames.map(name => (
+                   <span
+                     key={`active-${name}`}
+                     className="inline-flex items-center gap-1 bg-blue-600 text-white rounded-full px-2 py-0.5 shrink-0 font-bold"
+                     style={{
+                       fontSize: `${Math.max(11, zoneNameSize - 1)}px`,
+                       animation: 'lotStripeBlink 0.8s ease-in-out infinite',
+                     }}
+                     title={`作業中: ${name}`}
+                   >
+                     <span className="relative inline-flex items-center justify-center shrink-0">
+                       <span className="absolute inline-flex h-2.5 w-2.5 rounded-full bg-blue-300 opacity-75 animate-ping"/>
+                       <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-white"/>
+                     </span>
+                     <span>👤 {name}</span>
+                   </span>
+                 ))}
+                 {/* 担当中だが今は止まっている: 琥珀色・静的 */}
+                 {assignedOnly.map(name => (
+                   <span
+                     key={`assigned-${name}`}
+                     className="inline-flex items-center gap-1 bg-amber-500 text-white rounded-full px-2 py-0.5 shrink-0 font-bold"
+                     style={{ fontSize: `${Math.max(11, zoneNameSize - 1)}px` }}
+                     title={`担当 (停止中): ${name}`}
+                   >
+                     <span>⏸ {name}</span>
+                   </span>
+                 ))}
+               </span>
+               <span className="bg-white/70 px-1.5 rounded font-mono shrink-0" style={{ fontSize: `${Math.max(10, zoneNameSize - 2)}px` }}>{zoneLotCount}</span>
+             </div>
+             <div className="flex-1 overflow-y-auto p-0.5 space-y-0.5">
+               {(() => {
+                 // 3件以上は自動コンパクト表示で見やすく。ダッシュボード表示でも同じ。
+                 const useCompact = isDashboard || zoneLots.length >= 3;
+                 return (
+                   <>
+                     {zoneLots.map(lot => (
+                       <LotCard
+                         key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones}
+                         onOpenExecution={(l) => setExecutionLotId(l.id)}
+                         saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId}
+                         onEdit={onEditLot} onDelete={onDeleteLot}
+                         variant={useCompact ? 'dashboard-map' : 'full'}
+                       />
+                     ))}
+                     {zoneLots.length === 0 && !isLayoutMode && !isDashboard && (<div className="h-full flex items-center justify-center text-black/10 text-[10px]">Drop Here</div>)}
+                   </>
+                 );
+               })()}
              </div>
              {isLayoutMode && <div className="absolute bottom-0 right-0 w-3 h-3 bg-blue-500 cursor-nwse-resize rounded-tl"/>}
            </div>
-         ))}
+           );
+         })}
        </div>
+       {/* 未該当エリア: マップ底部に細長く固定。タイル詰めの邪魔をしない。 */}
+       {(() => {
+         if (isLayoutMode) return null; // レイアウト編集中は通常ゾーンと同じ扱い
+         const unassignedZone = visibleZones.find(z => z.id === 'zone_unassigned');
+         if (!unassignedZone) return null;
+         const zoneLots = lotsByZoneId.get('zone_unassigned') || [];
+         return (
+           <div
+             data-drop-zone="zone_unassigned"
+             onDragOver={(e) => e.preventDefault()}
+             onDrop={(e) => { e.preventDefault(); e.stopPropagation(); const lotId = e.dataTransfer.getData('lotId'); if (lotId) handleMoveLot(lotId, 'zone_unassigned'); }}
+             className="shrink-0 border-t-2 border-slate-400 bg-slate-100/80 flex flex-row"
+             style={{ minHeight: '64px', maxHeight: '120px' }}
+           >
+             <div className="shrink-0 w-32 bg-slate-200 px-2 py-1 flex flex-col items-start justify-center border-r border-slate-400">
+               <div className="text-xs font-black text-slate-700">未該当エリア</div>
+               <div className="text-[10px] text-slate-500">不良 / 残ロット等</div>
+               <div className="text-[10px] text-slate-600 mt-0.5"><span className="font-mono font-bold">{zoneLots.length}</span> 件</div>
+             </div>
+             <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-1 p-1">
+               {zoneLots.length === 0 && (
+                 <div className="flex items-center justify-center w-full text-[10px] text-slate-400 italic">ここに不良・残ロット等をドラッグ&ドロップ</div>
+               )}
+               {zoneLots.map(lot => (
+                 <div key={lot.id} className="shrink-0 w-48">
+                   <LotCard
+                     lot={lot} workers={workers} templates={templates} mapZones={mapZones}
+                     onOpenExecution={(l) => setExecutionLotId(l.id)}
+                     saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId}
+                     onEdit={onEditLot} onDelete={onDeleteLot}
+                     variant="dashboard-map"
+                   />
+                 </div>
+               ))}
+             </div>
+           </div>
+         );
+       })()}
+       </div>{/* close mapRef container */}
     </div>
   );
 };
@@ -1438,6 +2523,7 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
   const [addCategory, setAddCategory] = useState('');
   const [addDuration, setAddDuration] = useState('');
   const [addNote, setAddNote] = useState('');
+  const [expandedLots, setExpandedLots] = useState({}); // { lotKey: true } で詳細展開
   const categories = settings?.indirectCategories || DEFAULT_INDIRECT_CATEGORIES;
   const allWorkerNames = [...new Set([...workers.map(w => w.name), ...indirectWork.map(w => w.workerName).filter(Boolean)])];
 
@@ -1449,21 +2535,73 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
   const toTs = new Date(dateTo); toTs.setHours(23,59,59,999);
   const isSingleDay = dateFrom === dateTo;
 
+  // task.workerName が無いタスクは lot.workerId から作業者名を逆引きする (フォールバック)
+  // これにより、過去のロットで workerName を保存していなかった場合でも「型式とロットの担当者」として集計に乗る。
+  const resolveTaskWorker = (task, lot) => {
+    if (task.workerName) return task.workerName;
+    if (lot.workerId) {
+      const w = workers.find(w => w.id === lot.workerId);
+      if (w?.name) return w.name;
+    }
+    return '';
+  };
+
   // 直工集計
   const directDetails = [];
   lots.forEach(lot => {
     if (!lot.tasks) return;
     Object.entries(lot.tasks).forEach(([key, task]) => {
-      if (selectedWorkers.length > 0 && !selectedWorkers.includes(task.workerName)) return;
+      const taskWorker = resolveTaskWorker(task, lot);
+      if (selectedWorkers.length > 0 && !selectedWorkers.includes(taskWorker)) return;
       if (!task.duration || task.duration <= 0) return;
       const taskEnd = (task.startTime || lot.workStartTime || lot.createdAt || 0) + (task.duration * 1000);
       if (taskEnd < fromTs.getTime() || taskEnd > toTs.getTime() + 86400000) return;
       const step = lot.steps?.find(s => key.startsWith(s.id + '-')) || lot.steps?.[parseInt(key.split('-')[0])];
-      const detail = { lot: lot.orderNo, model: lot.model, step: step?.title || key, duration: task.duration, worker: task.workerName, date: new Date(taskEnd).toISOString().split('T')[0] };
+      // key 形式: "stepId-unitIdx" → unitIdx を抽出して機番情報を取得
+      const parts = key.split('-');
+      const unitIdx = parseInt(parts[parts.length - 1]);
+      const unitSn = !isNaN(unitIdx) ? (lot.unitSerialNumbers?.[unitIdx] || `#${unitIdx + 1}`) : '';
+      const detail = {
+        lotId: lot.id, lot: lot.orderNo, model: lot.model,
+        stepId: step?.id || key, step: step?.title || key,
+        unitIdx: isNaN(unitIdx) ? null : unitIdx, unitSn,
+        duration: task.duration, worker: taskWorker, date: new Date(taskEnd).toISOString().split('T')[0],
+      };
       if (searchText && !`${detail.model} ${detail.lot} ${detail.step}`.includes(searchText)) return;
       directDetails.push(detail);
     });
   });
+
+  // 指図ごとの集計 → 工程ごとにグループ化 (同じ工程が機番分繰り返される問題を解消)
+  const lotSummary = useMemo(() => {
+    const map = {};
+    directDetails.forEach(d => {
+      const key = d.lotId || d.lot;
+      if (!map[key]) {
+        map[key] = {
+          lotId: d.lotId, orderNo: d.lot, model: d.model,
+          totalSec: 0, totalCount: 0, stepMap: {}, workers: new Set(),
+        };
+      }
+      map[key].totalSec += d.duration;
+      map[key].totalCount += 1;
+      if (d.worker) map[key].workers.add(d.worker);
+      if (!map[key].stepMap[d.stepId]) {
+        map[key].stepMap[d.stepId] = { stepId: d.stepId, stepName: d.step, totalSec: 0, units: [], workers: new Set() };
+      }
+      const sg = map[key].stepMap[d.stepId];
+      sg.totalSec += d.duration;
+      sg.units.push({ unitIdx: d.unitIdx, unitSn: d.unitSn, duration: d.duration, worker: d.worker, date: d.date });
+      if (d.worker) sg.workers.add(d.worker);
+    });
+    return Object.values(map).map(v => ({
+      ...v,
+      workers: Array.from(v.workers),
+      steps: Object.values(v.stepMap)
+        .map(s => ({ ...s, workers: Array.from(s.workers), units: s.units.sort((a, b) => (a.unitIdx ?? 0) - (b.unitIdx ?? 0)) }))
+        .sort((a, b) => b.totalSec - a.totalSec),
+    })).sort((a, b) => b.totalSec - a.totalSec);
+  }, [directDetails]);
   const directSeconds = directDetails.reduce((a, d) => a + d.duration, 0);
 
   // 間接集計
@@ -1482,7 +2620,8 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
   const catBreakdown = {};
   filteredIndirect.forEach(w => { catBreakdown[w.category] = (catBreakdown[w.category] || 0) + (w.duration || 0); });
   const catEntries = Object.entries(catBreakdown).sort((a, b) => b[1] - a[1]);
-  const maxCatSec = catEntries.length > 0 ? catEntries[0][1] : 1;
+  // 0除算回避: 全カテゴリ duration が 0 のとき maxCatSec=0 で進捗バー幅が NaN になるのを防ぐ
+  const maxCatSec = catEntries.length > 0 ? Math.max(catEntries[0][1], 1) : 1;
 
   // 作業者別集計（分析用）
   const workerBreakdown = {};
@@ -1537,17 +2676,60 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
           </div>
 
           {tab === 'daily' && (<>
-            {/* 直工明細 */}
+            {/* 直工: 指図ごとサマリー → 展開で工程ごと + 機番別時間 */}
             <div className="border rounded-xl overflow-hidden">
-              <div className="bg-blue-600 text-white px-3 py-1.5 text-sm font-bold flex justify-between"><span>直工作業 ({directDetails.length}件)</span><span className="font-mono">{formatTime(directSeconds)}</span></div>
-              {directDetails.length > 0 ? (
-                <div className="divide-y max-h-48 overflow-y-auto">
-                  {directDetails.map((d, i) => (
-                    <div key={i} className="px-3 py-1 text-xs flex justify-between items-center">
-                      <span className="text-slate-600"><span className="font-bold text-blue-700">{d.worker}</span> <span className="font-bold">{d.model}</span> {d.lot} — {d.step} {!isSingleDay && <span className="text-slate-400 ml-1">{d.date}</span>}</span>
-                      <span className="font-mono font-bold text-blue-600">{formatTime(d.duration)}</span>
-                    </div>
-                  ))}
+              <div className="bg-blue-600 text-white px-3 py-1.5 text-sm font-bold flex justify-between"><span>直工作業 (指図 {lotSummary.length} 件)</span><span className="font-mono">{formatTime(directSeconds)}</span></div>
+              {lotSummary.length > 0 ? (
+                <div className="divide-y max-h-[60vh] overflow-y-auto">
+                  {lotSummary.map((g) => {
+                    const groupKey = g.lotId || g.orderNo;
+                    const isExpanded = !!expandedLots[groupKey];
+                    return (
+                      <div key={groupKey} className="text-xs">
+                        <div className="px-3 py-1.5 flex justify-between items-center hover:bg-blue-50">
+                          <button type="button" onClick={() => setExpandedLots(prev => ({ ...prev, [groupKey]: !prev[groupKey] }))} className="flex items-center gap-2 flex-1 text-left min-w-0">
+                            {isExpanded ? <ChevronDown className="w-3.5 h-3.5 text-blue-600 shrink-0"/> : <ChevronRight className="w-3.5 h-3.5 text-blue-600 shrink-0"/>}
+                            <span className="font-bold text-blue-700 truncate">{g.model}</span>
+                            <span className="text-slate-500 shrink-0">{g.orderNo}</span>
+                            <span className="text-[10px] text-slate-400 shrink-0">({g.steps.length}工程 / {g.totalCount}件)</span>
+                            {g.workers.length > 0 && <span className="text-[10px] text-slate-500 shrink-0">担当: {g.workers.join(', ')}</span>}
+                          </button>
+                          <span className="font-mono font-bold text-blue-600 shrink-0 ml-2">{formatTime(g.totalSec)}</span>
+                        </div>
+                        {isExpanded && (
+                          <div className="bg-slate-50 border-t border-blue-100">
+                            <table className="w-full text-[11px]">
+                              <tbody>
+                                {g.steps.map((s) => (
+                                  <tr key={s.stepId} className="border-b border-slate-200 last:border-b-0 hover:bg-blue-50/40">
+                                    <td className="px-4 py-1.5 align-top w-1/2">
+                                      <div className="font-bold text-slate-700 truncate" title={s.stepName}>{s.stepName}</div>
+                                      <div className="text-[10px] text-slate-400 mt-0.5">
+                                        {s.units.length}件 ・{s.workers.join(', ')}
+                                      </div>
+                                    </td>
+                                    <td className="px-2 py-1.5 align-top">
+                                      <div className="flex flex-wrap gap-1">
+                                        {s.units.map((u, i) => (
+                                          <span key={i} className="inline-flex items-center gap-1 bg-white border border-blue-200 rounded px-1.5 py-0.5">
+                                            <span className="text-[9px] text-slate-500">{u.unitSn}</span>
+                                            <span className="font-mono font-bold text-blue-700">{formatTime(u.duration)}</span>
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </td>
+                                    <td className="px-3 py-1.5 align-top text-right whitespace-nowrap">
+                                      <span className="font-mono font-bold text-blue-600">{formatTime(s.totalSec)}</span>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               ) : <div className="p-3 text-center text-slate-400 text-xs">データなし</div>}
             </div>
@@ -1625,6 +2807,244 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
   );
 };
 
+// ===========================
+// 作業標準ライブラリ
+// ===========================
+// PDF 形式の作業標準書を登録・閲覧する。
+// データ構造: settings.workStandards = [{ id, name, category, pdfData, description, createdAt, updatedAt, uploadedBy }]
+// ヘッダーボタン (常時) + WorkExecutionModal (作業中) からアクセス可能。
+const WorkStandardsLibraryModal = ({ standards, onClose, onEdit, allowManage = false, currentUserName = '' }) => {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('all');
+  const [selectedId, setSelectedId] = useState(null);
+
+  const categories = useMemo(() => {
+    const set = new Set(['all']);
+    (standards || []).forEach(s => { if (s.category) set.add(s.category); });
+    return Array.from(set);
+  }, [standards]);
+
+  const filtered = useMemo(() => {
+    return (standards || []).filter(s => {
+      if (selectedCategory !== 'all' && s.category !== selectedCategory) return false;
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        const hay = `${s.name || ''} ${s.description || ''} ${s.category || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    }).sort((a, b) => (a.category || '').localeCompare(b.category || '') || (a.name || '').localeCompare(b.name || ''));
+  }, [standards, selectedCategory, searchQuery]);
+
+  const selected = selectedId ? (standards || []).find(s => s.id === selectedId) : null;
+
+  return (
+    <div className="fixed inset-0 z-[150] bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-7xl h-[92vh] flex flex-col overflow-hidden">
+        {/* ヘッダー */}
+        <div className="bg-orange-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <h2 className="text-lg font-bold flex items-center gap-2"><BookOpen className="w-5 h-5"/> 作業標準ライブラリ</h2>
+          <div className="flex items-center gap-2">
+            {allowManage && (
+              <button onClick={() => onEdit && onEdit(null)} className="bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded text-sm font-bold flex items-center gap-1"><Plus className="w-4 h-4"/> 新規登録</button>
+            )}
+            <button onClick={onClose} className="hover:bg-white/20 rounded p-1"><X className="w-6 h-6"/></button>
+          </div>
+        </div>
+        {/* ボディ: 左 一覧 / 右 PDF プレビュー */}
+        <div className="flex-1 flex overflow-hidden">
+          {/* 左カラム: リスト */}
+          <div className="w-80 border-r border-slate-200 bg-slate-50 flex flex-col shrink-0">
+            <div className="p-3 border-b space-y-2">
+              <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border">
+                <Search className="w-4 h-4 text-slate-400"/>
+                <input type="text" placeholder="検索 (名前/カテゴリ/説明)" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="flex-1 text-sm outline-none"/>
+              </div>
+              <select value={selectedCategory} onChange={e => setSelectedCategory(e.target.value)} className="w-full border rounded p-1.5 text-sm bg-white">
+                {categories.map(c => <option key={c} value={c}>{c === 'all' ? '-- 全カテゴリ --' : c}</option>)}
+              </select>
+            </div>
+            <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+              {filtered.length === 0 && (
+                <div className="text-center text-slate-400 py-8 text-sm">
+                  {(standards || []).length === 0 ? '作業標準が登録されていません' : '該当する作業標準がありません'}
+                </div>
+              )}
+              {filtered.map(s => (
+                <div
+                  key={s.id}
+                  onClick={() => setSelectedId(s.id)}
+                  className={`p-2 rounded border-2 cursor-pointer transition-all ${selectedId === s.id ? 'border-orange-500 bg-orange-50' : 'border-slate-200 bg-white hover:border-orange-300'}`}
+                >
+                  <div className="flex items-start gap-2">
+                    <FileText className="w-4 h-4 text-orange-600 shrink-0 mt-0.5"/>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-sm text-slate-800 truncate" title={s.name}>{s.name}</div>
+                      {s.category && <div className="text-[10px] text-orange-700 bg-orange-100 inline-block px-1.5 py-0.5 rounded mt-0.5">{s.category}</div>}
+                      {s.description && <div className="text-[10px] text-slate-500 mt-1 line-clamp-2">{s.description}</div>}
+                    </div>
+                  </div>
+                  {allowManage && selectedId === s.id && (
+                    <div className="flex gap-1 mt-2 pt-2 border-t border-orange-200">
+                      <button onClick={(e) => { e.stopPropagation(); onEdit && onEdit(s); }} className="flex-1 text-[10px] bg-blue-100 hover:bg-blue-200 text-blue-700 px-2 py-1 rounded font-bold flex items-center justify-center gap-1"><Pencil className="w-3 h-3"/> 編集</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+          {/* 右カラム: PDF プレビュー */}
+          <div className="flex-1 bg-slate-100 flex flex-col overflow-hidden">
+            {!selected ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-slate-400 p-8">
+                <BookOpen className="w-16 h-16 mb-3 opacity-30"/>
+                <div className="font-bold text-lg">作業標準を選択してください</div>
+                <div className="text-sm mt-1">左の一覧から PDF を選ぶと、ここに表示されます</div>
+              </div>
+            ) : (
+              <>
+                <div className="bg-white border-b border-slate-200 px-4 py-2 flex items-center justify-between shrink-0">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-bold text-slate-800 truncate">{selected.name}</div>
+                    <div className="text-[10px] text-slate-500 flex items-center gap-2">
+                      {selected.category && <span className="bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-bold">{selected.category}</span>}
+                      {selected.uploadedBy && <span>登録: {selected.uploadedBy}</span>}
+                      {selected.updatedAt && <span>更新: {toDateShort(selected.updatedAt)}</span>}
+                    </div>
+                    {selected.description && <div className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">{selected.description}</div>}
+                  </div>
+                  <a href={selected.pdfData} download={`${selected.name || 'work-standard'}.pdf`} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm font-bold flex items-center gap-1 shrink-0 ml-3">
+                    <Download className="w-4 h-4"/> ダウンロード
+                  </a>
+                </div>
+                <div className="flex-1 bg-slate-700 p-2 overflow-hidden">
+                  {selected.pdfData ? (
+                    <embed src={selected.pdfData} type="application/pdf" className="w-full h-full bg-white rounded"/>
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-slate-300">PDF データがありません</div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 作業標準の編集・登録モーダル (PDF アップロード + メタデータ)
+const WorkStandardEditModal = ({ editingItem, onClose, onSave, onDelete, currentUserName = '' }) => {
+  const [name, setName] = useState(editingItem?.name || '');
+  const [category, setCategory] = useState(editingItem?.category || '');
+  const [description, setDescription] = useState(editingItem?.description || '');
+  const [pdfData, setPdfData] = useState(editingItem?.pdfData || null);
+  const [pdfFileName, setPdfFileName] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const handlePdfUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) { e.target.value = ''; return; }
+    if (file.type !== 'application/pdf') {
+      alert('PDF ファイルを選択してください');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      if (!confirm(`ファイルサイズが ${(file.size / 1024 / 1024).toFixed(1)}MB と大きめです。Firestore に保存できますが、5MB を超えると失敗する可能性があります。続行しますか？`)) {
+        e.target.value = '';
+        return;
+      }
+    }
+    setPdfFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (ev) => setPdfData(ev.target.result);
+    reader.onerror = () => {
+      alert(`PDF の読込みに失敗しました: ${reader.error?.message || 'Unknown'}`);
+      setPdfFileName(''); setPdfData(null);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = ''; // 同じファイル再選択可
+  };
+
+  const handleSave = async () => {
+    if (!name.trim()) { alert('名称を入力してください'); return; }
+    if (!pdfData) { alert('PDF ファイルを選択してください'); return; }
+    setBusy(true);
+    try {
+      await onSave({
+        ...(editingItem || {}),
+        name: name.trim(),
+        category: category.trim(),
+        description: description.trim(),
+        pdfData,
+        uploadedBy: editingItem?.uploadedBy || currentUserName || '',
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[160] bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden">
+        <div className="bg-orange-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <h2 className="text-lg font-bold flex items-center gap-2"><BookOpen className="w-5 h-5"/> {editingItem ? '作業標準 編集' : '作業標準 新規登録'}</h2>
+          <button onClick={onClose} className="hover:bg-white/20 rounded p-1"><X className="w-5 h-5"/></button>
+        </div>
+        <div className="p-4 space-y-3 overflow-y-auto">
+          <div>
+            <label className="block text-xs font-bold text-slate-600 mb-1">名称 *</label>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="例: 円テーブル組立作業標準書" className="w-full border rounded p-2 text-sm"/>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-600 mb-1">カテゴリ</label>
+            <input value={category} onChange={e => setCategory(e.target.value)} placeholder="例: 組立 / 検査 / 包装" className="w-full border rounded p-2 text-sm"/>
+            <p className="text-[10px] text-slate-400 mt-0.5">同じカテゴリ名でグループ化されます</p>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-600 mb-1">説明</label>
+            <textarea value={description} onChange={e => setDescription(e.target.value)} rows={3} placeholder="作業標準の概要・適用範囲・改訂内容など" className="w-full border rounded p-2 text-sm"/>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-600 mb-1">PDF ファイル *</label>
+            <label className="block w-full p-4 border-2 border-dashed border-orange-300 bg-orange-50 hover:bg-orange-100 rounded cursor-pointer text-center text-sm">
+              <FileText className="w-8 h-8 mx-auto mb-1 text-orange-600"/>
+              <div className="font-bold text-orange-800">{pdfData ? (pdfFileName || (editingItem ? '既存 PDF (差し替えるならクリック)' : '選択済み')) : 'クリックして PDF を選択'}</div>
+              <div className="text-[10px] text-slate-500 mt-1">推奨 5MB 以下</div>
+              <input type="file" accept="application/pdf" onChange={handlePdfUpload} className="hidden"/>
+            </label>
+            {pdfData && (
+              <div className="mt-2 h-48 bg-slate-700 rounded overflow-hidden">
+                <embed src={pdfData} type="application/pdf" className="w-full h-full bg-white"/>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="border-t bg-slate-50 px-4 py-3 flex justify-between gap-2 shrink-0">
+          {editingItem && typeof onDelete === 'function' ? (
+            <button
+              onClick={async () => {
+                if (!confirm(`作業標準「${editingItem.name}」を削除しますか？\nこの操作は元に戻せません。`)) return;
+                setBusy(true);
+                try { await onDelete(editingItem.id); onClose(); } finally { setBusy(false); }
+              }}
+              disabled={busy}
+              className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 rounded font-bold disabled:opacity-50 flex items-center gap-1"
+            ><Trash2 className="w-4 h-4"/> 削除</button>
+          ) : <div/>}
+          <div className="flex gap-2">
+            <button onClick={onClose} disabled={busy} className="px-4 py-2 text-slate-600 hover:bg-slate-200 rounded font-bold disabled:opacity-50">キャンセル</button>
+            <button onClick={handleSave} disabled={busy} className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded font-bold disabled:opacity-50">
+              {busy ? '保存中…' : (editingItem ? '更新' : '登録')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const NoteModal = ({ notes, templates, workers, selectedWorker, saveData, deleteData, onClose, currentUserName = '' }) => {
   const [tab, setTab] = useState('my'); // 'my' | 'shared' | 'create'
   const [model, setModel] = useState('');
@@ -1639,10 +3059,19 @@ const NoteModal = ({ notes, templates, workers, selectedWorker, saveData, delete
 
   const handleImageChange = (e) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file) { e.target.value = ''; return; }
+    // 画像ファイル以外を弾く (Android で accept="image/*" が無視されることがある)
+    if (!file.type.startsWith('image/')) {
+      alert('画像ファイルを選択してください');
+      e.target.value = '';
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (ev) => setNoteImage(ev.target.result);
+    reader.onerror = () => alert(`画像の読込みに失敗しました: ${reader.error?.message || 'Unknown'}`);
     reader.readAsDataURL(file);
+    // 同じファイルの再選択を可能にする (iPad/iPhone で頻発)
+    e.target.value = '';
   };
 
   const handleSave = () => {
@@ -1747,10 +3176,17 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
 
   const handleImageChange = (e) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file) { e.target.value = ''; return; }
+    if (!file.type.startsWith('image/')) {
+      alert('画像ファイルを選択してください');
+      e.target.value = '';
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (ev) => setAnnImage(ev.target.result);
+    reader.onerror = () => alert(`画像の読込みに失敗しました: ${reader.error?.message || 'Unknown'}`);
     reader.readAsDataURL(file);
+    e.target.value = ''; // 同じファイル再選択を可能に
   };
 
   const handlePost = () => {
@@ -1764,7 +3200,7 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
       notifyTimes: notifyTimes.length > 0 ? notifyTimes : null,
       mode: annMode // 'confirm' or 'alarm'
     });
-    setTitle(''); setContent(''); setAnnImage(null); setNotifyTime1(''); setNotifyTime2('');
+    setTitle(''); setContent(''); setAnnImage(null); setNotifyTime1(''); setNotifyTime2(''); setAnnMode('confirm');
     setView('list');
   };
 
@@ -1774,7 +3210,8 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
     saveData('announcements', selectedAnn.id, {
       title: title.trim(), content: content.trim(),
       image: annImage ?? selectedAnn.image ?? null,
-      notifyTimes: notifyTimes.length > 0 ? notifyTimes : null
+      notifyTimes: notifyTimes.length > 0 ? notifyTimes : null,
+      mode: annMode // 編集時に mode も保存 (旧コードは反映されなかった)
     });
     setView('detail');
   };
@@ -1799,6 +3236,7 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
     setSelectedAnn(ann); setTitle(ann.title); setContent(ann.content || '');
     setAnnImage(ann.image || null);
     setNotifyTime1(ann.notifyTimes?.[0] || ''); setNotifyTime2(ann.notifyTimes?.[1] || '');
+    setAnnMode(ann.mode || 'confirm'); // 編集時に現在のモードを復元
     setView('edit');
   };
 
@@ -1923,7 +3361,7 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
                   ))}
                 </div>
                 {workerName && <div className="flex gap-2">
-                  <input value={newComment} onChange={e => setNewComment(e.target.value)} className="flex-1 border rounded px-3 py-2 text-sm" placeholder="コメントを書く..." onKeyDown={e => { if (e.key === 'Enter') addComment(currentAnn); }}/>
+                  <input value={newComment} onChange={e => setNewComment(e.target.value)} className="flex-1 border rounded px-3 py-2 text-sm" placeholder="コメントを書く..." onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) addComment(currentAnn); }}/>
                   <button onClick={() => addComment(currentAnn)} className="bg-purple-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-purple-700">送信</button>
                 </div>}
               </div>
@@ -1965,13 +3403,81 @@ const AnnouncementModal = ({ announcements, workers, selectedWorker, saveData, d
   );
 };
 
+// 測定設定 / 工程テンプレ編集 のプレビュー用ボックス。
+// 図面画像の実アスペクト比を検出してコンテナに適用し、入力ポイントの % 座標と
+// 画像の特徴位置を完全に揃える。
+// (以前は固定高さの矩形にしていたため、3:1 のような横長画像だと余白部分に
+//  入力ポイントが落ちて「設定では揃って見えるのにテンプレ編集では大きくずれる」
+//  というバグが発生していた。)
+const MeasurementPreviewBox = ({ config, variant = 'tiny', maxHeight = 200 }) => {
+  const [imageAspect, setImageAspect] = useState(null);
+  useEffect(() => {
+    if (!config?.diagramImage) { setImageAspect(null); return; }
+    const img = new Image();
+    img.onload = () => { if (img.naturalWidth > 0 && img.naturalHeight > 0) setImageAspect(img.naturalWidth / img.naturalHeight); };
+    img.onerror = () => setImageAspect(null);
+    img.src = config.diagramImage;
+  }, [config?.diagramImage]);
+
+  const inputs = config?.inputs || [];
+  const dotCls = variant === 'large'
+    ? 'bg-teal-500 text-white text-[10px] font-bold rounded-full w-7 h-7 flex items-center justify-center shadow-md'
+    : 'w-3 h-3 rounded-full border-2 border-white shadow';
+  const labelCls = variant === 'large'
+    ? '' // ドット内にラベルを入れる
+    : 'text-[8px] font-bold text-slate-600 mt-0.5 bg-white/80 px-0.5 rounded';
+
+  return (
+    <div
+      className="relative bg-white border rounded overflow-hidden mx-auto"
+      style={{
+        ...(config?.diagramImage ? { backgroundImage: `url(${config.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}),
+        ...(imageAspect ? { aspectRatio: String(imageAspect) } : { aspectRatio: '1 / 1' }),
+        width: '100%',
+        maxHeight: `${maxHeight}px`,
+      }}
+    >
+      {!config?.diagramImage && config?.layout === 'circle-4point' && (
+        <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+          <circle cx="50" cy="50" r="35" fill="none" stroke="#94a3b8" strokeWidth="0.5" strokeDasharray="2,2"/>
+        </svg>
+      )}
+      {inputs.map((inp, idx) => (
+        <div
+          key={idx}
+          className="absolute flex flex-col items-center"
+          style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}
+          title={inp.label}
+        >
+          {variant === 'large' ? (
+            <div className={dotCls}>{inp.label?.slice(0, 3) || (idx + 1)}</div>
+          ) : (
+            <>
+              <div className={`${dotCls} ${inp.inputType === 'combobox' ? 'bg-amber-500' : 'bg-teal-500'}`}/>
+              <span className={labelCls}>{inp.label}</span>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSaveLayouts, comboPresets = [], builtInOverrides = {}, hiddenBuiltIns = [] }) => {
   const [name, setName] = useState(template?.name || '');
   const [steps, setSteps] = useState(template?.steps || []);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [type, setType] = useState('normal');
+  // 確認チェック項目 (type 不問で工程に添付できる)
+  const [checklistItems, setChecklistItems] = useState([]);
   const [targetTime, setTargetTime] = useState(0);
+  // 自動測定 (機械占有) 工程か / この工程は他の台の自動測定中に並行できるか
+  const [executionMode, setExecutionMode] = useState('manual'); // 'manual' | 'batch' (= 自動)
+  // workResource: この工程が占有するリソース。デフォルト null = 機械独立 (= 並行可)
+  // 'measurement-machine' = 測定機を占有 (= 他の台の自動測定中は不可)
+  // 'workbench' / その他カスタム
+  const [workResource, setWorkResource] = useState('');
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
   const [pdfData, setPdfData] = useState(null);
@@ -2049,9 +3555,36 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   };
   const handlePdfUpload = async (e) => { const file = e.target.files?.[0]; if (file) { try { const base64 = await getBase64(file); setPdfData(base64); alert('PDF添付'); } catch { alert('PDFエラー'); } } };
   const toggleListening = () => { const SR = (window).SpeechRecognition || (window).webkitSpeechRecognition; if (!SR) return alert('非対応'); const r = new SR(); r.lang = 'ja-JP'; r.onresult = (e) => setDescription(p => p + e.results[0][0].transcript); r.start(); };
-  const addStep = () => { if (!title) return alert('工程名入力'); const newStep = { id: editingStepId || generateId(), title, description, type, targetTime, images, pdfData, ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}) }; if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); } resetInput(); };
-  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); };
-  const editStep = (s) => { setEditingStepId(s.id); setTitle(s.title); setDescription(s.description); setType(s.type); setTargetTime(s.targetTime); setImages(s.images || []); setPdfData(s.pdfData || null); setMeasurementConfig(s.measurementConfig || null); };
+  const addStep = () => {
+    if (!title) return alert('工程名入力');
+    const validChecklistItems = (checklistItems || []).filter(i => i.label?.trim());
+    const newStep = {
+      id: editingStepId || generateId(),
+      title, description, type, targetTime, images, pdfData,
+      executionMode,           // 'manual' | 'batch' (自動測定)
+      workResource: workResource || null,  // null = 機械独立 (並行可)
+      ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
+      // checklistItems は type 問わず保存可能 (測定 + チェックの併用OK)
+      ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {})
+    };
+    if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); }
+    resetInput();
+  };
+  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); };
+  const editStep = (s) => {
+    setEditingStepId(s.id);
+    setTitle(s.title);
+    setDescription(s.description);
+    // 旧 'checklist' タイプは normal に正規化 (checklistItems は別フィールドで保持)
+    setType(s.type === 'checklist' ? 'normal' : s.type);
+    setTargetTime(s.targetTime);
+    setImages(s.images || []);
+    setPdfData(s.pdfData || null);
+    setMeasurementConfig(s.measurementConfig || null);
+    setExecutionMode(s.executionMode || (s.title?.includes('自動') ? 'batch' : 'manual'));
+    setWorkResource(s.workResource || '');
+    setChecklistItems(Array.isArray(s.checklistItems) ? s.checklistItems : []);
+  };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
   const moveStep = (index, direction) => { const newSteps = [...steps]; if (direction === 'up' && index > 0) { [newSteps[index-1], newSteps[index]] = [newSteps[index], newSteps[index-1]]; } else if (direction === 'down' && index < steps.length-1) { [newSteps[index+1], newSteps[index]] = [newSteps[index], newSteps[index+1]]; } setSteps(newSteps); };
   const handleSave = () => {
@@ -2104,13 +3637,137 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       </div>
       <div className="flex-1 flex overflow-hidden">
         <div className="w-1/3 p-4 overflow-y-auto border-r bg-white">
-          <div className="space-y-2">{steps.map((s, i) => (<div key={s.id} className={`p-3 border rounded-lg flex gap-3 cursor-pointer ${editingStepId===s.id ? 'border-blue-500 bg-blue-50' : 'hover:border-slate-300'}`} onClick={() => editStep(s)}><div className="flex flex-col gap-1 justify-center"><button onClick={(e)=>{e.stopPropagation();moveStep(i,'up')}} disabled={i===0} className="text-slate-300 hover:text-slate-600"><ArrowUp className="w-4 h-4"/></button><span className="text-xs font-bold text-slate-400 text-center">{i+1}</span><button onClick={(e)=>{e.stopPropagation();moveStep(i,'down')}} disabled={i===steps.length-1} className="text-slate-300 hover:text-slate-600"><ArrowDown className="w-4 h-4"/></button></div><div className="flex-1 min-w-0"><div className="font-bold text-sm truncate">{s.title}</div><p className="text-xs text-slate-500 truncate">{s.description}</p></div><div className="flex flex-col gap-1"><button onClick={(e)=>{e.stopPropagation();const dup={...s,id:generateId(),title:s.title+' (コピー)'};setSteps(prev=>[...prev.slice(0,i+1),dup,...prev.slice(i+1)]);}} className="text-slate-300 hover:text-blue-500" title="複製"><Copy className="w-4 h-4"/></button><button onClick={(e)=>{e.stopPropagation();deleteStep(s.id)}} className="text-slate-300 hover:text-red-500" title="削除"><Trash2 className="w-4 h-4"/></button></div></div>))}</div>
+          <div className="space-y-2">{steps.map((s, i) => {
+            const isAuto = s.executionMode === 'batch' || (s.title || '').includes('自動');
+            const resTag = s.workResource;
+            const resLabel = resTag === 'measurement-machine' ? '🔒 測定機占有' :
+                             resTag === 'jig-shared' ? '🔧 治具占有' :
+                             resTag ? `🔒 ${resTag}` :
+                             (resTag === null || resTag === '') ? '✓ 並行可 (機械独立)' : '⚠ タグ未設定';
+            const resColor = isAuto ? 'bg-purple-100 text-purple-700' :
+                             resTag === 'measurement-machine' || resTag === 'jig-shared' || (resTag && resTag !== '') ? 'bg-rose-100 text-rose-700' :
+                             (resTag === null || resTag === '') ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700';
+            return (<div key={s.id} className={`p-3 border rounded-lg flex gap-3 cursor-pointer ${editingStepId===s.id ? 'border-blue-500 bg-blue-50' : 'hover:border-slate-300'}`} onClick={() => editStep(s)}><div className="flex flex-col gap-1 justify-center"><button onClick={(e)=>{e.stopPropagation();moveStep(i,'up')}} disabled={i===0} className="text-slate-300 hover:text-slate-600"><ArrowUp className="w-4 h-4"/></button><span className="text-xs font-bold text-slate-400 text-center">{i+1}</span><button onClick={(e)=>{e.stopPropagation();moveStep(i,'down')}} disabled={i===steps.length-1} className="text-slate-300 hover:text-slate-600"><ArrowDown className="w-4 h-4"/></button></div><div className="flex-1 min-w-0"><div className="font-bold text-sm truncate flex items-center gap-1.5">{isAuto && <span className="bg-purple-500 text-white text-[9px] font-bold px-1 rounded shrink-0">自動</span>}{s.title}</div><p className="text-xs text-slate-500 truncate">{s.description}</p><div className="flex items-center gap-1 mt-1"><span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${resColor}`}>{isAuto ? '🤖 自動測定' : resLabel}</span></div></div><div className="flex flex-col gap-1"><button onClick={(e)=>{e.stopPropagation();const dup={...s,id:generateId(),title:s.title+' (コピー)'};setSteps(prev=>[...prev.slice(0,i+1),dup,...prev.slice(i+1)]);}} className="text-slate-300 hover:text-blue-500" title="複製"><Copy className="w-4 h-4"/></button><button onClick={(e)=>{e.stopPropagation();deleteStep(s.id)}} className="text-slate-300 hover:text-red-500" title="削除"><Trash2 className="w-4 h-4"/></button></div></div>);
+          })}</div>
         </div>
         <div className="w-2/3 p-6 bg-slate-50 overflow-y-auto flex gap-6">
           <div className="flex-1 space-y-4">
             <div><label className="block text-xs font-bold text-slate-500 mb-1">工程タイトル</label><input value={title} onChange={e => setTitle(e.target.value)} className="w-full p-2 border rounded"/></div>
-            <div className="flex gap-4"><div className="flex-1"><label className="block text-xs font-bold text-slate-500 mb-1">タイプ</label><div className="flex gap-1">{['normal', 'important', 'danger'].map(t => (<button key={t} onClick={() => { setType(t); if (t !== 'measurement') setMeasurementConfig(null); }} className={`flex-1 py-1.5 text-xs rounded border ${type===t ? 'bg-slate-800 text-white' : 'bg-white text-slate-500'}`}>{t}</button>))}<button onClick={() => { setType('measurement'); if (!measurementConfig) setMeasurementConfig({ layout: 'circle-4point', inputs: [...MEASUREMENT_LAYOUTS['circle-4point'].inputs.map(inp => ({ ...inp, inputType: 'number', presetValues: [], group: '' }))], calculations: [{ id: 'calc1', label: '計算結果', method: 'max-min', formula: '', inputIds: [], toleranceUpper: 0.05, toleranceLower: -0.05, unit: 'mm' }] }); }} className={`flex-1 py-1.5 text-xs rounded border ${type==='measurement' ? 'bg-teal-600 text-white' : 'bg-white text-teal-600 border-teal-300'}`}><Calculator className="w-3 h-3 inline mr-0.5"/>測定</button></div></div><div className="w-24"><label className="block text-xs font-bold text-slate-500 mb-1">目標(秒)</label><input type="number" value={targetTime} onChange={e => setTargetTime(Number(e.target.value))} className="w-full p-2 border rounded text-right"/></div></div>
+            <div className="flex gap-4"><div className="flex-1"><label className="block text-xs font-bold text-slate-500 mb-1">タイプ</label><div className="flex gap-1 flex-wrap">{['normal', 'important', 'danger'].map(t => (<button key={t} onClick={() => { setType(t); if (t !== 'measurement') setMeasurementConfig(null); }} className={`flex-1 py-1.5 text-xs rounded border ${type===t ? 'bg-slate-800 text-white' : 'bg-white text-slate-500'}`}>{t}</button>))}<button onClick={() => { setType('measurement'); if (!measurementConfig) setMeasurementConfig({ layout: 'circle-4point', inputs: [...MEASUREMENT_LAYOUTS['circle-4point'].inputs.map(inp => ({ ...inp, inputType: 'number', presetValues: [], group: '' }))], calculations: [{ id: 'calc1', label: '計算結果', method: 'max-min', formula: '', inputIds: [], toleranceUpper: 0.05, toleranceLower: -0.05, unit: 'mm' }] }); }} className={`flex-1 py-1.5 text-xs rounded border ${type==='measurement' ? 'bg-teal-600 text-white' : 'bg-white text-teal-600 border-teal-300'}`}><Calculator className="w-3 h-3 inline mr-0.5"/>測定</button></div></div><div className="w-24"><label className="block text-xs font-bold text-slate-500 mb-1">目標(秒)</label><input type="number" value={targetTime} onChange={e => setTargetTime(Number(e.target.value))} className="w-full p-2 border rounded text-right"/></div></div>
+
+            {/* === 実行モード & 占有リソース (オススメ順機能のための情報) === */}
+            <div className="bg-indigo-50/50 border-2 border-indigo-200 rounded-lg p-3 space-y-2.5">
+              <div className="text-xs font-bold text-indigo-800 flex items-center gap-1.5">
+                <Bot className="w-3.5 h-3.5"/> 実行モードと占有リソース
+                <span className="text-[10px] font-normal text-indigo-600 ml-1">(オススメ順機能で「並行可能か」を判定するための情報)</span>
+              </div>
+
+              {/* 実行モード: 手動 / 自動測定 */}
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 mb-1">実行モード</label>
+                <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setExecutionMode('manual')}
+                    className={`flex-1 py-1.5 text-xs font-bold rounded border ${executionMode === 'manual' ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-slate-500 border-slate-300'}`}
+                  >👤 手動 (作業者がやる)</button>
+                  <button
+                    type="button"
+                    onClick={() => setExecutionMode('batch')}
+                    className={`flex-1 py-1.5 text-xs font-bold rounded border ${executionMode === 'batch' ? 'bg-purple-600 text-white border-purple-700' : 'bg-white text-slate-500 border-slate-300'}`}
+                  >🤖 自動 (機械が動く)</button>
+                </div>
+              </div>
+
+              {/* 占有リソース */}
+              <div>
+                <label className="block text-[10px] font-bold text-slate-500 mb-1">占有リソース (この工程で使う機械・場所)</label>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setWorkResource('')}
+                    className={`px-2.5 py-1 text-xs font-bold rounded border ${!workResource ? 'bg-emerald-600 text-white border-emerald-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-emerald-50'}`}
+                    title="機械・治具に依存しない作業 (他の台の自動測定中に並行可)"
+                  >✓ 機械独立 (並行可)</button>
+                  <button
+                    type="button"
+                    onClick={() => setWorkResource('measurement-machine')}
+                    className={`px-2.5 py-1 text-xs font-bold rounded border ${workResource === 'measurement-machine' ? 'bg-rose-600 text-white border-rose-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-rose-50'}`}
+                    title="測定機を使う = 他の台の自動測定中は同じ機械を使えないので並行不可"
+                  >🔒 測定機を占有</button>
+                  <button
+                    type="button"
+                    onClick={() => setWorkResource('jig-shared')}
+                    className={`px-2.5 py-1 text-xs font-bold rounded border ${workResource === 'jig-shared' ? 'bg-amber-600 text-white border-amber-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-amber-50'}`}
+                    title="治具・工具を共有 = 同時に2台分はできない"
+                  >🔧 治具・工具を占有</button>
+                  <input
+                    type="text"
+                    value={workResource && !['measurement-machine', 'jig-shared'].includes(workResource) ? workResource : ''}
+                    onChange={e => setWorkResource(e.target.value)}
+                    placeholder="カスタムリソース名"
+                    className="px-2 py-1 text-xs border border-slate-300 rounded w-32 focus:border-indigo-500 outline-none"
+                  />
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1.5 leading-relaxed">
+                  💡 <b>機械独立</b> = 書類確認・準備など機械を使わない作業。他の台が自動測定中でも並行できる。<br/>
+                  💡 <b>測定機を占有</b> = 測定準備・測定プログラム・自動測定本体など。同じ機械を共有する作業なので並行不可。
+                </div>
+              </div>
+            </div>
             <div className="relative"><label className="block text-xs font-bold text-slate-500 mb-1">詳細・注意事項</label><textarea value={description} onChange={e => setDescription(e.target.value)} className="w-full p-2 border rounded h-32"/><button onClick={toggleListening} className="absolute bottom-2 right-2 p-1.5 bg-slate-100 rounded-full hover:bg-slate-200"><Mic className="w-4 h-4 text-slate-600"/></button></div>
+
+            {/* 確認チェック項目編集 (どのタイプの工程でも追加可能。測定 + チェック の併用OK) */}
+            <div className="bg-purple-50/20 border-2 border-purple-100 rounded-lg p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-bold text-purple-800 flex items-center gap-1">
+                    <ListChecks className="w-4 h-4"/> 確認チェック項目 ({checklistItems.length}件)
+                    <span className="text-[10px] font-normal text-purple-500 ml-1">(任意 — どの工程タイプでも追加可)</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setChecklistItems([...checklistItems, { id: `chk_${Date.now()}_${Math.random().toString(36).slice(2,5)}`, label: '', required: true }])}
+                    className="text-xs bg-purple-600 hover:bg-purple-700 text-white px-3 py-1 rounded font-bold flex items-center gap-1"
+                  >
+                    <Plus className="w-3 h-3"/> 項目追加
+                  </button>
+                </div>
+                {checklistItems.length > 0 && (<p className="text-[10px] text-purple-700">
+                  作業者が確認したらチェックを入れる項目です。全ての <span className="font-bold">必須</span> 項目がチェックされないと工程を完了できません (成績表にも記録)。
+                </p>)}
+                <div className="space-y-1.5">
+                  {checklistItems.map((item, idx) => {
+                    const update = (patch) => {
+                      const next = [...checklistItems];
+                      next[idx] = { ...next[idx], ...patch };
+                      setChecklistItems(next);
+                    };
+                    const remove = () => setChecklistItems(checklistItems.filter((_, i) => i !== idx));
+                    return (
+                      <div key={item.id || idx} className="bg-white border border-purple-200 rounded p-2 flex items-center gap-2">
+                        <span className="text-[10px] font-bold text-purple-500 w-5 text-center">{idx + 1}</span>
+                        <input
+                          value={item.label || ''}
+                          onChange={e => update({ label: e.target.value })}
+                          placeholder="例: 色見本との一致を確認 / 銘板貼付確認"
+                          className="flex-1 border rounded px-2 py-1 text-sm"
+                        />
+                        <label className="flex items-center gap-1 text-[10px] font-bold text-slate-600 cursor-pointer shrink-0" title="チェック必須項目">
+                          <input type="checkbox" checked={item.required !== false} onChange={e => update({ required: e.target.checked })} className="w-3.5 h-3.5 accent-purple-600"/>
+                          必須
+                        </label>
+                        <button type="button" onClick={remove} className="text-rose-400 hover:text-rose-600"><X className="w-4 h-4"/></button>
+                      </div>
+                    );
+                  })}
+                  {checklistItems.length === 0 && (
+                    <div className="text-center text-purple-400 text-xs py-4 bg-white rounded border border-dashed border-purple-200">
+                      まだ確認項目がありません。「項目追加」から始めてください。
+                    </div>
+                  )}
+                </div>
+              </div>
+
             {type === 'measurement' && measurementConfig && (() => {
               const mcCalcs = measurementConfig.calculations || [{ id: 'default', label: '計算結果', method: measurementConfig.calculation || 'max-min', formula: measurementConfig.formula || '', inputIds: [], toleranceUpper: measurementConfig.toleranceUpper ?? 0.05, toleranceLower: measurementConfig.toleranceLower ?? -0.05, unit: measurementConfig.unit || 'mm' }];
               const updateInput = (idx, patch) => { const ni = [...measurementConfig.inputs]; ni[idx] = { ...ni[idx], ...patch }; setMeasurementConfig({ ...measurementConfig, inputs: ni }); };
@@ -2157,6 +3814,24 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                     }
                   }
                   if (preset.diagramImage) next.diagramImage = preset.diagramImage;
+                  // 測定条件 (プリセット既定) も引き継ぐ。既存の条件があれば確認の上、上書き or マージ
+                  if (preset.conditionPreset && ((preset.conditionPreset.params && preset.conditionPreset.params.length > 0) || preset.conditionPreset.note)) {
+                    const existingCond = measurementConfig.conditionPreset;
+                    const hasExistingCond = existingCond && ((existingCond.params && existingCond.params.length > 0) || existingCond.note);
+                    if (hasExistingCond) {
+                      if (confirm('既存の測定条件があります。プリセットの測定条件で上書きしますか？\n（OK=上書き、キャンセル=既存を保持）')) {
+                        next.conditionPreset = {
+                          params: (preset.conditionPreset.params || []).map(p => ({ ...p })),
+                          note: preset.conditionPreset.note || ''
+                        };
+                      }
+                    } else {
+                      next.conditionPreset = {
+                        params: (preset.conditionPreset.params || []).map(p => ({ ...p })),
+                        note: preset.conditionPreset.note || ''
+                      };
+                    }
+                  }
                   setMeasurementConfig(next);
                 }
               };
@@ -2164,7 +3839,18 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                 const presetName = prompt('プリセット名を入力してください:');
                 if (!presetName || !presetName.trim()) return;
                 const key = generateId();
-                const newLayouts = { ...customLayouts, [key]: { label: presetName.trim(), inputs: measurementConfig.inputs.map(inp => ({ id: inp.id, label: inp.label, x: inp.x, y: inp.y, inputType: inp.inputType || 'number', presetValues: inp.presetValues || [], comboPresetId: inp.comboPresetId || '' })) } };
+                const presetData = {
+                  label: presetName.trim(),
+                  inputs: measurementConfig.inputs.map(inp => ({ id: inp.id, label: inp.label, x: inp.x, y: inp.y, inputType: inp.inputType || 'number', presetValues: inp.presetValues || [], comboPresetId: inp.comboPresetId || '' })),
+                  // 計算・矢印・図・測定条件もプリセットに含める
+                  ...(mcCalcs && mcCalcs.length > 0 ? { calculations: mcCalcs.map(c => ({ ...c })) } : {}),
+                  ...(measurementConfig.arrows && measurementConfig.arrows.length > 0 ? { arrows: measurementConfig.arrows.map(a => ({ ...a })) } : {}),
+                  ...(measurementConfig.diagramImage ? { diagramImage: measurementConfig.diagramImage } : {}),
+                  ...(measurementConfig.conditionPreset && ((measurementConfig.conditionPreset.params && measurementConfig.conditionPreset.params.length > 0) || measurementConfig.conditionPreset.note)
+                    ? { conditionPreset: { params: (measurementConfig.conditionPreset.params || []).map(p => ({ ...p })), note: measurementConfig.conditionPreset.note || '' } }
+                    : {})
+                };
+                const newLayouts = { ...customLayouts, [key]: presetData };
                 onSaveLayouts?.(newLayouts);
                 setMeasurementConfig({ ...measurementConfig, layout: `custom_${key}` });
               };
@@ -2225,7 +3911,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                         <div key={k} className="flex items-center gap-1 text-[10px] py-1 px-1.5 bg-teal-50 rounded border border-teal-100">
                           {editingPresetKey === k ? (
                             <>
-                              <input value={editingPresetName} onChange={e => setEditingPresetName(e.target.value)} className="flex-1 border rounded px-1 py-0.5 text-[10px]" autoFocus onKeyDown={e => { if (e.key === 'Enter') handleRenameCustomPreset(k, editingPresetName); if (e.key === 'Escape') { setEditingPresetKey(null); setEditingPresetName(''); } }}/>
+                              <input value={editingPresetName} onChange={e => setEditingPresetName(e.target.value)} className="flex-1 border rounded px-1 py-0.5 text-[10px]" autoFocus onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) handleRenameCustomPreset(k, editingPresetName); if (e.key === 'Escape') { setEditingPresetKey(null); setEditingPresetName(''); } }}/>
                               <button onClick={() => handleRenameCustomPreset(k, editingPresetName)} className="text-teal-600 hover:text-teal-800"><Check className="w-3 h-3"/></button>
                               <button onClick={() => { setEditingPresetKey(null); setEditingPresetName(''); }} className="text-slate-400 hover:text-slate-600"><X className="w-3 h-3"/></button>
                             </>
@@ -2304,6 +3990,9 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                     </div>
                     <input id="diagram-image-upload" type="file" className="hidden" accept="image/*" onChange={async (e) => { const file = e.target.files?.[0]; if (file) { const img = await resizeImage(file); setMeasurementConfig({ ...measurementConfig, diagramImage: img }); } e.target.value = ''; }}/>
                     {measurementConfig.diagramImage && <img src={measurementConfig.diagramImage} className="mt-2 w-full h-24 object-contain rounded border" alt="diagram"/>}
+                  </div>
+                  <div className="mt-2 text-[10px] text-slate-400 italic px-1 leading-snug">
+                    💡 型式別の<span className="font-bold">初期値プリセット</span> (ブロックゲージ組合せなど) は<span className="font-bold text-indigo-600">「マスタ設定 → 品質規格マスタ」</span>から型式群ごとに登録してください。型式と一緒に管理した方が運用が楽になります。
                   </div>
                 </div>
                 {/* Calculations Section */}
@@ -2593,22 +4282,61 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                     </div>
                   );
                 })()}
+                {/* 測定条件 (デフォルト) - 分割測定の段取り条件などをここに記録 */}
+                {/* 品質規格マスタで型式別の上書きが可能。ここはテンプレ全体のデフォルト値。 */}
+                {(() => {
+                  const condPreset = measurementConfig.conditionPreset || { params: [], note: '' };
+                  const updateCond = (patch) => setMeasurementConfig({ ...measurementConfig, conditionPreset: { ...condPreset, ...patch } });
+                  const addParam = () => updateCond({ params: [...(condPreset.params || []), { key: '', value: '' }] });
+                  const updateParam = (idx, patch) => {
+                    const params = [...(condPreset.params || [])];
+                    params[idx] = { ...params[idx], ...patch };
+                    updateCond({ params });
+                  };
+                  const removeParam = (idx) => {
+                    const params = (condPreset.params || []).filter((_, i) => i !== idx);
+                    updateCond({ params });
+                  };
+                  return (
+                    <div className="bg-purple-50 border border-purple-200 rounded-lg p-3">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="text-xs font-bold text-purple-900 flex items-center gap-1.5">
+                          <ListChecks className="w-3.5 h-3.5"/> 測定条件 (デフォルト)
+                        </label>
+                        <span className="text-[10px] text-purple-600">作業者に表示する段取り条件</span>
+                      </div>
+                      <p className="text-[10px] text-slate-500 mb-2">
+                        例: 分割数, 角度刻み, 評価種別 (ウォーム/ピニオン) など。<br/>
+                        型式別の上書きは <span className="font-bold text-indigo-700">品質規格マスタ</span> で設定できます。
+                      </p>
+                      <div className="space-y-1.5">
+                        {(condPreset.params || []).map((p, idx) => (
+                          <div key={idx} className="flex gap-2 items-center">
+                            <input value={p.key || ''} onChange={e => updateParam(idx, { key: e.target.value })} placeholder="項目名 (例: 分割数)" className="flex-1 border rounded p-1 text-xs"/>
+                            <input value={p.value || ''} onChange={e => updateParam(idx, { value: e.target.value })} placeholder="値 (例: 8)" className="flex-1 border rounded p-1 text-xs"/>
+                            <button type="button" onClick={() => removeParam(idx)} className="text-rose-400 hover:text-rose-600 p-1"><X className="w-3 h-3"/></button>
+                          </div>
+                        ))}
+                        <button type="button" onClick={addParam} className="text-xs text-purple-600 hover:text-purple-800 flex items-center gap-1 font-bold">
+                          <Plus className="w-3 h-3"/> 条件項目を追加
+                        </button>
+                      </div>
+                      <div className="mt-2">
+                        <label className="block text-[10px] text-slate-500 mb-0.5">条件メモ (自由記述)</label>
+                        <textarea value={condPreset.note || ''} onChange={e => updateCond({ note: e.target.value })} className="w-full border rounded p-1.5 text-xs" rows={2} placeholder="例: ホイール45°毎、ウォーム評価あり、温度23°C基準"/>
+                      </div>
+                      {(condPreset.params?.length > 0 || condPreset.note) && (
+                        <div className="mt-2 pt-2 border-t border-purple-200 text-[10px] text-purple-700">
+                          ✓ 作業者の測定画面に「測定条件」カードが表示されます
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
                 {/* Preview */}
                 <div>
                   <label className="block text-[10px] font-bold text-slate-500 mb-1">プレビュー</label>
-                  <div className="relative w-full h-48 bg-white border rounded overflow-hidden" style={measurementConfig.diagramImage ? { backgroundImage: `url(${measurementConfig.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}}>
-                    {!measurementConfig.diagramImage && measurementConfig.layout === 'circle-4point' && (
-                      <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
-                        <circle cx="50" cy="50" r="35" fill="none" stroke="#94a3b8" strokeWidth="0.5" strokeDasharray="2,2"/>
-                      </svg>
-                    )}
-                    {measurementConfig.inputs.map((inp, idx) => (
-                      <div key={idx} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
-                        <div className={`w-3 h-3 rounded-full border-2 border-white shadow ${inp.inputType === 'combobox' ? 'bg-amber-500' : 'bg-teal-500'}`}/>
-                        <span className="text-[8px] font-bold text-slate-600 mt-0.5 bg-white/80 px-0.5 rounded">{inp.label}</span>
-                      </div>
-                    ))}
-                  </div>
+                  <MeasurementPreviewBox config={measurementConfig} variant="tiny" maxHeight={192} />
                 </div>
               </div>
               );
@@ -2870,6 +4598,61 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
       </div>
 
       {/* コンパクト時のみ: 図面下に入力フィールドのリスト */}
+      {/* 初期値プリセット適用バー
+          - qsDefaultValues: 品質規格マスタで型式群ごとに設定した固定値 (ブロックゲージ組合せなど)
+          - pastData: 同型式の直近完了データ */}
+      {(() => {
+        const qsDefaults = config?.qsDefaultValues || null;
+        const hasQsDefaults = qsDefaults && Object.values(qsDefaults).some(v => v !== '' && v !== null && v !== undefined);
+        const hasPast = Array.isArray(pastData) && pastData.length > 0 && pastData[0]?.values;
+        if (!hasQsDefaults && !hasPast) return null;
+        const applyQsDefaults = () => {
+          if (!hasQsDefaults) return;
+          const next = { ...values };
+          inputs.forEach(inp => {
+            const v = qsDefaults[inp.id];
+            if (v !== undefined && v !== '' && v !== null) next[inp.id] = v;
+          });
+          onChange(next);
+        };
+        const applyPast = () => {
+          if (!hasPast) return;
+          const past = pastData[0].values || {};
+          const next = { ...values };
+          inputs.forEach(inp => {
+            const v = past[inp.id];
+            if (v !== undefined && v !== '' && v !== null) next[inp.id] = v;
+          });
+          onChange(next);
+        };
+        return (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 p-2 bg-amber-50/60 border border-amber-200 rounded">
+            <span className="text-[10px] font-bold text-amber-700 shrink-0">📋 初期値:</span>
+            {hasQsDefaults && (
+              <button
+                type="button"
+                onClick={applyQsDefaults}
+                className="text-xs px-2 py-1 bg-amber-100 hover:bg-amber-200 text-amber-800 border border-amber-300 rounded font-bold flex items-center gap-1"
+                title={`品質規格マスタで設定された初期値 (${lot?.appliedStandard?.standardNo || '型式規格'}) を全入力枠に適用`}
+              >
+                規格の初期値を入力
+              </button>
+            )}
+            {hasPast && (
+              <button
+                type="button"
+                onClick={applyPast}
+                className="text-xs px-2 py-1 bg-blue-100 hover:bg-blue-200 text-blue-700 border border-blue-300 rounded font-bold flex items-center gap-1"
+                title={`同型式 ${lot?.model} の直近完了データ ${pastData[0].orderNo || ''} の値をコピー`}
+              >
+                <RotateCcw className="w-3 h-3"/> 前回の値を使う ({pastData[0].orderNo || ''})
+              </button>
+            )}
+            <span className="text-[9px] text-amber-600 ml-auto">適用後、各枠を必要に応じて微調整</span>
+          </div>
+        );
+      })()}
+
       {!splitLayout && (
         <div className="mt-2 grid grid-cols-2 gap-1.5 max-h-48 overflow-y-auto">
           {inputs.map((inp, idx) => {
@@ -2993,13 +4776,426 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
   );
 };
 
-const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [] }) => {
+// === 同型式の直近気づき/不良情報パネル ===
+// 作業中に「この型式でこういう問題が発生してるよ」と作業者へ予防情報を提示
+// stepTitle が指定されている場合は、その工程に関連するものを上位に強調表示
+// === ライブ並行作業ガイド (自動測定中にリアルタイム表示) ===
+// 自動測定が走っている間、その経過時間に応じて「今やれる他の台の作業」を表示。
+// 自動測定が予定オーバーしたら、追加でやれる作業を動的に出す。
+const LiveParallelGuide = ({ guide, fmtTime }) => {
+  if (!guide || !guide.runningAuto) return null;
+  const { runningAuto, planned, extra, isOverrun, overrunSec, remainingSec } = guide;
+  const elapsed = runningAuto.elapsedSec;
+  const target = runningAuto.targetSec;
+  const pct = target > 0 ? Math.min(100, Math.round((elapsed / target) * 100)) : 0;
+  return (
+    <div className={`mb-3 rounded-xl border-2 shadow-md overflow-hidden ${isOverrun ? 'border-rose-400' : 'border-purple-400'}`}>
+      {/* ヘッダー: 自動測定の進捗 */}
+      <div className={`px-4 py-2.5 ${isOverrun ? 'bg-rose-600' : 'bg-purple-600'} text-white`}>
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <Bot className="w-5 h-5 animate-pulse"/>
+            <span className="font-black text-sm">🤖 #{runningAuto.unitIdx + 1}台目「{runningAuto.step.title}」自動測定中</span>
+          </div>
+          <div className="flex items-center gap-2 text-sm">
+            <span className="font-mono font-black text-lg">{fmtTime(elapsed)}</span>
+            {target > 0 && (
+              isOverrun
+                ? <span className="bg-white/25 px-2 py-0.5 rounded font-bold text-xs animate-pulse">⚠ 予定+{fmtTime(overrunSec)} 延長中</span>
+                : <span className="bg-white/20 px-2 py-0.5 rounded font-bold text-xs">残 {fmtTime(remainingSec)} (目安{fmtTime(target)})</span>
+            )}
+          </div>
+        </div>
+        {/* 進捗バー */}
+        {target > 0 && (
+          <div className="mt-1.5 h-1.5 bg-white/20 rounded-full overflow-hidden">
+            <div className={`h-full ${isOverrun ? 'bg-amber-300' : 'bg-white'} transition-all`} style={{ width: `${pct}%` }}/>
+          </div>
+        )}
+      </div>
+      {/* 本体: 今やれる作業 */}
+      <div className="bg-white p-3">
+        <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1">
+          <Zap className="w-3.5 h-3.5 text-purple-600"/> この自動測定中に、別の台でやれる作業:
+        </div>
+        {planned.length === 0 && extra.length === 0 ? (
+          <div className="text-xs text-slate-400 italic py-2">
+            並行できる作業がありません (他の台がない、または「機械独立」タグの工程がない)
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            {planned.map((t, i) => (
+              <div key={`p${i}`} className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded px-2.5 py-1.5">
+                <span className="bg-blue-600 text-white text-[11px] font-black px-1.5 py-0.5 rounded shrink-0">#{t.unitIdx + 1}台目</span>
+                <span className="font-bold text-slate-800 text-sm flex-1">{t.stepTitle}</span>
+                <span className="text-xs text-slate-500 font-mono">{fmtTime(t.durationSec)}</span>
+              </div>
+            ))}
+            {/* 延長で追加された候補 */}
+            {extra.length > 0 && (
+              <>
+                <div className="text-[11px] font-bold text-rose-600 mt-2 flex items-center gap-1 pt-1.5 border-t border-rose-100">
+                  ⚡ 自動測定が延長中 → 追加でこの作業もできます:
+                </div>
+                {extra.map((t, i) => (
+                  <div key={`e${i}`} className="flex items-center gap-2 bg-amber-50 border border-amber-300 rounded px-2.5 py-1.5 animate-pulse">
+                    <span className="bg-amber-500 text-white text-[10px] font-black px-1 py-0.5 rounded shrink-0">追加</span>
+                    <span className="bg-blue-600 text-white text-[11px] font-black px-1.5 py-0.5 rounded shrink-0">#{t.unitIdx + 1}台目</span>
+                    <span className="font-bold text-slate-800 text-sm flex-1">{t.stepTitle}</span>
+                    <span className="text-xs text-slate-500 font-mono">{fmtTime(t.durationSec)}</span>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// === カスタムモード コンパクト一覧表示 ===
+// 工程(行) × 台数(列) の高密度テーブル。カードより圧迫感が少なく全体を見渡せる。
+// 各セルをタップすると onCellClick(sIdx, uIdx) — カード版と同じ動作。
+const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNextTask, getTaskStatusColor, formatTime, activeCustomTaskKey, onCellClick, onBatchClick, onSkipRow }) => {
+  const qty = lot.quantity || 1;
+  const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+  const getTask = (step, sIdx, u) => {
+    const k = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
+    return tasks[k] || tasks[`${sIdx}-${u}`] || { status: 'waiting', duration: 0 };
+  };
+  // セルの短い表示 (ステータス記号 + 時間)
+  const cellContent = (task) => {
+    const st = task.status;
+    const dur = task.status === 'processing' && task.startTime
+      ? task.duration + Math.floor((Date.now() - task.startTime) / 1000)
+      : task.duration;
+    if (st === 'completed') return { mark: '✓', time: formatTime(dur), cls: 'bg-emerald-500 text-white' };
+    if (st === 'ng') return { mark: 'NG', time: formatTime(dur), cls: 'bg-red-600 text-white' };
+    // 修正中: メインは元の作業時間を保持し、修正の回数/各回の時間は下のチップで表示 (カードと同様)
+    if (st === 'reworking') return { mark: '修正', time: formatTime(dur), cls: 'bg-orange-500 text-white animate-pulse' };
+    if (st === 'rework-done') return { mark: '✓', time: formatTime(dur), cls: 'bg-emerald-500 text-white' };
+    if (st === 'skipped') return { mark: '–', time: '該当なし', cls: 'bg-slate-100 text-slate-400' };
+    if (st === 'processing') return { mark: '▶', time: formatTime(dur), cls: 'bg-blue-600 text-white animate-pulse' };
+    if (st === 'paused') return { mark: '⏸', time: formatTime(dur), cls: 'bg-amber-100 text-amber-700' };
+    return { mark: '', time: '', cls: 'bg-white text-slate-300 border border-slate-200' };
+  };
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-auto mb-4">
+      <table className="w-full border-collapse text-sm">
+        <thead className="sticky top-0 z-10">
+          <tr className="bg-slate-100 border-b-2 border-slate-300">
+            <th className="p-3 text-left font-bold sticky left-0 bg-slate-100 min-w-[170px] z-20">工程</th>
+            {Array.from({ length: qty }).map((_, u) => (
+              <th key={u} className="p-2 text-center font-bold min-w-[68px] border-l border-slate-200">
+                #{u + 1}
+                {lot.unitSerialNumbers?.[u] && <div className="font-normal text-slate-400 text-[10px] truncate max-w-[64px]">{lot.unitSerialNumbers[u]}</div>}
+              </th>
+            ))}
+            <th className="p-1 text-center font-bold w-16 bg-slate-200 border-l-2 border-slate-300">一括</th>
+          </tr>
+        </thead>
+        <tbody>
+          {localSteps.map((step, sIdx) => {
+            const isAuto = isAutoStepFn(step);
+            const isBatch = !!batchStartTimes[sIdx];
+            const resTag = step.workResource;
+            return (
+              <tr key={step.id || sIdx} className="border-b border-slate-100 hover:bg-blue-50/20">
+                {/* 工程名 (sticky) */}
+                <td className="p-3 sticky left-0 bg-white border-r border-slate-200 z-10">
+                  <div className="flex items-center gap-1.5">
+                    {isAuto && <span className="bg-purple-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">自動</span>}
+                    <span className="font-bold text-slate-800 text-[15px] leading-tight">{step.title}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 mt-1">
+                    <span className="text-[11px] text-slate-400">Step {sIdx + 1}</span>
+                    {!isAuto && (resTag === null || resTag === '') && <span className="text-[10px] bg-emerald-100 text-emerald-600 px-1.5 py-0.5 rounded">並行可</span>}
+                    {!isAuto && resTag === 'measurement-machine' && <span className="text-[10px] bg-rose-100 text-rose-600 px-1.5 py-0.5 rounded">測定機</span>}
+                    {!isAuto && resTag && resTag !== 'measurement-machine' && <span className="text-[10px] bg-amber-100 text-amber-600 px-1.5 py-0.5 rounded">占有</span>}
+                  </div>
+                </td>
+                {/* 各台のセル */}
+                {Array.from({ length: qty }).map((_, u) => {
+                  const task = getTask(step, sIdx, u);
+                  const c = cellContent(task);
+                  const isNext = globalNextTask && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === u && (task.status === 'waiting' || task.status === 'paused');
+                  const isActive = activeCustomTaskKey === `${sIdx}-${u}`;
+                  const reworks = task.reworks || [];
+                  const reworkTotal = reworks.reduce((s, r) => s + (r.duration || 0), 0);
+                  return (
+                    <td key={u} className="p-0.5 text-center border-l border-slate-100 relative align-top">
+                      {isNext && (
+                        <div className="absolute -top-2 -right-1 z-20 bg-emerald-500 text-white text-[11px] font-black px-1.5 py-0.5 rounded-full shadow-md ring-1 ring-white animate-bounce">次</div>
+                      )}
+                      <button
+                        onClick={() => onCellClick(sIdx, u)}
+                        className={`w-full rounded py-1.5 px-0.5 flex flex-col items-center justify-center leading-none transition-all ${c.cls} ${isNext ? 'ring-2 ring-emerald-400' : ''} ${isActive ? 'ring-2 ring-blue-400' : ''}`}
+                        style={{ minHeight: '52px' }}
+                        title={`#${u + 1}台目 ${step.title} (${task.status})${reworkTotal > 0 ? ` / 修正${reworks.length}回 合計${formatTime(reworkTotal)}` : ''}`}
+                      >
+                        {c.mark && <span className="text-sm font-black">{c.mark}</span>}
+                        <span className="text-xs font-mono mt-1">{c.time}</span>
+                      </button>
+                      {reworks.length > 0 && (
+                        <div className="mt-0.5 flex flex-col items-stretch gap-0.5">
+                          <div className="text-[10px] font-black text-orange-600 leading-none flex items-center justify-center gap-0.5">
+                            <Wrench className="w-2.5 h-2.5"/>修正{reworks.length}回
+                          </div>
+                          <div className="flex flex-wrap justify-center gap-0.5">
+                            {reworks.map((rw, rIdx) => {
+                              const live = !rw.endTime && task.status === 'reworking' && rIdx === reworks.length - 1;
+                              const t = live ? (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0) : (rw.duration || 0);
+                              return (
+                                <span key={rIdx} title={`修正${rIdx + 1}回目: ${formatTime(t)}`}
+                                  className={`inline-flex items-center gap-0.5 leading-none text-[9px] font-bold px-1 py-0.5 rounded ${live ? 'bg-orange-500 text-white animate-pulse' : 'bg-orange-100 text-orange-700 border border-orange-300'}`}>
+                                  <span className="opacity-70">{rIdx + 1}</span>
+                                  <span className="font-mono">{formatTime(t)}</span>
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </td>
+                  );
+                })}
+                {/* 一括ボタン */}
+                <td className="p-1 text-center bg-slate-50 border-l-2 border-slate-300">
+                  <button
+                    onClick={() => onBatchClick(sIdx)}
+                    className={`text-[11px] font-bold px-2 py-1.5 rounded border w-full ${isBatch ? 'bg-orange-500 text-white border-orange-600 animate-pulse' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100'}`}
+                    title={isBatch ? 'まとめて完了' : 'まとめて開始'}
+                  >
+                    {isBatch ? '完了' : '一括'}
+                  </button>
+                  {onSkipRow && (() => {
+                    const anySkipped = Array.from({ length: qty }).some((_, u) => getTask(step, sIdx, u)?.status === 'skipped');
+                    return (
+                      <button
+                        onClick={() => onSkipRow(sIdx)}
+                        className={`mt-1 text-[10px] font-bold px-1 py-1 rounded border w-full whitespace-nowrap ${anySkipped ? 'bg-slate-400 text-white border-slate-500' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100'}`}
+                        title={anySkipped ? '該当なしを解除' : 'この工程を該当なし (全台) にする'}
+                      >
+                        {anySkipped ? '解除' : '該当なし'}
+                      </button>
+                    );
+                  })()}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div className="px-4 py-2.5 bg-slate-50 border-t text-xs text-slate-500 flex flex-wrap gap-3 items-center">
+        <span>✓完了</span><span>▶作業中</span><span>⏸停止</span><span>NG</span><span>–該当なし</span>
+        <span className="text-emerald-600 font-bold">「次」= 今やるべきタスク</span>
+      </div>
+    </div>
+  );
+};
+
+const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
+  if (!info) return null;
+  const { complaints = [], defects = [], ngTasks = [], relatedLotCount = 0 } = info;
+  const total = complaints.length + defects.length + ngTasks.length;
+  if (total === 0 && relatedLotCount === 0) return null;
+  // 工程関連 (currently editing) と全体 を分ける
+  const stepRelated = {
+    complaints: stepTitle ? complaints.filter(c => c.isThisStep).slice(0, 5) : [],
+    defects: stepTitle ? defects.filter(d => d.isThisStep).slice(0, 5) : [],
+    ngTasks: stepTitle ? ngTasks.filter(n => n.isThisStep).slice(0, 5) : [],
+  };
+  const stepRelatedCount = stepRelated.complaints.length + stepRelated.defects.length + stepRelated.ngTasks.length;
+  const allRecent = {
+    complaints: complaints.slice(0, 5),
+    defects: defects.slice(0, 5),
+    ngTasks: ngTasks.slice(0, 5),
+  };
+  const fmtDate = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const today = new Date();
+    const diffDays = Math.floor((today - d) / (24 * 3600 * 1000));
+    if (diffDays === 0) return '今日';
+    if (diffDays === 1) return '昨日';
+    if (diffDays < 7) return `${diffDays}日前`;
+    if (diffDays < 30) return `${Math.floor(diffDays / 7)}週間前`;
+    return `${d.getMonth()+1}/${d.getDate()}`;
+  };
+  const hasUrgent = stepRelatedCount > 0;
+  return (
+    <div className={`mb-3 rounded-xl border-2 shadow-sm overflow-hidden ${hasUrgent ? 'border-rose-400 bg-rose-50/60' : 'border-indigo-200 bg-white'}`}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className={`w-full px-4 py-2 flex items-center justify-between hover:bg-opacity-80 ${hasUrgent ? 'bg-rose-100' : 'bg-indigo-50'}`}
+      >
+        <div className="flex items-center gap-2">
+          {hasUrgent ? <AlertCircle className="w-4 h-4 text-rose-600 animate-pulse"/> : <Megaphone className="w-4 h-4 text-indigo-600"/>}
+          <span className="font-bold text-sm text-slate-800">
+            {hasUrgent
+              ? `⚠ この工程で過去 ${stepRelatedCount} 件の問題あり`
+              : `この型式の品質情報 (直近${total}件 / 過去${relatedLotCount}ロット)`}
+          </span>
+          <span className="text-xs text-slate-500">{model}</span>
+        </div>
+        <span className="text-xs text-slate-500">{open ? '▲ 閉じる' : '▼ 開く'}</span>
+      </button>
+      {open && (
+        <div className="p-3 text-xs space-y-3">
+          {/* 工程特化セクション (赤系で強調) */}
+          {stepTitle && stepRelatedCount > 0 && (
+            <div className="bg-rose-100/60 border border-rose-300 rounded-lg p-2 space-y-1.5">
+              <div className="font-bold text-rose-800 mb-1">🔴 この工程「{stepTitle}」の要注意事項:</div>
+              {stepRelated.ngTasks.map((t, i) => (
+                <div key={'sng'+i} className="flex items-start gap-2 bg-white rounded px-2 py-1 border border-rose-200">
+                  <span className="bg-rose-700 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">NG</span>
+                  <span className="flex-1 text-rose-900">{t.ngReason || '理由未記載'}</span>
+                  <span className="text-[10px] text-slate-500">{t.orderNo}</span>
+                  <span className="text-[10px] text-slate-500">{fmtDate(t.ngAt)}</span>
+                </div>
+              ))}
+              {stepRelated.defects.map((d, i) => (
+                <div key={'sdf'+i} className="flex items-start gap-2 bg-white rounded px-2 py-1 border border-amber-200">
+                  <span className="bg-amber-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">不具合</span>
+                  <span className="flex-1 text-amber-900">{d.label || '内容未記載'}</span>
+                  {d.causeProcess && <span className="text-[10px] text-amber-700">原因:{d.causeProcess}</span>}
+                  <span className="text-[10px] text-slate-500">{d.lot?.orderNo || d.orderNo}</span>
+                  <span className="text-[10px] text-slate-500">{fmtDate(d.timestamp)}</span>
+                </div>
+              ))}
+              {stepRelated.complaints.map((c, i) => (
+                <div key={'scp'+i} className="flex items-start gap-2 bg-white rounded px-2 py-1 border border-purple-200">
+                  <span className="bg-purple-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">気づき</span>
+                  <span className="flex-1 text-purple-900">{c.label || '内容未記載'}</span>
+                  <span className="text-[10px] text-slate-500">{c.lot?.orderNo || c.orderNo}</span>
+                  <span className="text-[10px] text-slate-500">{fmtDate(c.timestamp)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {/* 型式全体: 他工程含む直近情報 */}
+          <div>
+            <div className="font-bold text-slate-600 mb-1">📋 この型式 {model} の直近の品質情報:</div>
+            {total === 0 ? (
+              <div className="text-slate-400 italic">問題報告なし</div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                {/* NG */}
+                <div className="bg-white border border-rose-200 rounded p-2">
+                  <div className="text-rose-700 font-bold mb-1 text-[11px]">🔴 NG ({ngTasks.length})</div>
+                  {allRecent.ngTasks.length === 0 && <div className="text-slate-400 text-[10px]">なし</div>}
+                  {allRecent.ngTasks.map((t, i) => (
+                    <div key={'ng'+i} className="text-[11px] py-0.5 border-b border-rose-100 last:border-b-0">
+                      <div className="font-bold truncate text-slate-700">{t.stepTitle}</div>
+                      <div className="text-rose-700 truncate">{t.ngReason || '理由未記載'}</div>
+                      <div className="text-[9px] text-slate-400">{t.orderNo} · {fmtDate(t.ngAt)}</div>
+                    </div>
+                  ))}
+                </div>
+                {/* 不具合 */}
+                <div className="bg-white border border-amber-200 rounded p-2">
+                  <div className="text-amber-700 font-bold mb-1 text-[11px]">⚠ 不具合 ({defects.length})</div>
+                  {allRecent.defects.length === 0 && <div className="text-slate-400 text-[10px]">なし</div>}
+                  {allRecent.defects.map((d, i) => (
+                    <div key={'df'+i} className="text-[11px] py-0.5 border-b border-amber-100 last:border-b-0">
+                      <div className="font-bold truncate text-slate-700">{d.stepInfo?.title || '全体'}</div>
+                      <div className="text-amber-700 truncate">{d.label}</div>
+                      <div className="text-[9px] text-slate-400">{d.lot?.orderNo || d.orderNo} · {fmtDate(d.timestamp)}</div>
+                    </div>
+                  ))}
+                </div>
+                {/* 気づき */}
+                <div className="bg-white border border-purple-200 rounded p-2">
+                  <div className="text-purple-700 font-bold mb-1 text-[11px]">💡 気づき ({complaints.length})</div>
+                  {allRecent.complaints.length === 0 && <div className="text-slate-400 text-[10px]">なし</div>}
+                  {allRecent.complaints.map((c, i) => (
+                    <div key={'cp'+i} className="text-[11px] py-0.5 border-b border-purple-100 last:border-b-0">
+                      <div className="font-bold truncate text-slate-700">{c.stepInfo?.title || '全体'}</div>
+                      <div className="text-purple-700 truncate">{c.label}</div>
+                      <div className="text-[9px] text-slate-400">{c.lot?.orderNo || c.orderNo} · {fmtDate(c.timestamp)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeTemplates = {}, onSaveStrictTemplate = null, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null }) => {
+  // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
+  // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
+  //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
+  const lot = _lotProp || {};
+  // ロットが消えた (削除/置換) 場合は自動でモーダルを閉じる
+  useEffect(() => {
+    if (!_lotProp && onClose) {
+      const id = setTimeout(() => onClose(), 0);
+      return () => clearTimeout(id);
+    }
+  }, [_lotProp, onClose]);
+  // 検査中に途中経過の成績表をプレビューする (データ未入力部分は空白)
+  const [showInProgressReport, setShowInProgressReport] = useState(false);
+  // 作業順最適化モーダル
+  const [showWorkOrderOptimizer, setShowWorkOrderOptimizer] = useState(false);
+  // 推奨順ガイダンス: カスタムモードで「1台目から順番に」のルールを視覚化
+  // 厳密モードの決定権は管理者 (テンプレ単位で settings.strictModeTemplates に保存・全端末共有)。
+  // 個人端末のローカルトグルは「管理者未設定のテンプレ」での一時的な個人利用のみ。
+  const isAdmin = currentUserName === '管理者';
+  const adminStrictForTemplate = strictModeTemplates?.[lot.templateId]; // true=ON / false=明示OFF / undefined=未設定
+  const [localStrictOrderMode, setLocalStrictOrderMode] = useState(() => {
+    try { return localStorage.getItem('strictOrderMode') === 'true'; } catch { return false; }
+  });
+  // 実効: 管理者設定が優先。未設定ならローカルトグル。
+  const strictOrderMode = adminStrictForTemplate === true ? true
+    : adminStrictForTemplate === false ? false
+    : localStrictOrderMode;
+  const toggleStrictOrderMode = () => {
+    // 管理者: テンプレ単位の共有設定を切り替え (全端末に反映)
+    if (isAdmin && lot.templateId && onSaveStrictTemplate) {
+      onSaveStrictTemplate(lot.templateId, !strictOrderMode);
+      return;
+    }
+    // 作業者 + 管理者がそのテンプレを明示設定済 → 変更不可
+    if (adminStrictForTemplate !== undefined) {
+      alert('このテンプレの厳密モードは管理者が設定しています。変更は管理者のみ可能です。');
+      return;
+    }
+    // 管理者未設定 → 個人ローカルトグル
+    const next = !localStrictOrderMode;
+    setLocalStrictOrderMode(next);
+    try { localStorage.setItem('strictOrderMode', next ? 'true' : 'false'); } catch {}
+  };
+  // 順序外タップで警告ダイアログ表示用
+  const [outOfOrderConfirm, setOutOfOrderConfirm] = useState(null); // { stepIdx, unitIdx, nextRecommendedUnit, action }
+  // カスタムモードの表示形式: 'card' (従来の大きいカード) | 'compact' (高密度テーブル)
+  const [customViewMode, setCustomViewMode] = useState(() => {
+    try { return localStorage.getItem('customViewMode') || 'card'; } catch { return 'card'; }
+  });
+  const setCustomViewModePersist = (m) => {
+    setCustomViewMode(m);
+    try { localStorage.setItem('customViewMode', m); } catch {}
+  };
   // 前回モードを復元 (lot.executionType があれば優先)
   const [executionType, setExecutionType] = useState(lot.executionType || 'initial');
   const [currentStepIdx, setCurrentStepIdx] = useState(lot.currentStepIndex || 0);
   const [currentUnitIdx, setCurrentUnitIdx] = useState(lot.currentUnitIndex || 0);
   const totalUnits = lot.quantity || 1;
+  // ※ optimizedStepOrder による自動並べ替えは撤去 (2026-05-30 ユーザー指示)
+  //   理由: テンプレ/ロットの正規工程順を勝手に書き換えるのは破壊的すぎる。
+  //         オススメ順は「自動測定中に並行可能な手動工程の提案」に留め、
+  //         テンプレ・ロットの steps 自体は触らない。
+  //   残存する lot.optimizedStepOrder フィールドは表示時に無視する (互換性のため Firestore からは消さない)
+  const lotTemplate = useMemo(() => (templates || []).find(t => t.id === lot.templateId), [templates, lot.templateId]);
   const [localSteps, setLocalSteps] = useState(lot.steps || []);
+  useEffect(() => {
+    setLocalSteps(lot.steps || []);
+  }, [lot.steps]);
   // 該当する共有ノート（型式 or 工程タイトルが一致）
   const getStepNotes = (stepTitle) => sharedNotes.filter(n =>
     (n.model && n.model === lot.model && (!n.stepTitle || n.stepTitle === stepTitle)) ||
@@ -3020,14 +5216,37 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   
   // Batch processing state for custom mode
   const [batchStartTimes, setBatchStartTimes] = useState({});
+  // 範囲指定でまとめて開始するモーダル: { stepIdx, from, to } | null
+  const [batchRangeModal, setBatchRangeModal] = useState(null);
 
   // Force re-render counter for custom mode timer display
   const [timerTick, setTimerTick] = useState(0);
-  
+
+  // 別エリアの自動測定タイマー (floating widget) の表示状態
+  const [showOtherAutoWidget, setShowOtherAutoWidget] = useState(true);
+  // 1秒毎に再描画して経過時間を更新
+  const [otherAutoTick, setOtherAutoTick] = useState(0);
+
+  // 停止理由 (中断時に選択): lot.pauseReason に永続化
+  // category: 'waiting_lot' | 'waiting_repair' | 'paused' | 'waiting_parts' | 'waiting_decision'
+  // note: 任意の自由テキスト
+  // startTime: 停止開始時刻 (経過時間表示用)
+  const [pauseReason, setPauseReason] = useState(lot.pauseReason || null);
+  const PAUSE_REASONS = [
+    { key: 'waiting_lot',      label: '残ロット待ち',  desc: '次回入荷待ち / 次の台が来るまで', color: 'amber',  emoji: '🟡' },
+    { key: 'waiting_repair',   label: '修正待ち',      desc: '不具合修正・再加工依頼中',       color: 'orange', emoji: '🟠' },
+    { key: 'paused',           label: '検査一旦停止',  desc: 'その他の理由 (休憩・移動など)',  color: 'rose',   emoji: '🔴' },
+    { key: 'waiting_parts',    label: '部品/工具待ち', desc: '道具・治具・部品が不足',         color: 'purple', emoji: '🟣' },
+    { key: 'waiting_decision', label: '判断待ち',      desc: '上長・設計の判断待ち',           color: 'blue',   emoji: '🔵' },
+  ];
+
   // Interruptions (Defects/Monitoring)
   const [interruptions, setInterruptions] = useState(lot.interruptions || []);
   // 測定画面メイン拡大表示トグル（測定タイプの工程のみで使用）
   const [measurementFullscreen, setMeasurementFullscreen] = useState(false);
+  // 確認チェック拡大表示 + 注意事項/画像 拡大表示
+  const [checklistFullscreen, setChecklistFullscreen] = useState(false);
+  const [detailsFullscreen, setDetailsFullscreen] = useState(false);
   const [showDefectModal, setShowDefectModal] = useState(false);
   const [defectLabel, setDefectLabel] = useState('');
   const [defectCauseProcess, setDefectCauseProcess] = useState('');
@@ -3091,6 +5310,22 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
   const [showPdf, setShowPdf] = useState(false);
   const [activeCustomTaskKey, setActiveCustomTaskKey] = useState(null);
+
+  // activeCustomTaskKey は "数値idx-unit" or "stepId-unit" の2形式が混在する。
+  // 安全に stepIdx/unitIdx を取り出すヘルパー (voice ハンドラ・描画両方で利用)
+  const parseActiveTaskKey = (taskKey) => {
+    if (!taskKey) return { stepIdx: 0, unitIdx: 0 };
+    const dashIdx = taskKey.lastIndexOf('-');
+    if (dashIdx < 0) return { stepIdx: 0, unitIdx: 0 };
+    const prefix = taskKey.slice(0, dashIdx);
+    const unitIdx = parseInt(taskKey.slice(dashIdx + 1)) || 0;
+    // 数値 index ベース ("0-1" 形式)
+    if (/^\d+$/.test(prefix)) return { stepIdx: Number(prefix), unitIdx };
+    // step.id ベース ("s1-1" や "abc123-1" 形式)
+    const stepIdxFromId = localSteps.findIndex(s => s.id === prefix);
+    if (stepIdxFromId >= 0) return { stepIdx: stepIdxFromId, unitIdx };
+    return { stepIdx: 0, unitIdx };
+  };
 
   // Voice Assistant
   const [voiceEnabled, setVoiceEnabled] = useState(() => {
@@ -3184,6 +5419,11 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   // 注意: 1秒ごとの再描画コストを抑えるため、不要な setState は避ける
   // 別モーダル長時間滞在時にデータが失われないよう、60秒に1回 totalWorkTime を Firestore へ自動 flush
   const lastFlushTimeRef = useRef(Date.now());
+  // 自動 flush で使う最新値を ref に保持 (effect deps に入れず、interval リスタートも避ける)
+  const measurementResultsRef = useRef(measurementResults);
+  const onSaveRef = useRef(onSave);
+  useEffect(() => { measurementResultsRef.current = measurementResults; }, [measurementResults]);
+  useEffect(() => { onSaveRef.current = onSave; }, [onSave]);
   useEffect(() => {
     let interval;
     const now = Date.now();
@@ -3202,7 +5442,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
              // 60秒に1回 Firestore へ書き戻し (リロード時のデータ消失防止)
              if (currentNow - lastFlushTimeRef.current >= 60_000) {
                lastFlushTimeRef.current = currentNow;
-               try { onSave({ totalWorkTime: newElapsed, measurementResults }); } catch {}
+               try { onSaveRef.current?.({ totalWorkTime: newElapsed, measurementResults: measurementResultsRef.current }); } catch {}
              }
          }
 
@@ -3234,7 +5474,12 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   // reportOnly=true: 記録だけ残し作業時間計測には影響しない (status='reported')
   // reportOnly=false: 従来通り「対応中」として時間計測開始 (status='active')
   const startInterruption = (type, label, causeProcess, photos, reportOnly = false) => {
-      const curStep = localSteps[currentStepIdx] || localSteps[0];
+      // 工程の特定:
+      //   custom モード: ユーザが画面上で見ている工程 (displayStepIdx) を使う
+      //   sequential モード: 現在の工程 (currentStepIdx)
+      //   ※ 旧コードは currentStepIdx 固定だったため、custom モードで報告するとすべて工程0(準備)で記録されるバグだった
+      const stepIdxForReport = executionType === 'custom' ? displayStepIdx : currentStepIdx;
+      const curStep = localSteps[stepIdxForReport] || localSteps[0];
       const now = Date.now();
       const newInt = {
           id: generateId(),
@@ -3273,7 +5518,16 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   const isOnBreak = executionType === 'sequential' ? !isTimerRunning : customPaused;
   const toggleBreak = () => {
     if (executionType === 'sequential') {
-      if (isTimerRunning) handlePause(); else handleStart();
+      if (isTimerRunning) {
+        handlePause();
+      } else {
+        // 再開時に停止理由をクリア
+        if (pauseReason) {
+          setPauseReason(null);
+          onSave({ pauseReason: null });
+        }
+        handleStart();
+      }
       return;
     }
     // カスタム: 進行中(processing)のタスクをまとめて停止/再開
@@ -3284,7 +5538,8 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       Object.entries(tasks).forEach(([k, t]) => {
         if (t?.status === 'processing' && t.startTime) {
           const sec = Math.floor((now - t.startTime) / 1000);
-          newTasks[k] = { ...t, status: 'paused', duration: (t.duration || 0) + sec, startTime: null, pausedAt: now };
+          // firstStartTime は維持 (最初に着手した時刻を覚えておく)
+          newTasks[k] = { ...t, status: 'paused', duration: (t.duration || 0) + sec, startTime: null, pausedAt: now, firstStartTime: t.firstStartTime || t.startTime };
         } else {
           newTasks[k] = t;
         }
@@ -3295,11 +5550,12 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       setCustomPaused(true);
     } else {
       // 再開: pausedAt があったタスクを processing に戻し、startTime を Date.now() に
+      // ※ firstStartTime は維持 (再開しても「最初の着手時刻」は変わらない)
       const now = Date.now();
       const newTasks = {};
       Object.entries(tasks).forEach(([k, t]) => {
         if (t?.status === 'paused' && t.pausedAt) {
-          newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null };
+          newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null, firstStartTime: t.firstStartTime || now };
         } else {
           newTasks[k] = t;
         }
@@ -3308,6 +5564,11 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       tasksRef.current = newTasks;
       onSave({ tasks: newTasks });
       setCustomPaused(false);
+      // 再開時に停止理由をクリア
+      if (pauseReason) {
+        setPauseReason(null);
+        onSave({ pauseReason: null });
+      }
     }
   };
 
@@ -3355,14 +5616,83 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
   // --- Sequential Handlers ---
   const currentStep = localSteps[currentStepIdx];
-  const handleStart = () => { setIsTimerRunning(true); setStartTime(Date.now()); stepUnitStartRef.current = Date.now(); onSave({ status: 'processing', workStartTime: Date.now(), measurementResults }); };
+
+  // === 同型式・同工程の直近気づき/不良情報 (品質情報の現場共有) ===
+  // 作業中の作業者が「この型式でよくある問題」を即座に把握できるようにする
+  const modelQualityInfo = useMemo(() => {
+    if (!lot.model || !lots) return { complaints: [], defects: [], ngTasks: [] };
+    // 同型式の他ロット (自分以外、過去6ヶ月以内)
+    const sixMonthsAgo = Date.now() - 180 * 24 * 3600 * 1000;
+    const relatedLots = lots.filter(l =>
+      l.id !== lot.id &&
+      l.model === lot.model &&
+      (l.completedAt || l.updatedAt || l.createdAt || 0) > sixMonthsAgo
+    );
+    const complaints = [];
+    const defects = [];
+    const ngTasks = [];
+    relatedLots.forEach(l => {
+      // interruptions から気づきと不具合を抽出
+      (l.interruptions || []).forEach(itr => {
+        const entry = {
+          ...itr,
+          orderNo: l.orderNo,
+          completedAt: l.completedAt,
+          // この工程に関連するかフラグ
+          isThisStep: itr.stepInfo?.title === currentStep?.title || itr.stepInfo?.id === currentStep?.id,
+        };
+        if (itr.type === 'complaint') complaints.push(entry);
+        else defects.push(entry);
+      });
+      // NG タスク
+      Object.entries(l.tasks || {}).forEach(([k, t]) => {
+        if (t.status !== 'ng') return;
+        const parts = k.split('-');
+        const unitIdxStr = parts.pop();
+        const stepIdOrIdx = parts.join('-');
+        const step = (l.steps || []).find(s => s.id === stepIdOrIdx) || (l.steps || [])[parseInt(stepIdOrIdx)];
+        ngTasks.push({
+          orderNo: l.orderNo,
+          stepTitle: step?.title || '不明',
+          stepId: step?.id,
+          ngReason: t.ngReason,
+          ngAt: t.ngAt || t.endTime,
+          isThisStep: step?.id === currentStep?.id || step?.title === currentStep?.title,
+        });
+      });
+    });
+    // 日付降順 (新しいもの優先)
+    complaints.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    defects.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    ngTasks.sort((a, b) => (b.ngAt || 0) - (a.ngAt || 0));
+    return { complaints, defects, ngTasks, relatedLotCount: relatedLots.length };
+  }, [lot.model, lot.id, lots, currentStep]);
+  // パネル開閉状態
+  const [showQualityInfoPanel, setShowQualityInfoPanel] = useState(true);
+  const handleStart = () => {
+    const nowTs = Date.now();
+    setIsTimerRunning(true);
+    setStartTime(nowTs);
+    stepUnitStartRef.current = nowTs;
+    onSave({
+      status: 'processing',
+      workStartTime: nowTs,
+      // firstWorkStartTime: ロットを最初に作業着手した時刻 (中断・再開で変わらない)
+      firstWorkStartTime: lot.firstWorkStartTime || nowTs,
+      measurementResults,
+    });
+  };
   const handlePause = () => {
-    // setElapsed は非同期反映のため、その場で再計算して保存ズレ防止
     const now = Date.now();
     const computed = (lot.totalWorkTime || 0) + (startTime ? (now - startTime) : 0);
     setIsTimerRunning(false);
     setElapsed(computed);
-    onSave({ status: 'paused', totalWorkTime: computed, workStartTime: null, measurementResults });
+    // workStartTime はセッション計測用、firstWorkStartTime は維持
+    onSave({
+      status: 'paused', totalWorkTime: computed, workStartTime: null, measurementResults,
+      firstWorkStartTime: lot.firstWorkStartTime || lot.workStartTime || null,
+      lastPausedAt: now,
+    });
   };
   // stepUnitTimes: { "stepId-unitIdx": seconds } 各工程×各台の個別時間
   const [stepUnitTimes, setStepUnitTimes] = useState(lot.stepUnitTimes || {});
@@ -3392,6 +5722,19 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   };
 
   const handleNext = () => {
+    // 確認チェック未完了ブロック (sequential モードの現在工程のみ)
+    if (currentStep && Array.isArray(currentStep.checklistItems) && currentStep.checklistItems.length > 0) {
+      const requiredItems = currentStep.checklistItems.filter(it => it.required !== false);
+      if (requiredItems.length > 0) {
+        const chkKey = `${currentStep.id}-${currentUnitIdx}-checklist`;
+        const checked = measurementResults[chkKey] || {};
+        const missing = requiredItems.filter(it => !checked[it.id]);
+        if (missing.length > 0) {
+          alert(`⚠ 確認チェックを完了してください:\n\n${missing.map(m => `・${m.label || '(無題)'}`).join('\n')}`);
+          return;
+        }
+      }
+    }
     // 現在の工程×台の作業時間を記録
     const now = Date.now();
     const unitDuration = Math.floor((now - stepUnitStartRef.current) / 1000);
@@ -3405,7 +5748,9 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     const taskKey = currentStep?.id ? `${currentStep.id}-${currentUnitIdx}` : `${currentStepIdx}-${currentUnitIdx}`;
     const legacyKey = `${currentStepIdx}-${currentUnitIdx}`;
     if (!tasks[taskKey] || tasks[taskKey].status !== 'completed') {
-      const newTasks = { ...tasks, [taskKey]: { status: 'completed', duration: unitDuration, startTime: null } };
+      // 開始時刻 = stepUnitStartRef.current の以前値 (= now - unitDuration*1000)、終了 = now
+      const firstStart = now - unitDuration * 1000;
+      const newTasks = { ...tasks, [taskKey]: { status: 'completed', duration: unitDuration, startTime: null, firstStartTime: firstStart, endTime: now } };
       // 旧 numeric キーが残っていたら削除（重複防止）
       if (taskKey !== legacyKey && newTasks[legacyKey]) delete newTasks[legacyKey];
       setTasks(newTasks);
@@ -3567,7 +5912,8 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
         // --- 次工程コマンド（同じ台数で次の工程へ）---
         if ((matchNextStep(cmd) || matchNextStep(rawCmd)) && activeCustomTaskKey) {
-          const [sI, uI] = activeCustomTaskKey.split('-').map(Number);
+          // activeCustomTaskKey は step.id ベースの場合があるので parseActiveTaskKey で正規化
+          const { stepIdx: sI, unitIdx: uI } = parseActiveTaskKey(activeCustomTaskKey);
           voiceToggleTask(sI, uI); // 現在を完了
           const nextS = sI + 1;
           if (nextS < localSteps.length) {
@@ -3641,13 +5987,13 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           }
         } else if (matchComplete(cmd)) {
           if (activeCustomTaskKey) {
-            const [sI, uI] = activeCustomTaskKey.split('-').map(Number);
+            const { stepIdx: sI, unitIdx: uI } = parseActiveTaskKey(activeCustomTaskKey);
             voiceToggleTask(sI, uI);
             await speakAsyncWithLog(`${sI+1}工程${uI+1}台目を完了しました。次はどうしますか？`);
           }
         } else if (matchMeasurement(cmd)) {
           if (activeCustomTaskKey) {
-            const [sI] = activeCustomTaskKey.split('-').map(Number);
+            const { stepIdx: sI } = parseActiveTaskKey(activeCustomTaskKey);
             const step = localSteps[sI];
             if (step?.type === 'measurement' && step.measurementConfig) {
               await runVoiceMeasurementFlow(step, sI);
@@ -3661,7 +6007,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           toggleBreak();
           await speakAsyncWithLog('中断しました');
         } else if (matchNext(cmd) && activeCustomTaskKey) {
-          const [sI, uI] = activeCustomTaskKey.split('-').map(Number);
+          const { stepIdx: sI, unitIdx: uI } = parseActiveTaskKey(activeCustomTaskKey);
           voiceToggleTask(sI, uI); // 現在を完了
           let nextS = sI, nextU = uI + 1;
           if (nextU >= lot.quantity) { nextS++; nextU = 0; }
@@ -3687,19 +6033,21 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
   // Voice: Handle a single custom task (measurement input etc.)
   // 音声フロー用: stale closure回避でRefからtoggle
+  // ※ キーは getTaskKey で step.id ベース優先 (UI 側と統一しないと画面が更新されない)
   const voiceToggleTask = (sIdx, uIdx) => {
-    const key = `${sIdx}-${uIdx}`;
+    const key = getTaskKey(sIdx, uIdx);
     setTasks(prev => {
       const cur = prev[key] || { status: 'waiting', duration: 0, startTime: null };
       if (cur.status === 'waiting' || cur.status === 'paused') {
-        const updated = { ...prev, [key]: { ...cur, status: 'processing', startTime: Date.now() } };
+        const nowTs = Date.now();
+        const updated = { ...prev, [key]: { ...cur, status: 'processing', startTime: nowTs, firstStartTime: cur.firstStartTime || nowTs } };
         onSave({ tasks: updated, status: 'processing' });
         startUndoTimer({ key, type: 'task', previousTasks: prev });
         return updated;
       } else if (cur.status === 'processing') {
         const now = Date.now();
         const dur = cur.startTime ? Math.floor((now - cur.startTime) / 1000) : 0;
-        const updated = { ...prev, [key]: { ...cur, status: 'completed', duration: cur.duration + dur, startTime: null } };
+        const updated = { ...prev, [key]: { ...cur, status: 'completed', duration: cur.duration + dur, startTime: null, endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now } };
         onSave({ tasks: updated, status: 'processing' });
         startUndoTimer({ key, type: 'task', previousTasks: prev });
         return updated;
@@ -3744,6 +6092,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
         const nextS = sIdx + 1;
         if (nextS < localSteps.length) {
           voiceToggleTask(nextS, uIdx); // 次工程の同じ台数
+          // activeCustomTaskKey は数値index 形式で統一 (他の voice ハンドラと一致させる、parse 時 NaN を避ける)
           setActiveCustomTaskKey(`${nextS}-${uIdx}`);
           await speakAsyncWithLog(`${nextS+1}工程、${uIdx+1}台目を開始しました`);
           await runVoiceCustomTaskFlow(nextS, uIdx);
@@ -3922,9 +6271,53 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     return () => { voiceRunningRef.current = false; };
   }, [voiceEnabled, currentStepIdx, currentUnitIdx, executionType, isTimerRunning]);
 
+  // 確認チェック未完了の工程を探す。返り値: [{ stepIdx, stepTitle, unitIdx, missingItems: [...] }, ...]
+  // 全 units の必須チェック未完了をリストアップ
+  const findIncompleteChecklists = () => {
+    const incomplete = [];
+    localSteps.forEach((step, sIdx) => {
+      if (!Array.isArray(step.checklistItems) || step.checklistItems.length === 0) return;
+      const requiredItems = step.checklistItems.filter(it => it.required !== false);
+      if (requiredItems.length === 0) return;
+      for (let u = 0; u < totalUnits; u++) {
+        const chkKey = `${step.id}-${u}-checklist`;
+        const checked = measurementResults[chkKey] || {};
+        const missing = requiredItems.filter(it => !checked[it.id]);
+        // タスクが skipped/completed 以外 (=実作業対象) のみチェック対象
+        const taskKey = step.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
+        const t = tasksRef.current[taskKey];
+        const taskNeeded = !t || (t.status !== 'skipped' && t.status !== 'completed');
+        // sequential モードでは 1台目で代表
+        const isCurrentStep = (executionType === 'sequential') ? (u === 0) : taskNeeded;
+        if (missing.length > 0 && isCurrentStep) {
+          incomplete.push({ stepIdx: sIdx, stepTitle: step.title, unitIdx: u, missingItems: missing.map(m => m.label || '(無題)') });
+        }
+      }
+    });
+    return incomplete;
+  };
+
   const handleCompleteTrigger = () => {
+      // 確認チェック未完了をブロック
+      const incompleteChks = findIncompleteChecklists();
+      if (incompleteChks.length > 0) {
+          const summary = incompleteChks.slice(0, 5).map(c =>
+              `・${c.stepTitle}${executionType !== 'sequential' ? ` (#${c.unitIdx + 1})` : ''}: ${c.missingItems.slice(0, 3).join(', ')}${c.missingItems.length > 3 ? '...' : ''}`
+          ).join('\n');
+          alert(`⚠ 確認チェック未完了の工程があります。先にチェックを完了してください:\n\n${summary}${incompleteChks.length > 5 ? `\n他 ${incompleteChks.length - 5} 件` : ''}`);
+          return;
+      }
       setIsTimerRunning(false);
-      onSave({ status: 'paused', totalWorkTime: elapsed, workStartTime: null, stepTimes, measurementResults });
+      onSave({
+        status: 'paused',
+        totalWorkTime: elapsed,
+        workStartTime: null,
+        // 時間取りアプリの本分: 作業開始時刻を絶対に失わないため firstWorkStartTime を保持
+        firstWorkStartTime: lot.firstWorkStartTime || lot.workStartTime || startTime || null,
+        lastPausedAt: Date.now(),
+        stepTimes,
+        measurementResults,
+      });
       setIsConfirming(true);
   };
 
@@ -3940,12 +6333,19 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       const meta = {};
       if (overrideMeta) {
           // 未完了タスクを 'skipped' として明示記録
+          // ※ 旧データ ({sIdx}-{u} 数値キー) のみ存在する場合は、新キーに skipped を書きつつ
+          //   旧キーも削除して、両方が tasks 集計で重複カウントされないようにする
           localSteps.forEach((step, sIdx) => {
               for (let u = 0; u < totalUnits; u++) {
                   const key = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
-                  const t = skippedTasks[key] || tasksRef.current[`${sIdx}-${u}`];
+                  const numKey = `${sIdx}-${u}`;
+                  const t = skippedTasks[key] || tasksRef.current[numKey];
                   if (!t || (t.status !== 'completed' && t.status !== 'skipped')) {
-                      skippedTasks[key] = { status: 'skipped', duration: 0, skipReason: overrideMeta.reason, skipBy: overrideMeta.responsibleBy, skipAt: completedAt };
+                      // skipped でも firstStartTime/endTime を記録 (時刻 = スキップ確定時刻)
+                      skippedTasks[key] = { status: 'skipped', duration: 0, skipReason: overrideMeta.reason, skipBy: overrideMeta.responsibleBy, skipAt: completedAt, firstStartTime: completedAt, endTime: completedAt };
+                      if (key !== numKey && skippedTasks[numKey]) {
+                          delete skippedTasks[numKey];
+                      }
                   }
               }
           });
@@ -3954,7 +6354,10 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       }
       onSave({
           status: 'completed', location: 'completed',
-          totalWorkTime: elapsed, workStartTime: null,
+          totalWorkTime: elapsed,
+          // workStartTime を null にすると「ロット作業開始時刻」が失われる → 保持する
+          // ガントチャートで「いつから〜いつまで」を表示するための重要データ
+          workStartTime: lot.workStartTime || startTime || null,
           currentStepIndex: localSteps.length,
           stepTimes, stepUnitTimes,
           tasks: skippedTasks,
@@ -3977,7 +6380,16 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                   return;
               }
               setIsTimerRunning(false);
-              await onSave({ status: 'paused', totalWorkTime: elapsed, workStartTime: null, stepTimes, measurementResults });
+              await onSave({
+                status: 'paused',
+                totalWorkTime: elapsed,
+                workStartTime: null,
+                // X ボタンで閉じる時の一時停止でも firstWorkStartTime を保持
+                firstWorkStartTime: lot.firstWorkStartTime || lot.workStartTime || startTime || null,
+                lastPausedAt: Date.now(),
+                stepTimes,
+                measurementResults,
+              });
           } else {
               // 計測中でなくても、未保存の測定値があるかもしれないので念のため保存
               await onSave({ measurementResults });
@@ -3991,15 +6403,252 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   // (handleNG は未使用。NG 報告は不具合報告モーダル経由で startInterruption('defect') を呼ぶ)
 
   // --- Custom Mode Handlers ---
+  // タスクキーから step を逆引きするヘルパー。
+  //   キー形式は ① `${step.id}-${unitIdx}` (新) または ② `${stepIdx}-${unitIdx}` (旧)
+  //   なので、最後の '-' の前を取り出して両方試す。
+  const findStepByTaskKey = (key) => {
+    if (!key || typeof key !== 'string') return null;
+    const last = key.lastIndexOf('-');
+    if (last < 0) return null;
+    const ident = key.slice(0, last);
+    // step.id ベース
+    const byId = localSteps.find(s => s && s.id === ident);
+    if (byId) return byId;
+    // 数値 index ベース
+    const n = Number(ident);
+    if (!Number.isNaN(n) && n >= 0 && n < localSteps.length) return localSteps[n];
+    return null;
+  };
+
+  // 手動工程の task が processing 中か (キー形式バグを修正済み)
   const isManualTaskRunning = useMemo(() => {
     return Object.keys(tasks).some(key => {
-       const [stepIdx] = key.split('-').map(Number);
-       const step = localSteps[stepIdx];
-       return step && !step.title.includes('自動') && tasks[key].status === 'processing';
+      if (tasks[key]?.status !== 'processing') return false;
+      const step = findStepByTaskKey(key);
+      return step && !step.title.includes('自動');
     });
   }, [tasks, localSteps]);
 
+  // 自動測定が今走っているか:
+  //   ① 自動工程の task が processing 状態 (自動測定 + 手動チェック型) OR
+  //   ② monitoring interruption が active (純粋な見守り)
+  // 並行手動作業はこの状態のときのみ許可する
+  const isAnyAutoRunning = useMemo(() => {
+    const autoTaskRunning = Object.keys(tasks).some(key => {
+      if (tasks[key]?.status !== 'processing') return false;
+      const step = findStepByTaskKey(key);
+      return step && step.title.includes('自動');
+    });
+    const monitoringActive = (interruptions || []).some(i => i.type === 'monitoring' && i.status === 'active');
+    return autoTaskRunning || monitoringActive;
+  }, [tasks, localSteps, interruptions]);
+
+  // 別エリア (= 別ロット) で動いている自動測定 / 監視中の情報を集める
+  // 「あと何分で戻ろうか」の判断材料を提供
+  // otherAutoTick で 1秒毎に経過時間を再計算
+  const otherActiveAutos = useMemo(() => {
+    const list = [];
+    const now = Date.now();
+    (lots || []).forEach(otherLot => {
+      if (!otherLot || otherLot.id === lot.id) return; // 自分のロットは除外
+      if (otherLot.status === 'completed') return;
+      const otherSteps = otherLot.steps || [];
+      const otherTasks = otherLot.tasks || {};
+      const otherInts = otherLot.interruptions || [];
+      const zoneName = mapZones.find(z => z.id === otherLot.mapZoneId)?.name || '';
+      const worker = workers.find(w => w.id === otherLot.workerId)?.name || '';
+
+      // ① 自動工程の task が processing 状態
+      otherSteps.forEach((step, sIdx) => {
+        if (!step?.title?.includes('自動')) return;
+        for (let u = 0; u < (otherLot.quantity || 1); u++) {
+          const key = `${step.id}-${u}`;
+          const numKey = `${sIdx}-${u}`;
+          const task = otherTasks[key] || otherTasks[numKey];
+          if (task && task.status === 'processing' && task.startTime) {
+            const elapsedMs = now - task.startTime;
+            const targetMs = (step.targetTime || 0) * 1000;
+            list.push({
+              lotId: otherLot.id,
+              lotModel: otherLot.model,
+              lotOrderNo: otherLot.orderNo,
+              unitIdx: u,
+              stepTitle: step.title,
+              zoneName,
+              workerName: worker,
+              elapsedMs,
+              targetMs,
+              source: 'task'
+            });
+          }
+        }
+      });
+      // ② monitoring interruption が active
+      otherInts.forEach(i => {
+        if (i.type !== 'monitoring' || i.status !== 'active' || !i.startTime) return;
+        const elapsedMs = now - i.startTime;
+        // 対応する自動 step を探して targetTime 取得
+        const matchingStep = otherSteps.find(s => s.title === i.label);
+        const targetMs = (matchingStep?.targetTime || 0) * 1000;
+        list.push({
+          lotId: otherLot.id,
+          lotModel: otherLot.model,
+          lotOrderNo: otherLot.orderNo,
+          stepTitle: i.label,
+          zoneName,
+          workerName: worker,
+          elapsedMs,
+          targetMs,
+          source: 'monitoring'
+        });
+      });
+    });
+    return list;
+  }, [lots, lot.id, mapZones, workers, otherAutoTick]);
+
+  // === データ成熟度: 同テンプレの完了ロット数 (厳密モード推奨の判断材料) ===
+  const templateDataMaturity = useMemo(() => {
+    if (!lot.templateId) return 0;
+    return (lots || []).filter(l => l.id !== lot.id && l.status === 'completed' && l.templateId === lot.templateId).length;
+  }, [lots, lot.templateId, lot.id]);
+  // このテンプレで厳密モード推奨を既に判断済みか (localStorage)
+  const strictSuggestKey = `strictSuggested_${lot.templateId || 'none'}`;
+  const [strictSuggestDismissed, setStrictSuggestDismissed] = useState(() => {
+    try { return !!localStorage.getItem(strictSuggestKey); } catch { return false; }
+  });
+  const STRICT_MATURITY_THRESHOLD = strictModeThreshold || 5; // 管理者が設定 (settings.strictModeThreshold)。同テンプレ完了ロットがこの数以上で「データ十分」
+  const showStrictSuggestion = templateDataMaturity >= STRICT_MATURITY_THRESHOLD && !strictOrderMode && !strictSuggestDismissed;
+
+  // === 「今やるべき唯一のタスク」を決定 (1台目から順番ルール) ===
+  // 各工程行ごとに「次」を出すと画面中に「次」が溢れて「どれでも押せる」ように見えてしまう。
+  // → 全体で1個だけ。ルール:
+  //   1) 手動タスクが進行中なら → 作業者は今それをやってる → 次バッジ不要 (null)
+  //   2) ある台で自動測定が進行中 → その台は機械占有 → 作業者は他の台へ → 次の台の先頭未着手を指す
+  //   3) それ以外 → 台順 (1→2→3) × テンプレ順で最初の未着手タスクを指す
+  const globalNextTask = useMemo(() => {
+    const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+    const qty = lot.quantity || 1;
+    const getKey = (step, sIdx, u) => (step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
+    const statusOf = (step, sIdx, u) => {
+      const t = tasks[getKey(step, sIdx, u)] || tasks[`${sIdx}-${u}`];
+      return t?.status || 'waiting';
+    };
+    // 1) 手動タスクが進行中なら 次は出さない (作業者は手を動かしてる)
+    for (let si = 0; si < localSteps.length; si++) {
+      const step = localSteps[si];
+      if (isAutoStepFn(step)) continue;
+      for (let u = 0; u < qty; u++) {
+        if (statusOf(step, si, u) === 'processing') return null;
+      }
+    }
+    // 各台が「機械占有中 (自動測定 processing)」かどうか
+    const unitHasRunningAuto = (u) => localSteps.some((step, si) => isAutoStepFn(step) && statusOf(step, si, u) === 'processing');
+    // 2)+3) 台順 × テンプレ順で最初の未着手を探す。機械占有中の台はスキップ。
+    for (let u = 0; u < qty; u++) {
+      if (unitHasRunningAuto(u)) continue; // この台は自動測定中 → 作業者は触れない
+      for (let si = 0; si < localSteps.length; si++) {
+        const step = localSteps[si];
+        const st = statusOf(step, si, u);
+        if (st === 'waiting' || st === 'paused') {
+          return { sIdx: si, unitIdx: u, isAuto: isAutoStepFn(step) };
+        }
+        // completed/skipped/ng → 次の工程へ。processing(自動) はこの台では上で除外済
+      }
+    }
+    return null;
+  }, [tasks, localSteps, lot.quantity, otherAutoTick]);
+
+  // === ライブ並行作業ガイド ===
+  // このロットで自動測定 (batch) が走っている間、その経過時間に応じて
+  // 「他の台で今やれる作業」をリアルタイム表示する。
+  // 自動測定が予定より延びたら (アクシデント等)、空いた時間ぶん追加候補を出す。
+  const liveParallelGuide = useMemo(() => {
+    const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+    // このロットで processing 中の自動タスクを探す (最も経過の長いもの)
+    let runningAuto = null; // { step, sIdx, unitIdx, startTime, elapsedSec, targetSec }
+    localSteps.forEach((step, sIdx) => {
+      if (!isAutoStepFn(step)) return;
+      for (let u = 0; u < (lot.quantity || 1); u++) {
+        const key = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
+        const t = tasks[key] || tasks[`${sIdx}-${u}`];
+        if (t && t.status === 'processing' && t.startTime) {
+          const elapsedSec = Math.floor((Date.now() - t.startTime) / 1000);
+          if (!runningAuto || elapsedSec > runningAuto.elapsedSec) {
+            runningAuto = { step, sIdx, unitIdx: u, startTime: t.startTime, elapsedSec, targetSec: step.targetTime || 0 };
+          }
+        }
+      }
+    });
+    if (!runningAuto) return null;
+
+    const autoResource = runningAuto.step.workResource || 'measurement-machine';
+    // 並列候補キー (機械独立 or 別リソース)
+    const candidateOf = (step) => {
+      if (isAutoStepFn(step)) return false;
+      if (step.workResource === null || step.workResource === '') return true;
+      if (step.workResource && step.workResource !== autoResource) return true;
+      if (step.parallelSafe === true) return true;
+      return false;
+    };
+    // 予算 = max(目標, 実経過). 延長したら実経過ぶん候補を増やす
+    const budgetSec = Math.max(runningAuto.targetSec, runningAuto.elapsedSec + 30); // 経過+30秒先まで見せる
+    const qty = lot.quantity || 1;
+
+    // 他の台について、テンプレ順ウォークで候補を集める (現在の進捗状態も考慮)
+    const planned = [];   // 予定内に入る候補
+    const extra = [];     // 延長で追加された候補 (経過が目標を超えた分)
+    let filledSec = 0;
+    for (let otherUnit = 0; otherUnit < qty; otherUnit++) {
+      if (otherUnit === runningAuto.unitIdx) continue;
+      let blocked = false;
+      for (let si = 0; si < localSteps.length; si++) {
+        if (blocked) break;
+        const step = localSteps[si];
+        if (isAutoStepFn(step)) { blocked = true; break; }
+        if (!candidateOf(step)) { blocked = true; break; }
+        // この台×工程の現在ステータス (既に完了してたらスキップ)
+        const key = step?.id ? `${step.id}-${otherUnit}` : `${si}-${otherUnit}`;
+        const ct = tasks[key] || tasks[`${si}-${otherUnit}`];
+        if (ct && (ct.status === 'completed' || ct.status === 'skipped' || ct.status === 'processing')) continue;
+        const dur = step.targetTime || 60;
+        const item = { stepTitle: step.title, unitIdx: otherUnit, durationSec: dur, stepIdx: si };
+        if (filledSec + dur <= runningAuto.targetSec * 1.05) {
+          planned.push(item);
+        } else if (filledSec < budgetSec) {
+          extra.push(item);  // 目標は超えたが、実経過が延びてるので追加可能
+        } else {
+          break;
+        }
+        filledSec += dur;
+      }
+    }
+    const isOverrun = runningAuto.targetSec > 0 && runningAuto.elapsedSec > runningAuto.targetSec;
+    return {
+      runningAuto,
+      planned,
+      extra,
+      isOverrun,
+      overrunSec: isOverrun ? runningAuto.elapsedSec - runningAuto.targetSec : 0,
+      remainingSec: runningAuto.targetSec > 0 ? Math.max(0, runningAuto.targetSec - runningAuto.elapsedSec) : 0,
+    };
+  }, [tasks, localSteps, lot.quantity, otherAutoTick]);
+
+  // 自動測定 (別エリア or このロット) がある間 1秒毎に更新
+  useEffect(() => {
+    const hasLocalAuto = !!liveParallelGuide;
+    if (otherActiveAutos.length === 0 && !hasLocalAuto) return;
+    const iv = setInterval(() => setOtherAutoTick(t => t + 1), 1000);
+    return () => clearInterval(iv);
+  }, [otherActiveAutos.length, !!liveParallelGuide]);
+
   const [completedTaskMenu, setCompletedTaskMenu] = useState(null); // { key, stepIdx, unitIdx }
+  // NG 理由ピッカー: { key, stepIdx, unitIdx } | null
+  // NG ボタンを押した直後に表示。complaintOptions (気づき報告候補) から選ばせて task.ngReason に保存。
+  const [ngReasonPicker, setNgReasonPicker] = useState(null);
+
+  // 全ての hooks 呼び出しが終わったあとで、ロット未定義の場合は何も描画しない
+  // (上の useEffect で onClose を呼ぶスケジュールが既に走っている)
+  if (!_lotProp) return null;
 
   // タスクキー生成: 既存データとの互換のため、step.id ベースを優先しつつ数値index フォールバック
   const getTaskKey = (stepIdx, unitIdx) => {
@@ -4032,7 +6681,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       const dur = currentTask.reworkStartTime ? Math.floor((now - currentTask.reworkStartTime) / 1000) : 0;
       const reworks = [...(currentTask.reworks || [])];
       reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: dur, endTime: now };
-      newTasks[key] = { ...currentTask, status: 'completed', reworkStartTime: null, reworks };
+      newTasks[key] = { ...currentTask, status: 'completed', reworkStartTime: null, reworks, endTime: now, firstStartTime: currentTask.firstStartTime || currentTask.startTime || now };
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
       startUndoTimer({ key, type: 'task', previousTasks });
@@ -4046,7 +6695,14 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
 
     if (currentTask.status === 'waiting' || currentTask.status === 'paused') {
       const previousTasks = { ...tasks };
-      newTasks[key] = { ...currentTask, status: 'processing', startTime: Date.now() };
+      const nowTs = Date.now();
+      newTasks[key] = {
+        ...currentTask,
+        status: 'processing',
+        startTime: nowTs,
+        // firstStartTime: 一番最初に着手した時刻 (中断・再開で変わらない)
+        firstStartTime: currentTask.firstStartTime || nowTs,
+      };
       setActiveCustomTaskKey(key);
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
@@ -4055,7 +6711,15 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       const previousTasks = { ...tasks };
       const now = Date.now();
       const sessionDuration = currentTask.startTime ? Math.floor((now - currentTask.startTime) / 1000) : 0;
-      newTasks[key] = { ...currentTask, status: 'completed', duration: currentTask.duration + sessionDuration, startTime: null };
+      newTasks[key] = {
+        ...currentTask,
+        status: 'completed',
+        duration: currentTask.duration + sessionDuration,
+        startTime: null,
+        // endTime: 完了した時刻 (ガントの「いつ終わったか」を確定するために必須)
+        endTime: now,
+        firstStartTime: currentTask.firstStartTime || (currentTask.startTime || now),
+      };
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
       startUndoTimer({ key, type: 'task', previousTasks });
@@ -4063,26 +6727,65 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   };
 
   // 完了タスクメニューのアクション（メニュー経由 or 直接呼び出し両対応）
-  const handleTaskMenuAction = (action, directKey = null) => {
+  // ngReason: NG 理由 (action='ng' のときに task.ngReason に保存)
+  const handleTaskMenuAction = (action, directKey = null, ngReason = null) => {
     const key = directKey || completedTaskMenu?.key;
     if (!key) return;
     const previousTasks = { ...tasks };
     const newTasks = { ...tasks };
     const currentTask = tasks[key] || {};
 
+    // processing 状態から遷移する場合は、ここまでの経過時間を duration に加算してから状態変更する。
+    // (これをやらないと「測定中に NG クリック」で測定時間が消失する)
+    const captureSessionIfProcessing = (t) => {
+      if (t?.status === 'processing' && t?.startTime) {
+        const sec = Math.floor((Date.now() - t.startTime) / 1000);
+        // firstStartTime は維持。startTime はセッション終了で null に。
+        return { ...t, duration: (t.duration || 0) + sec, startTime: null, firstStartTime: t.firstStartTime || t.startTime };
+      }
+      return t;
+    };
+
     if (action === 'continue') {
-      newTasks[key] = { ...currentTask, status: 'processing', startTime: Date.now() };
+      const nowTs = Date.now();
+      newTasks[key] = { ...currentTask, status: 'processing', startTime: nowTs, firstStartTime: currentTask.firstStartTime || nowTs };
       setActiveCustomTaskKey(key);
     } else if (action === 'restart') {
-      newTasks[key] = { status: 'processing', duration: 0, startTime: Date.now(), reworks: currentTask.reworks };
-      setActiveCustomTaskKey(key);
+      // 「最初から作業」: いきなり time-tracking 開始ではなく、まっさら (waiting) に戻す。
+      // ユーザがもう一度タスクボタンを押すと、通常の toggleTask フローで時間取り開始される。
+      newTasks[key] = { status: 'waiting', duration: 0, startTime: null, firstStartTime: null, endTime: null, reworks: currentTask.reworks };
+      if (activeCustomTaskKey === key) setActiveCustomTaskKey(null);
     } else if (action === 'ng') {
-      newTasks[key] = { ...currentTask, status: 'ng', ngAt: Date.now(), reworks: currentTask.reworks || [] };
+      const captured = captureSessionIfProcessing(currentTask);
+      const nowTs = Date.now();
+      newTasks[key] = {
+        ...captured,
+        status: 'ng',
+        ngAt: nowTs,
+        endTime: nowTs,
+        firstStartTime: captured.firstStartTime || captured.startTime || nowTs,
+        reworks: captured.reworks || [],
+        ...(ngReason ? { ngReason } : (captured.ngReason ? {} : {})),
+      };
     } else if (action === 'rework') {
-      const reworks = [...(currentTask.reworks || []), { startTime: Date.now(), duration: 0, round: (currentTask.reworks?.length || 0) + 1 }];
-      newTasks[key] = { ...currentTask, status: 'reworking', reworkStartTime: Date.now(), reworks };
+      const captured = captureSessionIfProcessing(currentTask);
+      const reworks = [...(captured.reworks || []), { startTime: Date.now(), duration: 0, round: (captured.reworks?.length || 0) + 1 }];
+      newTasks[key] = { ...captured, status: 'reworking', reworkStartTime: Date.now(), reworks };
     } else if (action === 'rework-ok') {
-      newTasks[key] = { ...currentTask, status: 'completed' };
+      // 修正完了: firstStartTime は currentTask から維持される (spread で継承)
+      const okAt = Date.now();
+      newTasks[key] = {
+        ...currentTask,
+        status: 'completed',
+        endTime: okAt,
+        firstStartTime: currentTask.firstStartTime || currentTask.startTime || okAt,
+      };
+    } else if (action === 'skip') {
+      // 該当なし: この工程はこの台に該当しないものとして記録 (作業中なら経過時間を確定してから)
+      const captured = captureSessionIfProcessing(currentTask);
+      const nowTs = Date.now();
+      newTasks[key] = { ...captured, status: 'skipped', duration: captured.duration || 0, endTime: nowTs, firstStartTime: captured.firstStartTime || captured.startTime || null };
+      if (activeCustomTaskKey === key) setActiveCustomTaskKey(null);
     }
 
     setTasks(newTasks);
@@ -4091,7 +6794,69 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     setCompletedTaskMenu(null);
   };
 
-  const toggleBatch = (stepIdx) => {
+  // 工程ごと「該当なし」: その工程の全台を該当なしにする。既に該当なしがあれば解除して未着手へ戻す。
+  const handleSkipRow = (stepIdx) => {
+    const step = localSteps[stepIdx];
+    const qtyN = lot.quantity || 1;
+    const keyOf = (u) => step?.id ? `${step.id}-${u}` : `${stepIdx}-${u}`;
+    const previousTasks = { ...tasks };
+    const newTasks = { ...tasks };
+    const anySkipped = Array.from({ length: qtyN }).some((_, u) => (tasks[keyOf(u)] || {}).status === 'skipped');
+    const nowTs = Date.now();
+    for (let u = 0; u < qtyN; u++) {
+      const k = keyOf(u);
+      const cur = newTasks[k] || { status: 'waiting', duration: 0 };
+      if (anySkipped) {
+        if (cur.status === 'skipped') newTasks[k] = { status: 'waiting', duration: 0, startTime: null, firstStartTime: null, endTime: null };
+      } else {
+        if (cur.status === 'completed' || cur.status === 'ng') continue; // 完了/NGは保護
+        const captured = (cur.status === 'processing' && cur.startTime)
+          ? { ...cur, duration: (cur.duration || 0) + Math.floor((nowTs - cur.startTime) / 1000), startTime: null, firstStartTime: cur.firstStartTime || cur.startTime }
+          : cur;
+        newTasks[k] = { ...captured, status: 'skipped', endTime: nowTs, firstStartTime: captured.firstStartTime || captured.startTime || null, duration: captured.duration || 0 };
+      }
+    }
+    setTasks(newTasks);
+    onSave({ tasks: newTasks, status: 'processing' });
+    startUndoTimer({ key: `skiprow-${stepIdx}`, type: 'task', previousTasks });
+  };
+
+  // まとめて開始ボタンのハンドラ。
+  //   未開始 → 範囲指定モーダルを開く（実台数が見積もりと違う時のため）
+  //   開始済 → そのまま完了する
+  const handleBatchClick = (stepIdx) => {
+    if (batchStartTimes[stepIdx]) {
+      toggleBatch(stepIdx);
+      return;
+    }
+    // 未着手 or 一時停止の台のうち、最小/最大番号をデフォルト範囲にする
+    // ※ キーは getTaskKey で step.id ベース優先 (新旧両方を見る)
+    let firstAvail = null;
+    let lastAvail = null;
+    const availSet = new Set();
+    for (let u = 0; u < lot.quantity; u++) {
+      const key = getTaskKey(stepIdx, u);
+      // 旧キー (数値index) のみ存在する古いデータにも対応
+      const t = tasks[key] || tasks[`${stepIdx}-${u}`];
+      const isAvail = !t || t.status === 'waiting' || t.status === 'paused';
+      if (isAvail) {
+        if (firstAvail === null) firstAvail = u;
+        lastAvail = u;
+        availSet.add(u);
+      }
+    }
+    const from = (firstAvail !== null ? firstAvail : 0) + 1;
+    const to = (lastAvail !== null ? lastAvail : (lot.quantity - 1)) + 1;
+    // selectedUnits: 個別選択モード用 (デフォルトは未着手/一時停止の全台が選択済み)。
+    setBatchRangeModal({ stepIdx, from, to, selectedUnits: availSet });
+  };
+
+  // stepIdx, fromIdx, toIdx は 0-indexed inclusive。範囲省略時は全台。
+  // 重要: タスクキーは getTaskKey を使って step.id ベース or 数値 index ベースを統一する。
+  //   過去のバグ: バッチは ${stepIdx}-${uIdx} (数値) を使い、個別タスクは ${step.id}-${uIdx} で保存
+  //   → 表示は step.id 優先のため、バッチで更新した duration が見えなくなる事故が発生
+  // selectedIndices (Set or Array) を渡すと、その台だけを対象にする (飛び番選択用)。
+  const toggleBatch = (stepIdx, fromIdx = 0, toIdx = lot.quantity - 1, selectedIndices = null) => {
     const isBatchStarted = !!batchStartTimes[stepIdx];
     const newTasks = { ...tasks };
     const now = Date.now();
@@ -4099,13 +6864,24 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     if (!isBatchStarted) {
         const previousTasks = { ...tasks };
         const previousBatchStartTimes = { ...batchStartTimes };
-        Array.from({ length: lot.quantity }).forEach((_, uIdx) => {
-            const key = `${stepIdx}-${uIdx}`;
+        // 対象 unit インデックスのリストを構築 (個別選択優先・なければ範囲)
+        let targetUnits;
+        if (selectedIndices) {
+            targetUnits = Array.from(selectedIndices).filter(u => u >= 0 && u < lot.quantity);
+        } else {
+            const lo = Math.max(0, Math.min(fromIdx, toIdx));
+            const hi = Math.min(lot.quantity - 1, Math.max(fromIdx, toIdx));
+            targetUnits = [];
+            for (let u = lo; u <= hi; u++) targetUnits.push(u);
+        }
+        for (const uIdx of targetUnits) {
+            const key = getTaskKey(stepIdx, uIdx);  // ← 統一キー
             const currentTask = newTasks[key] || { status: 'waiting', duration: 0, startTime: null };
             if (currentTask.status !== 'completed') {
-                newTasks[key] = { ...currentTask, status: 'processing', startTime: now };
+                // firstStartTime: 一度設定したら維持 (中断・再開で変わらない)
+                newTasks[key] = { ...currentTask, status: 'processing', startTime: now, firstStartTime: currentTask.firstStartTime || now };
             }
-        });
+        }
         setBatchStartTimes({ ...batchStartTimes, [stepIdx]: now });
         setTasks(newTasks);
         onSave({ tasks: newTasks, status: 'processing' });
@@ -4117,18 +6893,26 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
         const totalDuration = Math.floor((now - batchStart) / 1000);
         let processedCount = 0;
         Array.from({ length: lot.quantity }).forEach((_, uIdx) => {
-            const key = `${stepIdx}-${uIdx}`;
+            const key = getTaskKey(stepIdx, uIdx);  // ← 統一キー
             if (newTasks[key]?.status === 'processing' && newTasks[key]?.startTime === batchStart) {
                 processedCount++;
             }
         });
         const perUnitTime = processedCount > 0 ? Math.floor(totalDuration / processedCount) : 0;
 
+        // このバッチで開始した台 (startTime === batchStart) のみ完了。範囲外で個別開始した台は壊さない。
         Array.from({ length: lot.quantity }).forEach((_, uIdx) => {
-            const key = `${stepIdx}-${uIdx}`;
+            const key = getTaskKey(stepIdx, uIdx);  // ← 統一キー
             const currentTask = newTasks[key];
-            if (currentTask && currentTask.status === 'processing') {
-                newTasks[key] = { ...currentTask, status: 'completed', duration: currentTask.duration + perUnitTime, startTime: null };
+            if (currentTask && currentTask.status === 'processing' && currentTask.startTime === batchStart) {
+                newTasks[key] = {
+                    ...currentTask,
+                    status: 'completed',
+                    duration: (currentTask.duration || 0) + perUnitTime,
+                    startTime: null,
+                    endTime: now,
+                    firstStartTime: currentTask.firstStartTime || currentTask.startTime || batchStart,
+                };
             }
         });
         const newBatchStartTimes = { ...batchStartTimes };
@@ -4162,13 +6946,22 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
     return (
       <div className="fixed inset-0 z-[300] bg-black/50 flex items-center justify-center p-4" onClick={() => setCompletedTaskMenu(null)}>
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden" onClick={e => e.stopPropagation()}>
-          <div className="bg-slate-800 text-white p-3 text-center font-bold">#{completedTaskMenu.unitIdx + 1} — {isNG ? 'NG判定済み' : isReworkDone ? '修正完了' : '完了済み'}</div>
+          <div className="bg-slate-800 text-white p-3 text-center font-bold">
+            <div>#{completedTaskMenu.unitIdx + 1} — {task.status === 'waiting' ? '未着手' : task.status === 'skipped' ? '該当なし' : task.status === 'paused' ? '一時停止中' : isNG ? 'NG判定済み' : isReworkDone ? '修正完了' : '完了済み'}</div>
+            {isNG && task.ngReason && (
+              <div className="text-[11px] font-normal bg-red-900/40 mt-1.5 px-2 py-0.5 rounded inline-block">理由: {task.ngReason}</div>
+            )}
+          </div>
           <div className="p-4 space-y-2">
             {(task.status === 'completed') && (
               <>
                 <button onClick={() => handleTaskMenuAction('continue')} className="w-full py-3 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-xl text-blue-700 font-bold text-sm flex items-center justify-center gap-2"><PlayCircle className="w-5 h-5"/> 作業の続き</button>
                 <button onClick={() => handleTaskMenuAction('restart')} className="w-full py-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-700 font-bold text-sm flex items-center justify-center gap-2"><RotateCcw className="w-5 h-5"/> 最初から作業</button>
-                <button onClick={() => handleTaskMenuAction('ng')} className="w-full py-3 bg-red-600 hover:bg-red-700 border border-red-700 rounded-xl text-white font-black text-lg flex items-center justify-center gap-2"><XCircle className="w-6 h-6"/> NG</button>
+                <button onClick={() => {
+                  // NG クリック → 気づき報告候補から理由選択モーダルへ
+                  setNgReasonPicker({ key, stepIdx: completedTaskMenu.stepIdx, unitIdx: completedTaskMenu.unitIdx });
+                  setCompletedTaskMenu(null);
+                }} className="w-full py-3 bg-red-600 hover:bg-red-700 border border-red-700 rounded-xl text-white font-black text-lg flex items-center justify-center gap-2"><XCircle className="w-6 h-6"/> NG</button>
               </>
             )}
             {(isNG || isReworkDone) && (
@@ -4187,6 +6980,47 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             )}
           </div>
           <div className="p-3 border-t text-center"><button onClick={() => setCompletedTaskMenu(null)} className="text-slate-400 hover:text-slate-600 font-bold text-sm">閉じる</button></div>
+        </div>
+      </div>
+    );
+  })();
+
+  // NG 理由ピッカー: 気づき報告候補から NG 理由を選択
+  const ngReasonPickerModal = ngReasonPicker && (() => {
+    const opts = complaintOptions && complaintOptions.length > 0 ? complaintOptions : DEFAULT_COMPLAINT_OPTIONS;
+    const closePicker = () => setNgReasonPicker(null);
+    const applyReason = (reason) => {
+      handleTaskMenuAction('ng', ngReasonPicker.key, reason);
+      setNgReasonPicker(null);
+    };
+    return (
+      <div className="fixed inset-0 z-[310] bg-black/60 flex items-center justify-center p-4" onClick={closePicker}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="bg-red-600 text-white p-3 text-center">
+            <div className="font-black text-base flex items-center justify-center gap-2"><XCircle className="w-5 h-5"/> NG 理由を選択</div>
+            <div className="text-[11px] opacity-90 mt-0.5">#{ngReasonPicker.unitIdx + 1} を NG にします</div>
+          </div>
+          <div className="p-3 space-y-1.5">
+            {opts.map(opt => (
+              <button key={opt} onClick={() => applyReason(opt)}
+                className="w-full py-2.5 px-3 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg text-red-700 font-bold text-sm text-left transition-colors">
+                {opt}
+              </button>
+            ))}
+            <button onClick={() => {
+              const custom = prompt('NG 理由を入力してください', '');
+              if (custom && custom.trim()) applyReason(custom.trim());
+            }} className="w-full py-2 px-3 bg-slate-50 hover:bg-slate-100 border border-dashed border-slate-300 rounded-lg text-slate-600 font-bold text-xs text-left transition-colors">
+              ✎ その他 (自由入力)
+            </button>
+            <button onClick={() => applyReason(null)}
+              className="w-full py-2 px-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-slate-500 font-bold text-xs text-left transition-colors">
+              理由なしで NG にする
+            </button>
+          </div>
+          <div className="p-2 border-t text-center">
+            <button onClick={closePicker} className="text-slate-400 hover:text-slate-600 font-bold text-sm">キャンセル</button>
+          </div>
         </div>
       </div>
     );
@@ -4315,6 +7149,12 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
       <div data-fs="execution" className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
         <div className="bg-white rounded-xl shadow-2xl p-8 max-w-md w-full text-center">
            <h2 className="text-xl font-bold mb-6">作業モードを選択してください</h2>
+           {/* オススメ作業順: モード選択前にも参照可能に (実績ベース+AI) */}
+           <div className="flex items-center justify-center gap-2 mb-3">
+             <button onClick={() => setShowWorkOrderOptimizer(true)} className="flex items-center gap-2 px-4 py-2 rounded-full font-bold text-sm transition-all shadow-sm bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:shadow-md" title="自動測定中に並行できる手動工程の組合せを提案">
+               <Zap className="w-4 h-4"/> オススメ作業順を見る
+             </button>
+           </div>
            {/* Voice Assistant Toggle */}
            <div className="flex items-center justify-center mb-5">
              <button onClick={toggleVoice} className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-bold text-sm transition-all shadow-sm ${voiceEnabled ? 'bg-blue-600 text-white ring-2 ring-blue-300 shadow-blue-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
@@ -4340,6 +7180,18 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
            </div>
            <button onClick={onClose} className="mt-6 text-slate-400 hover:text-slate-600">キャンセル</button>
         </div>
+        {/* オススメ作業順モーダル (初期モード選択画面からもアクセス可) */}
+        {/* ※ onApply 系は撤去 — 順序を勝手に書き換える破壊的操作だったため (2026-05-30) */}
+        {showWorkOrderOptimizer && (
+          <WorkOrderOptimizerModal
+            lot={lot}
+            lots={lots}
+            templates={templates}
+            currentExecutionType="initial"
+            onSwitchToCustom={() => { setExecutionType('custom'); onSave({ executionType: 'custom' }); }}
+            onClose={() => setShowWorkOrderOptimizer(false)}
+          />
+        )}
       </div>
     );
   }
@@ -4349,9 +7201,9 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
   let displayStepIdx = 0;
   let displayUnitIdx = 0;
   if (activeCustomTaskKey) {
-     const parts = activeCustomTaskKey.split('-');
-     displayStepIdx = parseInt(parts[0]);
-     displayUnitIdx = parseInt(parts[1]) || 0;
+     const parsed = parseActiveTaskKey(activeCustomTaskKey);
+     displayStepIdx = parsed.stepIdx;
+     displayUnitIdx = parsed.unitIdx;
   }
   // Safeguard against empty steps or invalid index
   const displayStep = localSteps[displayStepIdx] || localSteps[0] || { title: 'No Step', description: '', images: [] };
@@ -4429,39 +7281,368 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                         <textarea className="w-full border rounded-lg p-2" rows={3} placeholder="気づいたことや改善提案を入力..." value={complaintLabel} onChange={e=>setComplaintLabel(e.target.value)}/>
                       </div>
                     </div>
-                    <div className="flex justify-end gap-2 mt-4">
+                    <div className="mt-4 p-2 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-500">
+                      ※「時間取りして報告」を選ぶと別作業として時間計測を開始します。<br/>普通の気づきメモなら「報告のみ」でOK。
+                    </div>
+                    <div className="flex justify-end gap-2 mt-3 flex-wrap">
                         <button onClick={()=>{setShowComplaintModal(false);setComplaintLabel('');setComplaintCategory('');}} className="px-4 py-2 text-slate-500">キャンセル</button>
                         <button onClick={()=>{
                           const label = complaintCategory ? `${complaintCategory} : ${complaintLabel}` : complaintLabel;
+                          if (!label.trim()) { alert('カテゴリか詳細内容を入力してください'); return; }
+                          // reportOnly = true → 時間取りなし
+                          startInterruption('complaint', label, '', [], true);
+                          setShowComplaintModal(false);
+                          setComplaintLabel('');
+                          setComplaintCategory('');
+                        }} className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-bold">報告のみ</button>
+                        <button onClick={()=>{
+                          const label = complaintCategory ? `${complaintCategory} : ${complaintLabel}` : complaintLabel;
+                          if (!label.trim()) { alert('カテゴリか詳細内容を入力してください'); return; }
                           startInterruption('complaint', label, '', []);
                           setShowComplaintModal(false);
                           setComplaintLabel('');
                           setComplaintCategory('');
-                        }} className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-bold">報告する</button>
+                        }} className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold flex items-center gap-1" title="この気づきの対応時間を計測開始します">
+                          <Clock className="w-4 h-4"/> 時間取りして報告
+                        </button>
                     </div>
                 </div>
             </div>
         )}
 
+        {batchRangeModal && (() => {
+          const step = localSteps[batchRangeModal.stepIdx];
+          if (!step) return null;
+          const stepTasks = Array.from({ length: lot.quantity }).map((_, u) => {
+            const key = step.id ? `${step.id}-${u}` : `${batchRangeModal.stepIdx}-${u}`;
+            return tasks[key] || tasks[`${batchRangeModal.stepIdx}-${u}`] || { status: 'waiting' };
+          });
+          const completedCount = stepTasks.filter(t => t.status === 'completed').length;
+          const skippedCount = stepTasks.filter(t => t.status === 'skipped').length;
+          const remainCount = lot.quantity - completedCount - skippedCount;
+          // 個別選択モード用: batchRangeModal.selectedUnits は Set<number> (0-indexed)
+          const selectedUnits = batchRangeModal.selectedUnits || new Set();
+          const selectedCount = selectedUnits.size;
+          // 個別選択中の番号を「範囲表記」に整形して表示 (例: "1, 2, 4-10")
+          const formatRanges = (set) => {
+            const arr = Array.from(set).sort((a, b) => a - b);
+            if (arr.length === 0) return '(なし)';
+            const parts = [];
+            let start = arr[0], prev = arr[0];
+            for (let i = 1; i < arr.length; i++) {
+              if (arr[i] === prev + 1) { prev = arr[i]; continue; }
+              parts.push(start === prev ? `${start + 1}` : `${start + 1}-${prev + 1}`);
+              start = arr[i]; prev = arr[i];
+            }
+            parts.push(start === prev ? `${start + 1}` : `${start + 1}-${prev + 1}`);
+            return parts.join(', ');
+          };
+          // 完了/スキップでない (未着手/一時停止) 台のみ「処理対象」
+          const canSelect = (u) => {
+            const t = stepTasks[u];
+            return !t || t.status === 'waiting' || t.status === 'paused';
+          };
+          const toggleUnit = (u) => {
+            if (!canSelect(u)) return;
+            const next = new Set(selectedUnits);
+            if (next.has(u)) next.delete(u);
+            else next.add(u);
+            setBatchRangeModal({ ...batchRangeModal, selectedUnits: next });
+          };
+          const selectAll = () => {
+            const all = new Set();
+            for (let u = 0; u < lot.quantity; u++) if (canSelect(u)) all.add(u);
+            setBatchRangeModal({ ...batchRangeModal, selectedUnits: all });
+          };
+          const clearAll = () => setBatchRangeModal({ ...batchRangeModal, selectedUnits: new Set() });
+          // 範囲入力欄からの "1-2,4-10" パース
+          const parseRangeText = (text) => {
+            const next = new Set();
+            text.split(',').map(s => s.trim()).filter(Boolean).forEach(token => {
+              const m = token.match(/^(\d+)\s*-\s*(\d+)$/);
+              if (m) {
+                const a = Math.max(1, parseInt(m[1]));
+                const b = Math.min(lot.quantity, parseInt(m[2]));
+                for (let v = Math.min(a,b); v <= Math.max(a,b); v++) {
+                  if (canSelect(v - 1)) next.add(v - 1);
+                }
+              } else if (/^\d+$/.test(token)) {
+                const v = parseInt(token);
+                if (v >= 1 && v <= lot.quantity && canSelect(v - 1)) next.add(v - 1);
+              }
+            });
+            return next;
+          };
+          return (
+            <div className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-white rounded-xl shadow-2xl p-5 w-full max-w-lg max-h-[90vh] overflow-y-auto">
+                <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-orange-600">
+                  <PlayCircle className="w-5 h-5"/> 範囲指定でまとめて開始
+                </h3>
+                <div className="text-sm text-slate-600 mb-3">
+                  <span className="font-bold">{step.title}</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-center mb-3">
+                  <div className="bg-slate-50 rounded p-2">
+                    <div className="text-[10px] text-slate-500 font-bold">全体</div>
+                    <div className="text-base font-black text-slate-700 font-mono">{lot.quantity}台</div>
+                  </div>
+                  <div className="bg-emerald-50 rounded p-2">
+                    <div className="text-[10px] text-emerald-600 font-bold">完了済</div>
+                    <div className="text-base font-black text-emerald-700 font-mono">{completedCount}台</div>
+                  </div>
+                  <div className="bg-amber-50 rounded p-2">
+                    <div className="text-[10px] text-amber-600 font-bold">未着手</div>
+                    <div className="text-base font-black text-amber-700 font-mono">{remainCount}台</div>
+                  </div>
+                </div>
+
+                {/* ① 番号ボタングリッド: クリックで個別ON/OFF */}
+                <div className="mb-3">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-bold text-slate-600">開始する台を選択 (タップでON/OFF)</label>
+                    <div className="flex gap-1">
+                      <button onClick={selectAll} className="text-[10px] px-2 py-0.5 bg-blue-100 text-blue-700 rounded font-bold hover:bg-blue-200">全選択</button>
+                      <button onClick={clearAll} className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded font-bold hover:bg-slate-200">全解除</button>
+                    </div>
+                  </div>
+                  <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${Math.min(10, Math.max(5, lot.quantity))}, 1fr)` }}>
+                    {Array.from({ length: lot.quantity }).map((_, u) => {
+                      const t = stepTasks[u];
+                      const sel = selectedUnits.has(u);
+                      const isCompleted = t?.status === 'completed';
+                      const isSkipped = t?.status === 'skipped';
+                      const disabled = !canSelect(u);
+                      const sn = lot.unitSerialNumbers?.[u];
+                      const cls = isCompleted ? 'bg-emerald-100 text-emerald-700 border-emerald-300 cursor-not-allowed'
+                        : isSkipped ? 'bg-slate-200 text-slate-400 border-slate-300 cursor-not-allowed line-through'
+                        : sel ? 'bg-orange-500 text-white border-orange-600 shadow font-black'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-orange-50';
+                      return (
+                        <button key={u} type="button" disabled={disabled} onClick={() => toggleUnit(u)}
+                          className={`min-h-[44px] flex flex-col items-center justify-center border-2 rounded text-sm font-bold transition-colors ${cls}`}
+                          title={sn ? `#${u + 1} (${sn})` : `#${u + 1}`}>
+                          <span>#{u + 1}</span>
+                          {isCompleted && <span className="text-[8px]">完</span>}
+                          {isSkipped && <span className="text-[8px]">該当なし</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* ② 範囲テキスト入力: "1-2,4-10" など */}
+                <div className="mb-3">
+                  <label className="text-xs font-bold text-slate-600 mb-1 block">範囲記法でも指定可 (例: 1-2,4-10)</label>
+                  <input type="text" defaultValue={formatRanges(selectedUnits)}
+                    onBlur={e => setBatchRangeModal({ ...batchRangeModal, selectedUnits: parseRangeText(e.target.value) })}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { setBatchRangeModal({ ...batchRangeModal, selectedUnits: parseRangeText(e.target.value) }); e.target.blur(); } }}
+                    className="w-full border rounded px-2 py-1.5 text-sm font-mono"
+                    placeholder="例: 1-2,4-10"/>
+                </div>
+
+                <div className="bg-amber-50 border border-amber-200 rounded p-2 text-[11px] text-amber-800 mb-3">
+                  ⚠ 完了済み・該当なしの台は選択不可。<br/>選択中: <span className="font-bold text-orange-700 font-mono">{formatRanges(selectedUnits)} ({selectedCount}台)</span>
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setBatchRangeModal(null)} className="px-4 py-2 text-slate-500">キャンセル</button>
+                  <button
+                    onClick={() => {
+                      const { stepIdx } = batchRangeModal;
+                      // 個別選択モード: selectedUnits をそのまま渡す
+                      toggleBatch(stepIdx, 0, lot.quantity - 1, selectedUnits);
+                      setBatchRangeModal(null);
+                    }}
+                    disabled={selectedCount < 1}
+                    className="px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white rounded-lg font-bold flex items-center gap-1">
+                    <PlayCircle className="w-4 h-4"/> 開始 ({selectedCount}台)
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         <div className="bg-white w-full max-w-6xl h-full max-h-full rounded-2xl shadow-2xl flex flex-col overflow-hidden relative">
-          <div className="bg-slate-800 text-white p-4 flex justify-between items-center shrink-0">
-             <div><h2 className="text-lg font-bold flex items-center gap-2"><button onClick={switchToSequential} className="bg-emerald-600 hover:bg-blue-600 px-2 py-0.5 rounded text-xs transition-colors" title="通常モードに切替">カスタム実行 ⇄</button>{lot.model} <span className="font-mono opacity-70">#{lot.serialNo}</span> ({lot.quantity}台)</h2></div>
-             <div className="flex gap-4">
+          <div className="bg-slate-800 text-white px-3 py-1.5 flex justify-between items-center shrink-0 gap-2">
+             <div className="shrink-0"><h2 className="text-sm font-bold flex items-center gap-1.5"><button onClick={switchToSequential} className="bg-emerald-600 hover:bg-blue-600 px-2 py-0.5 rounded text-[11px] transition-colors" title="通常モードに切替">カスタム ⇄</button><span className="truncate max-w-[10rem]">{lot.model}</span> <span className="font-mono opacity-70 text-xs">#{lot.serialNo}</span> <span className="text-xs opacity-70">({lot.quantity}台)</span></h2></div>
+             <div className="flex flex-wrap gap-1.5 items-center justify-end">
                  <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
                    {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
                  </button>
-                 <button onClick={()=>setShowComplaintModal(true)} className="px-3 py-2 bg-purple-600 hover:bg-purple-700 rounded font-bold text-sm flex items-center gap-1 min-h-[44px]"><Megaphone className="w-4 h-4"/> 気づき報告</button>
-                 <button onClick={()=>setShowDefectModal(true)} className="px-3 py-2 bg-rose-600 hover:bg-rose-700 rounded font-bold text-sm flex items-center gap-1 min-h-[44px]"><AlertTriangle className="w-4 h-4"/> 不具合報告</button>
-                 <button onClick={toggleBreak} className={`px-3 py-2 ${isOnBreak ? 'bg-emerald-500 hover:bg-emerald-600 animate-pulse' : 'bg-amber-600 hover:bg-amber-700'} rounded font-bold text-sm flex items-center gap-1 min-h-[44px]`} title={executionType === 'sequential' ? (isOnBreak ? '作業時間の計測を再開' : '作業時間の計測を一時停止') : (isOnBreak ? '全タスクを再開' : '進行中タスクをまとめて一時停止')}>
+                 {onSetExecFontScale && (
+                   <div className="flex items-center bg-white/10 rounded-lg overflow-hidden shrink-0" title="この作業画面の文字サイズ (即反映・保存)">
+                     <button onClick={() => onSetExecFontScale(execFontScale - 10)} className="px-2.5 py-1.5 hover:bg-white/20 font-black" title="文字を小さく">A−</button>
+                     <span className="px-1 text-[11px] font-bold text-white/80 min-w-[2.8rem] text-center">{execFontScale}%</span>
+                     <button onClick={() => onSetExecFontScale(execFontScale + 10)} className="px-2.5 py-1.5 hover:bg-white/20 font-black text-lg leading-none" title="文字を大きく">A＋</button>
+                   </div>
+                 )}
+                 {typeof onOpenWorkStandards === 'function' && (
+                   <button onClick={onOpenWorkStandards} className="px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="作業標準ライブラリを開く"><BookOpen className="w-4 h-4"/> 作業標準</button>
+                 )}
+                 <button onClick={()=>setShowInProgressReport(true)} className="px-3 py-2 bg-teal-600 hover:bg-teal-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="途中経過の成績表を表示 (未入力は空白)"><Printer className="w-4 h-4"/> 成績表</button>
+                 <button onClick={()=>setShowComplaintModal(true)} className="px-3 py-2 bg-purple-600 hover:bg-purple-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap"><Megaphone className="w-4 h-4"/> 気づき報告</button>
+                 <button onClick={()=>setShowDefectModal(true)} className="px-3 py-2 bg-rose-600 hover:bg-rose-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap"><AlertTriangle className="w-4 h-4"/> 不具合報告</button>
+                 {/* 停止理由ボタン (ドロップダウン): 押すと 5理由 + 解除 が出る。理由を選ぶと自動で一時停止＋ロットカードにバッジ表示 */}
+                 <details className="relative" onClick={e => e.stopPropagation()}>
+                   <summary className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap list-none cursor-pointer ${pauseReason ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'}`} title="停止理由を選ぶ (ロットカードに表示)">
+                     {pauseReason ? (
+                       <>
+                         <span>{PAUSE_REASONS.find(r => r.key === pauseReason.category)?.emoji}</span>
+                         <span className="truncate max-w-[8rem]">{pauseReason.label}</span>
+                       </>
+                     ) : (
+                       <><AlertCircle className="w-4 h-4"/> 停止理由</>
+                     )}
+                   </summary>
+                   <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-2xl border border-slate-200 w-72 z-50 overflow-hidden">
+                     <div className="p-2 border-b bg-slate-50 text-[11px] text-slate-500">
+                       停止理由を選ぶと <span className="font-bold">自動で一時停止 + ロットカードにバッジ表示</span>します
+                     </div>
+                     <div className="p-2 space-y-1">
+                       {PAUSE_REASONS.map(r => {
+                         const active = pauseReason?.category === r.key;
+                         const colorClass = {
+                           amber: active ? 'bg-amber-500 text-white' : 'hover:bg-amber-50 text-amber-800 border border-amber-200',
+                           orange: active ? 'bg-orange-500 text-white' : 'hover:bg-orange-50 text-orange-800 border border-orange-200',
+                           rose: active ? 'bg-rose-500 text-white' : 'hover:bg-rose-50 text-rose-800 border border-rose-200',
+                           purple: active ? 'bg-purple-500 text-white' : 'hover:bg-purple-50 text-purple-800 border border-purple-200',
+                           blue: active ? 'bg-blue-500 text-white' : 'hover:bg-blue-50 text-blue-800 border border-blue-200',
+                         }[r.color];
+                         return (
+                           <button
+                             key={r.key}
+                             onClick={(e) => {
+                               e.stopPropagation();
+                               if (active) {
+                                 // 既選択 → 解除
+                                 setPauseReason(null);
+                                 onSave({ pauseReason: null });
+                               } else {
+                                 // 新規選択 → 一時停止 + 理由セット
+                                 const reason = { category: r.key, label: r.label, note: '', startTime: Date.now() };
+                                 setPauseReason(reason);
+                                 onSave({ pauseReason: reason });
+                                 if (!isOnBreak) toggleBreak();
+                               }
+                               // details を閉じる
+                               e.currentTarget.closest('details')?.removeAttribute('open');
+                             }}
+                             className={`w-full text-left px-3 py-2 rounded-lg flex items-start gap-2 transition-colors ${colorClass}`}
+                           >
+                             <span className="text-lg">{r.emoji}</span>
+                             <div className="flex-1">
+                               <div className="font-bold text-sm">{r.label}</div>
+                               <div className={`text-[10px] ${active ? 'opacity-80' : 'opacity-70'}`}>{r.desc}</div>
+                             </div>
+                             {active && <Check className="w-4 h-4 mt-0.5"/>}
+                           </button>
+                         );
+                       })}
+                     </div>
+                     {pauseReason && (
+                       <div className="p-2 border-t bg-slate-50">
+                         <input
+                           type="text"
+                           value={pauseReason.note || ''}
+                           onChange={(e) => {
+                             const r = { ...pauseReason, note: e.target.value };
+                             setPauseReason(r);
+                             onSave({ pauseReason: r });
+                           }}
+                           placeholder="補足メモ (任意)"
+                           className="w-full border rounded p-1.5 text-xs text-slate-800 mb-1.5"
+                           onClick={e => e.stopPropagation()}
+                         />
+                         <button
+                           onClick={(e) => {
+                             e.stopPropagation();
+                             setPauseReason(null);
+                             onSave({ pauseReason: null });
+                             e.currentTarget.closest('details')?.removeAttribute('open');
+                           }}
+                           className="w-full px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-600 rounded font-bold text-xs border border-slate-200"
+                         >
+                           ✕ 停止理由を解除
+                         </button>
+                       </div>
+                     )}
+                   </div>
+                 </details>
+                 <button onClick={toggleBreak} className={`px-3 py-2 ${isOnBreak ? 'bg-emerald-500 hover:bg-emerald-600 animate-pulse' : 'bg-amber-600 hover:bg-amber-700'} rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap`} title={executionType === 'sequential' ? (isOnBreak ? '作業時間の計測を再開' : '作業時間の計測を一時停止') : (isOnBreak ? '全タスクを再開' : '進行中タスクをまとめて一時停止')}>
                    {isOnBreak ? <><Play className="w-4 h-4"/> 再開</> : <><Pause className="w-4 h-4"/> {executionType === 'sequential' ? '中断' : 'まとめて中断'}</>}
                  </button>
+                 {/* 作業順最適化: 同テンプレ実績から推奨順を生成 */}
+                 <button onClick={() => setShowWorkOrderOptimizer(true)} className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="自動測定中に並行できる手動工程を提案">
+                   <Zap className="w-4 h-4"/> オススメ順
+                 </button>
+                 {/* 表示形式切替: カード ⇄ コンパクト */}
+                 <button
+                   onClick={() => setCustomViewModePersist(customViewMode === 'card' ? 'compact' : 'card')}
+                   className="px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap bg-slate-600 hover:bg-slate-700"
+                   title={customViewMode === 'card' ? 'コンパクト一覧表示に切替 (画面を広く使う)' : 'カード表示に切替'}
+                 >
+                   {customViewMode === 'card' ? <><LayoutList className="w-4 h-4"/> 一覧</> : <><LayoutGrid className="w-4 h-4"/> カード</>}
+                 </button>
+                 {/* 厳密順序モード: 管理者がテンプレ単位で設定。作業者は管理者設定に従う */}
+                 <button
+                   onClick={toggleStrictOrderMode}
+                   className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap ${strictOrderMode ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'} ${(!isAdmin && adminStrictForTemplate !== undefined) ? 'opacity-70 cursor-not-allowed' : ''}`}
+                   title={
+                     adminStrictForTemplate !== undefined
+                       ? (isAdmin ? '管理者設定: タップでこのテンプレの厳密モードを切替 (全端末反映)' : '管理者がこのテンプレの厳密モードを設定済 (変更は管理者のみ)')
+                       : (strictOrderMode ? '個人設定: 厳密ON (タップで解除)' : '個人設定: 順番ガイド (タップで厳密ON)')
+                   }
+                 >
+                   {strictOrderMode ? '🔒' : '🔓'} {strictOrderMode ? '順番厳密' : '順番ガイド'}
+                   {adminStrictForTemplate !== undefined && <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">管理</span>}
+                 </button>
                  {/* 「全作業完了」は誤タップ防止のため、サイズ・色・余白で他ボタンと差別化 */}
-                 <div className="ml-2 pl-2 border-l border-white/20 flex items-center gap-2">
-                   <button onClick={handleCompleteTrigger} className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 ring-2 ring-emerald-300/50 rounded-lg font-black text-sm shadow-lg flex items-center gap-2 min-h-[44px]"><CheckCircle2 className="w-5 h-5"/> 全作業完了</button>
-                   <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-2.5 hover:bg-white/10 rounded-full min-h-[44px] min-w-[44px] flex items-center justify-center"><X className="w-6 h-6"/></button>
+                 <div className="ml-1.5 pl-1.5 border-l border-white/20 flex items-center gap-1.5">
+                   <button onClick={handleCompleteTrigger} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 ring-2 ring-emerald-300/50 rounded-lg font-black text-xs shadow-lg flex items-center gap-1 whitespace-nowrap"><CheckCircle2 className="w-4 h-4"/> 全作業完了</button>
+                   <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-1.5 hover:bg-white/10 rounded-full flex items-center justify-center"><X className="w-5 h-5"/></button>
                  </div>
              </div>
           </div>
+
+          {/* 別エリアの自動測定ステータス: ヘッダ下のサブバー (常時表示) — 大幅に拡大して見やすく */}
+          {otherActiveAutos.length > 0 && (
+            <div className="bg-indigo-900 text-white px-4 py-2 flex items-center gap-3 shrink-0 overflow-x-auto">
+              <Bot className="w-6 h-6 text-indigo-200 shrink-0 animate-pulse"/>
+              <span className="text-sm font-black text-indigo-200 shrink-0 whitespace-nowrap">別エリア自動測定:</span>
+              <div className="flex gap-2 flex-wrap">
+                {otherActiveAutos.map((a, ai) => {
+                  const elapsedSec = Math.floor(a.elapsedMs / 1000);
+                  const targetSec = Math.floor(a.targetMs / 1000);
+                  const remainingSec = targetSec > 0 ? targetSec - elapsedSec : null;
+                  const pct = targetSec > 0 ? Math.min(100, (elapsedSec / targetSec) * 100) : 0;
+                  const isOverdue = targetSec > 0 && elapsedSec > targetSec;
+                  const isNearDone = targetSec > 0 && remainingSec > 0 && remainingSec < 120; // 2分以内
+                  return (
+                    <button
+                      key={`${a.lotId}-${ai}`}
+                      onClick={() => setShowOtherAutoWidget(true)}
+                      className={`text-sm px-3 py-1.5 rounded-lg inline-flex items-center gap-2 border-2 whitespace-nowrap min-h-[36px] ${isOverdue ? 'bg-rose-600 border-rose-300 animate-pulse shadow-lg' : isNearDone ? 'bg-amber-500 border-amber-300 animate-pulse shadow-lg' : 'bg-indigo-700 border-indigo-500 hover:bg-indigo-600 shadow'}`}
+                      title={`${a.lotOrderNo} ${a.lotModel} / ${a.stepTitle}${a.zoneName ? ` @ ${a.zoneName}` : ''}${a.workerName ? ` (${a.workerName})` : ''}`}
+                    >
+                      <span className="font-black text-base">{a.zoneName || a.lotOrderNo}</span>
+                      <span className="font-mono font-bold text-base">{formatTime(elapsedSec)}</span>
+                      {targetSec > 0 && (
+                        <span className={`font-mono font-bold text-xs ${isOverdue ? 'text-white' : 'text-indigo-200'}`}>
+                          {isOverdue ? `⚠+${formatTime(elapsedSec - targetSec)}` : `残${formatTime(remainingSec)}`}
+                        </span>
+                      )}
+                      {targetSec > 0 && (
+                        <span className="h-2 w-16 bg-indigo-900/50 rounded-full overflow-hidden ml-0.5">
+                          <span className={`block h-full ${isOverdue ? 'bg-rose-200' : isNearDone ? 'bg-amber-200' : 'bg-indigo-200'}`} style={{ width: `${pct}%` }}/>
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           
           {/* 共有ノート警告バナー (読了で 24h サプレス) */}
           {(() => {
@@ -4488,15 +7669,117 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             );
           })()}
 
+          {/* 並行作業ステータスバナー (カスタムモード時): 自動測定中のみ並行手動作業を許可するルールの可視化 */}
+          {isAnyAutoRunning && isManualTaskRunning && (
+            <div className="bg-emerald-50 border-b-2 border-emerald-300 px-4 py-2 flex items-center gap-2 shrink-0 animate-pulse">
+              <Bot className="w-5 h-5 text-emerald-600 shrink-0"/>
+              <div className="text-sm font-bold text-emerald-800">
+                ✓ 自動測定中: 並行手動作業 OK
+                <span className="text-xs text-emerald-600 ml-2 font-normal">— 自動測定の待ち時間を活用しましょう</span>
+              </div>
+            </div>
+          )}
+          {!isAnyAutoRunning && isManualTaskRunning && (
+            <div className="bg-amber-50 border-b border-amber-300 px-4 py-1.5 flex items-center gap-2 shrink-0">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0"/>
+              <div className="text-xs font-bold text-amber-800">
+                手動作業1件 実行中 — 並行作業は自動測定中のみ可能です
+              </div>
+            </div>
+          )}
+
           <div className="flex-1 flex overflow-hidden">
             <div className="flex-1 overflow-auto p-6 bg-slate-50 pb-4">
-               <div className="grid gap-6">
+               {/* ライブ並行作業ガイド: 自動測定中に「今やれる他の台の作業」をリアルタイム表示 */}
+               <LiveParallelGuide guide={liveParallelGuide} fmtTime={formatTime} />
+               {/* 厳密モード推奨バナー: データが十分貯まったテンプレで提案 (有効化は管理者のみ) */}
+               {showStrictSuggestion && (
+                 <div className="mb-3 bg-gradient-to-r from-rose-50 to-amber-50 border-2 border-rose-300 rounded-xl p-3 flex items-start gap-3">
+                   <div className="bg-rose-100 p-2 rounded-full shrink-0"><ShieldCheck className="w-5 h-5 text-rose-600"/></div>
+                   <div className="flex-1">
+                     <div className="font-black text-rose-900 text-sm">🔒 このテンプレは実績 {templateDataMaturity} 件 — 厳密モードを推奨します</div>
+                     <div className="text-xs text-rose-800 mt-1 leading-relaxed">
+                       十分なデータが貯まり、最適な作業順が安定しています。<b>厳密モード</b>にすると「1台目から順番」を強制し、飛ばしによる作業漏れ・混乱を防げます。
+                     </div>
+                     {isAdmin ? (
+                       <div className="flex gap-2 mt-2">
+                         <button
+                           onClick={() => { if (onSaveStrictTemplate && lot.templateId) onSaveStrictTemplate(lot.templateId, true); try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
+                           className="bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3 py-1.5 rounded shadow flex items-center gap-1"
+                         >
+                           🔒 厳密モードを有効化 (このテンプレの全端末)
+                         </button>
+                         <button
+                           onClick={() => { try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
+                           className="bg-white hover:bg-slate-50 text-slate-500 text-xs font-bold px-3 py-1.5 rounded border border-slate-300"
+                         >
+                           今はしない
+                         </button>
+                       </div>
+                     ) : (
+                       <div className="mt-2 text-xs text-rose-700 bg-white/70 border border-rose-200 rounded px-2 py-1.5">
+                         👤 厳密モードの有効化は<b>管理者</b>が行います。管理者に連絡してください。
+                         <button
+                           onClick={() => { try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
+                           className="ml-2 text-slate-400 hover:text-slate-600 underline"
+                         >閉じる</button>
+                       </div>
+                     )}
+                   </div>
+                 </div>
+               )}
+               {/* 品質情報共有 (カスタムモード版): 型式全体に関する気づき/不良 */}
+               <ModelQualityInfoPanel
+                 model={lot.model}
+                 stepTitle={null}
+                 info={modelQualityInfo}
+                 open={showQualityInfoPanel}
+                 onToggle={() => setShowQualityInfoPanel(v => !v)}
+               />
+               {/* === コンパクト一覧表示 (工程×台数の高密度テーブル) === */}
+               {customViewMode === 'compact' && (
+                 <CustomCompactGrid
+                   localSteps={localSteps}
+                   lot={lot}
+                   tasks={tasks}
+                   batchStartTimes={batchStartTimes}
+                   globalNextTask={globalNextTask}
+                   getTaskStatusColor={getTaskStatusColor}
+                   formatTime={formatTime}
+                   activeCustomTaskKey={activeCustomTaskKey}
+                   onCellClick={(sIdx, uIdx) => {
+                     const step = localSteps[sIdx];
+                     const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+                     const key = step?.id ? `${step.id}-${uIdx}` : `${sIdx}-${uIdx}`;
+                     const task = tasks[key] || tasks[`${sIdx}-${uIdx}`] || { status: 'waiting' };
+                     if (task.status === 'ng' || task.status === 'reworking') { setCompletedTaskMenu({ key, stepIdx: sIdx, unitIdx: uIdx }); return; }
+                     // 順序外判定 (globalNextTask 基準)
+                     const isNext = globalNextTask && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === uIdx;
+                     const isOOO = globalNextTask && (task.status === 'waiting') && !isNext && (
+                       (globalNextTask.sIdx === sIdx && uIdx > globalNextTask.unitIdx) || (sIdx > globalNextTask.sIdx)
+                     );
+                     if (isOOO) {
+                       if (strictOrderMode) { alert(`🚫 厳密モードON: 先に「${localSteps[globalNextTask.sIdx]?.title}」#${globalNextTask.unitIdx + 1}台目 を完了させてください。`); return; }
+                       setOutOfOrderConfirm({ sIdx, uIdx, nextSIdx: globalNextTask.sIdx, nextU: globalNextTask.unitIdx, nextTitle: localSteps[globalNextTask.sIdx]?.title || '', thisTitle: step.title });
+                       return;
+                     }
+                     setActiveCustomTaskKey(`${sIdx}-${uIdx}`);
+                     toggleTask(sIdx, uIdx);
+                   }}
+                   onBatchClick={(sIdx) => handleBatchClick(sIdx)}
+                   onSkipRow={(sIdx) => handleSkipRow(sIdx)}
+                 />
+               )}
+               <div className="grid gap-6" style={{ display: customViewMode === 'compact' ? 'none' : 'grid' }}>
                  {localSteps.map((step, sIdx) => {
                    const isAuto = step.title.includes('自動');
                    const isBatch = !!batchStartTimes[sIdx];
                    const isMonitoring = interruptions.some(i => i.type === 'monitoring' && i.status === 'active' && i.label === step.title);
                    const stepSpecificNotes = getStepNotes(step.title).filter(n => n.stepTitle);
-                   
+                   // 推奨順は「全体で唯一の次タスク」(globalNextTask) のみで判定。
+                   // 各行に「次」を出すと画面中に溢れて「どれでも押せる」ように見えるため。
+                   const stepIsGlobalNext = globalNextTask && globalNextTask.sIdx === sIdx;
+
                    return (
                      <div key={step.id} className={`bg-white rounded-xl shadow-sm border p-4 ${sIdx === displayStepIdx ? 'ring-2 ring-blue-500' : ''}`}>
                         <div className="flex justify-between items-center mb-3">
@@ -4511,12 +7794,67 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                                        <Eye className="w-3 h-3"/> {isMonitoring ? '監視中...' : '監視'}
                                    </button>
                                )}
-                               <button 
-                                 onClick={() => toggleBatch(sIdx)}
+                               <button
+                                 onClick={() => handleBatchClick(sIdx)}
                                  className={`px-3 py-1 text-xs font-bold rounded border flex items-center gap-1 transition-colors ${isBatch ? 'bg-orange-500 text-white border-orange-600 animate-pulse' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+                                 title={isBatch ? 'まとめて完了' : '範囲指定でまとめて開始'}
                                >
                                  {isBatch ? <><StopCircle className="w-3 h-3"/> まとめて完了</> : <><PlayCircle className="w-3 h-3"/> まとめて開始</>}
                                </button>
+                               {(() => {
+                                 // この工程の全タスクが skipped かどうか
+                                 const allKeys = Array.from({ length: lot.quantity }).map((_, u) => step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
+                                 // step.id ベース + 旧数値キー 両方を見て、いずれかが skipped 状態を持っていれば skipped 扱い
+                                 const allSkipped = allKeys.every((k, u) => {
+                                   const numKey = `${sIdx}-${u}`;
+                                   return tasks[k]?.status === 'skipped' || tasks[numKey]?.status === 'skipped';
+                                 });
+                                 // step.id ベース + 旧 ${sIdx}-${u} 数値キーの両方を見る
+                                 // (旧コード `k.replace(step?.id || '', sIdx)` は step.id 空文字時に先頭に sIdx を「挿入」してしまうバグだった)
+                                 const anyCompleted = allKeys.some((k, u) => {
+                                   const numKey = `${sIdx}-${u}`;
+                                   const t = tasks[k] || tasks[numKey];
+                                   return t?.status === 'completed' || t?.status === 'ng' || t?.status === 'reworking';
+                                 });
+                                 const handleSkipStep = () => {
+                                   if (allSkipped) {
+                                     // 既に該当なし → 解除確認
+                                     if (!confirm(`「${step.title}」の該当なし指定を解除して「未着手」に戻しますか？`)) return;
+                                     const newTasks = { ...tasks };
+                                     // step.id ベース + 旧数値キー 両方を削除 (古いデータに対応)
+                                     allKeys.forEach((k, u) => {
+                                       const numKey = `${sIdx}-${u}`;
+                                       if (newTasks[k]?.status === 'skipped') delete newTasks[k];
+                                       if (newTasks[numKey]?.status === 'skipped') delete newTasks[numKey];
+                                     });
+                                     setTasks(newTasks);
+                                     onSave({ tasks: newTasks });
+                                   } else {
+                                     // 該当なしに設定
+                                     if (anyCompleted) {
+                                       if (!confirm(`「${step.title}」は一部に作業実績があります。\n全ての台を「該当なし」に上書きしますか？\n(実績データは破棄されます)`)) return;
+                                     } else {
+                                       if (!confirm(`「${step.title}」を全台「該当なし」にしますか？\n(この工程を実施しない)`)) return;
+                                     }
+                                     const newTasks = { ...tasks };
+                                     const now = Date.now();
+                                     allKeys.forEach(k => {
+                                       newTasks[k] = { status: 'skipped', duration: 0, skipAt: now, firstStartTime: now, endTime: now, workerName: tasks[k]?.workerName || '' };
+                                     });
+                                     setTasks(newTasks);
+                                     onSave({ tasks: newTasks });
+                                   }
+                                 };
+                                 return (
+                                   <button
+                                     onClick={handleSkipStep}
+                                     className={`px-3 py-1 text-xs font-bold rounded border flex items-center gap-1 transition-colors ${allSkipped ? 'bg-slate-500 text-white border-slate-600' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+                                     title={allSkipped ? '解除して未着手に戻す' : 'この工程は実施しない (該当なし)'}
+                                   >
+                                     <Ban className="w-3 h-3"/> {allSkipped ? '該当なし (解除)' : '該当なし'}
+                                   </button>
+                                 );
+                               })()}
                                <button onClick={() => setActiveCustomTaskKey(`${sIdx}-0`)} className="text-xs text-blue-600 underline">詳細を表示</button>
                            </div>
                         </div>
@@ -4535,18 +7873,62 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                              const task = tasks[key] || tasks[numKey] || { status: 'waiting', duration: 0 };
                              const isNG = task.status === 'ng' || task.status === 'reworking';
                              const reworks = task.reworks || [];
+                             // 推奨順関連
+                             // 全体で唯一の「次」タスクだけハイライト
+                             const isRecommendedNext = !!(stepIsGlobalNext && globalNextTask.unitIdx === uIdx && (task.status === 'waiting' || task.status === 'paused'));
+                             // 順序外判定: 「次」が決まっていて、それより後ろ (同じ台でこの工程がまだ来てない or 別の台で先走り) を押そうとしている未着手タスク
+                             const isOutOfOrder = !!(globalNextTask && task.status === 'waiting' && !isRecommendedNext && (
+                               // 同じ工程行で、globalNext より後ろの台
+                               (stepIsGlobalNext && uIdx > globalNextTask.unitIdx) ||
+                               // globalNext より後ろの工程行 (台に関係なく先走り)
+                               (sIdx > globalNextTask.sIdx)
+                             ));
                              return (
                                <div key={uIdx} className="flex flex-col gap-1">
                                  {/* メインボタン（通常 or NG表示） */}
-                                 <div className="relative">
-                                   <button onClick={() => {
-                                     if (!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch) {
-                                       alert('別の手動作業を実行中です。先にその作業を完了するか、「まとめて開始」を使ってください。');
+                                 {(() => {
+                                   // 並行手動ブロック判定:
+                                   //   この台が手動工程 (= !isAuto) で、未着手で、まとめて開始モードでもなく、
+                                   //   既に別の手動作業が走っていて、かつ 自動測定が走っていない → BLOCK
+                                   //   自動測定中なら並行作業 OK (本来の目的)
+                                   const blockParallel = !isAuto && task.status === 'waiting' && !isBatch && isManualTaskRunning && !isAnyAutoRunning;
+                                   // 自動測定中で並行可能な状態 → 視覚的に許可されている事を強調
+                                   const parallelAllowedHint = !isAuto && task.status === 'waiting' && !isBatch && isManualTaskRunning && isAnyAutoRunning;
+                                   const blockReason = blockParallel
+                                     ? '他の手動作業を実行中です。並行作業は自動測定中のみ可能です。\n先に作業を完了するか、自動工程の「監視」を開始してください。'
+                                     : '';
+                                   // 順序外タップの処理: 厳密モードならブロック、通常モードは警告ダイアログ
+                                   const handleClick = () => {
+                                     if (blockParallel) { alert('🚫 ' + blockReason); return; }
+                                     if (isNG) return;
+                                     // 推奨順から外れている (=「次」より先のタスクを押そうとしている)
+                                     if (isOutOfOrder && globalNextTask) {
+                                       const nextStepTitle = localSteps[globalNextTask.sIdx]?.title || '';
+                                       if (strictOrderMode) {
+                                         alert(`🚫 厳密モードON: 先に「${nextStepTitle}」#${globalNextTask.unitIdx + 1}台目 を完了させてください。\n\n(厳密モードはヘッダーの「順番厳密」ボタンで解除できます)`);
+                                         return;
+                                       }
+                                       // 通常モード: 確認ダイアログ
+                                       setOutOfOrderConfirm({ sIdx, uIdx, nextSIdx: globalNextTask.sIdx, nextU: globalNextTask.unitIdx, nextTitle: nextStepTitle, thisTitle: step.title });
                                        return;
                                      }
-                                     if (isNG) return;
+                                     setActiveCustomTaskKey(`${sIdx}-${uIdx}`);
                                      toggleTask(sIdx, uIdx);
-                                   }} title={!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch ? '別の手動作業を実行中です' : ''} className={`w-full h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNG ? 'bg-red-600 text-white' : getTaskStatusColor(task.status)} ${!isAuto && isManualTaskRunning && task.status === 'waiting' && !isBatch ? 'opacity-30' : ''}`}>
+                                   };
+                                   return (
+                                 <div className="relative">
+                                   {/* 「次」ハイライト: 推奨順の次にやるべき台 */}
+                                   {isRecommendedNext && (
+                                     <div className="absolute -top-2 -right-2 z-10 bg-emerald-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded-full shadow-lg animate-bounce flex items-center gap-0.5">
+                                       👉 次
+                                     </div>
+                                   )}
+                                   <button
+                                     disabled={blockParallel || isNG}
+                                     onClick={handleClick}
+                                     title={blockParallel ? blockReason : parallelAllowedHint ? '✓ 自動測定中: 並行作業 OK' : isRecommendedNext ? '👉 推奨次タスク (1台目から順番)' : isOutOfOrder ? '⚠ 順序外: 先に手前の台をやるのが推奨' : ''}
+                                     className={`w-full h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNG ? 'bg-red-600 text-white' : getTaskStatusColor(task.status)} ${blockParallel ? 'opacity-30 cursor-not-allowed grayscale' : ''} ${parallelAllowedHint ? 'ring-2 ring-emerald-300' : ''} ${isRecommendedNext ? 'ring-4 ring-emerald-400 shadow-emerald-200 shadow-lg' : ''} ${isOutOfOrder ? 'opacity-60' : ''}`}
+                                   >
                                      <span className="text-sm font-bold">#{uIdx+1}</span>
                                      {isNG ? (
                                        <>
@@ -4558,21 +7940,15 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                                      )}
                                      {task.status === 'processing' && <span className="absolute top-1 right-1 w-2 h-2 bg-white rounded-full animate-ping"/>}
                                    </button>
-                                   {/* 1タップNG: processing/completed のとき左下に直接 NG マーク可能 */}
-                                   {(task.status === 'processing' || task.status === 'completed') && (
-                                     <button
-                                       onClick={(e) => {
-                                         e.stopPropagation();
-                                         if (!confirm(`#${uIdx+1} を NG にしますか？`)) return;
-                                         handleTaskMenuAction('ng', key);
-                                       }}
-                                       className="absolute bottom-1 left-1 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-black px-1.5 py-0.5 border border-red-700 shadow ring-1 ring-white/30"
-                                       title="1タップで NG にする"
-                                     >
-                                       NG
-                                     </button>
+                                   {/* NG 理由をボタン外に独立表示 (枠内 truncate されないように) */}
+                                   {isNG && task.ngReason && (
+                                     <div className="mt-1 text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-300 rounded px-1.5 py-1 leading-tight whitespace-normal break-words" title={task.ngReason}>
+                                       <span className="text-rose-500 mr-0.5">理由:</span>{task.ngReason}
+                                     </div>
                                    )}
                                  </div>
+                                   );
+                                 })()}
                                  {/* 修正作業ボタン群（NG時 or 修正履歴あり） */}
                                  {(isNG || reworks.length > 0) && reworks.map((rw, rIdx) => (
                                    <button key={rIdx} onClick={() => {
@@ -4604,8 +7980,113 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             
             {/* Right Panel: Step Detail & PDF or Measurement */}
             <div className="w-96 bg-white border-l border-slate-200 flex flex-col p-6 overflow-y-auto shrink-0">
-               <h3 className="font-bold text-slate-800 text-lg mb-4 border-b pb-2">工程詳細 <span className="text-sm font-normal text-slate-500">— 機番 #{displayUnitIdx + 1} {lot.unitSerialNumbers?.[displayUnitIdx] ? `(${lot.unitSerialNumbers[displayUnitIdx]})` : ''}</span></h3>
-               {displayStep.type === 'measurement' && displayStep.measurementConfig ? (
+               <div className="mb-3 border-b pb-3">
+                 <h3 className="font-bold text-slate-800 text-lg flex items-center justify-between gap-2">
+                   <span>工程詳細</span>
+                   <span className="text-xs font-normal text-slate-500">Step {displayStepIdx + 1}</span>
+                 </h3>
+                 {/* 機番切り替えボタン (台数が複数あるとき) */}
+                 {lot.quantity > 1 && (
+                   <div className="mt-2">
+                     <div className="text-[10px] font-bold text-slate-500 mb-1">表示中の機番 (クリックで切り替え)</div>
+                     <div className="flex flex-wrap gap-1">
+                       {Array.from({ length: lot.quantity }).map((_, uIdx) => {
+                         const key = displayStep?.id ? `${displayStep.id}-${uIdx}` : `${displayStepIdx}-${uIdx}`;
+                         const numKey = `${displayStepIdx}-${uIdx}`;
+                         const t = tasks[key] || tasks[numKey] || { status: 'waiting' };
+                         const isActive = uIdx === displayUnitIdx;
+                         const isDone = t.status === 'completed';
+                         const isSkipped = t.status === 'skipped';
+                         const isNG = t.status === 'ng' || t.status === 'reworking';
+                         const isProc = t.status === 'processing';
+                         let cls = 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50';
+                         if (isActive) cls = 'bg-blue-600 border-blue-700 text-white shadow-md ring-2 ring-blue-300';
+                         else if (isDone) cls = 'bg-emerald-50 border-emerald-300 text-emerald-700 hover:bg-emerald-100';
+                         else if (isNG) cls = 'bg-rose-50 border-rose-300 text-rose-700 hover:bg-rose-100';
+                         else if (isSkipped) cls = 'bg-slate-100 border-slate-300 text-slate-400';
+                         else if (isProc) cls = 'bg-blue-50 border-blue-300 text-blue-700 hover:bg-blue-100 animate-pulse';
+                         return (
+                           <button
+                             key={uIdx}
+                             onClick={() => setActiveCustomTaskKey(`${displayStepIdx}-${uIdx}`)}
+                             className={`px-2 py-1 border-2 rounded text-xs font-bold transition-all min-w-[40px] ${cls}`}
+                             title={lot.unitSerialNumbers?.[uIdx] ? `機番: ${lot.unitSerialNumbers[uIdx]}` : `${uIdx + 1}台目`}
+                           >
+                             #{uIdx + 1}
+                             {isDone && <span className="ml-0.5 text-[9px]">✓</span>}
+                             {isNG && <span className="ml-0.5 text-[9px]">NG</span>}
+                             {isSkipped && <span className="ml-0.5 text-[9px]">－</span>}
+                           </button>
+                         );
+                       })}
+                     </div>
+                   </div>
+                 )}
+                 <div className="mt-2 text-sm font-normal text-slate-600">
+                   現在: <span className="font-bold text-blue-700">#{displayUnitIdx + 1}</span>
+                   {lot.unitSerialNumbers?.[displayUnitIdx] && <span className="text-slate-400 ml-1">({lot.unitSerialNumbers[displayUnitIdx]})</span>}
+                 </div>
+               </div>
+               {Array.isArray(displayStep.checklistItems) && displayStep.checklistItems.length > 0 && displayStep.type !== 'measurement' ? (() => {
+                 // チェックリスト単独工程 (測定なし)
+                 const chkKey = `${displayStep.id}-${displayUnitIdx}-checklist`;
+                 const checked = measurementResults[chkKey] || {};
+                 const items = displayStep.checklistItems;
+                 const requiredItems = items.filter(it => it.required !== false);
+                 const requiredOkCount = requiredItems.filter(it => checked[it.id]).length;
+                 const allRequiredDone = requiredOkCount === requiredItems.length;
+                 const toggle = (itemId) => {
+                   const next = { ...checked, [itemId]: !checked[itemId] };
+                   const newResults = { ...measurementResults, [chkKey]: next };
+                   setMeasurementResults(newResults);
+                   onSave({ measurementResults: newResults });
+                 };
+                 const checkAll = () => {
+                   const next = {};
+                   items.forEach(it => { next[it.id] = true; });
+                   const newResults = { ...measurementResults, [chkKey]: next };
+                   setMeasurementResults(newResults);
+                   onSave({ measurementResults: newResults });
+                 };
+                 return (
+                   <div className="flex flex-col gap-3">
+                     <div className="bg-purple-50/50 border-2 border-purple-200 rounded-lg p-3">
+                       <div className="flex items-center justify-between mb-2">
+                         <div className="text-sm font-bold text-purple-800 flex items-center gap-1.5">
+                           <ListChecks className="w-4 h-4"/> 確認チェック ({requiredOkCount}/{requiredItems.length} 必須)
+                         </div>
+                         <div className="flex items-center gap-1.5">
+                           <button onClick={() => setChecklistFullscreen(true)} className="text-[10px] bg-purple-600 hover:bg-purple-700 text-white px-2 py-1 rounded font-bold flex items-center gap-1"><Maximize2 className="w-3 h-3"/> 拡大</button>
+                           <button onClick={checkAll} className="text-[10px] bg-purple-100 hover:bg-purple-200 text-purple-700 px-2 py-1 rounded font-bold">全てチェック</button>
+                         </div>
+                       </div>
+                       <div className="space-y-1.5">
+                         {items.map(item => (
+                           <label key={item.id} className={`flex items-center gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${checked[item.id] ? 'bg-emerald-50 border-emerald-300' : 'bg-white border-slate-200 hover:border-purple-300'}`}>
+                             <input type="checkbox" checked={!!checked[item.id]} onChange={() => toggle(item.id)} className="w-6 h-6 accent-emerald-600 shrink-0"/>
+                             <span className={`flex-1 text-sm font-bold ${checked[item.id] ? 'text-emerald-700' : 'text-slate-700'}`}>
+                               {item.label || '(無題)'}
+                             </span>
+                             {item.required === false ? (
+                               <span className="text-[10px] text-slate-400 font-bold shrink-0">任意</span>
+                             ) : (
+                               <span className="text-[10px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded font-bold shrink-0">必須</span>
+                             )}
+                           </label>
+                         ))}
+                       </div>
+                       <div className={`mt-3 p-2 rounded text-center text-xs font-bold ${allRequiredDone ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-50 text-amber-700'}`}>
+                         {allRequiredDone ? '✓ 全ての必須項目をチェック済 — 次へ進めます' : `あと ${requiredItems.length - requiredOkCount} 件 必須項目があります`}
+                       </div>
+                     </div>
+                     {displayStep.description && (
+                       <div className="bg-slate-50 rounded-lg border border-slate-200 p-2 text-[11px] text-slate-700 whitespace-pre-wrap leading-snug">
+                         <span className="text-[9px] font-bold text-slate-500">注意事項:</span> {displayStep.description}
+                       </div>
+                     )}
+                   </div>
+                 );
+               })() : displayStep.type === 'measurement' && displayStep.measurementConfig ? (
                  <div className="flex flex-col gap-2">
                    <div className="bg-slate-50 rounded-lg border border-slate-200 p-2 shrink-0">
                      <div className="flex items-start gap-2">
@@ -4644,6 +8125,40 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                      comboPresets={comboPresets}
                      voiceAssistantActive={voiceEnabled}
                    />
+                   {/* 測定 + 確認チェック の併用: 同じ工程に checklistItems があれば下に追加表示 */}
+                   {Array.isArray(displayStep.checklistItems) && displayStep.checklistItems.length > 0 && (() => {
+                     const chkKey = `${displayStep.id}-${displayUnitIdx}-checklist`;
+                     const checked = measurementResults[chkKey] || {};
+                     const items = displayStep.checklistItems;
+                     const requiredItems = items.filter(it => it.required !== false);
+                     const requiredOkCount = requiredItems.filter(it => checked[it.id]).length;
+                     const allRequiredDone = requiredOkCount === requiredItems.length;
+                     const toggle = (itemId) => {
+                       const next = { ...checked, [itemId]: !checked[itemId] };
+                       const newResults = { ...measurementResults, [chkKey]: next };
+                       setMeasurementResults(newResults);
+                       onSave({ measurementResults: newResults });
+                     };
+                     return (
+                       <div className="mt-2 bg-purple-50/50 border-2 border-purple-200 rounded-lg p-2">
+                         <div className="flex items-center justify-between mb-1.5">
+                           <div className="text-xs font-bold text-purple-800 flex items-center gap-1">
+                             <ListChecks className="w-3.5 h-3.5"/> 確認チェック <span className={`text-[10px] ${allRequiredDone ? 'text-emerald-700' : 'text-amber-700'}`}>({requiredOkCount}/{requiredItems.length})</span>
+                           </div>
+                           <button onClick={() => setChecklistFullscreen(true)} className="text-[10px] bg-purple-600 hover:bg-purple-700 text-white px-1.5 py-0.5 rounded font-bold flex items-center gap-1"><Maximize2 className="w-2.5 h-2.5"/> 拡大</button>
+                         </div>
+                         <div className="space-y-0.5">
+                           {items.map(item => (
+                             <label key={item.id} className={`flex items-center gap-2 px-1.5 py-1 rounded text-xs cursor-pointer ${checked[item.id] ? 'bg-emerald-50' : 'bg-white hover:bg-purple-50'}`}>
+                               <input type="checkbox" checked={!!checked[item.id]} onChange={() => toggle(item.id)} className="w-3.5 h-3.5 accent-emerald-600 shrink-0"/>
+                               <span className={`flex-1 truncate ${checked[item.id] ? 'text-emerald-700 font-bold' : 'text-slate-700'}`}>{item.label || '(無題)'}</span>
+                               {item.required !== false && <span className="text-[9px] bg-rose-100 text-rose-700 px-1 rounded font-bold">必須</span>}
+                             </label>
+                           ))}
+                         </div>
+                       </div>
+                     );
+                   })()}
                  </div>
                ) : (
                  <>
@@ -4750,6 +8265,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             </div>
           )}
           {completedTaskMenuModal}
+          {ngReasonPickerModal}
         </div>
 
         {/* 測定画面 最大化モーダル (カスタム実行モード) */}
@@ -4768,6 +8284,16 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  {/* 拡大切替: 他の拡大ビューにスイッチ */}
+                  <div className="flex bg-white/10 rounded overflow-hidden">
+                    <button className="px-2.5 py-1 text-xs font-bold bg-teal-500 text-white" title="現在の表示"><Ruler className="w-3.5 h-3.5"/></button>
+                    {(activeStep.description || (activeStep.images && activeStep.images.length > 0)) && (
+                      <button onClick={() => { setMeasurementFullscreen(false); setDetailsFullscreen(true); }} className="px-2.5 py-1 text-xs font-bold text-white hover:bg-white/20 border-l border-slate-700" title="注意事項・画像を拡大"><FileText className="w-3.5 h-3.5"/></button>
+                    )}
+                    {Array.isArray(activeStep.checklistItems) && activeStep.checklistItems.length > 0 && (
+                      <button onClick={() => { setMeasurementFullscreen(false); setChecklistFullscreen(true); }} className="px-2.5 py-1 text-xs font-bold text-white hover:bg-white/20 border-l border-slate-700" title="確認チェックを拡大"><ListChecks className="w-3.5 h-3.5"/></button>
+                    )}
+                  </div>
                   {activeStep.description && (
                     <details className="relative">
                       <summary className="cursor-pointer bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1 list-none"><FileText className="w-3.5 h-3.5"/> 注意事項</summary>
@@ -4808,6 +8334,145 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             </div>
           );
         })()}
+
+        {/* 確認チェック 最大化モーダル */}
+        {checklistFullscreen && (() => {
+          const activeStep = localSteps[displayStepIdx] || currentStep;
+          if (!activeStep || !Array.isArray(activeStep.checklistItems) || activeStep.checklistItems.length === 0) return null;
+          const activeUnitIdx = displayUnitIdx;
+          const chkKey = `${activeStep.id}-${activeUnitIdx}-checklist`;
+          const checked = measurementResults[chkKey] || {};
+          const items = activeStep.checklistItems;
+          const requiredItems = items.filter(it => it.required !== false);
+          const requiredOkCount = requiredItems.filter(it => checked[it.id]).length;
+          const allRequiredDone = requiredOkCount === requiredItems.length;
+          const toggle = (itemId) => {
+            const next = { ...checked, [itemId]: !checked[itemId] };
+            const newResults = { ...measurementResults, [chkKey]: next };
+            setMeasurementResults(newResults);
+            onSave({ measurementResults: newResults });
+          };
+          const checkAll = () => {
+            const next = {};
+            items.forEach(it => { next[it.id] = true; });
+            const newResults = { ...measurementResults, [chkKey]: next };
+            setMeasurementResults(newResults);
+            onSave({ measurementResults: newResults });
+          };
+          const hasMeasurement = activeStep.type === 'measurement' && activeStep.measurementConfig;
+          return (
+            <div data-fs="checklist-fs" className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
+              <div className="bg-purple-800 text-white p-3 flex justify-between items-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <ListChecks className="w-5 h-5 text-purple-200"/>
+                  <div>
+                    <div className="text-base font-bold">{activeStep.title} — 確認チェック</div>
+                    <div className="text-[10px] text-purple-200 mt-0.5">{lot.model} #{lot.serialNo} ・{displayUnitIdx + 1}台目 ・必須 {requiredOkCount}/{requiredItems.length}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex bg-white/10 rounded overflow-hidden">
+                    {hasMeasurement && (
+                      <button onClick={() => { setChecklistFullscreen(false); setMeasurementFullscreen(true); }} className="px-2.5 py-1 text-xs font-bold text-white hover:bg-white/20" title="測定画面を拡大"><Ruler className="w-3.5 h-3.5"/></button>
+                    )}
+                    {(activeStep.description || (activeStep.images && activeStep.images.length > 0)) && (
+                      <button onClick={() => { setChecklistFullscreen(false); setDetailsFullscreen(true); }} className="px-2.5 py-1 text-xs font-bold text-white hover:bg-white/20 border-l border-purple-700" title="注意事項・画像を拡大"><FileText className="w-3.5 h-3.5"/></button>
+                    )}
+                    <button className="px-2.5 py-1 text-xs font-bold bg-purple-500 text-white border-l border-purple-700" title="現在の表示"><ListChecks className="w-3.5 h-3.5"/></button>
+                  </div>
+                  <button onClick={checkAll} className="bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded text-xs font-bold">全てチェック</button>
+                  <button onClick={() => setChecklistFullscreen(false)} className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><Minimize2 className="w-3.5 h-3.5"/> 閉じる</button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto p-6 bg-slate-100">
+                <div className="max-w-3xl mx-auto space-y-3">
+                  {items.map(item => (
+                    <label key={item.id} className={`flex items-center gap-4 p-5 rounded-xl border-4 cursor-pointer transition-all shadow-sm ${checked[item.id] ? 'bg-emerald-50 border-emerald-400' : 'bg-white border-slate-200 hover:border-purple-300'}`}>
+                      <input type="checkbox" checked={!!checked[item.id]} onChange={() => toggle(item.id)} className="w-10 h-10 accent-emerald-600 shrink-0"/>
+                      <span className={`flex-1 text-xl font-bold ${checked[item.id] ? 'text-emerald-700' : 'text-slate-800'}`}>{item.label || '(無題)'}</span>
+                      {item.required === false ? (
+                        <span className="text-sm text-slate-400 font-bold shrink-0">任意</span>
+                      ) : (
+                        <span className="text-sm bg-rose-100 text-rose-700 px-3 py-1 rounded font-bold shrink-0">必須</span>
+                      )}
+                    </label>
+                  ))}
+                  <div className={`p-4 rounded-xl text-center text-lg font-black ${allRequiredDone ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-50 text-amber-700'}`}>
+                    {allRequiredDone ? '✓ 全ての必須項目をチェック済 — 次工程へ進めます' : `あと ${requiredItems.length - requiredOkCount} 件 必須項目をチェックしてください`}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* 注意事項・画像 最大化モーダル */}
+        {detailsFullscreen && (() => {
+          const activeStep = localSteps[displayStepIdx] || currentStep;
+          if (!activeStep) return null;
+          const hasMeasurement = activeStep.type === 'measurement' && activeStep.measurementConfig;
+          const hasChecklist = Array.isArray(activeStep.checklistItems) && activeStep.checklistItems.length > 0;
+          return (
+            <div data-fs="details-fs" className="fixed inset-0 z-[300] bg-slate-900/95 flex flex-col">
+              <div className="bg-orange-800 text-white p-3 flex justify-between items-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <FileText className="w-5 h-5 text-orange-200"/>
+                  <div>
+                    <div className="text-base font-bold">{activeStep.title} — 注意事項・参考画像</div>
+                    <div className="text-[10px] text-orange-200 mt-0.5">{lot.model} #{lot.serialNo} ・{displayUnitIdx + 1}台目</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex bg-white/10 rounded overflow-hidden">
+                    {hasMeasurement && (
+                      <button onClick={() => { setDetailsFullscreen(false); setMeasurementFullscreen(true); }} className="px-2.5 py-1 text-xs font-bold text-white hover:bg-white/20" title="測定画面を拡大"><Ruler className="w-3.5 h-3.5"/></button>
+                    )}
+                    <button className="px-2.5 py-1 text-xs font-bold bg-orange-500 text-white border-l border-orange-700" title="現在の表示"><FileText className="w-3.5 h-3.5"/></button>
+                    {hasChecklist && (
+                      <button onClick={() => { setDetailsFullscreen(false); setChecklistFullscreen(true); }} className="px-2.5 py-1 text-xs font-bold text-white hover:bg-white/20 border-l border-orange-700" title="確認チェックを拡大"><ListChecks className="w-3.5 h-3.5"/></button>
+                    )}
+                  </div>
+                  {activeStep.pdfData && (
+                    <button onClick={() => setShowPdf(true)} className="bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><FileText className="w-3.5 h-3.5"/> PDF</button>
+                  )}
+                  <button onClick={() => setDetailsFullscreen(false)} className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1"><Minimize2 className="w-3.5 h-3.5"/> 閉じる</button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto p-6 bg-slate-100">
+                <div className="max-w-5xl mx-auto space-y-4">
+                  {activeStep.images && activeStep.images.length > 0 && (
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+                      <div className="text-sm font-bold text-slate-500 mb-2">参考画像</div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {activeStep.images.map((img, i) => (
+                          <img key={i} src={img} className="w-full max-h-96 object-contain rounded border border-slate-200 bg-slate-50" alt={`参考${i + 1}`}/>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {activeStep.description && (
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+                      <div className="text-sm font-bold text-slate-500 mb-2">作業内容 / 注意事項</div>
+                      <div className="text-xl text-slate-800 whitespace-pre-wrap leading-relaxed">{activeStep.description}</div>
+                    </div>
+                  )}
+                  {!activeStep.images?.length && !activeStep.description && (
+                    <div className="text-center text-slate-400 py-12">この工程には注意事項・画像が登録されていません。</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* 途中経過の成績表プレビュー (カスタムモード用) */}
+        {showInProgressReport && (
+          <ReportPreview
+            lot={lot}
+            workers={workers}
+            onClose={() => setShowInProgressReport(false)}
+          />
+        )}
       </div>
     );
   }
@@ -4879,12 +8544,79 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
               {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
             </button>
+            <button onClick={()=>setShowInProgressReport(true)} className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 rounded font-bold text-sm flex items-center gap-1" title="途中経過の成績表を表示 (未入力は空白)"><Printer className="w-4 h-4"/> 成績表</button>
+            <button onClick={() => setShowWorkOrderOptimizer(true)} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 rounded font-bold text-sm flex items-center gap-1" title="自動測定中に並行できる手動工程を提案"><Zap className="w-4 h-4"/> オススメ順</button>
             <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-2 hover:bg-white/10 rounded-full"><X className="w-6 h-6"/></button>
           </div>
         </div>
         <div className="flex-1 flex overflow-hidden">
           <div className="flex-1 bg-slate-100 p-4 flex flex-col relative overflow-y-auto">
-             {currentStep.type === 'measurement' && currentStep.measurementConfig ? (
+             {/* === 品質情報共有: この型式・この工程で直近こんな気づき/不良が出てます === */}
+             <ModelQualityInfoPanel
+               model={lot.model}
+               stepTitle={currentStep?.title}
+               info={modelQualityInfo}
+               open={showQualityInfoPanel}
+               onToggle={() => setShowQualityInfoPanel(v => !v)}
+             />
+             {Array.isArray(currentStep.checklistItems) && currentStep.checklistItems.length > 0 && currentStep.type !== 'measurement' ? (() => {
+               // チェックリスト単独工程 (順序実行モード、測定なし)
+               const chkKey = `${currentStep.id}-0-checklist`;  // 順序実行は 1台目で代表
+               const checked = measurementResults[chkKey] || {};
+               const items = currentStep.checklistItems;
+               const requiredItems = items.filter(it => it.required !== false);
+               const requiredOkCount = requiredItems.filter(it => checked[it.id]).length;
+               const allRequiredDone = requiredOkCount === requiredItems.length;
+               const toggle = (itemId) => {
+                 const next = { ...checked, [itemId]: !checked[itemId] };
+                 const newResults = { ...measurementResults, [chkKey]: next };
+                 setMeasurementResults(newResults);
+                 onSave({ measurementResults: newResults });
+               };
+               const checkAll = () => {
+                 const next = {};
+                 items.forEach(it => { next[it.id] = true; });
+                 const newResults = { ...measurementResults, [chkKey]: next };
+                 setMeasurementResults(newResults);
+                 onSave({ measurementResults: newResults });
+               };
+               return (
+                 <div className="flex flex-col gap-3">
+                   {currentStep.description && (
+                     <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm text-sm text-slate-700 whitespace-pre-wrap">
+                       <div className="text-[10px] font-bold text-slate-500 mb-1">作業内容 / 注意事項</div>
+                       {currentStep.description}
+                     </div>
+                   )}
+                   <div className="bg-purple-50/50 border-2 border-purple-200 rounded-xl p-4">
+                     <div className="flex items-center justify-between mb-3">
+                       <div className="text-base font-bold text-purple-800 flex items-center gap-2">
+                         <ListChecks className="w-5 h-5"/> 確認チェック ({requiredOkCount}/{requiredItems.length} 必須)
+                       </div>
+                       <button onClick={checkAll} className="text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 px-3 py-1 rounded font-bold">全てチェック</button>
+                     </div>
+                     <div className="space-y-2">
+                       {items.map(item => (
+                         <label key={item.id} className={`flex items-center gap-4 p-4 rounded-lg border-2 cursor-pointer transition-all ${checked[item.id] ? 'bg-emerald-50 border-emerald-300' : 'bg-white border-slate-200 hover:border-purple-300'}`}>
+                           <input type="checkbox" checked={!!checked[item.id]} onChange={() => toggle(item.id)} className="w-7 h-7 accent-emerald-600 shrink-0"/>
+                           <span className={`flex-1 text-base font-bold ${checked[item.id] ? 'text-emerald-700' : 'text-slate-700'}`}>
+                             {item.label || '(無題)'}
+                           </span>
+                           {item.required === false ? (
+                             <span className="text-xs text-slate-400 font-bold shrink-0">任意</span>
+                           ) : (
+                             <span className="text-xs bg-rose-100 text-rose-700 px-2 py-0.5 rounded font-bold shrink-0">必須</span>
+                           )}
+                         </label>
+                       ))}
+                     </div>
+                     <div className={`mt-3 p-3 rounded-lg text-center text-sm font-bold ${allRequiredDone ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-50 text-amber-700'}`}>
+                       {allRequiredDone ? '✓ 全ての必須項目をチェック済 — 次工程へ進めます' : `あと ${requiredItems.length - requiredOkCount} 件 必須項目をチェックしてください`}
+                     </div>
+                   </div>
+                 </div>
+               );
+             })() : currentStep.type === 'measurement' && currentStep.measurementConfig ? (
                <div className="flex flex-col h-full gap-2">
                  {/* 詳細・注意事項（測定タイプでも常に表示） */}
                  <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-3 shrink-0 max-h-[36%] overflow-y-auto">
@@ -4903,6 +8635,39 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
                      </div>
                    </div>
                  </div>
+
+                 {/* 測定条件 (品質規格から焼き付けられた conditionPreset) */}
+                 {currentStep.measurementConfig.conditionPreset && (
+                   ((currentStep.measurementConfig.conditionPreset.params && currentStep.measurementConfig.conditionPreset.params.length > 0) ||
+                    currentStep.measurementConfig.conditionPreset.note) && (
+                     <div className="bg-purple-50 border border-purple-200 rounded-xl p-3 shrink-0">
+                       <div className="flex items-center gap-2 mb-1.5">
+                         <ListChecks className="w-4 h-4 text-purple-700"/>
+                         <span className="text-xs font-bold text-purple-900">測定条件</span>
+                         {lot.appliedStandard?.standardNo && (
+                           <span className="text-[10px] bg-purple-200 text-purple-800 px-1.5 py-0.5 rounded font-mono">
+                             {lot.appliedStandard.standardNo}{lot.appliedStandard.revision ? ` Rev.${lot.appliedStandard.revision}` : ''}
+                           </span>
+                         )}
+                       </div>
+                       {currentStep.measurementConfig.conditionPreset.params && currentStep.measurementConfig.conditionPreset.params.length > 0 && (
+                         <div className="flex flex-wrap gap-1.5 mb-1.5">
+                           {currentStep.measurementConfig.conditionPreset.params.map((p, idx) => (
+                             <div key={idx} className="bg-white border border-purple-200 rounded px-2 py-1 text-xs">
+                               <span className="font-bold text-purple-700">{p.key}:</span>
+                               <span className="ml-1 font-mono text-slate-700">{p.value}</span>
+                             </div>
+                           ))}
+                         </div>
+                       )}
+                       {currentStep.measurementConfig.conditionPreset.note && (
+                         <div className="text-xs text-purple-900 bg-white border border-purple-200 rounded p-1.5 whitespace-pre-wrap leading-relaxed">
+                           {currentStep.measurementConfig.conditionPreset.note}
+                         </div>
+                       )}
+                     </div>
+                   )
+                 )}
                  <div className="flex justify-end shrink-0">
                    <button onClick={() => setMeasurementFullscreen(true)} className="bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 rounded-lg text-sm font-black flex items-center gap-2 shadow-md ring-1 ring-teal-400/40 min-h-[40px]">
                      <Maximize2 className="w-4 h-4"/> 測定画面を最大化
@@ -4996,7 +8761,7 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
         <div className="h-2 bg-slate-100"><div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${((currentStepIdx + (lot.status==='completed'?1:0)) / localSteps.length) * 100}%` }} /></div>
       </div>
 
-      {/* 中断中 (一時停止) のフルスクリーンオーバーレイ — 順序実行モード */}
+      {/* 中断中 (一時停止) のフルスクリーンオーバーレイ — 元のシンプル版 (タップで再開) */}
       {isOnBreak && !measurementFullscreen && (
         <div onClick={toggleBreak} className="fixed inset-0 z-[150] bg-amber-900/40 backdrop-blur-sm flex items-center justify-center cursor-pointer">
           <div className="bg-amber-500 text-white px-8 py-6 rounded-2xl shadow-2xl ring-4 ring-amber-300/50 text-center animate-pulse">
@@ -5004,6 +8769,12 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
             <div className="text-2xl font-black mb-1">作業を一時停止しています</div>
             <div className="text-sm opacity-90">タップで再開 / または右上の「再開」ボタンを押してください</div>
             <div className="mt-3 text-xs bg-white/20 inline-block px-3 py-1 rounded-full">経過時間: {formatTime(Math.floor(elapsed / 1000))}</div>
+            {pauseReason && (
+              <div className="mt-3 bg-white/20 inline-block px-3 py-1 rounded-full text-sm">
+                {PAUSE_REASONS.find(r => r.key === pauseReason.category)?.emoji || '⏸'} {pauseReason.label}
+                {pauseReason.note && <span className="opacity-80 ml-1">— {pauseReason.note}</span>}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -5068,6 +8839,141 @@ const WorkExecutionModal = ({ lot, onClose, onSave, onFinish, defectProcessOptio
           </div>
         );
       })()}
+
+      {/* 途中経過の成績表プレビュー (検査中アクセス) */}
+      {showInProgressReport && (
+        <ReportPreview
+          lot={lot}
+          workers={workers}
+          onClose={() => setShowInProgressReport(false)}
+        />
+      )}
+
+      {/* 作業順最適化 (ルールベース + AI + シミュレーション) */}
+      {/* ※ onApply 系は撤去 — 順序を勝手に書き換える破壊的操作だったため (2026-05-30) */}
+      {showWorkOrderOptimizer && (
+        <WorkOrderOptimizerModal
+          lot={lot}
+          lots={lots}
+          templates={templates}
+          currentExecutionType={executionType}
+          onSwitchToCustom={() => { setExecutionType('custom'); onSave({ executionType: 'custom' }); }}
+          onClose={() => setShowWorkOrderOptimizer(false)}
+        />
+      )}
+
+      {/* === 順序外タップの警告ダイアログ === */}
+      {outOfOrderConfirm && (
+        <div className="fixed inset-0 z-[110] bg-black/50 flex items-center justify-center p-4" onClick={() => setOutOfOrderConfirm(null)}>
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-5" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start gap-3 mb-4">
+              <div className="bg-amber-100 p-2 rounded-full"><AlertTriangle className="w-6 h-6 text-amber-600"/></div>
+              <div className="flex-1">
+                <h3 className="font-black text-slate-800 text-lg">順序外の作業です</h3>
+                <div className="text-sm text-slate-600 mt-1">
+                  推奨は <b className="text-emerald-600">「{outOfOrderConfirm.nextTitle}」#{outOfOrderConfirm.nextU + 1}台目</b>。<br/>
+                  今押したのは <b className="text-rose-600">「{outOfOrderConfirm.thisTitle}」#{outOfOrderConfirm.uIdx + 1}台目</b>。
+                </div>
+                <div className="text-xs text-slate-500 mt-2 bg-slate-50 rounded p-2 leading-relaxed">
+                  💡 ルール: <b>1台目から順番に</b>作業することを推奨しています。<br/>
+                  飛ばすと作業漏れや混乱の原因になります。
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setOutOfOrderConfirm(null)} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded font-bold text-sm">キャンセル</button>
+              <button onClick={() => {
+                // 推奨のタスクに切り替えてスタート
+                const { nextSIdx, nextU } = outOfOrderConfirm;
+                setOutOfOrderConfirm(null);
+                setActiveCustomTaskKey(`${nextSIdx}-${nextU}`);
+                toggleTask(nextSIdx, nextU);
+              }} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-bold text-sm flex items-center gap-1">
+                <CheckCircle2 className="w-4 h-4"/> 推奨の方をやる
+              </button>
+              <button onClick={() => {
+                const { sIdx, uIdx } = outOfOrderConfirm;
+                setOutOfOrderConfirm(null);
+                setActiveCustomTaskKey(`${sIdx}-${uIdx}`);
+                toggleTask(sIdx, uIdx);
+              }} className="px-4 py-2 bg-rose-100 hover:bg-rose-200 text-rose-700 border border-rose-300 rounded font-bold text-sm">それでも飛ばす</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 別エリアの自動測定 詳細フローティングウィジェット (右下、最小化可能) — ユーザー指摘により拡大 */}
+      {otherActiveAutos.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-[180] w-[420px] max-w-[95vw]">
+          {showOtherAutoWidget ? (
+            <div className="bg-white border-2 border-indigo-500 rounded-2xl shadow-2xl overflow-hidden">
+              <div className="bg-indigo-600 text-white px-4 py-2.5 flex items-center justify-between">
+                <div className="text-base font-black flex items-center gap-2">
+                  <Bot className="w-5 h-5 animate-pulse"/>
+                  別エリアの自動測定 ({otherActiveAutos.length}件)
+                </div>
+                <button onClick={() => setShowOtherAutoWidget(false)} className="text-white/80 hover:text-white p-1 min-w-[32px] min-h-[32px] flex items-center justify-center" title="最小化">
+                  <X className="w-5 h-5"/>
+                </button>
+              </div>
+              <div className="p-3 space-y-2.5 max-h-[60vh] overflow-y-auto">
+                {otherActiveAutos.map((a, ai) => {
+                  const elapsedSec = Math.floor(a.elapsedMs / 1000);
+                  const targetSec = Math.floor(a.targetMs / 1000);
+                  const remainingSec = targetSec > 0 ? targetSec - elapsedSec : null;
+                  const pct = targetSec > 0 ? Math.min(100, (elapsedSec / targetSec) * 100) : 0;
+                  const isOverdue = targetSec > 0 && elapsedSec > targetSec;
+                  const isNearDone = targetSec > 0 && remainingSec > 0 && remainingSec < 120;
+                  return (
+                    <div key={`${a.lotId}-${ai}`} className={`border-2 rounded-xl p-3 ${isOverdue ? 'bg-rose-50 border-rose-400' : isNearDone ? 'bg-amber-50 border-amber-400 animate-pulse' : 'bg-indigo-50 border-indigo-300'}`}>
+                      <div className="flex items-center justify-between mb-1.5 gap-2">
+                        <span className="text-sm font-black text-slate-800 truncate flex-1">
+                          {a.zoneName && <span className="text-indigo-700 mr-1">[{a.zoneName}]</span>}
+                          {a.lotOrderNo} <span className="text-slate-500 font-normal text-xs">{a.lotModel}</span>
+                        </span>
+                        {a.workerName && <span className="text-xs font-bold bg-slate-200 text-slate-700 px-2 py-0.5 rounded shrink-0">{a.workerName}</span>}
+                      </div>
+                      <div className="text-xs text-slate-600 mb-2 truncate font-bold" title={a.stepTitle}>
+                        <Bot className="w-3.5 h-3.5 inline mr-1"/>{a.stepTitle}
+                      </div>
+                      <div className="flex items-center justify-between font-mono mb-1.5 gap-2">
+                        <span className={`font-black text-xl ${isOverdue ? 'text-rose-700' : isNearDone ? 'text-amber-700' : 'text-indigo-700'}`}>
+                          {formatTime(elapsedSec)}
+                        </span>
+                        {targetSec > 0 && (
+                          <span className={`text-base font-bold ${isOverdue ? 'text-rose-700' : isNearDone ? 'text-amber-700' : 'text-slate-600'}`}>
+                            {isOverdue ? `⚠ 超過 +${formatTime(elapsedSec - targetSec)}` : isNearDone ? `🔔 残 ${formatTime(remainingSec)}` : `残 ${formatTime(remainingSec)}`}
+                          </span>
+                        )}
+                      </div>
+                      {targetSec > 0 && (
+                        <div className="h-3 bg-slate-200 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full transition-all ${isOverdue ? 'bg-rose-500' : isNearDone ? 'bg-amber-500' : 'bg-indigo-500'}`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="bg-slate-50 px-3 py-2 text-xs text-slate-600 border-t font-bold">
+                💡 黄=残2分以内 / 赤=目標超過 — 戻るタイミングの目安
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setShowOtherAutoWidget(true)}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white rounded-full shadow-2xl pl-4 pr-5 py-3 flex items-center gap-2 animate-pulse border-2 border-indigo-300"
+              title="別エリア自動測定の詳細を表示"
+            >
+              <Bot className="w-5 h-5"/>
+              <span className="text-base font-black">{otherActiveAutos.length}件 自動測定中</span>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 };
@@ -5166,33 +9072,40 @@ const ArrivalPlanningView = ({ onBack, lots, workers, templates, handleMoveLot, 
           {lots.filter(l => l.location === 'arrival').map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} minimal={false}/>)}
         </ZoneList>
       </div>
-      <div className="col-span-9 flex flex-col h-full">
-        <div className="bg-amber-50 rounded-xl border-2 border-amber-200 h-full flex flex-col shadow-xl">
-          <div className="p-3 border-b border-amber-200 bg-amber-100/50 flex justify-between items-center rounded-t-xl">
+      <div className="col-span-9 flex flex-col h-full min-h-0">
+        <div className="bg-amber-50 rounded-xl border-2 border-amber-200 h-full flex flex-col shadow-xl min-h-0">
+          <div className="p-3 border-b border-amber-200 bg-amber-100/50 flex justify-between items-center rounded-t-xl shrink-0">
             <h2 className="font-bold text-amber-900 flex items-center gap-2"><Calendar className="w-5 h-5"/> 作業予定 (作業者割当)</h2>
             <button onClick={handleAddWorker} className="text-xs bg-white border border-amber-300 text-amber-700 px-2 py-1 rounded hover:bg-amber-50">+ 作業者追加</button>
           </div>
-          <div className="flex-1 overflow-x-auto p-4 flex gap-4">
-            <div className="min-w-[200px] flex-1 border border-amber-200 bg-white rounded-lg p-3 flex flex-col" data-drop-zone="planned" onDragOver={(e)=>e.preventDefault()} onDrop={(e)=>{e.preventDefault(); const id=e.dataTransfer.getData('lotId'); if(id) handleMoveLot(id, 'planned', null);}}>
-              <div className="text-xs font-bold text-slate-400 mb-2 border-b pb-1">未割当</div>
-              <div className="flex-1 overflow-y-auto space-y-2">{lots.filter(l => l.location === 'planned' && !l.workerId).map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} minimal={false}/>)}</div>
+          {/* min-h-0 を入れて flex 子要素が縮めるように。これがないと縦overflow が発火しない */}
+          <div className="flex-1 overflow-x-auto p-4 flex gap-4 min-h-0">
+            {/* 未割当 = マップの「未該当エリア」と完全一致 (isUnassignedLot で一本化) */}
+            <div className="min-w-[200px] flex-1 border border-amber-200 bg-white rounded-lg p-3 flex flex-col min-h-0" data-drop-zone="zone_unassigned" onDragOver={(e)=>e.preventDefault()} onDrop={(e)=>{e.preventDefault(); const id=e.dataTransfer.getData('lotId'); if(id) handleMoveLot(id, 'zone_unassigned');}}>
+              <div className="text-xs font-bold text-slate-400 mb-2 border-b pb-1 shrink-0">未割当 / 未該当エリア</div>
+              <div className="flex-1 overflow-y-auto space-y-2 min-h-0">{lots.filter(isUnassignedLot).map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} minimal={false}/>)}</div>
             </div>
             {workers.map(w => {
-              const wPlannedLots = lots.filter(l => l.location === 'planned' && l.workerId === w.id);
-              const wPlannedTime = wPlannedLots.reduce((acc, lot) => acc + calculateLotEstimatedTime(lot), 0);
-              const wCompletedLots = lots.filter(l => l.location === 'completed' && l.workerId === w.id);
-              const wCompletedTime = wCompletedLots.reduce((acc, lot) => acc + (lot.totalWorkTime || 0) / 1000, 0);
+              const { plannedRemainingSec: wPlannedTime, actualDoneSec: wCompletedTime, inProgressCount: wInProgress, processingCount: wProcessing } = computeWorkerTimes(lots, w.id);
               return (
-              <div key={w.id} data-drop-zone="planned" data-worker-id={w.id} className="min-w-[200px] flex-1 border border-blue-100 bg-blue-50/30 rounded-lg p-3 flex flex-col" onDragOver={(e)=>e.preventDefault()} onDrop={(e)=>{e.preventDefault(); const id=e.dataTransfer.getData('lotId'); if(id) handleMoveLot(id, 'planned', w.id);}}>
-                <div className="text-sm font-bold text-blue-800 mb-1 flex items-center justify-between">
+              <div key={w.id} data-drop-zone="planned" data-worker-id={w.id} className="min-w-[200px] flex-1 border border-blue-100 bg-blue-50/30 rounded-lg p-3 flex flex-col min-h-0" onDragOver={(e)=>e.preventDefault()} onDrop={(e)=>{e.preventDefault(); const id=e.dataTransfer.getData('lotId'); if(id) handleMoveLot(id, 'planned', w.id);}}>
+                <div className="text-sm font-bold text-blue-800 mb-1 flex items-center justify-between shrink-0">
                   <div className="flex items-center gap-1"><User className="w-4 h-4"/> {w.name}</div>
-                  <div className="text-[10px] bg-blue-100 text-blue-700 px-1.5 rounded font-mono">{formatTime(wPlannedTime)}</div>
+                  <div className="flex items-center gap-1">
+                    {wInProgress > 0 && (
+                      <span className={`text-[10px] font-bold px-1 rounded inline-flex items-center gap-1 ${wProcessing > 0 ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`} title="進行中">
+                        {wProcessing > 0 && <span className="w-1 h-1 rounded-full bg-blue-500 animate-pulse"/>}
+                        中{wInProgress}
+                      </span>
+                    )}
+                    <div className="text-[10px] bg-blue-100 text-blue-700 px-1.5 rounded font-mono">{formatTime(wPlannedTime)}</div>
+                  </div>
                 </div>
-                <div className="flex gap-3 text-sm mb-2 border-b pb-1">
+                <div className="flex gap-3 text-sm mb-2 border-b pb-1 shrink-0">
                   <span className="text-blue-600">予定: <span className="font-black font-mono text-base">{formatTime(wPlannedTime)}</span></span>
                   <span className="text-emerald-600">実績: <span className="font-black font-mono text-base">{formatTime(wCompletedTime)}</span></span>
                 </div>
-                <div className="flex-1 overflow-y-auto space-y-2">{lots.filter(l => l.location === 'planned' && l.workerId === w.id).map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} minimal={false}/>)}</div>
+                <div className="flex-1 overflow-y-auto space-y-2 min-h-0">{lots.filter(l => l.location === 'planned' && l.workerId === w.id).map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} minimal={false}/>)}</div>
               </div>
             )})}
           </div>
@@ -5221,8 +9134,7 @@ const PlanningExecutionView = ({ onBack, workers, lots, templates, handleMoveLot
              {workers.map(w => {
                if (filterWorkerId && filterWorkerId !== w.id) return null;
                const workerLots = lots.filter(l => l.location === 'planned' && l.workerId === w.id);
-               const wPlanTime = workerLots.reduce((acc, lot) => acc + calculateLotEstimatedTime(lot), 0);
-               const wDoneTime = lots.filter(l => l.location === 'completed' && l.workerId === w.id).reduce((acc, lot) => acc + (lot.totalWorkTime || 0) / 1000, 0);
+               const { plannedRemainingSec: wPlanTime, actualDoneSec: wDoneTime, inProgressCount: wInProgress, processingCount: wProcessing } = computeWorkerTimes(lots, w.id);
                return (
                  <div key={w.id} className="bg-white border border-slate-200 rounded-lg shadow-sm flex flex-col overflow-hidden shrink-0">
                    <div
@@ -5231,7 +9143,15 @@ const PlanningExecutionView = ({ onBack, workers, lots, templates, handleMoveLot
                    >
                      <div className="flex items-center justify-between">
                        <div className="flex items-center gap-2"><User className="w-4 h-4"/> {w.name}</div>
-                       <span className="text-xs font-normal text-slate-500">({workerLots.length}件)</span>
+                       <div className="flex items-center gap-1">
+                         {wInProgress > 0 && (
+                           <span className={`text-[10px] font-bold px-1 rounded inline-flex items-center gap-1 ${wProcessing > 0 ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`} title="進行中ロット">
+                             {wProcessing > 0 && <span className="w-1 h-1 rounded-full bg-blue-500 animate-pulse"/>}
+                             中{wInProgress}
+                           </span>
+                         )}
+                         <span className="text-xs font-normal text-slate-500">({workerLots.length}件)</span>
+                       </div>
                      </div>
                      <div className="flex gap-3 text-[10px] font-normal mt-0.5">
                        <span className="text-blue-600">予定: <span className="font-bold font-mono">{formatTime(wPlanTime)}</span></span>
@@ -5259,11 +9179,11 @@ const PlanningExecutionView = ({ onBack, workers, lots, templates, handleMoveLot
                  </div>
                );
              })}
-             {!filterWorkerId && lots.filter(l => l.location === 'planned' && !l.workerId).length > 0 && (
+             {!filterWorkerId && lots.filter(isUnassignedLot).length > 0 && (
                <div className="bg-white border border-slate-200 rounded-lg shadow-sm flex flex-col overflow-hidden shrink-0">
-                 <div className="bg-slate-50 px-3 py-2 font-bold text-slate-400 text-xs border-b">未割当</div>
+                 <div className="bg-slate-50 px-3 py-2 font-bold text-slate-400 text-xs border-b">未割当 / 未該当エリア</div>
                  <div className="p-2 space-y-1 min-h-[50px]">
-                   {lots.filter(l => l.location === 'planned' && !l.workerId).map(lot => {
+                   {lots.filter(isUnassignedLot).map(lot => {
                      const tpl = templates?.find(t => t.id === lot.templateId);
                      const entryTime = lot.entryAt ? new Date(lot.entryAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }) : '';
                      return (
@@ -5302,20 +9222,28 @@ const PlanningExecutionView = ({ onBack, workers, lots, templates, handleMoveLot
   );
 };
 
-// New View: Map Only
+// New View: Map Only (フル画面マップ表示)
+// 画面全体を使うため fixed inset-0 で親レイアウトの padding/header を回避
 const MapOnlyView = ({ onBack, lots, workers, templates, handleMoveLot, saveData, setDraggedLotId, draggedLotId, setExecutionLotId, settings, handleImageUpload, saveSettings, mapZones, onEditLot, onDeleteLot }) => (
-    <div data-fs="dashboard" className="h-full flex flex-col">
-       <div className="mb-2 flex items-center justify-between shrink-0">
-          <button onClick={onBack} className="text-slate-500 hover:text-slate-800 flex items-center gap-1"><ArrowRight className="w-4 h-4 rotate-180"/> 戻る</button>
-          <h2 className="font-bold text-blue-800 flex items-center gap-2"><MapIcon className="w-5 h-5"/> 作業エリア全体図</h2>
+    <div data-fs="dashboard" className="fixed inset-0 z-40 bg-slate-100 flex flex-col">
+       {/* 戻る/タイトル は上部の細いバーに集約してマップに最大限のスペースを与える */}
+       <div className="bg-white border-b border-slate-200 px-3 py-1.5 flex items-center justify-between shrink-0 shadow-sm">
+          <button onClick={onBack} className="text-slate-500 hover:text-slate-800 flex items-center gap-1 text-sm font-bold">
+            <ArrowRight className="w-4 h-4 rotate-180"/> 戻る
+          </button>
+          <h2 className="font-bold text-blue-800 flex items-center gap-2 text-sm"><MapIcon className="w-4 h-4"/> 作業エリア全体図</h2>
+          <div className="w-16"/> {/* 中央揃え用スペーサ */}
        </div>
-       <InteractiveMap 
-          lots={lots} workers={workers} templates={templates} 
-          handleMoveLot={handleMoveLot} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} 
-          onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} 
-          settings={settings} handleImageUpload={handleImageUpload} saveSettings={saveSettings} mapZones={mapZones} 
-          isDashboard={false} 
-        />
+       {/* 余白を完全に排除してマップに最大限のスペースを */}
+       <div className="flex-1 overflow-hidden">
+         <InteractiveMap
+            lots={lots} workers={workers} templates={templates}
+            handleMoveLot={handleMoveLot} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId}
+            onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId}
+            settings={settings} handleImageUpload={handleImageUpload} saveSettings={saveSettings} mapZones={mapZones}
+            isDashboard={false}
+          />
+       </div>
     </div>
 );
 
@@ -5475,7 +9403,7 @@ const MeasurementOverridesPanel = ({ templates, lots, measurementOverrides, save
                         className="w-full border rounded p-2 text-sm bg-slate-50"
                     >
                         <option value="">-- テンプレート選択 --</option>
-                        {templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                        {[...templates].sort((a, b) => new Intl.Collator('ja').compare(a.name || '', b.name || '')).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
                     </select>
                 </div>
                 <div>
@@ -5623,7 +9551,939 @@ const MeasurementOverridesPanel = ({ templates, lots, measurementOverrides, save
     );
 };
 
-const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, targetTimeHistory, settings }) => {
+// ===========================
+// 品質規格マスタ + 型式マッピングパネル
+// ===========================
+// 「型式 → 品質規格 → 公差/測定条件」の 2 段構造を実装。
+// データ構造:
+//   settings.qualityStandards: { [qsId]: { id, standardNo, name, revision, note, templateId,
+//                                          measurementOverrides: {[stepId]: {[calcId]: {nominal, toleranceUpper, ...}}},
+//                                          measurementConditions: {[stepId]: {params: [{key, value}], note}} } }
+//   settings.modelStandardMap: { [model]: qsId }
+//
+// ロット作成時の優先順位:
+//   1) modelStandardMap に型式がマッピングされていれば、その規格を適用
+//   2) なければ既存の measurementOverrides[model] (レガシー) を適用
+//   3) どちらもなければテンプレートのデフォルト値
+// ロットには appliedStandard スナップショットを焼き付けてトレーサビリティを確保。
+// ===========================
+// 勤務時間マスタ設定パネル
+// ===========================
+// 始業/定時/残業/休憩時間を会社の実態に合わせて設定。
+// 週次/月次の負荷計算 (ProgressOverviewView) で使用される。
+const WorkScheduleSettingsPanel = ({ workSchedule, saveSettings, workloadEffectiveWorkers, registeredWorkerCount = 0 }) => {
+    const sch = { ...DEFAULT_WORK_SCHEDULE, ...(workSchedule || {}) };
+    const computed = computeWorkHours(sch);
+
+    const updateSchedule = (patch) => {
+        saveSettings({ workSchedule: { ...sch, ...patch } });
+    };
+
+    const updateBreak = (idx, patch) => {
+        const next = (sch.breaks || []).map((b, i) => i === idx ? { ...b, ...patch } : b);
+        updateSchedule({ breaks: next });
+    };
+    const addBreak = () => updateSchedule({ breaks: [...(sch.breaks || []), { start: '12:00', end: '12:30', name: '休憩' }] });
+    const removeBreak = (idx) => updateSchedule({ breaks: (sch.breaks || []).filter((_, i) => i !== idx) });
+    const resetToDefault = () => {
+        if (!confirm('勤務時間設定をデフォルトに戻しますか？')) return;
+        saveSettings({ workSchedule: { ...DEFAULT_WORK_SCHEDULE } });
+    };
+
+    return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mt-6">
+            <div className="flex items-center justify-between mb-2">
+                <h3 className="text-lg font-bold flex items-center gap-2 text-slate-800">
+                    <Clock className="w-5 h-5 text-blue-600" /> 勤務時間マスタ
+                </h3>
+                <button type="button" onClick={resetToDefault} className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-2 py-1 rounded font-bold flex items-center gap-1">
+                    <RotateCcw className="w-3 h-3" /> デフォルトに戻す
+                </button>
+            </div>
+            <p className="text-xs text-slate-500 mb-4">
+                会社の勤務時間 (始業・定時・残業・休憩) を設定します。週次/月次の負荷計算で使われ、休憩を除いた**実働時間**で人員上限を算出します。
+            </p>
+
+            {/* 始業 / 定時 / 残業 */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">始業</label>
+                    <input type="time" value={sch.dayStart} onChange={e => updateSchedule({ dayStart: e.target.value })} className="w-full border rounded p-2 text-sm font-mono" />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">定時 (終わり)</label>
+                    <input type="time" value={sch.dayEnd} onChange={e => updateSchedule({ dayEnd: e.target.value })} className="w-full border rounded p-2 text-sm font-mono" />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">残業 開始</label>
+                    <input type="time" value={sch.overtimeStart} onChange={e => updateSchedule({ overtimeStart: e.target.value })} className="w-full border rounded p-2 text-sm font-mono" />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">残業 終わり</label>
+                    <input type="time" value={sch.overtimeEnd} onChange={e => updateSchedule({ overtimeEnd: e.target.value })} className="w-full border rounded p-2 text-sm font-mono" />
+                </div>
+            </div>
+
+            {/* 休憩時間 */}
+            <div className="mb-4">
+                <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-bold text-slate-600">休憩時間</label>
+                    <button type="button" onClick={addBreak} className="text-xs bg-blue-50 hover:bg-blue-100 text-blue-700 px-2 py-1 rounded font-bold flex items-center gap-1"><Plus className="w-3 h-3" /> 休憩追加</button>
+                </div>
+                <div className="space-y-1.5">
+                    {(sch.breaks || []).map((b, i) => (
+                        <div key={i} className="flex items-center gap-2 bg-slate-50 p-2 rounded">
+                            <input type="time" value={b.start} onChange={e => updateBreak(i, { start: e.target.value })} className="border rounded p-1 text-sm font-mono w-28" />
+                            <span className="text-slate-400">〜</span>
+                            <input type="time" value={b.end} onChange={e => updateBreak(i, { end: e.target.value })} className="border rounded p-1 text-sm font-mono w-28" />
+                            <input value={b.name || ''} onChange={e => updateBreak(i, { name: e.target.value })} placeholder="名称 (例: 昼休憩)" className="flex-1 border rounded p-1 text-sm" />
+                            <span className="text-xs text-slate-500 w-16 text-right font-mono">{Math.max(0, timeStrToMinutes(b.end) - timeStrToMinutes(b.start))}分</span>
+                            <button type="button" onClick={() => removeBreak(i)} className="text-rose-400 hover:text-rose-600 p-1"><X className="w-4 h-4" /></button>
+                        </div>
+                    ))}
+                    {(sch.breaks || []).length === 0 && <div className="text-xs text-slate-400 text-center py-2">休憩時間が設定されていません</div>}
+                </div>
+            </div>
+
+            {/* 稼働日 / 想定作業者数 / 残業含めるか */}
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 mb-4">
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">稼働日 / 週</label>
+                    <input type="number" min="1" max="7" value={sch.daysPerWeek} onChange={e => updateSchedule({ daysPerWeek: Number(e.target.value) })} className="w-full border rounded p-2 text-sm font-mono" />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">稼働日 / 月</label>
+                    <input type="number" min="1" max="31" value={sch.daysPerMonth} onChange={e => updateSchedule({ daysPerMonth: Number(e.target.value) })} className="w-full border rounded p-2 text-sm font-mono" />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1" title="負荷計算で使う実働人数。登録作業者数と異なる場合に上書き">
+                        想定作業者数
+                        <span className="text-[10px] font-normal text-slate-400 ml-1">(登録 {registeredWorkerCount}人)</span>
+                    </label>
+                    <div className="flex items-center gap-1">
+                        <input
+                            type="number" min="0" max="99" step="1"
+                            value={workloadEffectiveWorkers ?? ''}
+                            placeholder={`登録 ${registeredWorkerCount} 人を使用`}
+                            onChange={e => {
+                                const v = e.target.value === '' ? null : Math.max(0, parseInt(e.target.value) || 0);
+                                saveSettings({ workloadEffectiveWorkers: v });
+                            }}
+                            className="flex-1 border rounded p-2 text-sm font-mono"
+                        />
+                        {workloadEffectiveWorkers != null && workloadEffectiveWorkers !== '' && (
+                            <button type="button" onClick={() => saveSettings({ workloadEffectiveWorkers: null })} className="text-[10px] text-slate-400 hover:text-rose-600 px-1" title="リセット (登録人数を使用)">
+                                <Undo2 className="w-3.5 h-3.5"/>
+                            </button>
+                        )}
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-0.5">負荷バー/必要人数の計算に使用</p>
+                </div>
+                <div className="flex items-end">
+                    <label className="flex items-center gap-2 cursor-pointer p-2 border rounded bg-slate-50 w-full">
+                        <input type="checkbox" checked={!!sch.includeOvertimeInCapacity} onChange={e => updateSchedule({ includeOvertimeInCapacity: e.target.checked })} className="w-4 h-4 accent-blue-600" />
+                        <span className="text-xs font-bold text-slate-700">負荷計算に残業時間も含める</span>
+                    </label>
+                </div>
+            </div>
+
+            {/* 計算結果サマリー */}
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                <div className="text-xs font-bold text-blue-800 mb-2">📊 実働時間 (計算結果)</div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+                    <div>
+                        <div className="text-[10px] text-blue-600 font-bold">1日 (定時内)</div>
+                        <div className="text-lg font-mono font-black text-blue-800">{formatHoursMinutes(computed.regularMinutes)}</div>
+                        <div className="text-[10px] text-slate-500">{computed.regularHours.toFixed(2)}h</div>
+                    </div>
+                    <div>
+                        <div className="text-[10px] text-blue-600 font-bold">1日 (残業含む)</div>
+                        <div className="text-lg font-mono font-black text-blue-800">{formatHoursMinutes(computed.totalMinutes)}</div>
+                        <div className="text-[10px] text-slate-500">{computed.totalHours.toFixed(2)}h</div>
+                    </div>
+                    <div>
+                        <div className="text-[10px] text-blue-600 font-bold">週 ({sch.daysPerWeek}日)</div>
+                        <div className="text-lg font-mono font-black text-blue-800">{(computed.regularHours * sch.daysPerWeek).toFixed(1)}h</div>
+                        <div className="text-[10px] text-slate-500">残業込 {(computed.totalHours * sch.daysPerWeek).toFixed(1)}h</div>
+                    </div>
+                    <div>
+                        <div className="text-[10px] text-blue-600 font-bold">月 ({sch.daysPerMonth}日)</div>
+                        <div className="text-lg font-mono font-black text-blue-800">{(computed.regularHours * sch.daysPerMonth).toFixed(1)}h</div>
+                        <div className="text-[10px] text-slate-500">残業込 {(computed.totalHours * sch.daysPerMonth).toFixed(1)}h</div>
+                    </div>
+                </div>
+                <div className="text-[10px] text-blue-700 mt-2">
+                    {sch.includeOvertimeInCapacity ? '✓ 全体進捗の負荷計算は「残業込み」で計算されます' : '✓ 全体進捗の負荷計算は「定時内のみ」で計算されます'}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandardMap, saveSettings, deleteSettingsFields }) => {
+    const [selectedQsId, setSelectedQsId] = useState('');
+    const [showCreate, setShowCreate] = useState(false);
+    const [newStandardNo, setNewStandardNo] = useState('');
+    const [newName, setNewName] = useState('');
+    const [newRevision, setNewRevision] = useState('A');
+    const [newTemplateId, setNewTemplateId] = useState('');
+    const [newModelInput, setNewModelInput] = useState('');
+    const [collapsedEntries, setCollapsedEntries] = useState({}); // { entryIdx: true } で折りたたみ
+
+    const qsList = useMemo(() => Object.values(qualityStandards || {}).sort((a, b) =>
+        (a.standardNo || '').localeCompare(b.standardNo || '')), [qualityStandards]);
+
+    const selectedQs = qualityStandards?.[selectedQsId];
+
+    // 規格内のテンプレートエントリ一覧 (新旧フォーマット吸収)
+    const templateEntries = useMemo(() => getQsTemplateEntries(selectedQs), [selectedQs]);
+
+    // 利用可能な型式
+    const knownModels = useMemo(() => {
+        const set = new Set();
+        (lots || []).forEach(l => { if (l.model) set.add(l.model); });
+        Object.keys(modelStandardMap || {}).forEach(m => set.add(m));
+        return Array.from(set).sort();
+    }, [lots, modelStandardMap]);
+
+    const createStandard = () => {
+        const standardNo = newStandardNo.trim();
+        const name = newName.trim();
+        if (!standardNo || !name || !newTemplateId) {
+            alert('規格番号、名称、対象テンプレートは必須です');
+            return;
+        }
+        const id = 'qs-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const now = Date.now();
+        const next = { ...(qualityStandards || {}) };
+        next[id] = {
+            id,
+            standardNo,
+            name,
+            revision: newRevision.trim() || 'A',
+            note: '',
+            // 新フォーマット: テンプレートエントリ配列
+            templates: [{
+                templateId: newTemplateId,
+                measurementOverrides: {},
+                measurementConditions: {},
+            }],
+            createdAt: now,
+            updatedAt: now,
+        };
+        saveSettings({ qualityStandards: next });
+        setSelectedQsId(id);
+        setShowCreate(false);
+        setNewStandardNo(''); setNewName(''); setNewRevision('A'); setNewTemplateId('');
+    };
+
+    const updateQs = (qsId, patch) => {
+        const cur = qualityStandards?.[qsId];
+        if (!cur) return;
+        const next = { ...(qualityStandards || {}) };
+        next[qsId] = { ...cur, ...patch, updatedAt: Date.now() };
+        saveSettings({ qualityStandards: next });
+    };
+
+    // テンプレートエントリ配列を更新 (新フォーマットで保存)
+    const writeTemplateEntries = (qsId, newEntries) => {
+        updateQs(qsId, { templates: newEntries });
+    };
+
+    const addTemplateEntry = () => {
+        if (!selectedQs) return;
+        const next = [...templateEntries, { templateId: '', measurementOverrides: {}, measurementConditions: {} }];
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    const removeTemplateEntry = (idx) => {
+        if (!selectedQs) return;
+        const entry = templateEntries[idx];
+        const tplName = templates.find(t => t.id === entry?.templateId)?.name || '(未選択)';
+        if (templateEntries.length === 1) {
+            alert('テンプレートエントリを 0 件にはできません。規格自体を削除する場合は「規格削除」ボタンを使ってください。');
+            return;
+        }
+        if (!confirm(`テンプレート「${tplName}」の規格設定 (公差・測定条件) を削除しますか？\n規格自体・他のテンプレ設定は残ります。`)) return;
+        const next = templateEntries.filter((_, i) => i !== idx);
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    const setEntryTemplateId = (idx, newTemplateId) => {
+        if (!selectedQs) return;
+        // 同じ規格内で重複チェック
+        if (newTemplateId && templateEntries.some((e, i) => i !== idx && e.templateId === newTemplateId)) {
+            alert('同じテンプレートは規格内で 1 回しか登録できません');
+            return;
+        }
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], templateId: newTemplateId };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    // Excel取込時の検査日オフセット (K33日からの差分日数。負=前)
+    const setEntryDaysBefore = (idx, daysBefore) => {
+        if (!selectedQs) return;
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], daysBefore: daysBefore };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    const updateEntryOverrides = (idx, newOverrides) => {
+        if (!selectedQs) return;
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], measurementOverrides: newOverrides };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    const updateEntryConditions = (idx, newConditions) => {
+        if (!selectedQs) return;
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], measurementConditions: newConditions };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    // 初期値プリセット (ブロックゲージ組合せなど) を保存
+    //   defaultValues[stepId][inputId] = 値
+    const updateEntryDefaultValues = (idx, newDefaults) => {
+        if (!selectedQs) return;
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], defaultValues: newDefaults };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    // 確認チェック項目の上書き (型式群ごとに項目を追加・削除できる)
+    //   checklistItemsByStep[stepId] = [{ id, label, required }, ...]
+    //   - 未設定 (undefined) → テンプレ標準の checklistItems を使用
+    //   - 設定済 → このQSの専用リストで上書き (テンプレ標準は無視)
+    const updateEntryChecklistItems = (idx, stepId, newItems) => {
+        if (!selectedQs) return;
+        const allItems = { ...(templateEntries[idx]?.checklistItemsByStep || {}) };
+        if (newItems == null) {
+            delete allItems[stepId];  // null/undefined で「テンプレ標準を使う」に戻す
+        } else {
+            allItems[stepId] = newItems;
+        }
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], checklistItemsByStep: allItems };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    const deleteQs = async (qsId) => {
+        const qs = qualityStandards?.[qsId];
+        if (!qs) return;
+        const usedModels = Object.entries(modelStandardMap || {}).filter(([, v]) => v === qsId).map(([k]) => k);
+        const msg = usedModels.length > 0
+            ? `規格「${qs.standardNo} ${qs.name}」を削除します。\n適用中の型式 (${usedModels.length}件): ${usedModels.join(', ')}\nの紐付けも解除されます。\n\n既存ロットは焼き付け済みなので影響ありません。続行しますか？`
+            : `規格「${qs.standardNo} ${qs.name}」を削除しますか？`;
+        if (!confirm(msg)) return;
+        // 規格本体 + 紐付いている型式マッピングを Firestore から完全削除
+        // (merge: true の setDoc では sub-key を omit しても削除されないため deleteField を使う)
+        const paths = [
+            `qualityStandards.${qsId}`,
+            ...usedModels.map(m => `modelStandardMap.${m}`),
+        ];
+        if (typeof deleteSettingsFields === 'function') {
+            await deleteSettingsFields(paths);
+        } else {
+            // フォールバック (deleteSettingsFields が無い古い環境用)
+            const nextQs = { ...(qualityStandards || {}) };
+            delete nextQs[qsId];
+            const nextMap = { ...(modelStandardMap || {}) };
+            usedModels.forEach(m => delete nextMap[m]);
+            await saveSettings({ qualityStandards: nextQs, modelStandardMap: nextMap });
+        }
+        if (selectedQsId === qsId) setSelectedQsId('');
+    };
+
+    // 公差オーバーライドの更新 (テンプレートエントリ単位)
+    const updateOverride = (entryIdx, stepId, calcId, patch) => {
+        const entry = templateEntries[entryIdx];
+        if (!entry) return;
+        const overrides = { ...(entry.measurementOverrides || {}) };
+        overrides[stepId] = { ...(overrides[stepId] || {}) };
+        const cur = overrides[stepId][calcId] || {};
+        const merged = { ...cur, ...patch };
+        const isEmpty = (merged.nominal === undefined || merged.nominal === null || merged.nominal === '')
+            && (merged.toleranceUpper === undefined || merged.toleranceUpper === '')
+            && (merged.toleranceLower === undefined || merged.toleranceLower === '')
+            && (merged.toleranceEnabled === undefined);
+        if (isEmpty) {
+            delete overrides[stepId][calcId];
+            if (Object.keys(overrides[stepId]).length === 0) delete overrides[stepId];
+        } else {
+            overrides[stepId][calcId] = merged;
+        }
+        updateEntryOverrides(entryIdx, overrides);
+    };
+
+    // 測定条件の更新 (テンプレートエントリ単位)
+    const updateCondition = (entryIdx, stepId, patch) => {
+        const entry = templateEntries[entryIdx];
+        if (!entry) return;
+        const conditions = { ...(entry.measurementConditions || {}) };
+        const cur = conditions[stepId] || { params: [], note: '' };
+        conditions[stepId] = { ...cur, ...patch };
+        updateEntryConditions(entryIdx, conditions);
+    };
+
+    const addConditionParam = (entryIdx, stepId) => {
+        const entry = templateEntries[entryIdx];
+        const cur = entry?.measurementConditions?.[stepId] || { params: [], note: '' };
+        updateCondition(entryIdx, stepId, { params: [...(cur.params || []), { key: '', value: '' }] });
+    };
+
+    const updateConditionParam = (entryIdx, stepId, paramIdx, patch) => {
+        const entry = templateEntries[entryIdx];
+        const cur = entry?.measurementConditions?.[stepId] || { params: [], note: '' };
+        const params = [...(cur.params || [])];
+        params[paramIdx] = { ...params[paramIdx], ...patch };
+        updateCondition(entryIdx, stepId, { params });
+    };
+
+    const removeConditionParam = (entryIdx, stepId, paramIdx) => {
+        const entry = templateEntries[entryIdx];
+        const cur = entry?.measurementConditions?.[stepId] || { params: [], note: '' };
+        const params = (cur.params || []).filter((_, i) => i !== paramIdx);
+        updateCondition(entryIdx, stepId, { params });
+    };
+
+    const setModelMapping = async (model, qsId) => {
+        if (qsId) {
+            // 追加・上書き: 通常の merge 更新で OK
+            await saveSettings({ modelStandardMap: { ...(modelStandardMap || {}), [model]: qsId } });
+        } else if (typeof deleteSettingsFields === 'function') {
+            // 削除: deleteField を使わないと Firestore から実際に消えない
+            await deleteSettingsFields([`modelStandardMap.${model}`]);
+        } else {
+            const next = { ...(modelStandardMap || {}) };
+            delete next[model];
+            await saveSettings({ modelStandardMap: next });
+        }
+    };
+
+    return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mt-6">
+            <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
+                <ClipboardCheck className="w-5 h-5 text-indigo-600" /> 品質規格マスタ
+                <span className="text-[10px] font-normal text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">推奨</span>
+            </h3>
+            <p className="text-xs text-slate-500 mb-4">
+                品質規格 (QS) = <span className="font-bold">公差・基準値 + 測定条件 + 対象テンプレート群 + Excel取込時の検査日オフセット</span> をひとまとめにしたマスタ。<br/>
+                1 つの規格に<span className="font-bold text-indigo-700">複数のテンプレートを順番に紐付け</span>できます (例: 中間分割 → 一般傾斜 → 回転検査)。<br/>
+                1 つの規格を複数型式で共有できます (例: <span className="font-mono bg-amber-100 text-amber-800 px-1 rounded">RTT-441/442/443 → QS-001「RT系 標準仕様」</span>)。<br/>
+                <span className="text-indigo-700 font-bold">既存ロットには影響なし</span>。新規ロット作成時に、ロットの工程テンプレートと一致するエントリが適用されます。<br/>
+                規格マッピングがある型式は、上の「型式別オーバーライド」より優先されます。
+            </p>
+            <div className="bg-amber-50 border border-amber-200 rounded p-2 mb-4 text-[11px] text-amber-800">
+                💡 <span className="font-bold">規格の名前付けのコツ</span>: 「どんな製品群か」「どんな仕様か」が後で見て分かる名前を。<br/>
+                例: <span className="font-mono">「RT系 標準仕様」</span> / <span className="font-mono">「特注パターンA」</span> / <span className="font-mono">「RBS 高精度モデル」</span> / <span className="font-mono">「KIT-22 改定3」</span><br/>
+                規格番号は社内番号 (例: <span className="font-mono">QS-001</span>) や 図面番号 / 仕様書番号 をそのまま流用してOK。
+            </div>
+
+            {/* 規格一覧 + 新規作成 */}
+            <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+                <div className="flex-1 min-w-[280px]">
+                    <label className="block text-xs font-bold text-slate-600 mb-1">編集する規格</label>
+                    <select
+                        value={selectedQsId}
+                        onChange={e => setSelectedQsId(e.target.value)}
+                        className="w-full border rounded p-2 text-sm bg-slate-50"
+                    >
+                        <option value="">-- 規格を選択 --</option>
+                        {qsList.map(qs => (
+                            <option key={qs.id} value={qs.id}>
+                                {qs.standardNo} Rev.{qs.revision} | {qs.name}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => setShowCreate(!showCreate)}
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded text-sm font-bold shadow flex items-center gap-1 mt-5"
+                >
+                    <Plus className="w-4 h-4" /> 新規規格
+                </button>
+            </div>
+
+            {/* 新規規格フォーム */}
+            {showCreate && (
+                <div className="border border-indigo-200 bg-indigo-50/40 rounded-lg p-3 mb-4 space-y-2">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                        <div>
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5">規格番号 *</label>
+                            <input value={newStandardNo} onChange={e => setNewStandardNo(e.target.value)} placeholder="例: QS-12345" className="w-full border rounded p-1.5 text-sm" />
+                        </div>
+                        <div>
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5" title="どんな製品群・どんな仕様か分かる名前。型式リストから後で自動連想できます">名称 *</label>
+                            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="例: RT系 標準仕様" className="w-full border rounded p-1.5 text-sm" />
+                            <p className="text-[9px] text-slate-400 mt-0.5">
+                                記入例: <span className="font-mono">「RT系 標準仕様」「特注パターンA」「RBSシリーズ 高精度」「KIT-22 改定3」</span>
+                            </p>
+                        </div>
+                        <div>
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5">リビジョン</label>
+                            <input value={newRevision} onChange={e => setNewRevision(e.target.value)} placeholder="A" className="w-full border rounded p-1.5 text-sm" />
+                        </div>
+                    </div>
+                    <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">対象テンプレート *</label>
+                        <select value={newTemplateId} onChange={e => setNewTemplateId(e.target.value)} className="w-full border rounded p-1.5 text-sm bg-white">
+                            <option value="">-- テンプレートを選択 --</option>
+                            {[...templates].sort((a, b) => new Intl.Collator('ja').compare(a.name || '', b.name || '')).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                        </select>
+                    </div>
+                    <div className="flex justify-end gap-2 pt-1">
+                        <button type="button" onClick={() => setShowCreate(false)} className="px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded">キャンセル</button>
+                        <button type="button" onClick={createStandard} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded">作成</button>
+                    </div>
+                </div>
+            )}
+
+            {/* 規格編集本体 */}
+            {selectedQs && (
+                <div className="space-y-3">
+                    {/* メタ情報 */}
+                    <div className="bg-slate-50 rounded-lg p-3 grid grid-cols-1 md:grid-cols-4 gap-2">
+                        <div>
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5">規格番号</label>
+                            <input value={selectedQs.standardNo || ''} onChange={e => updateQs(selectedQs.id, { standardNo: e.target.value })} className="w-full border rounded p-1 text-sm" />
+                        </div>
+                        <div>
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5">リビジョン</label>
+                            <input value={selectedQs.revision || ''} onChange={e => updateQs(selectedQs.id, { revision: e.target.value })} className="w-full border rounded p-1 text-sm" />
+                        </div>
+                        <div className="md:col-span-2">
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5" title="どんな製品群・どんな仕様か分かる名前">名称 <span className="font-normal text-slate-400">(記入例: RT系 標準仕様 / 特注パターンA / 高精度モデル)</span></label>
+                            <input value={selectedQs.name || ''} onChange={e => updateQs(selectedQs.id, { name: e.target.value })} placeholder="例: RT系 標準仕様" className="w-full border rounded p-1 text-sm" />
+                        </div>
+                        <div className="md:col-span-3 flex items-end">
+                            <div className="text-[10px] text-slate-500 leading-tight">
+                                <span className="font-bold text-indigo-700">{templateEntries.length}</span> 件のテンプレートが紐付いています。下のセクションで個別に編集できます。
+                            </div>
+                        </div>
+                        <div className="md:col-span-1 flex items-end">
+                            <button type="button" onClick={() => deleteQs(selectedQs.id)} className="w-full px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 rounded text-xs font-bold flex items-center justify-center gap-1">
+                                <Trash2 className="w-3 h-3" /> 規格削除
+                            </button>
+                        </div>
+                        <div className="md:col-span-4">
+                            <label className="block text-[10px] font-bold text-slate-600 mb-0.5">備考</label>
+                            <textarea value={selectedQs.note || ''} onChange={e => updateQs(selectedQs.id, { note: e.target.value })} className="w-full border rounded p-1 text-sm" rows={2} placeholder="規格書の出典・改訂理由など" />
+                        </div>
+                    </div>
+
+                    {/* 型式マッピング (この規格に紐付ける型式) — 名称の直下に配置 */}
+                    <div className="border-2 border-amber-100 rounded-lg overflow-hidden">
+                        <div className="bg-amber-50 px-3 py-2 text-sm font-bold text-amber-900 flex items-center justify-between">
+                            <span className="flex items-center gap-2"><Hash className="w-4 h-4" /> この規格に紐付ける型式</span>
+                        </div>
+                        <div className="p-3 bg-white">
+                            <div className="flex flex-wrap gap-2 mb-3">
+                                {Object.entries(modelStandardMap || {}).filter(([, v]) => v === selectedQs.id).map(([m]) => (
+                                    <div key={m} className="bg-amber-50 border border-amber-300 rounded-full pl-3 pr-1 py-0.5 text-xs font-bold text-amber-800 flex items-center gap-1">
+                                        {m}
+                                        <button type="button" onClick={() => setModelMapping(m, '')} className="ml-1 hover:bg-amber-200 rounded-full p-0.5"><X className="w-3 h-3" /></button>
+                                    </div>
+                                ))}
+                                {Object.entries(modelStandardMap || {}).filter(([, v]) => v === selectedQs.id).length === 0 && (
+                                    <span className="text-xs text-slate-400">まだ型式が紐付けられていません</span>
+                                )}
+                            </div>
+                            <div className="flex gap-2 items-center">
+                                <select onChange={e => { if (e.target.value) { setModelMapping(e.target.value, selectedQs.id); e.target.value = ''; } }} className="flex-1 border rounded p-1.5 text-xs bg-slate-50">
+                                    <option value="">-- 既存型式から追加 --</option>
+                                    {knownModels.filter(m => modelStandardMap?.[m] !== selectedQs.id).map(m => (
+                                        <option key={m} value={m}>
+                                            {m}{modelStandardMap?.[m] ? ` (現在: ${qualityStandards[modelStandardMap[m]]?.standardNo || '?'})` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                                <input value={newModelInput} onChange={e => setNewModelInput(e.target.value)} placeholder="新規型式名を入力" className="w-40 border rounded p-1.5 text-xs" />
+                                <button type="button" onClick={() => { const m = newModelInput.trim(); if (m) { setModelMapping(m, selectedQs.id); setNewModelInput(''); } }} disabled={!newModelInput.trim()} className="bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 text-white px-3 py-1.5 rounded text-xs font-bold">追加</button>
+                            </div>
+                            <p className="text-[10px] text-slate-500 mt-2">既存型式に別規格が割当済みの場合は上書きされます。新規ロット作成時から有効。</p>
+                        </div>
+                    </div>
+
+                    {/* テンプレートエントリ一覧 (順番に使うテンプレートを並べる) */}
+                    <div className="bg-indigo-50/50 border border-indigo-200 rounded-lg p-3">
+                        <div className="flex items-center justify-between mb-2">
+                            <div className="text-sm font-bold text-indigo-900 flex items-center gap-1.5">
+                                <ClipboardList className="w-4 h-4"/> 対象テンプレート ({templateEntries.length} 件)
+                                <span className="text-[10px] font-normal text-indigo-600 ml-1">受入→組立→中間→…→最終 のように順に並べられます</span>
+                            </div>
+                            <button type="button" onClick={addTemplateEntry} className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1 rounded font-bold flex items-center gap-1">
+                                <Plus className="w-3 h-3"/> テンプレート追加
+                            </button>
+                        </div>
+                        {templateEntries.length === 0 && (
+                            <div className="text-xs text-slate-400 text-center py-3">「+ テンプレート追加」で対象テンプレートを追加してください</div>
+                        )}
+                    </div>
+
+                    {/* 各テンプレートエントリのカード */}
+                    {templateEntries.map((entry, entryIdx) => {
+                        const tpl = templates.find(t => t.id === entry.templateId);
+                        // 編集対象 = 測定工程 OR 確認チェック項目を持つ工程 (型式群ごとに上書き可能)
+                        const measurementSteps = (tpl?.steps || []).filter(s =>
+                            (s.type === 'measurement' && s.measurementConfig) ||
+                            (Array.isArray(s.checklistItems) && s.checklistItems.length > 0)
+                        );
+                        const isCollapsed = !!collapsedEntries[entryIdx];
+                        const otherUsed = templateEntries.map((e, i) => i !== entryIdx ? e.templateId : null).filter(Boolean);
+                        const stepCount = measurementSteps.length;
+                        const overrideCount = Object.values(entry.measurementOverrides || {}).reduce((a, m) => a + Object.keys(m).length, 0);
+                        const conditionCount = Object.keys(entry.measurementConditions || {}).filter(k => {
+                            const c = entry.measurementConditions[k];
+                            return (c?.params || []).length > 0 || c?.note;
+                        }).length;
+                        const defaultsCount = Object.values(entry.defaultValues || {}).reduce((a, obj) => a + Object.values(obj || {}).filter(v => v !== '' && v != null).length, 0);
+                        return (
+                            <div key={entryIdx} className="border-2 border-indigo-200 rounded-lg overflow-hidden">
+                                {/* エントリヘッダー (折りたたみ可能) */}
+                                <div className="bg-indigo-100 px-3 py-2 flex items-center justify-between gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setCollapsedEntries(prev => ({ ...prev, [entryIdx]: !prev[entryIdx] }))}
+                                        className="flex items-center gap-2 text-sm font-bold text-indigo-900 hover:text-indigo-700"
+                                        title={isCollapsed ? 'クリックで展開' : 'クリックで折りたたみ'}
+                                    >
+                                        {isCollapsed ? <ChevronRight className="w-4 h-4"/> : <ChevronDown className="w-4 h-4"/>}
+                                        <span className="bg-indigo-600 text-white text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center shrink-0">{entryIdx + 1}</span>
+                                        <span className="truncate">{tpl?.name || '(テンプレート未選択)'}</span>
+                                    </button>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <span className="text-[10px] text-indigo-700">工程 {stepCount} / 条件 {conditionCount} / 公差 {overrideCount} / 初期値 {defaultsCount}</span>
+                                        {/* Excel取込時の検査日オフセット (K33基準) */}
+                                        <div className="flex items-center gap-1 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5" title="Excel取込時、進捗管理表のZ列 (K33検査予定日) からの日数オフセット。負の数 = 何日前、0 = 当日、正の数 = 何日後">
+                                            <FileSpreadsheet className="w-3 h-3 text-emerald-600"/>
+                                            <span className="text-[10px] text-emerald-700 font-bold">K33</span>
+                                            <input
+                                                type="number"
+                                                value={entry.daysBefore ?? ''}
+                                                placeholder="0"
+                                                onChange={e => {
+                                                    const v = e.target.value === '' ? null : parseInt(e.target.value) || 0;
+                                                    setEntryDaysBefore(entryIdx, v);
+                                                }}
+                                                className="w-12 border rounded p-0.5 text-xs text-center font-mono bg-white"
+                                            />
+                                            <span className="text-[10px] text-emerald-700">日</span>
+                                        </div>
+                                        <select
+                                            value={entry.templateId || ''}
+                                            onChange={e => setEntryTemplateId(entryIdx, e.target.value)}
+                                            className="text-xs border rounded p-1 bg-white max-w-[200px]"
+                                            title="このエントリに割り当てるテンプレート"
+                                        >
+                                            <option value="">-- 未選択 --</option>
+                                            {templates.filter(t => !otherUsed.includes(t.id) || t.id === entry.templateId).map(t => (
+                                                <option key={t.id} value={t.id}>{t.name}</option>
+                                            ))}
+                                        </select>
+                                        <button type="button" onClick={() => removeTemplateEntry(entryIdx)} className="text-rose-600 hover:bg-rose-100 p-1 rounded" title="このテンプレート設定を削除">
+                                            <Trash2 className="w-3.5 h-3.5"/>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* エントリ本体 (工程ごとの 条件 + 公差) */}
+                                {!isCollapsed && (
+                                    <div className="p-3 space-y-3 bg-white">
+                                        {!entry.templateId ? (
+                                            <div className="text-sm text-slate-400 py-4 text-center bg-slate-50 rounded">
+                                                右上のドロップダウンで対象テンプレートを選択してください
+                                            </div>
+                                        ) : measurementSteps.length === 0 ? (
+                                            <div className="text-sm text-slate-400 py-4 text-center bg-slate-50 rounded">
+                                                このテンプレートに測定タイプの工程がありません
+                                            </div>
+                                        ) : (
+                                            measurementSteps.map(step => {
+                                                const isMeasurement = step.type === 'measurement' && step.measurementConfig;
+                                                const calcs = isMeasurement ? (step.measurementConfig.calculations || []) : [];
+                                                const condition = entry.measurementConditions?.[step.id] || { params: [], note: '' };
+                                                const overrides = entry.measurementOverrides?.[step.id] || {};
+                                                // 初期値プリセット (ブロックゲージ組合せなど): defaultValues[step.id][inputId]
+                                                const stepDefaults = entry.defaultValues?.[step.id] || {};
+                                                const inputsList = isMeasurement ? (step.measurementConfig.inputs || []) : [];
+                                                // 確認チェック上書き: undefined = テンプレ標準を使う, 配列 = この規格専用
+                                                const tplChecklist = Array.isArray(step.checklistItems) ? step.checklistItems : [];
+                                                const customChecklist = entry.checklistItemsByStep?.[step.id];
+                                                const hasCustomChecklist = Array.isArray(customChecklist);
+                                                const effectiveChecklist = hasCustomChecklist ? customChecklist : tplChecklist;
+                                                const updateDefault = (inpId, val) => {
+                                                    const allDefaults = { ...(entry.defaultValues || {}) };
+                                                    const stepObj = { ...(allDefaults[step.id] || {}) };
+                                                    if (val === '' || val === null || val === undefined) {
+                                                        delete stepObj[inpId];
+                                                    } else {
+                                                        stepObj[inpId] = val;
+                                                    }
+                                                    if (Object.keys(stepObj).length === 0) {
+                                                        delete allDefaults[step.id];
+                                                    } else {
+                                                        allDefaults[step.id] = stepObj;
+                                                    }
+                                                    updateEntryDefaultValues(entryIdx, allDefaults);
+                                                };
+                                                const clearStepDefaults = () => {
+                                                    const allDefaults = { ...(entry.defaultValues || {}) };
+                                                    delete allDefaults[step.id];
+                                                    updateEntryDefaultValues(entryIdx, allDefaults);
+                                                };
+                                                const filledCount = Object.values(stepDefaults).filter(v => v !== '' && v != null).length;
+                                                return (
+                                                    <div key={step.id} className="border border-indigo-100 rounded-lg overflow-hidden">
+                                                        <div className="bg-indigo-50 px-3 py-1.5 text-xs font-bold text-indigo-900 flex items-center gap-2">
+                                                            <Ruler className="w-3.5 h-3.5" /> 工程: {step.title}
+                                                        </div>
+                                                        {/* 測定条件 (HOW) — 測定工程のみ */}
+                                                        {isMeasurement && (
+                                                        <div className="p-3 bg-white border-b border-slate-100">
+                                                            <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1.5">
+                                                                <ListChecks className="w-3.5 h-3.5 text-purple-600" /> 測定条件 (HOW)
+                                                                <span className="text-[10px] font-normal text-slate-400 ml-1">どう測るか / 段取り条件</span>
+                                                            </div>
+                                                            <div className="space-y-1.5">
+                                                                {(condition.params || []).map((p, idx) => (
+                                                                    <div key={idx} className="flex gap-2 items-center">
+                                                                        <input value={p.key || ''} onChange={e => updateConditionParam(entryIdx, step.id, idx, { key: e.target.value })} placeholder="項目名 (例: 分割数)" className="flex-1 border rounded p-1 text-xs" />
+                                                                        <input value={p.value || ''} onChange={e => updateConditionParam(entryIdx, step.id, idx, { value: e.target.value })} placeholder="値 (例: 8)" className="flex-1 border rounded p-1 text-xs" />
+                                                                        <button type="button" onClick={() => removeConditionParam(entryIdx, step.id, idx)} className="text-rose-400 hover:text-rose-600 p-1"><X className="w-3 h-3" /></button>
+                                                                    </div>
+                                                                ))}
+                                                                <button type="button" onClick={() => addConditionParam(entryIdx, step.id)} className="text-xs text-purple-600 hover:text-purple-800 flex items-center gap-1 font-bold">
+                                                                    <Plus className="w-3 h-3" /> 条件項目を追加
+                                                                </button>
+                                                            </div>
+                                                            <div className="mt-2">
+                                                                <label className="block text-[10px] text-slate-500 mb-0.5">条件メモ (自由記述)</label>
+                                                                <textarea value={condition.note || ''} onChange={e => updateCondition(entryIdx, step.id, { note: e.target.value })} className="w-full border rounded p-1.5 text-xs" rows={2} placeholder="例: ホイール45°毎、ウォーム評価あり、温度23°C基準" />
+                                                            </div>
+                                                        </div>
+                                                        )}
+                                                        {/* 初期値プリセット (ブロックゲージ組合せなど、型式群で共通の入力初期値) */}
+                                                        {isMeasurement && inputsList.length > 0 && (
+                                                            <div className="p-3 bg-amber-50/30 border-b border-slate-100">
+                                                                <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1.5">
+                                                                    <ListChecks className="w-3.5 h-3.5 text-amber-600" /> 初期値プリセット
+                                                                    <span className="text-[10px] font-normal text-slate-400 ml-1">ブロックゲージ組合せなど。測定画面で「規格の初期値を入力」ボタンが出ます</span>
+                                                                    {filledCount > 0 && (
+                                                                        <button type="button" onClick={clearStepDefaults} className="ml-auto text-[10px] text-rose-500 hover:bg-rose-50 px-1.5 py-0.5 rounded font-bold border border-rose-200">
+                                                                            <X className="w-2.5 h-2.5 inline mr-0.5"/>全クリア ({filledCount}件)
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                                <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-1.5">
+                                                                    {inputsList.map(inp => (
+                                                                        <div key={inp.id} className="flex flex-col gap-0.5 bg-white border border-amber-200 rounded p-1.5">
+                                                                            <span className="text-[9px] font-bold text-slate-500 truncate" title={inp.label}>
+                                                                                {inp.label || inp.id}
+                                                                            </span>
+                                                                            <input
+                                                                                type="text"
+                                                                                value={stepDefaults[inp.id] ?? ''}
+                                                                                onChange={e => updateDefault(inp.id, e.target.value)}
+                                                                                placeholder="—"
+                                                                                className="w-full border rounded px-1 py-0.5 text-xs font-mono text-right"
+                                                                            />
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                        {/* 確認チェック上書き (型式群ごとにカスタマイズ可能) */}
+                                                        <div className="p-3 bg-purple-50/30 border-b border-slate-100">
+                                                            <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1.5">
+                                                                <ListChecks className="w-3.5 h-3.5 text-purple-600" /> 確認チェック
+                                                                <span className="text-[10px] font-normal text-slate-400 ml-1">
+                                                                    {hasCustomChecklist ? '⚙ この規格専用' : 'テンプレ標準を継承'}
+                                                                </span>
+                                                                <span className="ml-auto flex items-center gap-1.5">
+                                                                    {!hasCustomChecklist ? (
+                                                                        <button type="button" onClick={() => updateEntryChecklistItems(entryIdx, step.id, [...tplChecklist])} className="text-[10px] bg-purple-100 hover:bg-purple-200 text-purple-700 px-2 py-0.5 rounded font-bold border border-purple-300">
+                                                                            <Pencil className="w-2.5 h-2.5 inline mr-0.5"/>規格用に編集
+                                                                        </button>
+                                                                    ) : (
+                                                                        <button type="button" onClick={() => { if (confirm('この規格専用の確認チェック設定を解除し、テンプレ標準に戻しますか？')) updateEntryChecklistItems(entryIdx, step.id, null); }} className="text-[10px] bg-slate-100 hover:bg-slate-200 text-slate-600 px-2 py-0.5 rounded font-bold border border-slate-300">
+                                                                            <Undo2 className="w-2.5 h-2.5 inline mr-0.5"/>テンプレ標準に戻す
+                                                                        </button>
+                                                                    )}
+                                                                </span>
+                                                            </div>
+                                                            {!hasCustomChecklist ? (
+                                                                tplChecklist.length === 0 ? (
+                                                                    <div className="text-[11px] text-slate-400 text-center py-2 bg-white rounded border border-dashed border-slate-200">
+                                                                        テンプレ側にチェック項目が未設定です。「規格用に編集」で追加できます。
+                                                                    </div>
+                                                                ) : (
+                                                                    <div className="space-y-1">
+                                                                        {tplChecklist.map((item, idx) => (
+                                                                            <div key={item.id || idx} className="bg-white border border-slate-200 rounded px-2 py-1 text-[11px] flex items-center gap-2">
+                                                                                <span className="text-purple-500 font-bold w-4">{idx + 1}.</span>
+                                                                                <span className="flex-1 text-slate-700">{item.label || '(無題)'}</span>
+                                                                                <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${item.required === false ? 'bg-slate-100 text-slate-500' : 'bg-rose-100 text-rose-700'}`}>
+                                                                                    {item.required === false ? '任意' : '必須'}
+                                                                                </span>
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                )
+                                                            ) : (
+                                                                <div className="space-y-1.5">
+                                                                    {customChecklist.map((item, idx) => {
+                                                                        const updateItem = (patch) => {
+                                                                            const next = [...customChecklist];
+                                                                            next[idx] = { ...next[idx], ...patch };
+                                                                            updateEntryChecklistItems(entryIdx, step.id, next);
+                                                                        };
+                                                                        const removeItem = () => {
+                                                                            updateEntryChecklistItems(entryIdx, step.id, customChecklist.filter((_, i) => i !== idx));
+                                                                        };
+                                                                        return (
+                                                                            <div key={item.id || idx} className="bg-white border border-purple-200 rounded p-1.5 flex items-center gap-1.5">
+                                                                                <span className="text-[10px] font-bold text-purple-500 w-5 text-center">{idx + 1}</span>
+                                                                                <input
+                                                                                    value={item.label || ''}
+                                                                                    onChange={e => updateItem({ label: e.target.value })}
+                                                                                    placeholder="例: 色見本との一致を確認"
+                                                                                    className="flex-1 border rounded px-2 py-0.5 text-xs"
+                                                                                />
+                                                                                <label className="flex items-center gap-1 text-[10px] font-bold text-slate-600 cursor-pointer shrink-0" title="チェック必須項目">
+                                                                                    <input type="checkbox" checked={item.required !== false} onChange={e => updateItem({ required: e.target.checked })} className="w-3 h-3 accent-purple-600"/>
+                                                                                    必須
+                                                                                </label>
+                                                                                <button type="button" onClick={removeItem} className="text-rose-400 hover:text-rose-600"><X className="w-3.5 h-3.5"/></button>
+                                                                            </div>
+                                                                        );
+                                                                    })}
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => updateEntryChecklistItems(entryIdx, step.id, [...customChecklist, { id: `chk_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`, label: '', required: true }])}
+                                                                        className="w-full py-1 bg-purple-100 hover:bg-purple-200 text-purple-700 text-[10px] font-bold rounded border border-purple-300 flex items-center justify-center gap-1"
+                                                                    >
+                                                                        <Plus className="w-3 h-3"/> 項目追加
+                                                                    </button>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                        {/* 公差・基準値 (WHAT) — 測定工程のみ */}
+                                                        {isMeasurement && (
+                                                        <div className="p-3 bg-white">
+                                                            <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1.5">
+                                                                <Target className="w-3.5 h-3.5 text-teal-600" /> 公差・基準値 (WHAT)
+                                                                <span className="text-[10px] font-normal text-slate-400 ml-1">合否判定用スペック</span>
+                                                            </div>
+                                                            {calcs.length === 0 ? (
+                                                                <div className="text-xs text-slate-400 py-2 text-center">この工程には計算設定がありません</div>
+                                                            ) : (
+                                                                <table className="w-full text-xs">
+                                                                    <thead className="bg-slate-50 text-slate-600">
+                                                                        <tr>
+                                                                            <th className="p-1.5 text-left font-bold">計算</th>
+                                                                            <th className="p-1.5 text-right font-bold">基準値</th>
+                                                                            <th className="p-1.5 text-right font-bold">上限(+)</th>
+                                                                            <th className="p-1.5 text-right font-bold">下限(-)</th>
+                                                                            <th className="p-1.5 text-center font-bold">判定</th>
+                                                                            <th className="p-1.5 text-center font-bold text-[10px]">テンプレ値</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody className="divide-y divide-slate-100">
+                                                                        {calcs.map(calc => {
+                                                                            const ov = overrides[calc.id] || {};
+                                                                            const fmt = v => (v == null || v === '') ? '' : v;
+                                                                            return (
+                                                                                <tr key={calc.id} className="hover:bg-blue-50/30">
+                                                                                    <td className="p-1.5 font-bold text-slate-700">{calc.label || calc.id}</td>
+                                                                                    <td className="p-1.5"><input type="number" step="any" value={fmt(ov.nominal)} onChange={e => updateOverride(entryIdx, step.id, calc.id, { nominal: e.target.value === '' ? undefined : Number(e.target.value) })} placeholder={calc.nominal != null ? String(calc.nominal) : '(0)'} className="w-20 border rounded p-1 text-right font-mono text-xs" /></td>
+                                                                                    <td className="p-1.5"><input type="number" step="0.001" value={fmt(ov.toleranceUpper)} onChange={e => updateOverride(entryIdx, step.id, calc.id, { toleranceUpper: e.target.value === '' ? undefined : Number(e.target.value) })} placeholder={String(calc.toleranceUpper ?? '')} className="w-20 border rounded p-1 text-right font-mono text-xs" /></td>
+                                                                                    <td className="p-1.5"><input type="number" step="0.001" value={fmt(ov.toleranceLower)} onChange={e => updateOverride(entryIdx, step.id, calc.id, { toleranceLower: e.target.value === '' ? undefined : Number(e.target.value) })} placeholder={String(calc.toleranceLower ?? '')} className="w-20 border rounded p-1 text-right font-mono text-xs" /></td>
+                                                                                    <td className="p-1.5 text-center">
+                                                                                        <select value={ov.toleranceEnabled === undefined ? 'default' : (ov.toleranceEnabled ? 'on' : 'off')} onChange={e => { const v = e.target.value; updateOverride(entryIdx, step.id, calc.id, { toleranceEnabled: v === 'default' ? undefined : (v === 'on') }); }} className="border rounded p-1 text-[10px]">
+                                                                                            <option value="default">デフォルト</option>
+                                                                                            <option value="on">ON</option>
+                                                                                            <option value="off">OFF</option>
+                                                                                        </select>
+                                                                                    </td>
+                                                                                    <td className="p-1.5 text-center text-slate-400 text-[10px]"><div>基: {calc.nominal ?? 0}</div><div>±: {calc.toleranceLower}〜{calc.toleranceUpper}</div></td>
+                                                                                </tr>
+                                                                            );
+                                                                        })}
+                                                                    </tbody>
+                                                                </table>
+                                                            )}
+                                                        </div>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
+
+                </div>
+            )}
+
+            {/* 規格マッピング一覧 (全体俯瞰) */}
+            {Object.keys(modelStandardMap || {}).length > 0 && (
+                <div className="mt-6 pt-4 border-t">
+                    <div className="text-xs font-bold text-slate-500 mb-2">型式 ↔ 規格マッピング ({Object.keys(modelStandardMap).length} 件)</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                        {Object.entries(modelStandardMap).map(([m, qsId]) => {
+                            const qs = qualityStandards?.[qsId];
+                            return (
+                                <div key={m} className="bg-indigo-50 border border-indigo-200 rounded px-2 py-1.5 text-xs flex items-center justify-between gap-2">
+                                    <div className="min-w-0 flex-1">
+                                        <div className="font-bold text-indigo-900 truncate">{m}</div>
+                                        <div className="text-indigo-600 text-[10px] truncate">→ {qs ? `${qs.standardNo} Rev.${qs.revision}` : '⚠ 不明な規格'}</div>
+                                    </div>
+                                    <button type="button" onClick={() => { setSelectedQsId(qsId); document.querySelector('[data-qs-panel]')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }} className="text-indigo-600 hover:text-indigo-800 p-1" title="この規格を編集"><Pencil className="w-3 h-3" /></button>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, targetTimeHistory, settings, saveData = null, currentUserName = '' }) => {
+  // === 進行中ロットへの較正値再適用 ===
+  // 新規ロットは作成時に較正値が焼き付くが、既に作成済の進行中ロットには反映されていない。
+  // 管理者がこのボタンで一括再適用できる。
+  const [reapplyStatus, setReapplyStatus] = useState(null);
+  const reapplyCalibrationToActiveLots = async () => {
+    if (!saveData) return;
+    const ctt = customTargetTimes || {};
+    const targets = (lots || []).filter(l => l.status !== 'completed' && l.location !== 'completed' && l.model && ctt[`model_${l.model}`]);
+    if (targets.length === 0) { alert('再適用対象の進行中ロットがありません (較正値のある型式の進行中ロットなし)'); return; }
+    let updated = 0;
+    setReapplyStatus('applying');
+    try {
+      for (const lot of targets) {
+        const modelCal = ctt[`model_${lot.model}`];
+        let changed = false;
+        const newSteps = (lot.steps || []).map(s => {
+          const cal = modelCal[`${s.category || ''}_${s.title || ''}`];
+          if (typeof cal === 'number' && cal > 0 && cal !== s.targetTime) { changed = true; return { ...s, targetTime: cal, targetTimeCalibrated: true }; }
+          return s;
+        });
+        if (changed) { await saveData('lots', lot.id, { steps: newSteps }); updated++; }
+      }
+      setReapplyStatus(`done:${updated}`);
+      alert(`${updated} 件の進行中ロットに較正済み目標時間を再適用しました。`);
+    } catch (e) {
+      console.error(e); setReapplyStatus('error');
+      alert('再適用に失敗しました: ' + e.message);
+    }
+  };
     const [targetValue, setTargetValue] = useState('');
     const [bulkStrategy, setBulkStrategy] = useState('standard');
     const [period, setPeriod] = useState('3m');
@@ -5741,11 +10601,63 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                 { id: 'conservative', name: '余裕確保型', desc: 'バラつきを考慮した余裕あるペース。', value: Math.round(stats.mean + stats.stdDev), color: 'text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100' }
             ];
 
-            results.push({ key, ...data, stats, currentTarget, insights, strategies });
+            // === 【C】信頼度: 標本数とバラつき (変動係数) で較正値の信頼度を判定 ===
+            // 高: n>=10 かつ CV<0.3 / 中: n>=5 かつ CV<0.5 / 低: それ未満
+            const n = stats.validCount;
+            const cv = stats.mean > 0 ? stats.stdDev / stats.mean : 1;
+            let confidence = 'low';
+            if (n >= 10 && cv < 0.3) confidence = 'high';
+            else if (n >= 5 && cv < 0.5) confidence = 'mid';
+            const confidenceLabel = confidence === 'high' ? '高' : confidence === 'mid' ? '中' : '低';
+
+            results.push({ key, ...data, stats, currentTarget, insights, strategies, confidence, confidenceLabel, cv });
         });
 
         return results.sort((a, b) => b.stats.mean - a.stats.mean);
     }, [lots, targetValue, customTargetTimes, period, customStartDate, customEndDate, workers]);
+
+    // === 【E】乖離検知: 全型式を走査し、現在の目標時間と実績平均が乖離している工程を抽出 ===
+    // 較正→承認→監視 ループの「監視」部分。再較正すべき箇所を管理者に提示する。
+    const driftAlerts = useMemo(() => {
+        const { start: startDate, end: endDate } = getPeriodDates();
+        const byModelStep = {}; // `${model}||${stepKey}` → { model, title, category, target, times[] }
+        lots.forEach(l => {
+            if (l.status !== 'completed' && l.location !== 'completed') return;
+            const ts0 = l.updatedAt || l.createdAt || 0;
+            const ts = typeof ts0 === 'number' ? ts0 : new Date(ts0).getTime();
+            if (ts < startDate || ts > endDate) return;
+            const model = l.model;
+            if (!model) return;
+            (l.steps || []).forEach((step, idx) => {
+                const sKey = `${step.category || ''}_${step.title}`;
+                const mapKey = `${model}||${sKey}`;
+                // 現在の実効目標 (較正値があればそれ、なければテンプレ)
+                const cal = customTargetTimes[`model_${model}`]?.[sKey];
+                const effTarget = (typeof cal === 'number' && cal > 0) ? cal : (step.targetTime || 0);
+                if (!byModelStep[mapKey]) byModelStep[mapKey] = { model, title: step.title, category: step.category || '', stepKey: sKey, target: effTarget, calibrated: typeof cal === 'number' && cal > 0, times: [] };
+                for (let i = 0; i < (l.quantity || 1); i++) {
+                    const t = l.tasks?.[`${step.id}-${i}`] || l.tasks?.[`${idx}-${i}`];
+                    if (t && (t.status === 'completed' || t.status === 'ng') && t.duration > 0) byModelStep[mapKey].times.push(t.duration);
+                }
+            });
+        });
+        const alerts = [];
+        Object.values(byModelStep).forEach(d => {
+            if (d.times.length < 5) return; // 標本5件未満は判定しない
+            if (!d.target || d.target <= 0) return;
+            const mean = Math.round(d.times.reduce((a, b) => a + b, 0) / d.times.length);
+            const ratio = mean / d.target;
+            // 目標から ±30% 以上ずれていたら乖離アラート
+            if (ratio >= 1.3 || ratio <= 0.7) {
+                alerts.push({
+                    model: d.model, title: d.title, category: d.category, stepKey: d.stepKey,
+                    target: d.target, mean, ratio, n: d.times.length, calibrated: d.calibrated,
+                    direction: ratio >= 1.3 ? 'over' : 'under',
+                });
+            }
+        });
+        return alerts.sort((a, b) => Math.abs(b.ratio - 1) - Math.abs(a.ratio - 1));
+    }, [lots, customTargetTimes, period, customStartDate, customEndDate]);
 
     const applySuggestedTarget = (itemKey, strat, data) => {
         const savedKey = `model_${targetValue}`;
@@ -5795,9 +10707,22 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                     <div>
                         <h3 className="font-bold text-slate-800">工程改善・目標時間最適化</h3>
                         <p className="text-xs text-slate-500">実績データからエビデンスを算出し、状況に応じた最適な目標時間を提案します。</p>
+                        <p className="text-[11px] text-emerald-700 font-bold mt-0.5 flex items-center gap-1">
+                          <CheckCircle2 className="w-3 h-3"/> 適用先: 較正した目標時間は<b>新規ロット作成時に自動反映</b>され、ETA・進捗・オススメ順・ガントすべてに使われます
+                        </p>
                     </div>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex gap-2 items-center">
+                    {saveData && currentUserName === '管理者' && (
+                      <button
+                        onClick={reapplyCalibrationToActiveLots}
+                        disabled={reapplyStatus === 'applying'}
+                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white text-xs font-bold rounded shadow flex items-center gap-1"
+                        title="作成済みの進行中ロットにも較正済み目標時間を反映する"
+                      >
+                        {reapplyStatus === 'applying' ? '適用中...' : '🔄 進行中ロットに再適用'}
+                      </button>
+                    )}
                     <button onClick={() => setShowHistory(false)} className={`px-4 py-1.5 rounded-lg text-sm font-bold transition-all ${!showHistory ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>
                         最適化提案
                     </button>
@@ -5809,6 +10734,36 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
 
             {!showHistory ? (
                 <>
+                    {/* === 【E】乖離アラート: 目標と実績がズレた工程を全型式から検出 === */}
+                    {driftAlerts.length > 0 && (
+                        <div className="bg-gradient-to-r from-rose-50 to-amber-50 border-2 border-rose-300 rounded-xl p-3 shrink-0">
+                            <div className="flex items-center gap-2 mb-2">
+                                <AlertOctagon className="w-5 h-5 text-rose-600"/>
+                                <span className="font-black text-rose-900 text-sm">⚠ 目標時間の乖離アラート ({driftAlerts.length}件)</span>
+                                <span className="text-[11px] text-rose-700">— 目標と実績が±30%以上ズレています。再較正を検討してください</span>
+                            </div>
+                            <div className="max-h-44 overflow-y-auto space-y-1">
+                                {driftAlerts.slice(0, 20).map((a, i) => (
+                                    <div key={i} className="bg-white border border-rose-200 rounded px-2 py-1.5 flex items-center gap-2 text-xs">
+                                        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${a.direction === 'over' ? 'bg-rose-100 text-rose-700' : 'bg-blue-100 text-blue-700'}`}>
+                                            {a.direction === 'over' ? `${Math.round((a.ratio-1)*100)}% 超過` : `${Math.round((1-a.ratio)*100)}% 短縮`}
+                                        </span>
+                                        <span className="font-bold text-slate-700">{a.model}</span>
+                                        <span className="text-slate-500">/ {a.title}</span>
+                                        <span className="ml-auto font-mono text-slate-600">目標{a.target}s → 実績{a.mean}s</span>
+                                        <span className="text-[10px] text-slate-400">n={a.n}{a.calibrated ? ' ✓較正済' : ''}</span>
+                                        <button
+                                            onClick={() => setTargetValue(a.model)}
+                                            className="text-[10px] bg-indigo-600 hover:bg-indigo-700 text-white px-2 py-0.5 rounded font-bold shrink-0"
+                                            title="この型式の最適化提案を開く"
+                                        >開く</button>
+                                    </div>
+                                ))}
+                            </div>
+                            {driftAlerts.length > 20 && <div className="text-[10px] text-rose-500 mt-1 text-center">他 {driftAlerts.length - 20} 件</div>}
+                        </div>
+                    )}
+
                     <div className="flex flex-wrap items-center gap-4 bg-white p-3 rounded-lg border shadow-sm shrink-0">
                         <select value={targetValue} onChange={e => setTargetValue(e.target.value)} className="border border-indigo-200 rounded px-3 py-1.5 font-bold text-slate-700 outline-none focus:border-indigo-500 min-w-[200px]">
                             <option value="">型式を選択...</option>
@@ -5890,7 +10845,14 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                                     <div className="p-4 flex-1 flex flex-col">
                                         <div className="flex justify-between items-center mb-2">
                                             <h4 className="text-sm font-bold text-slate-600 flex items-center gap-1"><Activity className="w-4 h-4" /> 統計エビデンス</h4>
-                                            <span className="text-xs text-slate-400">有効データ: {data.stats.validCount}件 (除外: {data.stats.rawCount - data.stats.validCount}件)</span>
+                                            <div className="flex items-center gap-2">
+                                                {/* 【C】信頼度バッジ */}
+                                                <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${data.confidence === 'high' ? 'bg-emerald-100 text-emerald-700' : data.confidence === 'mid' ? 'bg-amber-100 text-amber-700' : 'bg-slate-200 text-slate-500'}`}
+                                                  title={`信頼度: 標本${data.stats.validCount}件・変動係数${(data.cv*100).toFixed(0)}%。${data.confidence === 'high' ? 'データ十分・安定 → 較正値を信頼できます' : data.confidence === 'mid' ? '標本やや少 or ばらつき有 → 参考程度に' : 'データ不足 → 手動目標の維持を推奨'}`}>
+                                                  信頼度 {data.confidenceLabel}
+                                                </span>
+                                                <span className="text-xs text-slate-400">有効: {data.stats.validCount}件</span>
+                                            </div>
                                         </div>
 
                                         <div className="mb-4 bg-slate-100 rounded-full h-8 relative flex items-center px-2 shadow-inner overflow-hidden border border-slate-200">
@@ -5962,29 +10924,174 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
 };
 
 // Advanced Analysis View
-const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [] }) => {
-  const [activeMode, setActiveMode] = useState('daily');
+// === AI 深掘り分析セクション ===
+// 改善ヒントタブ内に表示される。Gemini を呼んで深い洞察を取得・表示
+const AIDeepAnalysisSection = ({ payload }) => {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const handleRun = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await requestGeminiDeepAnalysis(payload);
+      setResult(r);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <div className="bg-gradient-to-br from-purple-50 to-indigo-50 rounded-xl shadow-sm border-2 border-indigo-200 p-5">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h3 className="text-lg font-bold text-indigo-900 flex items-center gap-2"><Bot className="w-5 h-5 text-purple-600"/> 🤖 AI 深掘り分析 (Gemini)</h3>
+          <div className="text-xs text-slate-600 mt-1">下のデータを Gemini に渡して、人間が気づきにくい相関・隠れた問題・優先アクションを抽出します</div>
+        </div>
+        <button
+          onClick={handleRun}
+          disabled={loading}
+          className={`px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2 shadow ${loading ? 'bg-slate-300 text-slate-500' : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:shadow-lg text-white'}`}
+        >
+          {loading ? <><Loader2 className="w-4 h-4 animate-spin"/> 解析中...</> : result ? <><Zap className="w-4 h-4"/> 再分析</> : <><Bot className="w-4 h-4"/> AI 分析を実行</>}
+        </button>
+      </div>
+      {error && (
+        <div className="bg-rose-50 border border-rose-300 rounded-lg p-3 text-sm text-rose-800">
+          <div className="font-bold">❌ エラー</div>
+          <div className="text-xs mt-1">{error}</div>
+          {error.includes('VITE_GEMINI_API_KEY') && (
+            <div className="text-xs mt-2 bg-white p-2 rounded border border-rose-200">
+              💡 .env ファイルに <code className="bg-slate-100 px-1 rounded">VITE_GEMINI_API_KEY=...</code> を設定してビルドし直してください。
+            </div>
+          )}
+        </div>
+      )}
+      {result && (
+        <div className="space-y-4 mt-2">
+          {/* 総括 */}
+          {result.summary && (
+            <div className="bg-white border-l-4 border-indigo-500 rounded-r-lg p-3 text-sm text-indigo-900">
+              <div className="font-bold text-xs text-indigo-600 mb-1">📋 AI 総括</div>
+              {result.summary}
+            </div>
+          )}
+          {/* Top Insights */}
+          {(result.topInsights || []).length > 0 && (
+            <div>
+              <div className="font-bold text-sm text-slate-700 mb-2 flex items-center gap-1.5"><AlertCircle className="w-4 h-4 text-amber-500"/> 主要な洞察</div>
+              <div className="space-y-2">
+                {result.topInsights.map((ins, i) => (
+                  <div key={i} className={`border rounded-lg p-3 ${ins.severity === 'high' ? 'bg-rose-50 border-rose-300' : ins.severity === 'mid' ? 'bg-amber-50 border-amber-300' : 'bg-emerald-50 border-emerald-300'}`}>
+                    <div className="flex items-start gap-2">
+                      <span className="text-lg">{ins.severity === 'high' ? '🔴' : ins.severity === 'mid' ? '🟡' : '🟢'}</span>
+                      <div className="flex-1">
+                        <div className="font-bold text-sm text-slate-800">{ins.title}</div>
+                        <div className="text-xs text-slate-600 mt-1"><span className="font-bold">根拠:</span> {ins.evidence}</div>
+                        <div className="text-xs text-slate-700 mt-1"><span className="font-bold">示唆:</span> {ins.implication}</div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* Priority Actions */}
+          {(result.priorityActions || []).length > 0 && (
+            <div>
+              <div className="font-bold text-sm text-slate-700 mb-2 flex items-center gap-1.5"><Target className="w-4 h-4 text-emerald-600"/> 優先アクション</div>
+              <div className="space-y-2">
+                {result.priorityActions.map((act, i) => (
+                  <div key={i} className="bg-emerald-50 border border-emerald-300 rounded-lg p-3">
+                    <div className="flex items-start gap-2">
+                      <span className="bg-emerald-600 text-white text-xs font-bold px-2 py-0.5 rounded-full">#{i+1}</span>
+                      <div className="flex-1">
+                        <div className="font-bold text-sm text-emerald-900">{act.action}</div>
+                        <div className="text-xs text-slate-600 mt-1">期待効果: {act.expectedImpact} · 工数感: {act.effort}</div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* Hidden Issues */}
+          {(result.hiddenIssues || []).length > 0 && (
+            <div>
+              <div className="font-bold text-sm text-slate-700 mb-2 flex items-center gap-1.5"><Activity className="w-4 h-4 text-purple-600"/> 隠れた問題</div>
+              <div className="space-y-2">
+                {result.hiddenIssues.map((h, i) => (
+                  <div key={i} className="bg-purple-50 border border-purple-300 rounded-lg p-3">
+                    <div className="font-bold text-sm text-purple-900">{h.issue}</div>
+                    <div className="text-xs text-slate-600 mt-1">💡 検出根拠: {h.detection}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {!result && !loading && !error && (
+        <div className="text-xs text-slate-500 mt-2">
+          現在 {payload?.removalCandidates?.length || 0} 件の不要工程候補・{payload?.skillGaps?.length || 0} 件のスキル差・{payload?.parallelRanking?.length || 0} 件の並列実績を分析対象としています。
+        </div>
+      )}
+    </div>
+  );
+};
+
+const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [] }) => {
+  // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
+  const [activeMode, setActiveMode] = useState('process');
   const [selectedModel, setSelectedModel] = useState('all');
   const [targetTolerance, setTargetTolerance] = useState(20); // % for USL/LSL
   const [dateRange, setDateRange] = useState('week');
-  const [filterMode, setFilterMode] = useState('month');
-  const [filterStartDate, setFilterStartDate] = useState(() => {
-    const d = new Date(); d.setMonth(d.getMonth() - 1);
-    return d.toISOString().slice(0, 10);
-  });
-  const [filterEndDate, setFilterEndDate] = useState(() => new Date().toISOString().slice(0, 10));
-
-  const isInFilterPeriod = (timestamp) => {
-    if (!timestamp) return true;
+  // 旧 filterMode/filterStartDate/filterEndDate と isInFilterPeriod は削除。
+  // 全タブ共通で defectFilter* と isInDefectPeriod を使う。
+  const [defectFilterMonth, setDefectFilterMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [defectFilterMode, setDefectFilterMode] = useState('month');
+  const [defectFilterStart, setDefectFilterStart] = useState(new Date().toISOString().split('T')[0].slice(0, 8) + '01');
+  const [defectFilterEnd, setDefectFilterEnd] = useState(new Date().toISOString().split('T')[0]);
+  const isInDefectPeriod = (timestamp) => {
+    if (!timestamp) return false;
     const d = new Date(timestamp);
-    if (filterMode === 'month') {
-      const now = new Date();
-      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+    if (defectFilterMode === 'month') {
+      try { return d.toISOString().slice(0, 7) === defectFilterMonth; } catch { return false; }
     }
-    const start = new Date(filterStartDate);
-    const end = new Date(filterEndDate);
-    end.setHours(23, 59, 59, 999);
-    return d >= start && d <= end;
+    const startMs = new Date(defectFilterStart + 'T00:00:00').getTime();
+    const endMs = new Date(defectFilterEnd + 'T23:59:59').getTime();
+    return d.getTime() >= startMs && d.getTime() <= endMs;
+  };
+  const isInFilterPeriod = (timestamp) => {
+    // analysisData は status==='completed' な lot を扱う。timestamp なしは true (除外しない)。
+    if (!timestamp) return true;
+    return isInDefectPeriod(timestamp);
+  };
+
+  // 前期間 (前月 or 同じ長さの直前期間) を計算するヘルパー — defectStats/complaintStats より前に定義必須 (TDZ 回避)
+  const getPrevPeriodChecker = () => {
+    if (defectFilterMode === 'month') {
+      const [yStr, mStr] = (defectFilterMonth || '').split('-');
+      const y = Number(yStr), m = Number(mStr);
+      if (!y || !m) return () => false;
+      const prevDate = new Date(y, m - 2, 1); // 前月
+      const prevYm = `${prevDate.getFullYear()}-${String(prevDate.getMonth()+1).padStart(2,'0')}`;
+      return (ts) => {
+        if (!ts) return false;
+        try { return new Date(ts).toISOString().slice(0, 7) === prevYm; } catch { return false; }
+      };
+    }
+    const startMs = new Date(defectFilterStart + 'T00:00:00').getTime();
+    const endMs = new Date(defectFilterEnd + 'T23:59:59').getTime();
+    const span = endMs - startMs;
+    const prevEnd = startMs - 1;
+    const prevStart = prevEnd - span;
+    return (ts) => {
+      if (!ts) return false;
+      const t = new Date(ts).getTime();
+      return t >= prevStart && t <= prevEnd;
+    };
   };
 
   // --- Step Analysis Data ---
@@ -6007,13 +11114,28 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
         targetLots.forEach(lot => {
             // Check Custom Tasks
             if (lot.tasks) {
-                // Sum all units for this step
+                // Sum all units for this step (step.id ベースの新キー + 数値index 旧キーの両方を集計)
                 let stepSum = 0;
                 let unitCount = 0;
+                const stepIdPrefix = step.id ? `${step.id}-` : null;
+                const idxPrefix = `${idx}-`;
+                // 新旧キーの両方を見るが、同じ unit は重複カウントしないため Set で管理
+                const seenUnits = new Set();
                 Object.keys(lot.tasks).forEach(key => {
-                    if (key.startsWith(`${idx}-`) && lot.tasks[key].status === 'completed') {
+                    let unitIdx = null;
+                    if (stepIdPrefix && key.startsWith(stepIdPrefix)) {
+                        unitIdx = key.slice(stepIdPrefix.length);
+                    } else if (key.startsWith(idxPrefix)) {
+                        unitIdx = key.slice(idxPrefix.length);
+                        // 数値で始まらないなら別ステップ (例: 's1-0' は 'idx=0' とマッチしない)
+                        if (!/^\d+$/.test(unitIdx)) return;
+                    }
+                    if (unitIdx == null) return;
+                    if (seenUnits.has(unitIdx)) return; // 既に新キーで計上済
+                    if (lot.tasks[key].status === 'completed') {
                         stepSum += lot.tasks[key].duration;
                         unitCount++;
+                        seenUnits.add(unitIdx);
                     }
                 });
                 if (unitCount > 0) {
@@ -6143,27 +11265,13 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
   }, [lots, workers]);
 
   // --- Defect Analysis ---
-  const [defectFilterMonth, setDefectFilterMonth] = useState(new Date().toISOString().slice(0, 7));
-  const [defectFilterMode, setDefectFilterMode] = useState('month');
-  const [defectFilterStart, setDefectFilterStart] = useState(new Date().toISOString().split('T')[0].slice(0, 8) + '01');
-  const [defectFilterEnd, setDefectFilterEnd] = useState(new Date().toISOString().split('T')[0]);
+  // ※ defectFilter* と isInDefectPeriod は冒頭で定義済 (analysisData より前に必要なため)
   const [expandedDefectImage, setExpandedDefectImage] = useState(null);
   const [editModal, setEditModal] = useState({ isOpen: false, type: null, data: null, lotId: null });
   const [editLabel, setEditLabel] = useState('');
   const [editCauseProcess, setEditCauseProcess] = useState('');
   const [editPhotos, setEditPhotos] = useState([]);
   const defectProcessOptions = settings?.defectProcessOptions || DEFAULT_DEFECT_PROCESS_OPTIONS;
-
-  const isInDefectPeriod = (timestamp) => {
-    if (!timestamp) return false;
-    const d = new Date(timestamp);
-    if (defectFilterMode === 'month') {
-      try { return d.toISOString().slice(0, 7) === defectFilterMonth; } catch { return false; }
-    }
-    const startMs = new Date(defectFilterStart + 'T00:00:00').getTime();
-    const endMs = new Date(defectFilterEnd + 'T23:59:59').getTime();
-    return d.getTime() >= startMs && d.getTime() <= endMs;
-  };
 
   const defectStats = useMemo(() => {
     let totalCompletedLots = 0;
@@ -6173,12 +11281,18 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     const stepCounts = {};
     const workerCounts = {};
     const processCounts = {};
+    const monthlyCounts = {}; // YYYY-MM → count
+    let prevCount = 0;
+    const isInPrev = getPrevPeriodChecker();
 
     lots.forEach(lot => {
       const lotTime = lot.updatedAt || lot.entryAt || lot.createdAt;
+      // 前期間カウント (件数比較用)
+      const lotDefectsAll = (lot.interruptions || []).filter(i => i.type === 'defect');
+      lotDefectsAll.forEach(d => { if (isInPrev(d.timestamp)) prevCount++; });
       if (!isInDefectPeriod(lotTime)) return;
       if (lot.status === 'completed' || lot.location === 'completed') totalCompletedLots++;
-      const lotDefects = (lot.interruptions || []).filter(i => i.type === 'defect');
+      const lotDefects = lotDefectsAll;
       if (lotDefects.length > 0) {
         defectLotCount++;
         lotDefects.forEach(d => {
@@ -6191,13 +11305,30 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
           workerCounts[w] = (workerCounts[w] || 0) + 1;
           const cp = d.causeProcess || '未指定';
           processCounts[cp] = (processCounts[cp] || 0) + 1;
+          if (d.timestamp) {
+            const dd = new Date(d.timestamp);
+            const ym = `${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}`;
+            monthlyCounts[ym] = (monthlyCounts[ym] || 0) + 1;
+          }
         });
       }
     });
 
     const defectRate = totalCompletedLots > 0 ? ((defectLotCount / totalCompletedLots) * 100).toFixed(1) : 0;
     const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
-    return { totalCompletedLots, defectLotCount, totalDefects: defects.length, defectRate, defects: defects.sort((a, b) => b.timestamp - a.timestamp), models: sortObj(modelCounts), steps: sortObj(stepCounts), workers: sortObj(workerCounts), processes: sortObj(processCounts) };
+    // 月別推移: 直近 12ヶ月
+    const trendMonths = [];
+    {
+      const now = new Date();
+      for (let i = 11; i >= 0; i--) {
+        const dd = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const ym = `${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}`;
+        trendMonths.push({ ym, label: `${dd.getMonth()+1}月`, count: monthlyCounts[ym] || 0 });
+      }
+    }
+    const diff = defects.length - prevCount;
+    const diffRate = prevCount > 0 ? ((diff / prevCount) * 100) : (defects.length > 0 ? 100 : 0);
+    return { totalCompletedLots, defectLotCount, totalDefects: defects.length, defectRate, defects: defects.sort((a, b) => b.timestamp - a.timestamp), models: sortObj(modelCounts), steps: sortObj(stepCounts), workers: sortObj(workerCounts), processes: sortObj(processCounts), trendMonths, prevCount, diff, diffRate };
   }, [lots, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
   const complaintStats = useMemo(() => {
@@ -6205,6 +11336,12 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     const labelCounts = {};
     const stepCounts = {};
     const workerCounts = {};
+    const modelCounts = {};
+    const monthlyCounts = {}; // YYYY-MM → count
+    const dayCounts = {}; // YYYY-MM-DD → count (1日平均算出用)
+    let minTs = Infinity, maxTs = -Infinity;
+    let prevCount = 0;
+    const isInPrev = getPrevPeriodChecker();
 
     lots.forEach(lot => {
       const lotComplaints = (lot.interruptions || []).filter(i => i.type === 'complaint');
@@ -6217,12 +11354,56 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
           stepCounts[st] = (stepCounts[st] || 0) + 1;
           const w = c.workerName || '不明';
           workerCounts[w] = (workerCounts[w] || 0) + 1;
+          const m = lot.model || '不明';
+          modelCounts[m] = (modelCounts[m] || 0) + 1;
+          if (c.timestamp) {
+            const d = new Date(c.timestamp);
+            const ym = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+            const ymd = `${ym}-${String(d.getDate()).padStart(2,'0')}`;
+            monthlyCounts[ym] = (monthlyCounts[ym] || 0) + 1;
+            dayCounts[ymd] = (dayCounts[ymd] || 0) + 1;
+            if (c.timestamp < minTs) minTs = c.timestamp;
+            if (c.timestamp > maxTs) maxTs = c.timestamp;
+          }
+        } else if (isInPrev(c.timestamp)) {
+          prevCount++;
         }
       });
     });
 
     const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
-    return { totalComplaints: complaints.length, complaints: complaints.sort((a, b) => b.timestamp - a.timestamp), labels: sortObj(labelCounts), steps: sortObj(stepCounts), workers: sortObj(workerCounts) };
+    // 月別推移: 直近 12ヶ月分を出す (データが少なくても枠は作る)
+    const trendMonths = [];
+    {
+      const now = new Date();
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const ym = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+        trendMonths.push({ ym, label: `${d.getMonth()+1}月`, count: monthlyCounts[ym] || 0 });
+      }
+    }
+    // 1日平均件数: フィルタ期間の日数 (実際にデータがあった範囲) で割る
+    let avgPerDay = 0;
+    if (complaints.length > 0 && minTs !== Infinity) {
+      const spanDays = Math.max(1, Math.ceil((maxTs - minTs) / (24*60*60*1000)) + 1);
+      avgPerDay = complaints.length / spanDays;
+    }
+    // 前期間比 (件数の増減)
+    const diff = complaints.length - prevCount;
+    const diffRate = prevCount > 0 ? ((diff / prevCount) * 100) : (complaints.length > 0 ? 100 : 0);
+    return {
+      totalComplaints: complaints.length,
+      complaints: complaints.sort((a, b) => b.timestamp - a.timestamp),
+      labels: sortObj(labelCounts),
+      steps: sortObj(stepCounts),
+      workers: sortObj(workerCounts),
+      models: sortObj(modelCounts),
+      trendMonths,
+      avgPerDay,
+      prevCount,
+      diff,
+      diffRate,
+    };
   }, [lots, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
   const defectFilterLabel = defectFilterMode === 'month' ? defectFilterMonth : `${defectFilterStart} ~ ${defectFilterEnd}`;
@@ -6350,152 +11531,170 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
        {/* Header Tabs */}
        <div className="bg-white border-b px-6 py-4 flex flex-col gap-3 shrink-0">
           <div className="flex items-center justify-between">
-            <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2"><BarChart3 className="w-6 h-6"/> 生産性分析</h2>
+            {/* タイトルは activeMode に応じて切り替え (旧「生産性分析」固定は削除) */}
+            <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
+              {activeMode === 'process' && (<><TrendingUp className="w-6 h-6 text-blue-600"/> 工程改善分析</>)}
+              {activeMode === 'defects' && (<><AlertTriangle className="w-6 h-6 text-rose-600"/> 不具合分析</>)}
+              {activeMode === 'complaints' && (<><Megaphone className="w-6 h-6 text-purple-600"/> 気づき・改善提案</>)}
+              {activeMode === 'direct-indirect' && (<><Activity className="w-6 h-6 text-teal-600"/> 直間分析</>)}
+              {activeMode === 'worker-eval' && (<><Users className="w-6 h-6 text-amber-600"/> 作業者評価</>)}
+              {activeMode === 'improvement' && (<><Zap className="w-6 h-6 text-indigo-600"/> 改善ヒント</>)}
+            </h2>
             <div className="flex items-center gap-3">
               <div className="flex bg-slate-200 p-1 rounded-lg">
-                 <button onClick={()=>setActiveMode('daily')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='daily' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> 本日の生産状況</button>
                  <button onClick={()=>setActiveMode('process')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='process' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><TrendingUp className="w-4 h-4"/> 工程改善分析</button>
                  <button onClick={()=>setActiveMode('defects')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='defects' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><AlertTriangle className="w-4 h-4"/> 不具合分析</button>
                  <button onClick={()=>setActiveMode('complaints')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='complaints' ? 'bg-white shadow text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}><Megaphone className="w-4 h-4"/> 気づき・改善提案</button>
                  <button onClick={()=>setActiveMode('direct-indirect')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='direct-indirect' ? 'bg-white shadow text-teal-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> 直間分析</button>
                  {currentUserName === '管理者' && <button onClick={()=>setActiveMode('worker-eval')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='worker-eval' ? 'bg-white shadow text-amber-600' : 'text-slate-500 hover:text-slate-700'}`}><Users className="w-4 h-4"/> 作業者評価</button>}
+                 <button onClick={()=>setActiveMode('improvement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='improvement' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Zap className="w-4 h-4"/> 改善ヒント</button>
               </div>
               <div className="flex gap-1 border rounded-lg overflow-hidden">
-                <button onClick={async ()=>{ const ExcelJS = await loadExcelJS(); const wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet('分析データ'); ws.addRow(['型式','平均時間(s)','目標時間(s)','標準偏差','Cpk','サンプル数']); analysisData.forEach(r=>ws.addRow([r.model,r.avg.toFixed(1),r.target,r.stdDev.toFixed(1),r.cpk.toFixed(2),r.count])); ws.getRow(1).font={bold:true,color:{argb:'FFFFFFFF'}}; ws.getRow(1).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF2563EB'}}; wb.xlsx.writeBuffer().then(buf=>{const blob=new Blob([buf],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='analysis_'+new Date().toISOString().slice(0,10)+'.xlsx'; a.click();}); }} className="px-3 py-1.5 text-xs font-bold bg-emerald-600 text-white hover:bg-emerald-700 flex items-center gap-1"><FileSpreadsheet className="w-3 h-3"/> Excel</button>
+                {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
+                <button onClick={async ()=>{
+                  const ExcelJS = await loadExcelJS();
+                  const wb = new ExcelJS.Workbook();
+                  const dateStr = new Date().toISOString().slice(0,10);
+                  const styleHeader = (row) => { row.font = { bold: true, color: { argb: 'FFFFFFFF' } }; row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } }; };
+                  if (activeMode === 'process') {
+                    const ws = wb.addWorksheet('工程改善分析');
+                    ws.addRow(['型式','平均時間(s)','目標時間(s)','標準偏差','Cpk','サンプル数']);
+                    analysisData.forEach(r => ws.addRow([r.model, Number(r.avg.toFixed(1)), r.target, Number(r.stdDev.toFixed(1)), Number(r.cpk.toFixed(2)), r.count]));
+                    styleHeader(ws.getRow(1));
+                    ws.columns.forEach(c => c.width = 14);
+                  } else if (activeMode === 'defects') {
+                    const ws = wb.addWorksheet('不具合明細');
+                    ws.addRow(['日時','型式','指図番号','工程','不具合内容','原因工程','作業者','対応時間(秒)']);
+                    defectStats.defects.forEach(d => {
+                      const dt = d.timestamp ? new Date(d.timestamp).toLocaleString('ja-JP') : '-';
+                      ws.addRow([dt, d.lot?.model || '', d.lot?.orderNo || '', d.stepInfo?.title || '全体', d.label || '', d.causeProcess || '', d.workerName || '', d.duration || 0]);
+                    });
+                    styleHeader(ws.getRow(1));
+                    ws.columns.forEach(c => c.width = 18);
+                    // サマリーシート
+                    const sm = wb.addWorksheet('不具合サマリー');
+                    sm.addRow(['指標','値']); sm.addRow(['完了ロット数', defectStats.totalCompletedLots]); sm.addRow(['不具合発生ロット', defectStats.defectLotCount]); sm.addRow(['不具合率(%)', defectStats.defectRate]); sm.addRow(['総件数', defectStats.totalDefects]);
+                    styleHeader(sm.getRow(1));
+                    sm.addRow([]); sm.addRow(['型式別','件数']); defectStats.models.forEach(x => sm.addRow([x.name, x.count]));
+                    sm.addRow([]); sm.addRow(['工程別','件数']); defectStats.steps.forEach(x => sm.addRow([x.name, x.count]));
+                    sm.addRow([]); sm.addRow(['作業者別','件数']); defectStats.workers.forEach(x => sm.addRow([x.name, x.count]));
+                    sm.addRow([]); sm.addRow(['原因工程別','件数']); defectStats.processes.forEach(x => sm.addRow([x.name, x.count]));
+                  } else if (activeMode === 'complaints') {
+                    const ws = wb.addWorksheet('気づき明細');
+                    ws.addRow(['日時','型式','指図番号','工程','カテゴリ/内容','作業者','備考']);
+                    complaintStats.complaints.forEach(c => {
+                      const dt = c.timestamp ? new Date(c.timestamp).toLocaleString('ja-JP') : '-';
+                      const parts = (c.label || '').split(' : ');
+                      const main = parts[0] || '';
+                      const sub = parts.slice(1).join(' : ');
+                      ws.addRow([dt, c.lot?.model || '', c.lot?.orderNo || '', c.stepInfo?.title || '全体', main, c.workerName || '', sub]);
+                    });
+                    styleHeader(ws.getRow(1));
+                    ws.columns.forEach(c => c.width = 18);
+                    const sm = wb.addWorksheet('気づきサマリー');
+                    sm.addRow(['カテゴリ','件数']); complaintStats.labels.forEach(x => sm.addRow([x.name, x.count]));
+                    sm.addRow([]); sm.addRow(['工程別','件数']); complaintStats.steps.forEach(x => sm.addRow([x.name, x.count]));
+                    sm.addRow([]); sm.addRow(['作業者別','件数']); complaintStats.workers.forEach(x => sm.addRow([x.name, x.count]));
+                    styleHeader(sm.getRow(1));
+                  } else if (activeMode === 'direct-indirect') {
+                    let directTotal = 0, indirectTotal = 0;
+                    const catBreak = {};
+                    lots.forEach(lot => { if (!lot.tasks) return; Object.values(lot.tasks).forEach(t => { if (t.duration > 0) directTotal += t.duration; }); });
+                    indirectWork.forEach(w => { if (w.duration > 0) { indirectTotal += w.duration; catBreak[w.category] = (catBreak[w.category]||0) + w.duration; } });
+                    const ws = wb.addWorksheet('直間分析');
+                    ws.addRow(['区分','時間(秒)','時間(h)']);
+                    ws.addRow(['直工', directTotal, Number((directTotal/3600).toFixed(2))]);
+                    ws.addRow(['間接', indirectTotal, Number((indirectTotal/3600).toFixed(2))]);
+                    ws.addRow([]); ws.addRow(['間接ジャンル','時間(秒)','時間(h)']);
+                    Object.entries(catBreak).sort((a,b)=>b[1]-a[1]).forEach(([c,s]) => ws.addRow([c, s, Number((s/3600).toFixed(2))]));
+                    styleHeader(ws.getRow(1));
+                  } else {
+                    const ws = wb.addWorksheet('分析');
+                    ws.addRow(['このタブはエクスポート未対応です']);
+                  }
+                  const buf = await wb.xlsx.writeBuffer();
+                  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${activeMode}_${dateStr}.xlsx`; a.click();
+                }} className="px-3 py-1.5 text-xs font-bold bg-emerald-600 text-white hover:bg-emerald-700 flex items-center gap-1"><FileSpreadsheet className="w-3 h-3"/> Excel</button>
+                {/* PDF エクスポート: タブ別に内容を切り替え */}
                 <button onClick={() => {
                   const pw = window.open('', '_blank');
                   if (!pw) { alert('ポップアップがブロックされています'); return; }
                   const now = new Date().toLocaleString('ja-JP');
-                  const period = filterMode === 'month' ? filterMonth : `${filterStartDate} 〜 ${filterEndDate}`;
-                  // 生産性データ
-                  const prodRows = analysisData.map(r => `<tr><td>${r.model}</td><td style="text-align:right">${r.avg.toFixed(1)}s</td><td style="text-align:right">${r.target}s</td><td style="text-align:right">${r.stdDev.toFixed(1)}</td><td style="text-align:right">${r.cpk.toFixed(2)}</td><td style="text-align:right">${r.count}</td></tr>`).join('');
-                  // 直間データ
-                  let directTotal = 0, indirectTotal = 0;
-                  const catBreak = {};
-                  lots.forEach(lot => { if (!lot.tasks) return; Object.values(lot.tasks).forEach(t => { if (t.duration > 0) directTotal += t.duration; }); });
-                  indirectWork.forEach(w => { if (w.duration > 0) { indirectTotal += w.duration; catBreak[w.category] = (catBreak[w.category]||0) + w.duration; } });
-                  const diRatio = (directTotal+indirectTotal) > 0 ? ((directTotal/(directTotal+indirectTotal))*100).toFixed(1) : '0';
-                  const catRows = Object.entries(catBreak).sort((a,b)=>b[1]-a[1]).map(([c,s]) => `<tr><td>${c}</td><td style="text-align:right">${formatTime(s)}</td><td style="text-align:right">${(s/3600).toFixed(1)}h</td></tr>`).join('');
-                  pw.document.write(`<!DOCTYPE html><html><head><title>分析レポート</title>
-                  <style>
+                  const period = defectFilterMode === 'month' ? defectFilterMonth : `${defectFilterStart} 〜 ${defectFilterEnd}`;
+                  const baseStyle = `<style>
                     @page { size: A4; margin: 15mm; }
-                    body { font-family: 'Segoe UI', sans-serif; font-size: 11px; color: #1e293b; max-width: 210mm; margin: 0 auto; padding: 20px; }
+                    body { font-family: 'Segoe UI', 'Hiragino Sans', sans-serif; font-size: 11px; color: #1e293b; max-width: 210mm; margin: 0 auto; padding: 20px; }
                     h1 { font-size: 18px; border-bottom: 3px solid #3b82f6; padding-bottom: 8px; margin-bottom: 16px; }
                     h2 { font-size: 14px; color: #3b82f6; margin-top: 20px; margin-bottom: 8px; border-left: 4px solid #3b82f6; padding-left: 8px; }
                     table { width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 10px; }
                     th { background: #1e293b; color: white; padding: 6px 8px; text-align: left; font-size: 10px; }
-                    td { padding: 5px 8px; border-bottom: 1px solid #e2e8f0; }
+                    td { padding: 5px 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
                     tr:nth-child(even) { background: #f8fafc; }
                     .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
                     .kpi { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; text-align: center; }
                     .kpi-val { font-size: 24px; font-weight: 900; }
                     .kpi-label { font-size: 9px; color: #64748b; margin-top: 2px; }
-                    .bar-container { background: #f1f5f9; border-radius: 4px; height: 16px; margin: 2px 0; overflow: hidden; }
-                    .bar-direct { background: #3b82f6; height: 100%; display: inline-block; }
-                    .bar-indirect { background: #d97706; height: 100%; display: inline-block; }
                     .footer { margin-top: 20px; text-align: center; font-size: 9px; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 8px; }
+                    .meta { display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-bottom:16px }
                     @media print { body { padding: 0; } }
-                  </style></head><body>
-                  <h1>📊 製品検査 分析レポート</h1>
-                  <div style="display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-bottom:16px">
-                    <span>期間: ${period}</span><span>出力日時: ${now}</span>
-                  </div>
-                  <h2>工程分析 サマリー</h2>
-                  <div class="kpi-grid">
-                    <div class="kpi"><div class="kpi-val" style="color:#3b82f6">${analysisData.length}</div><div class="kpi-label">分析型式数</div></div>
-                    <div class="kpi"><div class="kpi-val" style="color:#059669">${analysisData.reduce((a,r)=>a+r.count,0)}</div><div class="kpi-label">総サンプル数</div></div>
-                    <div class="kpi"><div class="kpi-val" style="color:#7c3aed">${diRatio}%</div><div class="kpi-label">直工比率</div></div>
-                    <div class="kpi"><div class="kpi-val" style="color:#d97706">${((directTotal+indirectTotal)/3600).toFixed(1)}h</div><div class="kpi-label">総作業時間</div></div>
-                  </div>
-                  <h2>型式別 工程分析</h2>
-                  <table><thead><tr><th>型式</th><th style="text-align:right">平均(s)</th><th style="text-align:right">目標(s)</th><th style="text-align:right">σ</th><th style="text-align:right">Cpk</th><th style="text-align:right">N</th></tr></thead><tbody>${prodRows || '<tr><td colspan="6" style="text-align:center;color:#94a3b8">データなし</td></tr>'}</tbody></table>
-                  <h2>直間比率</h2>
-                  <div style="display:flex;height:24px;border-radius:6px;overflow:hidden;margin-bottom:8px">
-                    <div class="bar-direct" style="width:${diRatio}%"></div>
-                    <div class="bar-indirect" style="width:${100-parseFloat(diRatio)}%"></div>
-                  </div>
-                  <div style="display:flex;gap:16px;font-size:10px;margin-bottom:12px">
-                    <span style="color:#3b82f6">■ 直工 ${(directTotal/3600).toFixed(1)}h (${diRatio}%)</span>
-                    <span style="color:#d97706">■ 間接 ${(indirectTotal/3600).toFixed(1)}h (${(100-parseFloat(diRatio)).toFixed(1)}%)</span>
-                  </div>
-                  ${catRows ? `<h2>間接作業 ジャンル別内訳</h2><table><thead><tr><th>ジャンル</th><th style="text-align:right">時間</th><th style="text-align:right">時間(h)</th></tr></thead><tbody>${catRows}</tbody></table>` : ''}
-                  <div class="footer">製品検査Webアプリ — 分析レポート</div>
-                  </body></html>`);
+                  </style>`;
+                  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+                  let title = '', body = '';
+                  if (activeMode === 'process') {
+                    title = '工程改善分析';
+                    const prodRows = analysisData.map(r => `<tr><td>${esc(r.model)}</td><td style="text-align:right">${r.avg.toFixed(1)}s</td><td style="text-align:right">${r.target}s</td><td style="text-align:right">${r.stdDev.toFixed(1)}</td><td style="text-align:right">${r.cpk.toFixed(2)}</td><td style="text-align:right">${r.count}</td></tr>`).join('');
+                    body = `<h2>サマリー</h2><div class="kpi-grid"><div class="kpi"><div class="kpi-val" style="color:#3b82f6">${analysisData.length}</div><div class="kpi-label">分析型式数</div></div><div class="kpi"><div class="kpi-val" style="color:#059669">${analysisData.reduce((a,r)=>a+r.count,0)}</div><div class="kpi-label">総サンプル数</div></div></div><h2>型式別 工程分析</h2><table><thead><tr><th>型式</th><th style="text-align:right">平均(s)</th><th style="text-align:right">目標(s)</th><th style="text-align:right">σ</th><th style="text-align:right">Cpk</th><th style="text-align:right">N</th></tr></thead><tbody>${prodRows || '<tr><td colspan="6" style="text-align:center;color:#94a3b8">データなし</td></tr>'}</tbody></table>`;
+                  } else if (activeMode === 'defects') {
+                    title = '不具合分析';
+                    const dRows = defectStats.defects.map(d => `<tr><td>${d.timestamp ? new Date(d.timestamp).toLocaleString('ja-JP') : '-'}</td><td>${esc(d.lot?.model)}</td><td>${esc(d.lot?.orderNo)}</td><td>${esc(d.stepInfo?.title || '全体')}</td><td>${esc(d.label)}</td><td>${esc(d.causeProcess)}</td><td>${esc(d.workerName)}</td></tr>`).join('');
+                    const summary = (arr, title) => arr.length ? `<h2>${title}</h2><table><thead><tr><th>${title}</th><th style="text-align:right">件数</th></tr></thead><tbody>${arr.map(x => `<tr><td>${esc(x.name)}</td><td style="text-align:right">${x.count}</td></tr>`).join('')}</tbody></table>` : '';
+                    body = `<h2>サマリー</h2><div class="kpi-grid"><div class="kpi"><div class="kpi-val" style="color:#3b82f6">${defectStats.totalCompletedLots}</div><div class="kpi-label">完了ロット数</div></div><div class="kpi"><div class="kpi-val" style="color:#dc2626">${defectStats.defectLotCount}</div><div class="kpi-label">不具合ロット</div></div><div class="kpi"><div class="kpi-val" style="color:#dc2626">${defectStats.defectRate}%</div><div class="kpi-label">不具合率</div></div><div class="kpi"><div class="kpi-val" style="color:#dc2626">${defectStats.totalDefects}</div><div class="kpi-label">総件数</div></div></div>${summary(defectStats.models,'型式別')}${summary(defectStats.steps,'工程別')}${summary(defectStats.workers,'作業者別')}${summary(defectStats.processes,'原因工程別')}<h2>明細</h2><table><thead><tr><th>日時</th><th>型式</th><th>指図</th><th>工程</th><th>内容</th><th>原因工程</th><th>作業者</th></tr></thead><tbody>${dRows || '<tr><td colspan="7" style="text-align:center;color:#94a3b8">データなし</td></tr>'}</tbody></table>`;
+                  } else if (activeMode === 'complaints') {
+                    title = '気づき・改善提案';
+                    const cRows = complaintStats.complaints.map(c => {
+                      const parts = (c.label || '').split(' : ');
+                      return `<tr><td>${c.timestamp ? new Date(c.timestamp).toLocaleString('ja-JP') : '-'}</td><td>${esc(c.lot?.model)}</td><td>${esc(c.lot?.orderNo)}</td><td>${esc(c.stepInfo?.title || '全体')}</td><td>${esc(parts[0])}</td><td>${esc(parts.slice(1).join(' : '))}</td><td>${esc(c.workerName)}</td></tr>`;
+                    }).join('');
+                    const summary = (arr, t) => arr.length ? `<h2>${t}</h2><table><thead><tr><th>${t}</th><th style="text-align:right">件数</th></tr></thead><tbody>${arr.map(x => `<tr><td>${esc(x.name)}</td><td style="text-align:right">${x.count}</td></tr>`).join('')}</tbody></table>` : '';
+                    body = `<h2>サマリー</h2><div class="kpi-grid"><div class="kpi"><div class="kpi-val" style="color:#7c3aed">${complaintStats.totalComplaints}</div><div class="kpi-label">総件数</div></div><div class="kpi"><div class="kpi-val" style="color:#7c3aed">${complaintStats.labels.length}</div><div class="kpi-label">カテゴリ数</div></div><div class="kpi"><div class="kpi-val" style="color:#7c3aed">${complaintStats.workers.length}</div><div class="kpi-label">投稿者数</div></div><div class="kpi"><div class="kpi-val" style="color:#7c3aed">${complaintStats.steps.length}</div><div class="kpi-label">関連工程数</div></div></div>${summary(complaintStats.labels,'カテゴリ別')}${summary(complaintStats.steps,'工程別')}${summary(complaintStats.workers,'投稿者別')}<h2>明細</h2><table><thead><tr><th>日時</th><th>型式</th><th>指図</th><th>工程</th><th>カテゴリ</th><th>内容</th><th>作業者</th></tr></thead><tbody>${cRows || '<tr><td colspan="7" style="text-align:center;color:#94a3b8">データなし</td></tr>'}</tbody></table>`;
+                  } else if (activeMode === 'direct-indirect') {
+                    title = '直間分析';
+                    let directTotal = 0, indirectTotal = 0;
+                    const catBreak = {};
+                    lots.forEach(lot => { if (!lot.tasks) return; Object.values(lot.tasks).forEach(t => { if (t.duration > 0) directTotal += t.duration; }); });
+                    indirectWork.forEach(w => { if (w.duration > 0) { indirectTotal += w.duration; catBreak[w.category] = (catBreak[w.category]||0) + w.duration; } });
+                    const totalSec = directTotal + indirectTotal;
+                    const diRatio = totalSec > 0 ? ((directTotal/totalSec)*100).toFixed(1) : '0';
+                    const catRows = Object.entries(catBreak).sort((a,b)=>b[1]-a[1]).map(([c,s]) => `<tr><td>${esc(c)}</td><td style="text-align:right">${formatTime(s)}</td><td style="text-align:right">${(s/3600).toFixed(1)}h</td></tr>`).join('');
+                    body = `<h2>サマリー</h2><div class="kpi-grid"><div class="kpi"><div class="kpi-val" style="color:#3b82f6">${(directTotal/3600).toFixed(1)}h</div><div class="kpi-label">直工</div></div><div class="kpi"><div class="kpi-val" style="color:#d97706">${(indirectTotal/3600).toFixed(1)}h</div><div class="kpi-label">間接</div></div><div class="kpi"><div class="kpi-val" style="color:#7c3aed">${diRatio}%</div><div class="kpi-label">直工比率</div></div><div class="kpi"><div class="kpi-val" style="color:#1e293b">${(totalSec/3600).toFixed(1)}h</div><div class="kpi-label">総作業時間</div></div></div>${catRows ? `<h2>間接ジャンル別内訳</h2><table><thead><tr><th>ジャンル</th><th style="text-align:right">時間</th><th style="text-align:right">時間(h)</th></tr></thead><tbody>${catRows}</tbody></table>` : ''}`;
+                  } else if (activeMode === 'worker-eval') {
+                    title = '作業者評価';
+                    body = '<p style="color:#64748b">作業者評価の詳細レポート出力は現在対応中です。画面を印刷してください。</p>';
+                  }
+                  pw.document.write(`<!DOCTYPE html><html><head><title>${esc(title)}</title>${baseStyle}</head><body><h1>${esc(title)}</h1><div class="meta"><span>期間: ${esc(period)}</span><span>出力日時: ${esc(now)}</span></div>${body}<div class="footer">製品検査Webアプリ — ${esc(title)}</div></body></html>`);
                   pw.document.close();
                   setTimeout(() => pw.print(), 500);
                 }} className="px-3 py-1.5 text-xs font-bold bg-rose-600 text-white hover:bg-rose-700 flex items-center gap-1"><Printer className="w-3 h-3"/> PDF</button>
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="flex bg-slate-100 p-1 rounded-lg">
-              <button onClick={()=>setFilterMode('month')} className={`px-3 py-1 rounded text-xs font-bold ${filterMode==='month'?'bg-white shadow text-blue-600':'text-slate-500'}`}>今月</button>
-              <button onClick={()=>setFilterMode('range')} className={`px-3 py-1 rounded text-xs font-bold ${filterMode==='range'?'bg-white shadow text-blue-600':'text-slate-500'}`}>期間指定</button>
-            </div>
-            {filterMode === 'range' && (
-              <div className="flex items-center gap-2 text-sm">
-                <input type="date" value={filterStartDate} onChange={e=>setFilterStartDate(e.target.value)} className="border rounded px-2 py-1 text-xs"/>
-                <span className="text-slate-400">〜</span>
-                <input type="date" value={filterEndDate} onChange={e=>setFilterEndDate(e.target.value)} className="border rounded px-2 py-1 text-xs"/>
-              </div>
-            )}
+          {/* 共通フィルタ UI: 月単位 / 期間指定 (全タブ共有)。
+              旧コードでは「今月/期間指定」と「月単位/期間指定」が別 state で並列表示されて混乱の元だった。 */}
+          <div className="flex items-center gap-3 flex-wrap">
+            {renderDefectFilterUI()}
           </div>
        </div>
 
        <div className="flex-1 overflow-y-auto p-6">
-          {activeMode === 'daily' ? (
-             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {workerProgress.map(w => {
-                   const total = w.plannedSec + w.doneSec;
-                   const progress = total > 0 ? (w.doneSec / total) * 100 : 0;
-                   return (
-                     <div key={w.id} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                        <div className="flex items-center gap-3 mb-4">
-                           <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold text-xl">{w.name[0]}</div>
-                           <div>
-                              <div className="font-bold text-lg">{w.name}</div>
-                              <div className="text-xs text-slate-500">本日のタスク</div>
-                           </div>
-                           <div className="ml-auto text-right">
-                              <div className="text-2xl font-black text-slate-800">{Math.round(progress)}%</div>
-                           </div>
-                        </div>
-                        <div className="w-full bg-slate-100 h-3 rounded-full overflow-hidden mb-4">
-                           <div className="bg-blue-600 h-full transition-all duration-1000" style={{ width: `${progress}%` }}></div>
-                        </div>
-                        <div className="grid grid-cols-2 gap-4 text-center">
-                           <div className="bg-slate-50 p-2 rounded">
-                              <div className="text-xs text-slate-500 font-bold">完了(実績)</div>
-                              <div className="text-lg font-mono font-bold text-emerald-600">{formatTime(w.actualDoneSec)}</div>
-                           </div>
-                           <div className="bg-slate-50 p-2 rounded">
-                              <div className="text-xs text-slate-500 font-bold">残り予定</div>
-                              <div className="text-lg font-mono font-bold text-blue-600">{formatTime(w.plannedSec)}</div>
-                           </div>
-                        </div>
-                     </div>
-                   );
-                })}
-             </div>
-          ) : (
+          {/* 「本日の生産状況」タブ (workerProgress) は全体進捗ビューと機能が重複するため削除した。
+              activeMode='daily' 状態のロットを開いていた場合のために、初期値は 'process' に変更済み。 */}
+          {(
              <div className="space-y-8">
-                {/* Controls */}
-                <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-wrap gap-4 items-end">
-                   <div>
-                      <label className="block text-xs font-bold text-slate-500 mb-1">対象型式</label>
-                      <select value={selectedModel} onChange={e=>setSelectedModel(e.target.value)} className="border rounded p-2 text-sm min-w-[150px]">
-                         <option value="all">全型式</option>
-                         {Array.from(new Set(lots.map(l=>l.model))).map(m=><option key={m} value={m}>{m}</option>)}
-                      </select>
-                   </div>
-                   <div>
-                      <label className="block text-xs font-bold text-slate-500 mb-1">許容公差 (±%)</label>
-                      <input type="number" value={targetTolerance} onChange={e=>setTargetTolerance(Number(e.target.value))} className="border rounded p-2 text-sm w-24"/>
-                   </div>
-                </div>
-
-                {/* Reports */}
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* 旧「対象型式・許容公差」コントロールと Cpk/ヒストグラム/工程別分析は撤去。
+                    工程改善は下部の ProcessInsightsTab(工程改善・目標時間最適化)に集約。 */}
+                {false && activeMode === 'process' && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 _process_reports_wrap">
                    {/* Overall Report */}
                    {analysisData.map((report, idx) => (
                       <div key={idx} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
@@ -6667,63 +11866,147 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
 
                     {analysisData.length === 0 && <div className="col-span-full text-center py-20 text-slate-400">分析可能なデータがありません</div>}
                  </div>
+                )}
               </div>
            )}
 
-           {/* Defect Analysis Tab */}
-           {activeMode === 'defects' && (
+           {/* Defect Analysis Tab — KPI + チャート化 */}
+           {activeMode === 'defects' && (() => {
+             const ds = defectStats;
+             const maxModel = Math.max(1, ...ds.models.map(x => x.count));
+             const maxStep = Math.max(1, ...ds.steps.map(x => x.count));
+             const maxProc = Math.max(1, ...ds.processes.map(x => x.count));
+             const maxWorker = Math.max(1, ...ds.workers.map(x => x.count));
+             const maxMonth = Math.max(1, ...ds.trendMonths.map(x => x.count));
+             return (
              <div className="space-y-6">
-               <div className="flex justify-between items-center flex-wrap gap-2">
-                 <div className="font-bold text-slate-600 flex items-center gap-2"><AlertTriangle className="w-5 h-5" /> 不具合集計</div>
-                 {renderDefectFilterUI()}
+               {/* フィルタUIはヘッダーに統一済 */}
+
+               {/* KPI 4枚 */}
+               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                 <div className="bg-white border-2 border-slate-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-slate-500 mb-1">完了ロット数</div>
+                   <div className="text-3xl font-black text-slate-800">{ds.totalCompletedLots}<span className="text-sm font-normal ml-1">件</span></div>
+                 </div>
+                 <div className="bg-gradient-to-br from-rose-50 to-rose-100 border-2 border-rose-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-rose-600 mb-1">不具合発生ロット</div>
+                   <div className="text-3xl font-black text-rose-700">{ds.defectLotCount}<span className="text-sm font-normal ml-1">件</span></div>
+                 </div>
+                 <div className="bg-gradient-to-br from-amber-50 to-amber-100 border-2 border-amber-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-amber-700 mb-1">不具合率</div>
+                   <div className="text-3xl font-black text-amber-700">{ds.defectRate}<span className="text-sm font-normal ml-1">%</span></div>
+                 </div>
+                 <div className="bg-white border-2 border-slate-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-slate-500 mb-1 flex items-center justify-between">
+                     <span>不具合総件数</span>
+                     {ds.prevCount > 0 || ds.totalDefects > 0 ? (
+                       <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${ds.diff > 0 ? 'bg-rose-200 text-rose-800' : ds.diff < 0 ? 'bg-emerald-200 text-emerald-800' : 'bg-slate-200 text-slate-600'}`} title={`前期間: ${ds.prevCount}件`}>
+                         {ds.diff > 0 ? '▲' : ds.diff < 0 ? '▼' : '—'} {Math.abs(ds.diff)}件 ({ds.diffRate > 0 ? '+' : ''}{ds.diffRate.toFixed(0)}%)
+                       </span>
+                     ) : null}
+                   </div>
+                   <div className="text-3xl font-black text-slate-700">{ds.totalDefects}<span className="text-sm font-normal ml-1">件</span></div>
+                   <div className="text-[10px] text-slate-500 mt-1">前期間 {ds.prevCount}件</div>
+                 </div>
                </div>
 
-               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                 <div className="bg-white p-6 rounded-xl border shadow-sm">
-                   <div className="text-sm font-bold text-slate-500 mb-2">完了ロット数</div>
-                   <div className="text-3xl font-black text-slate-800">{defectStats.totalCompletedLots} <span className="text-base font-normal">件</span></div>
-                 </div>
-                 <div className="bg-rose-50 border-rose-200 p-6 rounded-xl border shadow-sm">
-                   <div className="text-sm font-bold text-rose-600 mb-2">不具合発生ロット数</div>
-                   <div className="text-3xl font-black text-rose-700">{defectStats.defectLotCount} <span className="text-base font-normal">件</span></div>
-                 </div>
-                 <div className="bg-amber-50 border-amber-200 p-6 rounded-xl border shadow-sm">
-                   <div className="text-sm font-bold text-amber-600 mb-2">不具合発生率(%)</div>
-                   <div className="text-3xl font-black text-amber-700">{defectStats.defectRate} <span className="text-base font-normal">%</span></div>
-                 </div>
-                 <div className="bg-white p-6 rounded-xl border shadow-sm">
-                   <div className="text-sm font-bold text-slate-500 mb-2">不具合総数</div>
-                   <div className="text-3xl font-black text-slate-700">{defectStats.totalDefects} <span className="text-base font-normal">件</span></div>
+               {/* 月別推移 */}
+               <div className="bg-white rounded-xl shadow-sm border p-4">
+                 <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><Activity className="w-4 h-4 text-rose-600"/> 月別推移 (直近12ヶ月)</h3>
+                 <div className="flex items-end gap-1 h-32">
+                   {ds.trendMonths.map((m, i) => {
+                     const h = (m.count / maxMonth) * 100;
+                     const isHighlight = m.count === maxMonth && m.count > 0;
+                     return (
+                       <div key={i} className="flex-1 flex flex-col items-center justify-end gap-1 group">
+                         <div className="text-[10px] font-mono font-bold text-slate-600">{m.count}</div>
+                         <div className={`w-full rounded-t transition-all ${isHighlight ? 'bg-rose-600' : 'bg-rose-300 group-hover:bg-rose-400'}`} style={{ height: `${Math.max(2, h)}%`, minHeight: m.count > 0 ? '4px' : '2px' }}/>
+                         <div className="text-[10px] text-slate-500 mt-0.5">{m.label}</div>
+                       </div>
+                     );
+                   })}
                  </div>
                </div>
 
-               <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Package className="w-4 h-4" /> 型式別 ワースト</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {defectStats.models.map((m, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-sm text-slate-800 truncate pr-2">{m.name}</span><span className="text-rose-600 font-bold bg-rose-100 px-2 py-0.5 rounded text-xs shrink-0">{m.count}件</span></div>))}
-                     {defectStats.models.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
+               {/* 型式別 + 工程別 */}
+               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><Tag className="w-4 h-4 text-rose-600"/> 型式別ワースト</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {ds.models.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {ds.models.map((m, i) => {
+                       const pct = (m.count / maxModel) * 100;
+                       const ratio = Math.round(m.count / Math.max(1, ds.totalDefects) * 100);
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0" title={m.name}>{i+1}. {m.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-rose-500 to-rose-600 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{m.count}件 <span className="text-[10px] opacity-70 ml-1">({ratio}%)</span></div>
+                           </div>
+                         </div>
+                       );
+                     })}
                    </div>
                  </div>
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><CheckSquare className="w-4 h-4" /> 項目別 ワースト</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {defectStats.steps.map((s, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-xs text-slate-800 truncate pr-2" title={s.name}>{s.name}</span><span className="text-rose-600 font-bold bg-rose-100 px-2 py-0.5 rounded text-xs shrink-0">{s.count}件</span></div>))}
-                     {defectStats.steps.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><CheckSquare className="w-4 h-4 text-blue-600"/> 項目別ワースト</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {ds.steps.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {ds.steps.map((s, i) => {
+                       const pct = (s.count / maxStep) * 100;
+                       const ratio = Math.round(s.count / Math.max(1, ds.totalDefects) * 100);
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0" title={s.name}>{i+1}. {s.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{s.count}件 <span className="text-[10px] opacity-70 ml-1">({ratio}%)</span></div>
+                           </div>
+                         </div>
+                       );
+                     })}
                    </div>
                  </div>
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><AlertTriangle className="w-4 h-4" /> 原因工程別 ワースト</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {defectStats.processes.map((p, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-sm text-slate-800 truncate pr-2">{p.name}</span><span className="text-orange-600 font-bold bg-orange-100 px-2 py-0.5 rounded text-xs shrink-0">{p.count}件</span></div>))}
-                     {defectStats.processes.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
+               </div>
+
+               {/* 原因工程別 + 報告者別 */}
+               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><AlertTriangle className="w-4 h-4 text-orange-600"/> 原因工程別</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {ds.processes.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {ds.processes.map((p, i) => {
+                       const pct = (p.count / maxProc) * 100;
+                       const ratio = Math.round(p.count / Math.max(1, ds.totalDefects) * 100);
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0" title={p.name}>{i+1}. {p.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-orange-500 to-orange-600 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{p.count}件 <span className="text-[10px] opacity-70 ml-1">({ratio}%)</span></div>
+                           </div>
+                         </div>
+                       );
+                     })}
                    </div>
                  </div>
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><User className="w-4 h-4" /> 報告者別</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {defectStats.workers.map((w, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-sm text-slate-800 truncate pr-2">{w.name}</span><span className="text-amber-600 font-bold bg-amber-100 px-2 py-0.5 rounded text-xs shrink-0">{w.count}件</span></div>))}
-                     {defectStats.workers.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><User className="w-4 h-4 text-amber-600"/> 報告者別</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {ds.workers.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {ds.workers.map((w, i) => {
+                       const pct = (w.count / maxWorker) * 100;
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0">{w.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-amber-400 to-amber-500 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{w.count}件</div>
+                           </div>
+                         </div>
+                       );
+                     })}
                    </div>
                  </div>
                </div>
@@ -6775,65 +12058,175 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  </div>
                </div>
              </div>
-           )}
+             );
+           })()}
 
-           {/* Complaints / Observations Tab */}
-           {activeMode === 'complaints' && (
+           {/* Complaints / Observations Tab — KPI + 横棒チャート + 月別推移 + 詳細 */}
+           {activeMode === 'complaints' && (() => {
+             const cs = complaintStats;
+             const maxLabel = Math.max(1, ...cs.labels.map(x => x.count));
+             const maxStep = Math.max(1, ...cs.steps.map(x => x.count));
+             const maxWorker = Math.max(1, ...cs.workers.map(x => x.count));
+             const maxModel = Math.max(1, ...cs.models.map(x => x.count));
+             const maxMonth = Math.max(1, ...cs.trendMonths.map(x => x.count));
+             const topLabel = cs.labels[0];
+             const topStep = cs.steps[0];
+             const topReporter = cs.workers[0];
+             return (
              <div className="space-y-6">
-               <div className="flex justify-between items-center flex-wrap gap-2">
-                 <div className="font-bold text-slate-600 flex items-center gap-2"><Megaphone className="w-5 h-5 text-purple-600" /> 気づき・改善提案集計</div>
-                 {renderDefectFilterUI()}
-               </div>
+               {/* フィルタUIはヘッダーに統一済 */}
 
-               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                 <div className="bg-purple-50 border-purple-200 p-6 rounded-xl border shadow-sm">
-                   <div className="text-sm font-bold text-purple-600 mb-2">報告された気づき総数</div>
-                   <div className="text-3xl font-black text-purple-700">{complaintStats.totalComplaints} <span className="text-base font-normal">件</span></div>
-                 </div>
-               </div>
-
-               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><Megaphone className="w-4 h-4" /> 内容別 ワースト</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {complaintStats.labels.map((m, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-sm text-slate-800 truncate pr-2" title={m.name}>{m.name}</span><span className="text-purple-600 font-bold bg-purple-100 px-2 py-0.5 rounded text-xs shrink-0">{m.count}件</span></div>))}
-                     {complaintStats.labels.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
+               {/* KPI: 4枚カード */}
+               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                 <div className="bg-gradient-to-br from-purple-50 to-purple-100 border-2 border-purple-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-purple-600 mb-1 flex items-center justify-between">
+                     <span>総報告数</span>
+                     {cs.prevCount > 0 || cs.totalComplaints > 0 ? (
+                       <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${cs.diff > 0 ? 'bg-rose-200 text-rose-800' : cs.diff < 0 ? 'bg-emerald-200 text-emerald-800' : 'bg-slate-200 text-slate-600'}`} title={`前期間: ${cs.prevCount}件`}>
+                         {cs.diff > 0 ? '▲' : cs.diff < 0 ? '▼' : '—'} {Math.abs(cs.diff)}件 ({cs.diffRate > 0 ? '+' : ''}{cs.diffRate.toFixed(0)}%)
+                       </span>
+                     ) : null}
                    </div>
+                   <div className="text-3xl font-black text-purple-700">{cs.totalComplaints}<span className="text-sm font-normal ml-1">件</span></div>
+                   <div className="text-[10px] text-purple-500 mt-1">{cs.avgPerDay > 0 ? `1日平均 ${cs.avgPerDay.toFixed(1)}件 / 前期間 ${cs.prevCount}件` : `前期間 ${cs.prevCount}件`}</div>
                  </div>
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><CheckSquare className="w-4 h-4" /> 項目別 ワースト</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {complaintStats.steps.map((s, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-xs text-slate-800 truncate pr-2" title={s.name}>{s.name}</span><span className="text-purple-600 font-bold bg-purple-100 px-2 py-0.5 rounded text-xs shrink-0">{s.count}件</span></div>))}
-                     {complaintStats.steps.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
-                   </div>
+                 <div className="bg-white border-2 border-slate-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-slate-500 mb-1">最多カテゴリ</div>
+                   <div className="text-lg font-black text-slate-800 truncate" title={topLabel?.name}>{topLabel?.name || '—'}</div>
+                   <div className="text-xs text-slate-500 mt-1">{topLabel ? `${topLabel.count}件 (${Math.round(topLabel.count / Math.max(1, cs.totalComplaints) * 100)}%)` : '—'}</div>
                  </div>
-                 <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col h-64">
-                   <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2"><User className="w-4 h-4" /> 報告者別</h3>
-                   <div className="flex-1 overflow-y-auto space-y-2">
-                     {complaintStats.workers.map((w, i) => (<div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded"><span className="font-bold text-sm text-slate-800 truncate pr-2">{w.name}</span><span className="text-amber-600 font-bold bg-amber-100 px-2 py-0.5 rounded text-xs shrink-0">{w.count}件</span></div>))}
-                     {complaintStats.workers.length === 0 && <div className="text-center text-slate-400 text-sm mt-4">データなし</div>}
-                   </div>
+                 <div className="bg-white border-2 border-slate-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-slate-500 mb-1">最多発生工程</div>
+                   <div className="text-lg font-black text-slate-800 truncate" title={topStep?.name}>{topStep?.name || '—'}</div>
+                   <div className="text-xs text-slate-500 mt-1">{topStep ? `${topStep.count}件 (${Math.round(topStep.count / Math.max(1, cs.totalComplaints) * 100)}%)` : '—'}</div>
+                 </div>
+                 <div className="bg-white border-2 border-slate-200 p-4 rounded-xl shadow-sm">
+                   <div className="text-xs font-bold text-slate-500 mb-1">トップ報告者</div>
+                   <div className="text-lg font-black text-slate-800 truncate" title={topReporter?.name}>{topReporter?.name || '—'}</div>
+                   <div className="text-xs text-slate-500 mt-1">{topReporter ? `${topReporter.count}件 / 全${cs.workers.length}名` : '—'}</div>
                  </div>
                </div>
 
+               {/* 月別推移バー */}
+               <div className="bg-white rounded-xl shadow-sm border p-4">
+                 <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><Activity className="w-4 h-4 text-purple-600"/> 月別推移 (直近12ヶ月)</h3>
+                 <div className="flex items-end gap-1 h-32">
+                   {cs.trendMonths.map((m, i) => {
+                     const h = (m.count / maxMonth) * 100;
+                     const isHighlight = m.count === maxMonth && m.count > 0;
+                     return (
+                       <div key={i} className="flex-1 flex flex-col items-center justify-end gap-1 group">
+                         <div className="text-[10px] font-mono font-bold text-slate-600">{m.count}</div>
+                         <div className={`w-full rounded-t transition-all ${isHighlight ? 'bg-purple-600' : 'bg-purple-300 group-hover:bg-purple-400'}`} style={{ height: `${Math.max(2, h)}%`, minHeight: m.count > 0 ? '4px' : '2px' }}/>
+                         <div className="text-[10px] text-slate-500 mt-0.5">{m.label}</div>
+                       </div>
+                     );
+                   })}
+                 </div>
+               </div>
+
+               {/* カテゴリ別 + 工程別 横棒チャート */}
+               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><Megaphone className="w-4 h-4 text-purple-600"/> カテゴリ別 (件数順)</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {cs.labels.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {cs.labels.map((m, i) => {
+                       const pct = (m.count / maxLabel) * 100;
+                       const ratioOfTotal = Math.round(m.count / Math.max(1, cs.totalComplaints) * 100);
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0" title={m.name}>{m.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-purple-500 to-purple-600 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{m.count}件 <span className="text-[10px] opacity-70 ml-1">({ratioOfTotal}%)</span></div>
+                           </div>
+                         </div>
+                       );
+                     })}
+                   </div>
+                 </div>
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><CheckSquare className="w-4 h-4 text-blue-600"/> 工程別 (件数順)</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {cs.steps.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {cs.steps.map((s, i) => {
+                       const pct = (s.count / maxStep) * 100;
+                       const ratio = Math.round(s.count / Math.max(1, cs.totalComplaints) * 100);
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0" title={s.name}>{s.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{s.count}件 <span className="text-[10px] opacity-70 ml-1">({ratio}%)</span></div>
+                           </div>
+                         </div>
+                       );
+                     })}
+                   </div>
+                 </div>
+               </div>
+
+               {/* 報告者別 + 型式別 */}
+               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><User className="w-4 h-4 text-amber-600"/> 報告者別</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {cs.workers.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {cs.workers.map((w, i) => {
+                       const pct = (w.count / maxWorker) * 100;
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0">{w.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-amber-400 to-amber-500 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{w.count}件</div>
+                           </div>
+                         </div>
+                       );
+                     })}
+                   </div>
+                 </div>
+                 <div className="bg-white rounded-xl shadow-sm border p-4">
+                   <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><Tag className="w-4 h-4 text-emerald-600"/> 型式別</h3>
+                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                     {cs.models.length === 0 && <div className="text-center text-slate-400 text-sm py-8">データなし</div>}
+                     {cs.models.map((m, i) => {
+                       const pct = (m.count / maxModel) * 100;
+                       const ratio = Math.round(m.count / Math.max(1, cs.totalComplaints) * 100);
+                       return (
+                         <div key={i} className="flex items-center gap-2">
+                           <span className="text-xs font-bold text-slate-700 w-32 truncate shrink-0" title={m.name}>{m.name}</span>
+                           <div className="flex-1 bg-slate-100 rounded-full h-6 relative overflow-hidden">
+                             <div className="h-full bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-full transition-all" style={{ width: `${pct}%` }}/>
+                             <div className="absolute inset-0 flex items-center px-2 text-xs font-bold text-slate-700">{m.count}件 <span className="text-[10px] opacity-70 ml-1">({ratio}%)</span></div>
+                           </div>
+                         </div>
+                       );
+                     })}
+                   </div>
+                 </div>
+               </div>
+
+               {/* 詳細テーブル */}
                <div className="bg-white rounded-xl shadow-sm border flex flex-col min-h-[15rem] overflow-hidden">
                  <div className="p-4 border-b font-bold text-slate-700 bg-slate-50 flex justify-between items-center">
-                   <span>気づき・改善提案 報告履歴</span>
+                   <span className="flex items-center gap-2"><FileSpreadsheet className="w-4 h-4 text-slate-500"/> 詳細一覧 ({cs.totalComplaints}件)</span>
                  </div>
-                 <div className="overflow-y-auto p-0 flex-1">
+                 <div className="overflow-y-auto p-0 flex-1 max-h-96">
                    <table className="w-full text-left border-collapse text-sm">
                      <thead className="sticky top-0 bg-slate-50 shadow-sm z-10 text-slate-500">
                        <tr className="border-b">
                          <th className="p-3 font-bold">日時</th>
                          <th className="p-3 font-bold">型式 / 指図</th>
-                         <th className="p-3 font-bold">報告項目</th>
+                         <th className="p-3 font-bold">工程</th>
                          <th className="p-3 font-bold">内容</th>
                          <th className="p-3 font-bold">報告者</th>
                          <th className="p-3 font-bold text-center">操作</th>
                        </tr>
                      </thead>
                      <tbody>
-                       {complaintStats.complaints.map((d, i) => (
+                       {cs.complaints.map((d, i) => (
                          <tr key={i} className="border-b hover:bg-purple-50 transition-colors">
                            <td className="p-3 text-xs text-slate-500 whitespace-nowrap">{d.timestamp ? new Date(d.timestamp).toLocaleString() : '-'}</td>
                            <td className="p-3 font-bold text-slate-800 whitespace-nowrap">{d.lot?.model || ''} <span className="text-xs text-slate-400 ml-1 font-normal">{d.lot?.orderNo || ''}</span></td>
@@ -6848,13 +12241,14 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                            </td>
                          </tr>
                        ))}
-                       {complaintStats.complaints.length === 0 && <tr><td colSpan="6" className="p-8 text-center text-slate-400">報告はありません</td></tr>}
+                       {cs.complaints.length === 0 && <tr><td colSpan="6" className="p-8 text-center text-slate-400">報告はありません</td></tr>}
                      </tbody>
                    </table>
                  </div>
                </div>
              </div>
-           )}
+             );
+           })()}
 
            {activeMode === 'process' && (
              <ProcessInsightsTab
@@ -6864,14 +12258,23 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                onSaveSettings={saveSettings}
                targetTimeHistory={settings.targetTimeHistory || []}
                settings={settings}
+               saveData={saveData}
+               currentUserName={currentUserName}
              />
            )}
 
            {activeMode === 'direct-indirect' && (() => {
-             const [diDateFrom, setDiDateFrom] = [filterStartDate, setFilterStartDate];
-             const [diDateTo, setDiDateTo] = [filterEndDate, setFilterEndDate];
-             const fromTs = new Date(diDateFrom); fromTs.setHours(0,0,0,0);
-             const toTs = new Date(diDateTo); toTs.setHours(23,59,59,999);
+             // 共通フィルタ (defectFilter*) を使う。月単位なら当月、範囲指定なら期間指定。
+             let fromTs, toTs;
+             if (defectFilterMode === 'month') {
+               const [yStr, mStr] = (defectFilterMonth || '').split('-');
+               const y = Number(yStr), m = Number(mStr);
+               fromTs = new Date(y, m - 1, 1); fromTs.setHours(0,0,0,0);
+               toTs = new Date(y, m, 0); toTs.setHours(23,59,59,999); // 月末
+             } else {
+               fromTs = new Date(defectFilterStart); fromTs.setHours(0,0,0,0);
+               toTs = new Date(defectFilterEnd); toTs.setHours(23,59,59,999);
+             }
 
              // 直工集計（作業者別）
              const workerDirect = {};
@@ -6902,12 +12305,8 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
              const maxCat = catEntries.length > 0 ? catEntries[0][1] : 1;
 
              return (
-               <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                 <div className="flex items-center gap-3 flex-wrap">
-                   <input type="date" value={diDateFrom} onChange={e => setDiDateFrom(e.target.value)} className="border rounded px-2 py-1 text-sm"/>
-                   <span className="text-slate-400">〜</span>
-                   <input type="date" value={diDateTo} onChange={e => setDiDateTo(e.target.value)} className="border rounded px-2 py-1 text-sm"/>
-                 </div>
+               <div className="space-y-6">
+                 {/* 期間はヘッダーの共通フィルタで指定 */}
                  {/* 全体直間比率 */}
                  <div className="bg-white rounded-xl border shadow-sm p-5">
                    <h3 className="font-bold text-slate-800 mb-3">全体の直間比率</h3>
@@ -6953,201 +12352,744 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
            })()}
 
            {activeMode === 'worker-eval' && (() => {
-             // 作業者別の評価データ生成
-             const completedLots = lots.filter(l => l.status === 'completed');
+             // 作業者別の評価データ生成 (エビデンスベース)
+             // 期間フィルタを反映: 完了が isInDefectPeriod に該当するロットのみ
+             const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(l.completedAt || l.updatedAt));
+
+             // 自動工程の判定: executionMode='batch' or title に '自動' を含む
+             const isAutoStep = (step) => step?.executionMode === 'batch' || step?.title?.includes('自動');
+
+             // === 1) 工程別の全社ベースタイム (平均) と最速タイムを事前算出 ===
+             const stepGlobalTimes = {}; // stepKey → { times: [], targetTime }
+             completedLots.forEach(lot => {
+               const tasks = lot.tasks || {};
+               (lot.steps || []).forEach((step, sIdx) => {
+                 const sk = `${lot.model}-${step.title}`;
+                 if (!stepGlobalTimes[sk]) stepGlobalTimes[sk] = { times: [], targetTime: step.targetTime || 0 };
+                 for (let u = 0; u < (lot.quantity || 1); u++) {
+                   const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`];
+                   const dur = t?.duration;
+                   if (dur && dur > 0) stepGlobalTimes[sk].times.push(dur);
+                 }
+               });
+             });
+             const stepGlobalMin = {};
+             Object.entries(stepGlobalTimes).forEach(([k, v]) => {
+               if (v.times.length === 0) return;
+               stepGlobalMin[k] = Math.min(...v.times);
+             });
+
+             // === 2) 作業者ごとに「自動工程の時間範囲」と「手動工程の時間範囲」を集める ===
+             //    これによりロット境界を越えた並列作業 (例: ロットAの自動加工中にロットBの手動作業) を検出
+             const intervalsByWorker = {}; // wid -> { auto: [{s,e}], manual: [{s,e,label}] }
+             const ensureBucket = (wid) => {
+               if (!intervalsByWorker[wid]) intervalsByWorker[wid] = { auto: [], manual: [] };
+               return intervalsByWorker[wid];
+             };
+             completedLots.forEach(lot => {
+               const tasks = lot.tasks || {};
+               const steps = lot.steps || [];
+               const qty = lot.quantity || 1;
+               steps.forEach((step, sIdx) => {
+                 const auto = isAutoStep(step);
+                 for (let u = 0; u < qty; u++) {
+                   const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`];
+                   if (!t || !t.startTime || !t.duration) continue;
+                   // 作業者ID: task.workerName 優先 → lot.workerId
+                   const taskWid = t.workerName ? (workers.find(w => w.name === t.workerName)?.id) : null;
+                   const wid = taskWid || lot.workerId;
+                   if (!wid) continue;
+                   const interval = { s: t.startTime, e: t.startTime + t.duration * 1000, lot: lot.orderNo, step: step.title };
+                   const bucket = ensureBucket(wid);
+                   if (auto) bucket.auto.push(interval);
+                   else bucket.manual.push(interval);
+                 }
+               });
+               // monitoring interruption も auto レンジに含める
+               (lot.interruptions || []).filter(i => i.type === 'monitoring' && i.startTime).forEach(i => {
+                 const wid = lot.workerId;
+                 if (!wid) return;
+                 const interval = { s: i.startTime, e: i.endTime || (i.startTime + (i.duration || 0) * 1000), lot: lot.orderNo, step: i.label || '監視' };
+                 ensureBucket(wid).auto.push(interval);
+               });
+             });
+
+             // === 3) 作業者ごとの集計 ===
              const workerStats = workers.map(w => {
                const wLots = completedLots.filter(l => l.workerId === w.id);
-               let totalTasks = 0, completedTasks = 0, totalDuration = 0, championCount = 0;
-               let parallelScore = 0, parallelOpportunities = 0;
+               let totalTasks = 0, completedTasks = 0, totalDuration = 0;
                let ngCount = 0, reworkTime = 0;
-               const stepTimes = {}; // model-step → [durations]
+               let onTargetCount = 0, onTargetOpportunities = 0;
+               let bestTimeStepCount = 0;
+               const stepTimes = {};
+               const fastestStepsList = [];
 
                wLots.forEach(lot => {
                  const tasks = lot.tasks || {};
                  const steps = lot.steps || [];
                  const qty = lot.quantity || 1;
-
-                 // タスク別分析
+                 const getTask = (step, sIdx, uIdx) => tasks[`${step?.id}-${uIdx}`] || tasks[`${sIdx}-${uIdx}`];
                  steps.forEach((step, sIdx) => {
-                   const isAuto = step.title?.includes('自動');
                    const stepKey = `${lot.model}-${step.title}`;
                    if (!stepTimes[stepKey]) stepTimes[stepKey] = [];
-
-                   let autoRunning = false;
-                   let autoStartTime = null, autoEndTime = null;
-                   let manualDuringAuto = 0;
-
                    for (let uIdx = 0; uIdx < qty; uIdx++) {
-                     const key = `${sIdx}-${uIdx}`;
-                     const task = tasks[key];
+                     const task = getTask(step, sIdx, uIdx);
                      if (!task) continue;
                      totalTasks++;
                      if (task.status === 'completed' || task.status === 'ng') completedTasks++;
-                     totalDuration += task.duration || 0;
-                     stepTimes[stepKey].push(task.duration || 0);
-
-                     // NG/修正集計
+                     const dur = task.duration || 0;
+                     totalDuration += dur;
+                     if (dur > 0) stepTimes[stepKey].push(dur);
+                     if (step.targetTime && step.targetTime > 0 && dur > 0) {
+                       onTargetOpportunities++;
+                       if (dur <= step.targetTime) onTargetCount++;
+                     }
                      if (task.reworks?.length > 0) {
                        ngCount += 1;
                        reworkTime += (task.reworks || []).reduce((a, r) => a + (r.duration || 0), 0);
                      }
-
-                     // 自動工程の時間帯を記録
-                     if (isAuto && task.startTime) {
-                       autoStartTime = autoStartTime ? Math.min(autoStartTime, task.startTime) : task.startTime;
-                       const endT = task.startTime + (task.duration || 0) * 1000;
-                       autoEndTime = autoEndTime ? Math.max(autoEndTime, endT) : endT;
-                     }
-                   }
-
-                   // 自動工程中に他の手動工程をやっていたか分析
-                   if (isAuto && autoStartTime && autoEndTime) {
-                     parallelOpportunities++;
-                     steps.forEach((otherStep, oIdx) => {
-                       if (oIdx === sIdx || otherStep.title?.includes('自動')) return;
-                       for (let uIdx = 0; uIdx < qty; uIdx++) {
-                         const oTask = tasks[`${oIdx}-${uIdx}`];
-                         if (!oTask || !oTask.startTime) continue;
-                         const oStart = oTask.startTime;
-                         const oEnd = oStart + (oTask.duration || 0) * 1000;
-                         // 重なり判定
-                         if (oStart < autoEndTime && oEnd > autoStartTime) {
-                           manualDuringAuto += oTask.duration || 0;
-                         }
-                       }
-                     });
-                     if (manualDuringAuto > 0) parallelScore++;
                    }
                  });
-
-                 // チャンピオンタイム: ロット全体の作業時間が目標以下
-                 const lotTime = (lot.totalWorkTime || 0) / 1000;
-                 const targetKey = `${lot.model}-${lot.templateId}`;
-                 const target = settings?.customTargetTimes?.[targetKey];
-                 if (target && lotTime > 0 && lotTime <= target) championCount++;
                });
 
-               // 工程別のチャンピオンタイム（最速記録を持ってるか）
-               let bestTimeCount = 0;
-               Object.entries(stepTimes).forEach(([key, times]) => {
+               // 工程別 最速記録
+               Object.entries(stepTimes).forEach(([k, times]) => {
                  if (times.length === 0) return;
                  const myBest = Math.min(...times);
-                 // 全作業者の同じ工程のタイムと比較
-                 let globalBest = myBest;
-                 completedLots.forEach(l => {
-                   const t = l.tasks || {};
-                   const s = l.steps || [];
-                   s.forEach((step, sI) => {
-                     const sk = `${l.model}-${step.title}`;
-                     if (sk !== key) return;
-                     for (let u = 0; u < (l.quantity || 1); u++) {
-                       const dur = t[`${sI}-${u}`]?.duration;
-                       if (dur && dur > 0) globalBest = Math.min(globalBest, dur);
-                     }
-                   });
-                 });
-                 if (myBest <= globalBest && myBest > 0) bestTimeCount++;
+                 const globalBest = stepGlobalMin[k];
+                 if (globalBest && myBest <= globalBest) {
+                   bestTimeStepCount++;
+                   fastestStepsList.push(k.split('-').slice(1).join('-'));
+                 }
                });
 
+               // === 並列作業: 自動工程の時間中に手動工程をやっていた秒数を集計 ===
+               // ロット境界を越えて検出 (例: ロットAの自動加工中にロットBの梱包)
+               const { auto: autoIntervals = [], manual: manualIntervals = [] } = intervalsByWorker[w.id] || {};
+               let parallelMs = 0;
+               let autoTotalMs = 0;
+               autoIntervals.forEach(a => {
+                 autoTotalMs += (a.e - a.s);
+                 manualIntervals.forEach(m => {
+                   const overlapStart = Math.max(a.s, m.s);
+                   const overlapEnd = Math.min(a.e, m.e);
+                   if (overlapEnd > overlapStart) parallelMs += (overlapEnd - overlapStart);
+                 });
+               });
+               // 同じ自動レンジに複数の手動が重なる場合の二重計上を防ぐため、parallelMs は autoTotalMs を超えない
+               parallelMs = Math.min(parallelMs, autoTotalMs);
+
                const avgTime = completedTasks > 0 ? totalDuration / completedTasks : 0;
-               const parallelRate = parallelOpportunities > 0 ? (parallelScore / parallelOpportunities) * 100 : 0;
-               // 総合スコア（100点満点）
-               const speedScore = Math.min(40, avgTime > 0 ? Math.max(0, 40 - (avgTime / 60) * 2) : 0);
-               const parallelBonus = Math.min(30, parallelRate * 0.3);
-               const championBonus = Math.min(20, championCount * 5 + bestTimeCount * 3);
-               const qualityScore = Math.min(10, ngCount * 3); // NG発見が多いほど高評価（品質意識が高い）
-               const totalScore = Math.round(Math.max(0, speedScore + parallelBonus + championBonus + Math.max(0, qualityScore)));
+               const parallelRate = autoTotalMs > 0 ? (parallelMs / autoTotalMs) * 100 : 0;
+               const parallelSec = Math.round(parallelMs / 1000);
+               const autoTotalSec = Math.round(autoTotalMs / 1000);
+               const onTargetRate = onTargetOpportunities > 0 ? (onTargetCount / onTargetOpportunities) * 100 : 0;
 
                return {
                  ...w, lotCount: wLots.length, totalTasks, completedTasks, avgTime, totalDuration,
-                 parallelRate, parallelScore, parallelOpportunities,
-                 championCount, bestTimeCount, ngCount, reworkTime,
-                 totalScore, speedScore, parallelBonus, championBonus, qualityScore
+                 parallelRate, parallelSec, autoTotalSec,
+                 onTargetRate, onTargetCount, onTargetOpportunities,
+                 bestTimeStepCount, fastestStepsList: fastestStepsList.slice(0, 3),
+                 ngCount, reworkTime, stepTimes,
                };
-             }).sort((a, b) => b.totalScore - a.totalScore);
+             }).filter(w => w.completedTasks > 0);
 
-             const medalColors = ['text-amber-500', 'text-slate-400', 'text-orange-600'];
-             const medalLabels = ['🥇', '🥈', '🥉'];
+             // === 4) 全作業者の平均 (ベンチマーク) ===
+             const allTaskCount = workerStats.reduce((a, w) => a + w.completedTasks, 0);
+             const allTotalDur = workerStats.reduce((a, w) => a + w.totalDuration, 0);
+             const groupAvgTime = allTaskCount > 0 ? allTotalDur / allTaskCount : 0;
+             // 並列作業: 自動工程時間が一定以上の作業者だけで平均 (1分未満は分母から除外)
+             const parallelEligible = workerStats.filter(w => w.autoTotalSec >= 60);
+             const groupAvgParallel = parallelEligible.length > 0
+               ? parallelEligible.reduce((a, w) => a + w.parallelRate, 0) / parallelEligible.length
+               : 0;
+             const groupAvgOnTarget = workerStats.length > 0
+               ? workerStats.reduce((a, w) => a + w.onTargetRate, 0) / workerStats.length
+               : 0;
+             const groupAvgNg = workerStats.length > 0
+               ? workerStats.reduce((a, w) => a + w.ngCount, 0) / workerStats.length
+               : 0;
+
+             // 各作業者に「強み・改善ポイント」を生成 (具体的な根拠つき)
+             workerStats.forEach(w => {
+               const insights = []; // { type: 'strength'|'gap', text }
+               // 速度
+               if (groupAvgTime > 0 && w.avgTime > 0) {
+                 const speedDiffPct = ((groupAvgTime - w.avgTime) / groupAvgTime) * 100;
+                 if (speedDiffPct >= 10) insights.push({ type: 'strength', text: `作業速度が全体平均より ${speedDiffPct.toFixed(0)}% 速い (${formatTime(Math.round(w.avgTime))} vs 平均${formatTime(Math.round(groupAvgTime))})` });
+                 else if (speedDiffPct <= -10) insights.push({ type: 'gap', text: `作業速度が全体平均より ${Math.abs(speedDiffPct).toFixed(0)}% 遅い (${formatTime(Math.round(w.avgTime))} vs 平均${formatTime(Math.round(groupAvgTime))}) — 工程改善の余地` });
+               }
+               // 目標達成率
+               if (w.onTargetOpportunities >= 3) {
+                 if (w.onTargetRate >= 80) insights.push({ type: 'strength', text: `目標タイム達成率 ${w.onTargetRate.toFixed(0)}% (${w.onTargetCount}/${w.onTargetOpportunities}タスク)` });
+                 else if (w.onTargetRate < 50) insights.push({ type: 'gap', text: `目標タイム達成率 ${w.onTargetRate.toFixed(0)}% (${w.onTargetCount}/${w.onTargetOpportunities}タスク) — 半分以下` });
+               }
+               // 並列作業 (自動工程中に手動工程を進めた時間 ÷ 自動工程の合計時間)
+               if (w.autoTotalSec >= 60) {
+                 if (w.parallelRate >= 70) insights.push({ type: 'strength', text: `並列作業 ${w.parallelRate.toFixed(0)}% (自動${formatTime(w.autoTotalSec)} のうち ${formatTime(w.parallelSec)} で別工程進行)` });
+                 else if (w.parallelRate <= 30) insights.push({ type: 'gap', text: `並列作業 ${w.parallelRate.toFixed(0)}% (自動${formatTime(w.autoTotalSec)} のうち ${formatTime(w.parallelSec)} のみ) — 自動測定中に他工程を進める余地` });
+               }
+               // 最速
+               if (w.bestTimeStepCount > 0) insights.push({ type: 'strength', text: `${w.bestTimeStepCount}工程で全作業者中の最速記録 (${w.fastestStepsList.join(' / ') || '—'})` });
+               // 品質: NG発見数が平均以上か (NGを見つけることは品質意識の表れ)
+               if (groupAvgNg > 0 && w.ngCount > groupAvgNg * 1.2) insights.push({ type: 'strength', text: `NG発見 ${w.ngCount}件 (平均 ${groupAvgNg.toFixed(1)}件より多い) — 品質意識が高い` });
+               if (w.reworkTime > 0 && w.completedTasks > 0) {
+                 const reworkRatio = w.reworkTime / w.totalDuration;
+                 if (reworkRatio > 0.2) insights.push({ type: 'gap', text: `修正作業に${formatTime(w.reworkTime)} (作業時間の${(reworkRatio*100).toFixed(0)}%) — 初回品質向上の余地` });
+               }
+               w.insights = insights;
+             });
+
+             // 並び順: 1) 目標達成率 → 2) 平均速度 (速い順)
+             workerStats.sort((a, b) => {
+               if (b.onTargetRate !== a.onTargetRate) return b.onTargetRate - a.onTargetRate;
+               return a.avgTime - b.avgTime;
+             });
 
              return (
                <div className="space-y-6">
-                 {/* ランキングカード */}
-                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                   {workerStats.map((w, idx) => (
-                     <div key={w.id} className={`bg-white rounded-xl shadow-sm border-2 p-5 ${idx === 0 ? 'border-amber-400 ring-2 ring-amber-100' : idx === 1 ? 'border-slate-300' : idx === 2 ? 'border-orange-300' : 'border-slate-200'}`}>
-                       <div className="flex items-center gap-3 mb-4">
-                         <div className="text-3xl">{idx < 3 ? medalLabels[idx] : `#${idx+1}`}</div>
-                         <div className="flex-1">
-                           <div className="font-black text-lg text-slate-800">{w.name}</div>
-                           <div className="text-xs text-slate-500">{w.lotCount}ロット / {w.completedTasks}タスク完了</div>
-                         </div>
-                         <div className="text-right">
-                           <div className={`text-3xl font-black ${idx === 0 ? 'text-amber-500' : 'text-blue-600'}`}>{w.totalScore}</div>
-                           <div className="text-[10px] text-slate-400 font-bold">総合スコア</div>
-                         </div>
-                       </div>
-
-                       {/* スコア内訳 */}
-                       <div className="space-y-2 mb-4">
-                         <div className="flex items-center gap-2">
-                           <span className="text-xs font-bold text-slate-500 w-20">作業速度</span>
-                           <div className="flex-1 bg-slate-100 rounded-full h-3"><div className="h-full bg-blue-500 rounded-full" style={{width: `${(w.speedScore/40)*100}%`}}/></div>
-                           <span className="text-xs font-mono font-bold w-8 text-right">{Math.round(w.speedScore)}</span>
-                         </div>
-                         <div className="flex items-center gap-2">
-                           <span className="text-xs font-bold text-slate-500 w-20">並行作業</span>
-                           <div className="flex-1 bg-slate-100 rounded-full h-3"><div className="h-full bg-emerald-500 rounded-full" style={{width: `${(w.parallelBonus/30)*100}%`}}/></div>
-                           <span className="text-xs font-mono font-bold w-8 text-right">{Math.round(w.parallelBonus)}</span>
-                         </div>
-                         <div className="flex items-center gap-2">
-                           <span className="text-xs font-bold text-slate-500 w-20">最速記録</span>
-                           <div className="flex-1 bg-slate-100 rounded-full h-3"><div className="h-full bg-amber-500 rounded-full" style={{width: `${(w.championBonus/20)*100}%`}}/></div>
-                           <span className="text-xs font-mono font-bold w-8 text-right">{Math.round(w.championBonus)}</span>
-                         </div>
-                         <div className="flex items-center gap-2">
-                           <span className="text-xs font-bold text-slate-500 w-20">品質発見</span>
-                           <div className="flex-1 bg-slate-100 rounded-full h-3"><div className="h-full bg-rose-500 rounded-full" style={{width: `${(Math.max(0,w.qualityScore)/10)*100}%`}}/></div>
-                           <span className="text-xs font-mono font-bold w-8 text-right">{Math.round(Math.max(0,w.qualityScore))}</span>
-                         </div>
-                       </div>
-
-                       {/* 詳細データ */}
-                       <div className="grid grid-cols-2 gap-2 text-xs">
-                         <div className="bg-blue-50 p-2 rounded-lg">
-                           <div className="text-blue-500 font-bold mb-0.5">平均作業時間</div>
-                           <div className="font-black text-blue-700 text-lg">{formatTime(Math.round(w.avgTime))}</div>
-                         </div>
-                         <div className="bg-emerald-50 p-2 rounded-lg">
-                           <div className="text-emerald-500 font-bold mb-0.5">並行作業率</div>
-                           <div className="font-black text-emerald-700 text-lg">{w.parallelRate.toFixed(0)}%</div>
-                           <div className="text-emerald-500">{w.parallelScore}/{w.parallelOpportunities}回</div>
-                         </div>
-                         <div className="bg-amber-50 p-2 rounded-lg">
-                           <div className="text-amber-500 font-bold mb-0.5">チャンピオン</div>
-                           <div className="font-black text-amber-700 text-lg">{w.championCount}回</div>
-                           <div className="text-amber-500">最速{w.bestTimeCount}工程</div>
-                         </div>
-                         <div className="bg-rose-50 p-2 rounded-lg">
-                           <div className="text-rose-500 font-bold mb-0.5">NG/修正</div>
-                           <div className="font-black text-rose-700 text-lg">{w.ngCount}件</div>
-                           <div className="text-rose-500">修正{formatTime(w.reworkTime)}</div>
-                         </div>
-                       </div>
+                 {/* 概要 (ベンチマーク) */}
+                 <div className="bg-gradient-to-br from-slate-50 to-slate-100 border-2 border-slate-200 rounded-xl p-4">
+                   <div className="text-sm font-bold text-slate-700 mb-2 flex items-center gap-2"><Users className="w-4 h-4"/> 全体ベンチマーク (期間内・完了ロット {completedLots.length}件)</div>
+                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                     <div className="bg-white p-2 rounded">
+                       <div className="text-slate-500 font-bold">平均タスク時間</div>
+                       <div className="font-black text-slate-800 text-lg">{formatTime(Math.round(groupAvgTime))}</div>
+                       <div className="text-[10px] text-slate-400">{allTaskCount}タスクの平均</div>
                      </div>
-                   ))}
+                     <div className="bg-white p-2 rounded">
+                       <div className="text-slate-500 font-bold">目標達成率 平均</div>
+                       <div className="font-black text-slate-800 text-lg">{groupAvgOnTarget.toFixed(0)}%</div>
+                       <div className="text-[10px] text-slate-400">targetTime 以内の割合</div>
+                     </div>
+                     <div className="bg-white p-2 rounded">
+                       <div className="text-slate-500 font-bold">並列作業率 平均</div>
+                       <div className="font-black text-slate-800 text-lg">{groupAvgParallel.toFixed(0)}%</div>
+                       <div className="text-[10px] text-slate-400">自動工程中の他工程進行</div>
+                     </div>
+                     <div className="bg-white p-2 rounded">
+                       <div className="text-slate-500 font-bold">NG発見 平均</div>
+                       <div className="font-black text-slate-800 text-lg">{groupAvgNg.toFixed(1)}件</div>
+                       <div className="text-[10px] text-slate-400">1人あたり</div>
+                     </div>
+                   </div>
                  </div>
 
-                 {workerStats.length === 0 && <div className="text-center py-20 text-slate-400">評価データがありません（完了済みロットが必要です）</div>}
+                 {/* 作業者カード (ベンチマーク比較 + 強み・課題) */}
+                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-4">
+                   {workerStats.map((w, idx) => {
+                     const speedDiff = groupAvgTime > 0 && w.avgTime > 0 ? ((groupAvgTime - w.avgTime) / groupAvgTime) * 100 : 0;
+                     const onTargetDiff = w.onTargetRate - groupAvgOnTarget;
+                     const parallelDiff = w.parallelRate - groupAvgParallel;
+                     return (
+                     <div key={w.id} className="bg-white rounded-xl shadow-sm border-2 p-5 border-slate-200">
+                       <div className="flex items-center gap-3 mb-3 pb-3 border-b">
+                         <div className="w-12 h-12 rounded-full bg-amber-100 flex items-center justify-center text-amber-700 font-black text-xl">{w.name?.[0] || '?'}</div>
+                         <div className="flex-1 min-w-0">
+                           <div className="font-black text-lg text-slate-800">{w.name}</div>
+                           <div className="text-xs text-slate-500">期間内: {w.lotCount}ロット / {w.completedTasks}タスク完了 / 計 {formatTime(Math.round(w.totalDuration))}</div>
+                         </div>
+                         <div className="text-right shrink-0">
+                           <div className="text-[10px] text-slate-400 font-bold">順位</div>
+                           <div className="text-2xl font-black text-amber-500">#{idx + 1}</div>
+                         </div>
+                       </div>
 
-                 {/* 評価基準の説明 */}
+                       {/* 4 指標 (実数 + 全体平均比) */}
+                       <div className="grid grid-cols-2 gap-2 mb-3">
+                         <div className="bg-blue-50 border border-blue-200 p-2 rounded-lg">
+                           <div className="text-[10px] text-blue-600 font-bold mb-0.5">平均タスク時間</div>
+                           <div className="font-black text-blue-700 text-lg">{formatTime(Math.round(w.avgTime))}</div>
+                           <div className={`text-[10px] font-bold ${speedDiff >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                             {speedDiff >= 0 ? '▲' : '▼'} 平均比 {speedDiff >= 0 ? '+' : ''}{speedDiff.toFixed(0)}%
+                           </div>
+                         </div>
+                         <div className="bg-emerald-50 border border-emerald-200 p-2 rounded-lg">
+                           <div className="text-[10px] text-emerald-600 font-bold mb-0.5">目標達成率</div>
+                           <div className="font-black text-emerald-700 text-lg">{w.onTargetRate.toFixed(0)}%</div>
+                           <div className="text-[10px] text-emerald-500">{w.onTargetCount}/{w.onTargetOpportunities}タスク {onTargetDiff !== 0 && `(${onTargetDiff > 0 ? '+' : ''}${onTargetDiff.toFixed(0)}pt)`}</div>
+                         </div>
+                         <div className="bg-purple-50 border border-purple-200 p-2 rounded-lg">
+                           <div className="text-[10px] text-purple-600 font-bold mb-0.5">並列作業率</div>
+                           <div className="font-black text-purple-700 text-lg">{w.parallelRate.toFixed(0)}%</div>
+                           <div className="text-[10px] text-purple-500">自動{formatTime(w.autoTotalSec)}中{formatTime(w.parallelSec)} {parallelDiff !== 0 && `(${parallelDiff > 0 ? '+' : ''}${parallelDiff.toFixed(0)}pt)`}</div>
+                         </div>
+                         <div className="bg-amber-50 border border-amber-200 p-2 rounded-lg">
+                           <div className="text-[10px] text-amber-600 font-bold mb-0.5">最速記録 / NG発見</div>
+                           <div className="font-black text-amber-700 text-lg">{w.bestTimeStepCount}<span className="text-xs">工程</span> / {w.ngCount}<span className="text-xs">件</span></div>
+                           <div className="text-[10px] text-amber-500">{w.fastestStepsList.length > 0 ? `最速: ${w.fastestStepsList.slice(0,2).join(',')}` : '—'}</div>
+                         </div>
+                       </div>
+
+                       {/* 強み・改善ポイント (根拠つき) */}
+                       <div className="space-y-1.5">
+                         <div className="text-[11px] font-bold text-slate-500">▼ 強み・改善ポイント</div>
+                         {w.insights.length === 0 && <div className="text-xs text-slate-400 italic">特筆すべき傾向はありません</div>}
+                         {w.insights.map((ins, i) => (
+                           <div key={i} className={`text-xs px-2 py-1 rounded ${ins.type === 'strength' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'}`}>
+                             <span className="font-bold mr-1">{ins.type === 'strength' ? '◎ 強み:' : '△ 課題:'}</span>{ins.text}
+                           </div>
+                         ))}
+                       </div>
+                     </div>
+                     );
+                   })}
+                 </div>
+
+                 {workerStats.length === 0 && <div className="text-center py-20 text-slate-400">評価データがありません (期間内の完了ロットが必要です)</div>}
+
+                 {/* 評価指標の説明 */}
                  <div className="bg-slate-50 rounded-xl p-4 border">
-                   <div className="text-sm font-bold text-slate-700 mb-2">評価基準</div>
-                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-600">
-                     <div><span className="font-bold text-blue-600">作業速度 (40点)</span><br/>1タスクあたりの平均所要時間が短いほど高得点</div>
-                     <div><span className="font-bold text-emerald-600">並行作業 (30点)</span><br/>自動測定中に別の手動工程を進めた割合</div>
-                     <div><span className="font-bold text-amber-600">最速記録 (20点)</span><br/>目標タイム達成回数 + 全作業者中の最速工程数</div>
-                     <div><span className="font-bold text-rose-600">品質発見力 (10点)</span><br/>NG判定を多く見つけるほど高得点（品質意識が高い）</div>
+                   <div className="text-sm font-bold text-slate-700 mb-2">評価指標の定義</div>
+                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-600">
+                     <div><span className="font-bold text-blue-600">平均タスク時間</span>: 期間内に完了したタスクの所要時間平均。全作業者の平均と比較した％を表示。</div>
+                     <div><span className="font-bold text-emerald-600">目標達成率</span>: 工程に設定された targetTime 以内に完了したタスクの割合。targetTime 未設定の工程は除外。</div>
+                     <div><span className="font-bold text-purple-600">並列作業率</span>: 自動工程 (executionMode=batch or 工程名に「自動」を含む) の合計時間のうち、同じ作業者が別の手動工程を進めていた時間の割合。<span className="text-[10px]">※ロット境界を越えて検出 (例: ロットAの自動加工中にロットBの梱包)</span></div>
+                     <div><span className="font-bold text-amber-600">最速記録 / NG発見</span>: 全作業者中で最速タイムを持つ工程数 / 期間内に NG 判定した件数 (品質意識)。</div>
                    </div>
+                   <div className="text-[10px] text-slate-400 mt-2">※ 順位は <span className="font-bold">目標達成率</span> 優先、次に <span className="font-bold">平均タスク時間</span> (速い順)。期間は上部のフィルタで変更可能。</div>
+                 </div>
+               </div>
+             );
+           })()}
+
+           {activeMode === 'improvement' && (() => {
+             const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(l.completedAt || l.updatedAt));
+             const isAutoStep = (step) => step?.executionMode === 'batch' || step?.title?.includes('自動');
+
+             // === 1) 不要工程あぶり出し ===
+             // 各工程の「該当なし率」「不良発生数」「平均時間」を集計し、削除候補をランキング
+             // テンプレ単位で分析: 同テンプレで使われてる工程のうち、 80%以上 該当なしのもの = 高確率で削除候補
+             const stepStats = {};  // key=`${templateId}::${stepId}` → { templateId, templateName, step, totalAppearances, skippedCount, ngCount, completedDurations, isAuto }
+             completedLots.forEach(lot => {
+               const tplId = lot.templateId || 'unknown';
+               const tpl = templates.find(t => t.id === tplId);
+               (lot.steps || []).forEach((step, sIdx) => {
+                 const stepKey = `${tplId}::${step.id}`;
+                 if (!stepStats[stepKey]) {
+                   stepStats[stepKey] = {
+                     templateId: tplId,
+                     templateName: tpl?.name || '(テンプレ削除済)',
+                     step,
+                     totalAppearances: 0,
+                     skippedCount: 0,
+                     ngCount: 0,
+                     completedCount: 0,
+                     completedDurations: [],
+                     isAuto: isAutoStep(step),
+                   };
+                 }
+                 const s = stepStats[stepKey];
+                 for (let u = 0; u < (lot.quantity || 1); u++) {
+                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
+                   if (!t) continue;
+                   s.totalAppearances++;
+                   if (t.status === 'skipped') s.skippedCount++;
+                   else if (t.status === 'ng') s.ngCount++;
+                   else if (t.status === 'completed') { s.completedCount++; if (t.duration > 0) s.completedDurations.push(t.duration); }
+                 }
+               });
+             });
+             // ランキング: 削除スコア = 該当なし率(*100) - 不良率(*50). NG多い工程は削除しない方がいい。
+             const removalCandidates = Object.values(stepStats).map(s => {
+               const skipRate = s.totalAppearances > 0 ? (s.skippedCount / s.totalAppearances) : 0;
+               const ngRate = s.totalAppearances > 0 ? (s.ngCount / s.totalAppearances) : 0;
+               const avgDuration = s.completedDurations.length > 0 ? Math.round(s.completedDurations.reduce((a, b) => a + b, 0) / s.completedDurations.length) : 0;
+               const removalScore = skipRate * 100 - ngRate * 50;
+               // 完了かつ常にゼロ秒近い = 形骸化してる
+               const isFormality = avgDuration > 0 && avgDuration < 10 && s.completedCount >= 5;
+               return {
+                 ...s,
+                 skipRate: Math.round(skipRate * 100),
+                 ngRate: Math.round(ngRate * 100),
+                 avgDuration,
+                 removalScore: Math.round(removalScore),
+                 isFormality,
+               };
+             }).filter(s => s.totalAppearances >= 3).sort((a, b) => b.removalScore - a.removalScore);
+
+             // === 2) 作業者スキル差: 同じ工程を作業者別比較 ===
+             const stepWorkerTimes = {}; // key=stepTitle → { [workerId]: [durations] }
+             completedLots.forEach(lot => {
+               if (!lot.workerId) return;
+               (lot.steps || []).forEach((step, sIdx) => {
+                 const title = step.title || `step-${sIdx}`;
+                 if (!stepWorkerTimes[title]) stepWorkerTimes[title] = { isAuto: isAutoStep(step), byWorker: {} };
+                 for (let u = 0; u < (lot.quantity || 1); u++) {
+                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
+                   if (!t || t.status !== 'completed' || !t.duration) continue;
+                   if (!stepWorkerTimes[title].byWorker[lot.workerId]) stepWorkerTimes[title].byWorker[lot.workerId] = [];
+                   stepWorkerTimes[title].byWorker[lot.workerId].push(t.duration);
+                 }
+               });
+             });
+             // スキル差ランキング: max/min 比率が大きい工程 = 教育機会大
+             const skillGaps = Object.entries(stepWorkerTimes).map(([title, { isAuto, byWorker }]) => {
+               const workerAvgs = Object.entries(byWorker)
+                 .filter(([, durs]) => durs.length >= 2)
+                 .map(([wid, durs]) => {
+                   const avg = durs.reduce((a, b) => a + b, 0) / durs.length;
+                   const worker = workers.find(w => w.id === wid);
+                   return { workerId: wid, workerName: worker?.name || wid.slice(0, 6), avg, sampleCount: durs.length, min: Math.min(...durs), max: Math.max(...durs) };
+                 }).sort((a, b) => a.avg - b.avg);
+               if (workerAvgs.length < 2) return null;
+               const fastest = workerAvgs[0];
+               const slowest = workerAvgs[workerAvgs.length - 1];
+               const ratio = slowest.avg / fastest.avg;
+               return { title, isAuto, workerAvgs, fastest, slowest, ratio, gapPct: Math.round((ratio - 1) * 100) };
+             }).filter(Boolean).sort((a, b) => b.ratio - a.ratio);
+
+             // === 3) 並列実績ヒートマップ ===
+             // (自動工程キー, 手動工程キー) ペアの並列実行回数
+             const parallelPairs = {};  // `${autoTitle}::${manualTitle}` → count
+             completedLots.forEach(lot => {
+               const stepById = new Map((lot.steps || []).map(s => [s.id, s]));
+               const taskEvents = []; // { stepId, start, end }
+               Object.entries(lot.tasks || {}).forEach(([k, t]) => {
+                 if (!t.firstStartTime || !t.endTime) return;
+                 const parts = k.split('-');
+                 const unitIdxStr = parts.pop();
+                 const stepIdOrIdx = parts.join('-');
+                 const step = stepById.get(stepIdOrIdx) || (lot.steps || [])[parseInt(stepIdOrIdx)];
+                 if (!step) return;
+                 taskEvents.push({ stepTitle: step.title, isAuto: isAutoStep(step), start: t.firstStartTime, end: t.endTime });
+               });
+               // ペアごとに重複検出
+               for (let i = 0; i < taskEvents.length; i++) {
+                 for (let j = i + 1; j < taskEvents.length; j++) {
+                   const a = taskEvents[i], b = taskEvents[j];
+                   const overlap = Math.min(a.end, b.end) - Math.max(a.start, b.start);
+                   if (overlap < 5000) continue; // 5秒未満は誤差
+                   // 自動 + 手動 のペアのみカウント
+                   if (a.isAuto && !b.isAuto) parallelPairs[`${a.stepTitle}::${b.stepTitle}`] = (parallelPairs[`${a.stepTitle}::${b.stepTitle}`] || 0) + 1;
+                   else if (!a.isAuto && b.isAuto) parallelPairs[`${b.stepTitle}::${a.stepTitle}`] = (parallelPairs[`${b.stepTitle}::${a.stepTitle}`] || 0) + 1;
+                 }
+               }
+             });
+             const parallelRanking = Object.entries(parallelPairs)
+               .map(([k, count]) => { const [autoStep, manualStep] = k.split('::'); return { autoStep, manualStep, count }; })
+               .sort((a, b) => b.count - a.count);
+
+             // === 【D】作業者スキル係数 ===
+             // 各作業者について「標準(全作業者中央値)に対する自分の実績の比」の中央値を係数とする。
+             // 係数 < 1.0 = 速い / > 1.0 = 遅い。ETA・割当計画に使える指標。
+             const stepMedians = {}; // stepTitle → 全作業者の中央値
+             const stepWorkerSamples = {}; // stepTitle → { workerId: [durations] }
+             completedLots.forEach(lot => {
+               if (!lot.workerId) return;
+               (lot.steps || []).forEach((step, sIdx) => {
+                 if (isAutoStep(step)) return; // 手動のみ (自動は機械時間なのでスキル無関係)
+                 const title = step.title;
+                 for (let u = 0; u < (lot.quantity || 1); u++) {
+                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
+                   if (!t || t.status !== 'completed' || !t.duration) continue;
+                   if (!stepWorkerSamples[title]) stepWorkerSamples[title] = {};
+                   if (!stepWorkerSamples[title][lot.workerId]) stepWorkerSamples[title][lot.workerId] = [];
+                   stepWorkerSamples[title][lot.workerId].push(t.duration);
+                 }
+               });
+             });
+             const medianOf = (arr) => { if (!arr.length) return 0; const s = [...arr].sort((a,b)=>a-b); return s[Math.floor(s.length/2)]; };
+             Object.entries(stepWorkerSamples).forEach(([title, byW]) => {
+               const allDur = Object.values(byW).flat();
+               stepMedians[title] = medianOf(allDur);
+             });
+             const workerSkillFactors = (workers || []).map(w => {
+               const ratios = [];
+               let sampleTotal = 0;
+               Object.entries(stepWorkerSamples).forEach(([title, byW]) => {
+                 const myDurs = byW[w.id];
+                 const stdMed = stepMedians[title];
+                 if (myDurs && myDurs.length >= 2 && stdMed > 0) {
+                   ratios.push(medianOf(myDurs) / stdMed);
+                   sampleTotal += myDurs.length;
+                 }
+               });
+               if (ratios.length === 0) return null;
+               const factor = medianOf(ratios);
+               return { workerId: w.id, name: w.name, factor, stepCount: ratios.length, sampleTotal };
+             }).filter(Boolean).sort((a, b) => a.factor - b.factor);
+
+             // === 【F】ボトルネック分析 ===
+             // 各工程の「フロー全体への寄与時間」= 平均時間 × 総実施回数。
+             // 寄与が大きい = そこを改善すれば全体が一番速くなる律速工程。
+             const bottleneckMap = {}; // title → { title, isAuto, avgSec, count, totalContribSec }
+             completedLots.forEach(lot => {
+               (lot.steps || []).forEach((step, sIdx) => {
+                 const title = step.title;
+                 for (let u = 0; u < (lot.quantity || 1); u++) {
+                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
+                   if (!t || t.status !== 'completed' || !t.duration) continue;
+                   if (!bottleneckMap[title]) bottleneckMap[title] = { title, isAuto: isAutoStep(step), durations: [], count: 0 };
+                   bottleneckMap[title].durations.push(t.duration);
+                   bottleneckMap[title].count++;
+                 }
+               });
+             });
+             const bottlenecks = Object.values(bottleneckMap).map(b => {
+               const avgSec = Math.round(b.durations.reduce((a, c) => a + c, 0) / b.durations.length);
+               return { title: b.title, isAuto: b.isAuto, avgSec, count: b.count, totalContribSec: avgSec * b.count };
+             }).sort((a, b) => b.totalContribSec - a.totalContribSec);
+             const totalAllContrib = bottlenecks.reduce((a, b) => a + b.totalContribSec, 0);
+
+             const fmtSec = (s) => s >= 60 ? `${Math.floor(s/60)}分${s%60>0?(s%60)+'秒':''}` : `${s}秒`;
+
+             // AI 分析用ペイロード (上位データのみ送信)
+             const aiPayload = {
+               removalCandidates: removalCandidates.slice(0, 20).map(s => ({
+                 templateName: s.templateName,
+                 title: s.step.title,
+                 isAuto: s.isAuto,
+                 skipRate: s.skipRate,
+                 ngRate: s.ngRate,
+                 avgDuration: s.avgDuration,
+                 totalAppearances: s.totalAppearances,
+                 isFormality: s.isFormality,
+               })),
+               skillGaps: skillGaps.slice(0, 15).map(g => ({
+                 title: g.title,
+                 isAuto: g.isAuto,
+                 fastestWorker: g.fastest.workerName,
+                 fastestAvgSec: Math.round(g.fastest.avg),
+                 slowestWorker: g.slowest.workerName,
+                 slowestAvgSec: Math.round(g.slowest.avg),
+                 gapPct: g.gapPct,
+               })),
+               parallelRanking: parallelRanking.slice(0, 15),
+               workerSkillFactors: workerSkillFactors.map(w => ({ name: w.name, factor: Number(w.factor.toFixed(2)), stepCount: w.stepCount })),
+               bottlenecks: bottlenecks.slice(0, 10).map(b => ({ title: b.title, isAuto: b.isAuto, avgSec: b.avgSec, count: b.count, totalContribSec: b.totalContribSec })),
+               stats: {
+                 completedLotCount: completedLots.length,
+                 totalRemovalCandidates: removalCandidates.length,
+                 totalSkillGaps: skillGaps.length,
+                 totalParallelPairs: parallelRanking.length,
+               },
+             };
+
+             return (
+               <div className="space-y-8">
+                 {/* ガイド */}
+                 <div className="bg-indigo-50 border-l-4 border-indigo-500 rounded-r-lg p-3 text-sm text-indigo-900">
+                   <div className="font-bold flex items-center gap-2 mb-1"><Zap className="w-4 h-4"/> 改善ヒント</div>
+                   <div className="text-xs leading-relaxed">時間取りデータから自動的に「削除候補の工程」「スキル差の大きい工程」「並列実績のあるペア」を抽出して表示します。<br/>これらを元にテンプレートを精錬したり、教育・改善活動の優先順位を決めましょう。</div>
+                 </div>
+
+                 {/* === AI 深掘り分析 === */}
+                 <AIDeepAnalysisSection payload={aiPayload}/>
+
+                 {/* === 不要工程あぶり出し === */}
+                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                   <div className="flex items-center justify-between mb-3">
+                     <div>
+                       <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Trash2 className="w-5 h-5 text-rose-500"/> 不要工程候補 (該当なし率 + 形骸化検出)</h3>
+                       <div className="text-xs text-slate-500 mt-1">「該当なし」率が高い、または完了時間がほぼゼロの工程 = テンプレから削除を検討してもいい候補</div>
+                     </div>
+                   </div>
+                   {removalCandidates.length === 0 ? (
+                     <div className="text-slate-400 py-6 text-center">分析できる工程がありません (期間内に完了ロット 1件以上必要)</div>
+                   ) : (
+                     <div className="overflow-x-auto">
+                       <table className="w-full text-sm border-collapse">
+                         <thead>
+                           <tr className="bg-slate-50 border-b-2 border-slate-200">
+                             <th className="p-2 text-left font-bold">工程</th>
+                             <th className="p-2 text-left font-bold text-xs">テンプレ</th>
+                             <th className="p-2 text-right font-bold text-xs">該当なし率</th>
+                             <th className="p-2 text-right font-bold text-xs">不良率</th>
+                             <th className="p-2 text-right font-bold text-xs">平均時間</th>
+                             <th className="p-2 text-right font-bold text-xs">出現回数</th>
+                             <th className="p-2 text-left font-bold text-xs">判定</th>
+                           </tr>
+                         </thead>
+                         <tbody>
+                           {removalCandidates.slice(0, 30).map((s, i) => {
+                             const verdict = s.skipRate >= 80 ? '🔴 削除強推奨' : s.skipRate >= 50 ? '🟠 条件付き表示推奨' : s.isFormality ? '🟡 形骸化の疑い (時間ゼロ)' : s.ngRate >= 20 ? '✅ 残すべき (NG多)' : '🟢 通常';
+                             const bg = s.skipRate >= 80 ? 'bg-rose-50' : s.skipRate >= 50 ? 'bg-amber-50' : '';
+                             return (
+                               <tr key={i} className={`border-b border-slate-100 ${bg}`}>
+                                 <td className="p-2 font-bold text-slate-800 flex items-center gap-1">
+                                   {s.isAuto && <span className="bg-purple-500 text-white text-[9px] font-bold px-1 rounded">自動</span>}
+                                   {s.step.title}
+                                 </td>
+                                 <td className="p-2 text-xs text-slate-500 truncate max-w-[200px]">{s.templateName}</td>
+                                 <td className="p-2 text-right font-mono"><span className={s.skipRate >= 80 ? 'text-rose-700 font-bold' : s.skipRate >= 50 ? 'text-amber-700 font-bold' : 'text-slate-600'}>{s.skipRate}%</span></td>
+                                 <td className="p-2 text-right font-mono"><span className={s.ngRate >= 20 ? 'text-rose-700 font-bold' : 'text-slate-500'}>{s.ngRate}%</span></td>
+                                 <td className="p-2 text-right font-mono text-xs">{s.avgDuration > 0 ? fmtSec(s.avgDuration) : '–'}</td>
+                                 <td className="p-2 text-right font-mono text-xs text-slate-500">{s.totalAppearances}</td>
+                                 <td className="p-2 text-xs">{verdict}</td>
+                               </tr>
+                             );
+                           })}
+                         </tbody>
+                       </table>
+                       {removalCandidates.length > 30 && <div className="text-xs text-slate-400 mt-2 text-center">他 {removalCandidates.length - 30} 件 (上位30件のみ表示)</div>}
+                     </div>
+                   )}
+                 </div>
+
+                 {/* === 作業者スキル差 === */}
+                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                   <div className="flex items-center justify-between mb-3">
+                     <div>
+                       <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Users className="w-5 h-5 text-amber-500"/> 作業者スキル差 (教育機会の発見)</h3>
+                       <div className="text-xs text-slate-500 mt-1">同じ工程の作業時間を作業者別比較。差が大きい = 早い人が遅い人に教えられる機会</div>
+                     </div>
+                   </div>
+                   {skillGaps.length === 0 ? (
+                     <div className="text-slate-400 py-6 text-center">2人以上の作業者データが揃った工程がありません</div>
+                   ) : (
+                     <div className="space-y-2">
+                       {skillGaps.slice(0, 15).map((g, i) => (
+                         <div key={i} className="border border-slate-200 rounded-lg p-3 bg-slate-50/30">
+                           <div className="flex items-center justify-between mb-2">
+                             <div className="font-bold text-slate-800 flex items-center gap-1">
+                               {g.isAuto && <span className="bg-purple-500 text-white text-[9px] font-bold px-1 rounded">自動</span>}
+                               {g.title}
+                             </div>
+                             <div className="text-xs">
+                               <span className="bg-rose-100 text-rose-700 font-bold px-2 py-0.5 rounded-full">{g.gapPct > 0 ? `+${g.gapPct}%差` : '同等'}</span>
+                             </div>
+                           </div>
+                           <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 text-xs">
+                             {g.workerAvgs.map((w, wi) => {
+                               const isFast = wi === 0;
+                               const isSlow = wi === g.workerAvgs.length - 1 && g.workerAvgs.length > 1;
+                               const bar = Math.round((w.avg / g.slowest.avg) * 100);
+                               return (
+                                 <div key={wi} className="flex items-center gap-2">
+                                   <span className={`w-16 truncate font-bold ${isFast ? 'text-emerald-700' : isSlow ? 'text-rose-700' : 'text-slate-600'}`}>{isFast ? '🏆 ' : isSlow ? '🐢 ' : ''}{w.workerName}</span>
+                                   <div className="flex-1 bg-slate-200 rounded-full h-3 overflow-hidden">
+                                     <div className={`h-full ${isFast ? 'bg-emerald-500' : isSlow ? 'bg-rose-500' : 'bg-amber-500'}`} style={{ width: `${bar}%` }}></div>
+                                   </div>
+                                   <span className="font-mono text-slate-700 w-16 text-right">{fmtSec(Math.round(w.avg))}</span>
+                                   <span className="text-[10px] text-slate-400 w-12 text-right">n={w.sampleCount}</span>
+                                 </div>
+                               );
+                             })}
+                           </div>
+                         </div>
+                       ))}
+                     </div>
+                   )}
+                 </div>
+
+                 {/* === 並列実績ヒートマップ === */}
+                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                   <div className="flex items-center justify-between mb-3">
+                     <div>
+                       <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Layers className="w-5 h-5 text-purple-500"/> 並列実績 (自動工程 × 手動工程)</h3>
+                       <div className="text-xs text-slate-500 mt-1">実際に並列で実施された組合せ。回数が多い = 実証済みの効率的な作業パターン</div>
+                     </div>
+                   </div>
+                   {parallelRanking.length === 0 ? (
+                     <div className="text-slate-400 py-6 text-center">並列実績データがまだ蓄積されていません<br/><span className="text-xs">※ タスクに firstStartTime/endTime が記録された期間のデータが必要</span></div>
+                   ) : (
+                     <div className="overflow-x-auto">
+                       <table className="w-full text-sm border-collapse">
+                         <thead>
+                           <tr className="bg-purple-50 border-b-2 border-purple-200">
+                             <th className="p-2 text-left font-bold text-xs">🔧 自動工程</th>
+                             <th className="p-2 text-left font-bold text-xs">📝 並行された手動工程</th>
+                             <th className="p-2 text-right font-bold text-xs">実証回数</th>
+                             <th className="p-2 text-left font-bold text-xs">頻度バー</th>
+                           </tr>
+                         </thead>
+                         <tbody>
+                           {parallelRanking.slice(0, 30).map((p, i) => {
+                             const maxCount = parallelRanking[0]?.count || 1;
+                             const barPct = Math.round((p.count / maxCount) * 100);
+                             return (
+                               <tr key={i} className="border-b border-slate-100 hover:bg-purple-50/30">
+                                 <td className="p-2 font-bold text-purple-800">{p.autoStep}</td>
+                                 <td className="p-2 text-slate-700">{p.manualStep}</td>
+                                 <td className="p-2 text-right font-mono font-bold">{p.count}回</td>
+                                 <td className="p-2">
+                                   <div className="bg-slate-100 rounded-full h-2 w-32">
+                                     <div className="h-full bg-purple-500 rounded-full" style={{ width: `${barPct}%` }}></div>
+                                   </div>
+                                 </td>
+                               </tr>
+                             );
+                           })}
+                         </tbody>
+                       </table>
+                     </div>
+                   )}
+                 </div>
+
+                 {/* === 【D】作業者スキル係数 === */}
+                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                   <div className="mb-3">
+                     <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Users className="w-5 h-5 text-blue-500"/> 作業者スキル係数 (標準比)</h3>
+                     <div className="text-xs text-slate-500 mt-1">全工程の「標準時間(全員中央値)に対する自分の実績」の中央値。<b>1.0未満=速い / 超過=遅い</b>。割当計画・ETAの精度向上に使えます。</div>
+                   </div>
+                   {workerSkillFactors.length === 0 ? (
+                     <div className="text-slate-400 py-6 text-center text-sm">2件以上の実績がある作業者データがありません</div>
+                   ) : (
+                     <div className="space-y-2">
+                       {workerSkillFactors.map((w, i) => {
+                         const pct = Math.round(w.factor * 100);
+                         const isFast = w.factor < 0.9;
+                         const isSlow = w.factor > 1.15;
+                         const barW = Math.min(100, Math.round(w.factor / (workerSkillFactors[workerSkillFactors.length-1]?.factor || 2) * 100));
+                         return (
+                           <div key={i} className="flex items-center gap-2">
+                             <span className={`w-20 truncate font-bold text-sm ${isFast ? 'text-emerald-700' : isSlow ? 'text-rose-700' : 'text-slate-600'}`}>
+                               {isFast ? '🏆 ' : isSlow ? '🐢 ' : ''}{w.name}
+                             </span>
+                             <div className="flex-1 bg-slate-100 rounded-full h-5 overflow-hidden relative">
+                               <div className={`h-full ${isFast ? 'bg-emerald-500' : isSlow ? 'bg-rose-500' : 'bg-blue-400'}`} style={{ width: `${barW}%` }}/>
+                               <div className="absolute inset-0 flex items-center px-2 text-[11px] font-bold text-slate-700">
+                                 ×{w.factor.toFixed(2)} <span className="opacity-60 ml-1">({pct}%)</span>
+                               </div>
+                             </div>
+                             <span className="text-[10px] text-slate-400 w-24 text-right">{w.stepCount}工程 / {w.sampleTotal}件</span>
+                           </div>
+                         );
+                       })}
+                       <div className="text-[11px] text-slate-500 mt-2 bg-slate-50 rounded p-2 leading-relaxed">
+                         💡 例: 係数 0.7 の作業者は標準より3割速い → その人に任せれば ETA は目標×0.7。逆に 1.8 の新人は教育機会。<br/>
+                         この係数は今後 ETA・割当計画の精度向上に活用予定 (【D】応用フェーズ)。
+                       </div>
+                     </div>
+                   )}
+                 </div>
+
+                 {/* === 【F】ボトルネック分析 === */}
+                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                   <div className="mb-3">
+                     <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Timer className="w-5 h-5 text-rose-500"/> ボトルネック工程 (改善インパクト順)</h3>
+                     <div className="text-xs text-slate-500 mt-1">「平均時間 × 総実施回数 = フロー全体への寄与時間」が大きい順。<b>上位を改善すれば全体が最も速くなる</b>律速工程です。</div>
+                   </div>
+                   {bottlenecks.length === 0 ? (
+                     <div className="text-slate-400 py-6 text-center text-sm">完了データがありません</div>
+                   ) : (
+                     <div className="space-y-1.5">
+                       {bottlenecks.slice(0, 12).map((b, i) => {
+                         const sharePct = totalAllContrib > 0 ? Math.round(b.totalContribSec / totalAllContrib * 100) : 0;
+                         const barW = bottlenecks[0] ? Math.round(b.totalContribSec / bottlenecks[0].totalContribSec * 100) : 0;
+                         return (
+                           <div key={i} className="flex items-center gap-2 text-xs">
+                             <span className="w-5 text-center font-black text-slate-400">{i+1}</span>
+                             <span className="w-40 truncate font-bold text-slate-700 flex items-center gap-1" title={b.title}>
+                               {b.isAuto && <span className="bg-purple-500 text-white text-[8px] px-1 rounded shrink-0">自動</span>}
+                               {b.title}
+                             </span>
+                             <div className="flex-1 bg-slate-100 rounded-full h-5 overflow-hidden relative">
+                               <div className={`h-full ${i < 3 ? 'bg-rose-500' : 'bg-slate-400'}`} style={{ width: `${barW}%` }}/>
+                               <div className="absolute inset-0 flex items-center px-2 text-[11px] font-bold text-slate-700">
+                                 寄与 {fmtSec(b.totalContribSec)} <span className="opacity-60 ml-1">({sharePct}%)</span>
+                               </div>
+                             </div>
+                             <span className="text-[10px] text-slate-400 w-28 text-right">平均{fmtSec(b.avgSec)} × {b.count}回</span>
+                           </div>
+                         );
+                       })}
+                       <div className="text-[11px] text-slate-500 mt-2 bg-slate-50 rounded p-2 leading-relaxed">
+                         💡 上位3つ(赤)が改善の最優先。<b>自動工程</b>がボトルネックなら → オススメ順で並列吸収。<b>手動工程</b>なら → 標準化・教育・治具改善。
+                       </div>
+                     </div>
+                   )}
                  </div>
                </div>
              );
@@ -7190,10 +13132,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  lot.steps.forEach((step, idx) => {
                      let actualDuration = 0;
                      
-                     // 実績時間の算出
+                     // 実績時間の算出 (step.id ベースの新キー優先 + 数値index 旧キー fallback)
                      if (lot.tasks) {
-                         const taskKey = `${idx}-${unitIdx}`;
-                         const task = lot.tasks[taskKey];
+                         const task = (step.id && lot.tasks[`${step.id}-${unitIdx}`]) || lot.tasks[`${idx}-${unitIdx}`];
                          if (task && task.status === 'completed') {
                              actualDuration = task.duration;
                          }
@@ -7280,8 +13221,8 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                 lot.steps.forEach((step, idx) => {
                     let actualDuration = 0;
                     if (lot.tasks) {
-                        const taskKey = `${idx}-${unitIdx}`;
-                        const task = lot.tasks[taskKey];
+                        // step.id ベースの新キー優先 + 数値index 旧キー fallback
+                        const task = (step.id && lot.tasks[`${step.id}-${unitIdx}`]) || lot.tasks[`${idx}-${unitIdx}`];
                         if (task && task.status === 'completed') actualDuration = task.duration;
                     } else if (lot.stepTimes && lot.stepTimes[step.id]) {
                         actualDuration = Math.floor((lot.stepTimes[step.id] / 1000) / (lot.quantity || 1));
@@ -7343,7 +13284,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
         } else if (lot.tasks) {
           let total = 0, count = 0;
           Array.from({ length: lot.quantity || 1 }).forEach((_, uIdx) => {
-            const task = lot.tasks[`${idx}-${uIdx}`];
+            const task = (step.id && lot.tasks[`${step.id}-${uIdx}`]) || lot.tasks[`${idx}-${uIdx}`];
             if (task && task.status === 'completed') { total += task.duration; count++; }
           });
           duration = count > 0 ? Math.round(total / count) : 0;
@@ -7446,6 +13387,10 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
   const [draftDiagram, setDraftDiagram] = useState(null);
   const [draftCalcs, setDraftCalcs] = useState([]);
   const [draftArrows, setDraftArrows] = useState([]);
+  // 測定条件 (デフォルト): { params: [{key, value}], note }
+  // プリセット自体に「分割数 8」「角度 45°」などの規定条件を持たせられる。
+  // テンプレ側でさらに上書き可能、品質規格でさらに型式別上書き可能。
+  const [draftCondition, setDraftCondition] = useState({ params: [], note: '' });
 
   const initialCalc = (idx = 1) => ({
     id: `calc${idx}`, label: `計算${idx}`, method: 'max-min',
@@ -7468,6 +13413,7 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
     setDraftDiagram(null);
     setDraftCalcs([initialCalc(1)]);
     setDraftArrows([]);
+    setDraftCondition({ params: [], note: '' });
   };
 
   const startEdit = (kind, key) => {
@@ -7486,10 +13432,14 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
       ? src.calculations.map(c => ({ ...c }))
       : [initialCalc(1)]);
     setDraftArrows((src.arrows || []).map(a => ({ ...a })));
+    setDraftCondition(src.conditionPreset
+      ? { params: (src.conditionPreset.params || []).map(p => ({ ...p })), note: src.conditionPreset.note || '' }
+      : { params: [], note: '' });
   };
 
   const cancelEdit = () => {
     setEditTarget(null); setDraftLabel(''); setDraftInputs([]); setDraftDiagram(null); setDraftCalcs([]); setDraftArrows([]);
+    setDraftCondition({ params: [], note: '' });
   };
 
   const saveDraft = () => {
@@ -7519,7 +13469,16 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
         position: a.position, // { x, y } または null
         threshold: Number(a.threshold) || 0
       })),
-      ...(draftDiagram ? { diagramImage: draftDiagram } : {})
+      ...(draftDiagram ? { diagramImage: draftDiagram } : {}),
+      // 測定条件 (空でなければ保存)
+      ...((draftCondition.params?.some(p => p.key || p.value) || draftCondition.note)
+        ? {
+            conditionPreset: {
+              params: (draftCondition.params || []).filter(p => p.key || p.value).map(p => ({ key: p.key || '', value: p.value || '' })),
+              note: draftCondition.note || ''
+            }
+          }
+        : {})
     };
     if (editTarget.kind === 'builtin') {
       // 既存テンプレートの中で同じレイアウトキーを使っている工程を数える
@@ -7667,13 +13626,11 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
               <div className="space-y-3">
                 <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
                   <label className="block text-xs font-bold text-slate-500 mb-2">プレビュー</label>
-                  <div className="relative w-full h-72 bg-white border rounded overflow-hidden" style={draftDiagram ? { backgroundImage: `url(${draftDiagram})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}}>
-                    {draftInputs.map((inp, idx) => (
-                      <div key={idx} className="absolute bg-teal-500 text-white text-[10px] font-bold rounded-full w-7 h-7 flex items-center justify-center shadow-md" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }} title={inp.label}>
-                        {inp.label?.slice(0, 3) || (idx + 1)}
-                      </div>
-                    ))}
-                  </div>
+                  <MeasurementPreviewBox
+                    config={{ diagramImage: draftDiagram, inputs: draftInputs, layout: 'custom' }}
+                    variant="large"
+                    maxHeight={288}
+                  />
                 </div>
                 <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
                   <label className="block text-xs font-bold text-slate-500 mb-2">測定図面画像 (任意)</label>
@@ -7935,6 +13892,72 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
                 {draftArrows.length === 0 && <div className="text-[10px] text-amber-700 text-center py-2">「+ 矢印を追加」で 2つの値を比較できる矢印を追加できます (例: 左の通り vs 右の通り)</div>}
               </div>
             </div>
+
+            {/* 測定条件 (デフォルト) - プリセット自体に既定の段取り条件を持たせる */}
+            <div className="bg-purple-50 border border-purple-200 rounded-lg p-3">
+              <div className="flex justify-between items-center mb-1.5">
+                <label className="text-xs font-bold text-purple-900 flex items-center gap-1.5">
+                  <ListChecks className="w-3.5 h-3.5"/> 測定条件 (プリセット既定)
+                  <span className="text-[10px] font-normal text-purple-600 ml-1">作業者に表示する段取り条件</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setDraftCondition({ params: [...(draftCondition.params || []), { key: '', value: '' }], note: draftCondition.note || '' })}
+                  className="bg-purple-500 hover:bg-purple-600 text-white px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1"
+                ><Plus className="w-3 h-3"/> 条件を追加</button>
+              </div>
+              <p className="text-[10px] text-slate-500 mb-2">
+                例: 分割数, 角度刻み, 評価種別 (ウォーム/ピニオン) など。<br/>
+                適用優先順位: <span className="font-bold text-indigo-700">品質規格</span> &gt; テンプレ工程の条件 &gt; <span className="font-bold text-purple-700">このプリセット既定</span>
+              </p>
+              <div className="space-y-1.5">
+                {(draftCondition.params || []).map((p, idx) => (
+                  <div key={idx} className="flex gap-2 items-center">
+                    <input
+                      value={p.key || ''}
+                      onChange={e => {
+                        const params = [...(draftCondition.params || [])];
+                        params[idx] = { ...params[idx], key: e.target.value };
+                        setDraftCondition({ ...draftCondition, params });
+                      }}
+                      placeholder="項目名 (例: 分割数)"
+                      className="flex-1 border rounded p-1 text-xs"
+                    />
+                    <input
+                      value={p.value || ''}
+                      onChange={e => {
+                        const params = [...(draftCondition.params || [])];
+                        params[idx] = { ...params[idx], value: e.target.value };
+                        setDraftCondition({ ...draftCondition, params });
+                      }}
+                      placeholder="値 (例: 8)"
+                      className="flex-1 border rounded p-1 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const params = (draftCondition.params || []).filter((_, i) => i !== idx);
+                        setDraftCondition({ ...draftCondition, params });
+                      }}
+                      className="text-rose-400 hover:text-rose-600 p-1"
+                    ><X className="w-3 h-3"/></button>
+                  </div>
+                ))}
+                {(!draftCondition.params || draftCondition.params.length === 0) && (
+                  <div className="text-[10px] text-purple-700 text-center py-2">「+ 条件を追加」で項目を追加できます (任意・空のままでも OK)</div>
+                )}
+              </div>
+              <div className="mt-2">
+                <label className="block text-[10px] text-slate-500 mb-0.5">条件メモ (自由記述)</label>
+                <textarea
+                  value={draftCondition.note || ''}
+                  onChange={e => setDraftCondition({ ...draftCondition, note: e.target.value })}
+                  className="w-full border rounded p-1.5 text-xs"
+                  rows={2}
+                  placeholder="例: ホイール45°毎、ウォーム評価あり、温度23°C基準"
+                />
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -7959,6 +13982,9 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
             {v.inputs?.length || 0}点
             {v.calculations?.length > 0 && ` ・計算${v.calculations.length}件`}
             {v.diagramImage && ' ・図面付き'}
+            {v.conditionPreset && ((v.conditionPreset.params && v.conditionPreset.params.length > 0) || v.conditionPreset.note) && (
+              <span className="ml-1 text-[10px] bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-bold">条件あり</span>
+            )}
           </div>
         </div>
         <div className="relative w-24 h-16 bg-white border rounded overflow-hidden hidden md:block" style={v.diagramImage ? { backgroundImage: `url(${v.diagramImage})`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } : {}}>
@@ -8027,7 +14053,212 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
   );
 };
 
- const TemplatesView = ({ editingTemplate, setEditingTemplate, handleSaveTemplate, workers, saveData, deleteData, templates, lots = [], handleExcelImport, handleExcelDownload, handleBackupExport, handleBackupImport, excelInputRef, backupInputRef, settings, saveSettings, mapZones }) => {
+// テンプレート管理: 検索 / フィルタ / 並び替えサポート
+const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplate, deleteData, handleExcelImport, handleExcelDownload, handleBackupExport, handleBackupImport, excelInputRef, backupInputRef }) => {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [sortOrder, setSortOrder] = useState('name_asc'); // name_asc | name_desc | steps_desc | steps_asc | recent | usage_desc
+  // フィルタ (multi-select)
+  const [filterFeatures, setFilterFeatures] = useState([]); // ['measurement','checklist','image','pdf']
+  const [showFilters, setShowFilters] = useState(false);
+
+  // テンプレートID別の使用ロット数を集計 (履歴含む)
+  const usageMap = useMemo(() => {
+    const map = {};
+    (lots || []).forEach(l => { if (l.templateId) map[l.templateId] = (map[l.templateId] || 0) + 1; });
+    return map;
+  }, [lots]);
+
+  // テンプレートの特徴 (どの種類の工程を持つか)
+  const featureMap = useMemo(() => {
+    const map = {};
+    templates.forEach(t => {
+      const features = new Set();
+      (t.steps || []).forEach(s => {
+        if (s.type === 'measurement' && s.measurementConfig) features.add('measurement');
+        if (Array.isArray(s.checklistItems) && s.checklistItems.length > 0) features.add('checklist');
+        if (s.images && s.images.length > 0) features.add('image');
+        if (s.pdfData) features.add('pdf');
+        if (s.type === 'important') features.add('important');
+        if (s.type === 'danger') features.add('danger');
+      });
+      map[t.id] = features;
+    });
+    return map;
+  }, [templates]);
+
+  const toggleFilter = (key) => {
+    setFilterFeatures(prev => prev.includes(key) ? prev.filter(f => f !== key) : [...prev, key]);
+  };
+
+  const filteredTemplates = useMemo(() => {
+    let list = [...templates];
+    // 検索 (テンプレ名 + 工程タイトルにヒット)
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      list = list.filter(t => {
+        if ((t.name || '').toLowerCase().includes(q)) return true;
+        return (t.steps || []).some(s => (s.title || '').toLowerCase().includes(q));
+      });
+    }
+    // フィルタ (AND: 選択された全特徴を持つ)
+    if (filterFeatures.length > 0) {
+      list = list.filter(t => {
+        const features = featureMap[t.id] || new Set();
+        return filterFeatures.every(f => features.has(f));
+      });
+    }
+    // 並び替え
+    list.sort((a, b) => {
+      const collator = new Intl.Collator('ja');
+      if (sortOrder === 'name_asc') return collator.compare(a.name || '', b.name || '');
+      if (sortOrder === 'name_desc') return collator.compare(b.name || '', a.name || '');
+      if (sortOrder === 'steps_desc') return (b.steps?.length || 0) - (a.steps?.length || 0);
+      if (sortOrder === 'steps_asc') return (a.steps?.length || 0) - (b.steps?.length || 0);
+      if (sortOrder === 'recent') return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+      if (sortOrder === 'usage_desc') return (usageMap[b.id] || 0) - (usageMap[a.id] || 0);
+      return 0;
+    });
+    return list;
+  }, [templates, searchQuery, sortOrder, filterFeatures, featureMap, usageMap]);
+
+  const FEATURE_LABELS = {
+    measurement: { label: '測定あり', color: 'bg-teal-100 text-teal-700 border-teal-300', icon: '📏' },
+    checklist:   { label: 'チェックあり', color: 'bg-purple-100 text-purple-700 border-purple-300', icon: '☑' },
+    image:       { label: '画像あり', color: 'bg-blue-100 text-blue-700 border-blue-300', icon: '🖼' },
+    pdf:         { label: 'PDFあり', color: 'bg-orange-100 text-orange-700 border-orange-300', icon: '📄' },
+    important:   { label: '重要工程', color: 'bg-amber-100 text-amber-700 border-amber-300', icon: '⚠' },
+    danger:      { label: '危険工程', color: 'bg-rose-100 text-rose-700 border-rose-300', icon: '🔴' },
+  };
+
+  return (
+    <div className="p-8 max-w-5xl mx-auto space-y-6 h-full overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="font-bold text-lg flex items-center gap-2"><ClipboardList className="w-5 h-5" /> 工程テンプレート管理</h3>
+          <div className="flex gap-2">
+            <label className="text-xs flex items-center gap-1 cursor-pointer bg-green-50 text-green-700 px-3 py-2 rounded border border-green-200 hover:bg-green-100"><FileUp className="w-4 h-4"/> Excel取込<input type="file" ref={excelInputRef} accept=".xlsx" onChange={handleExcelImport} className="hidden"/></label>
+            <button onClick={handleBackupExport} className="text-xs flex items-center gap-1 bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><DownloadCloud className="w-4 h-4"/> バックアップ</button>
+            <label className="text-xs flex items-center gap-1 cursor-pointer bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><RefreshCw className="w-4 h-4"/> 復元<input type="file" ref={backupInputRef} accept=".json" onChange={handleBackupImport} className="hidden"/></label>
+          </div>
+        </div>
+
+        {/* 検索 + 並び替え + フィルタトグル */}
+        <div className="flex flex-wrap gap-2 mb-3 items-center">
+          <div className="flex items-center gap-1.5 bg-white border rounded-lg px-2 py-1.5 shadow-sm flex-1 min-w-[200px]">
+            <Search className="w-4 h-4 text-slate-400 shrink-0"/>
+            <input
+              type="text"
+              placeholder="テンプレ名 / 工程名で検索..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="flex-1 text-sm outline-none font-medium text-slate-700"
+            />
+            {searchQuery && (
+              <button onClick={() => setSearchQuery('')} className="text-slate-400 hover:text-slate-600"><X className="w-3.5 h-3.5"/></button>
+            )}
+          </div>
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-600">
+            <ArrowUpDown className="w-4 h-4"/> 並び:
+            <select value={sortOrder} onChange={(e) => setSortOrder(e.target.value)} className="border rounded px-2 py-1.5 bg-slate-50 text-slate-800 text-xs">
+              <option value="name_asc">名前 (昇順 A→Z)</option>
+              <option value="name_desc">名前 (降順 Z→A)</option>
+              <option value="steps_desc">工程数 (多い順)</option>
+              <option value="steps_asc">工程数 (少ない順)</option>
+              <option value="usage_desc">使用ロット数 (多い順)</option>
+              <option value="recent">最近更新順</option>
+            </select>
+          </div>
+          <button
+            onClick={() => setShowFilters(!showFilters)}
+            className={`relative px-3 py-1.5 text-xs font-bold rounded-lg border shadow-sm flex items-center gap-1.5 ${showFilters || filterFeatures.length > 0 ? 'border-indigo-400 text-indigo-700 bg-indigo-50' : 'bg-white text-slate-700 hover:bg-slate-50'}`}
+          >
+            <Filter className="w-3.5 h-3.5"/> フィルタ
+            {filterFeatures.length > 0 && (
+              <span className="bg-indigo-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full min-w-[18px] text-center">{filterFeatures.length}</span>
+            )}
+          </button>
+        </div>
+
+        {/* フィルタパネル */}
+        {showFilters && (
+          <div className="bg-indigo-50/50 border border-indigo-200 rounded-lg p-3 mb-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold text-indigo-700">含まれる要素で絞り込み (複数選択可・AND)</span>
+              {filterFeatures.length > 0 && (
+                <button onClick={() => setFilterFeatures([])} className="text-[10px] text-rose-600 hover:bg-rose-50 px-2 py-0.5 rounded font-bold border border-rose-200">✕ クリア</button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {Object.entries(FEATURE_LABELS).map(([key, info]) => {
+                const active = filterFeatures.includes(key);
+                const count = templates.filter(t => (featureMap[t.id] || new Set()).has(key)).length;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => toggleFilter(key)}
+                    className={`text-xs px-2.5 py-1 rounded-full border-2 font-bold transition-colors inline-flex items-center gap-1 ${active ? info.color.replace('100', '500').replace('text-', 'text-white border-').replace('700', '600') : `${info.color} hover:opacity-80`}`}
+                    style={active ? { backgroundColor: '#4f46e5', color: 'white', borderColor: '#4338ca' } : {}}
+                  >
+                    <span>{info.icon}</span>{info.label}
+                    <span className={`text-[10px] px-1 rounded ${active ? 'bg-white/30' : 'bg-white/60'}`}>{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* 件数表示 */}
+        <div className="text-[11px] text-slate-500 mb-2">
+          表示: <span className="font-bold text-slate-700">{filteredTemplates.length}</span> 件
+          {(searchQuery || filterFeatures.length > 0) && <span className="ml-2">/ 全 {templates.length} 件</span>}
+        </div>
+
+        <button onClick={() => setEditingTemplate({ id: '', name: '', steps: [] })} className="w-full py-3 border-2 border-dashed border-slate-300 rounded-lg text-slate-500 hover:border-blue-500 font-bold mb-4">+ 新規テンプレート作成</button>
+
+        <div className="space-y-3">
+          {filteredTemplates.length === 0 ? (
+            <div className="text-center text-slate-400 py-12">
+              <Search className="w-12 h-12 mx-auto mb-2 opacity-30"/>
+              <p>該当するテンプレートがありません</p>
+              {(searchQuery || filterFeatures.length > 0) && (
+                <button onClick={() => { setSearchQuery(''); setFilterFeatures([]); }} className="mt-2 text-xs text-blue-600 hover:underline">検索・フィルタをクリア</button>
+              )}
+            </div>
+          ) : filteredTemplates.map(t => {
+            const usage = usageMap[t.id] || 0;
+            const features = featureMap[t.id] || new Set();
+            return (
+              <div key={t.id} className="border rounded-lg p-4 flex justify-between items-center group hover:border-blue-300 transition-colors cursor-pointer" onClick={() => setEditingTemplate(t)}>
+                <div className="flex-1 min-w-0">
+                  <div className="font-bold text-slate-800 group-hover:text-blue-600 truncate">{t.name}</div>
+                  <div className="text-xs text-slate-500 mt-1 flex items-center gap-2 flex-wrap">
+                    <span>全 {t.steps?.length || 0} 工程</span>
+                    {usage > 0 && <span className="text-blue-600 font-bold">・使用ロット {usage}件</span>}
+                    {Array.from(features).map(f => {
+                      const info = FEATURE_LABELS[f];
+                      return info ? (
+                        <span key={f} className={`text-[10px] ${info.color} border rounded px-1.5 py-0.5 font-bold`}>{info.icon} {info.label}</span>
+                      ) : null;
+                    })}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 ml-2">
+                  <button onClick={(e) => { e.stopPropagation(); handleExcelDownload(t); }} className="p-2 text-slate-400 hover:text-emerald-600 bg-slate-50 rounded" title="Excel出力"><FileSpreadsheet className="w-4 h-4"/></button>
+                  <button onClick={(e) => { e.stopPropagation(); setEditingTemplate({ ...t, id: '', name: t.name + ' (コピー)', steps: t.steps?.map(s => ({...s, id: generateId()})) || [] }); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="複製"><Copy className="w-4 h-4"/></button>
+                  <button onClick={(e) => { e.stopPropagation(); setEditingTemplate(t); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="編集"><Pencil className="w-4 h-4"/></button>
+                  <button onClick={(e) => { e.stopPropagation(); if (confirm(`テンプレ「${t.name}」を削除しますか？`)) deleteData('templates', t.id); }} className="p-2 text-slate-400 hover:text-rose-600 bg-slate-50 rounded" title="削除"><Trash2 className="w-4 h-4"/></button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+ const TemplatesView = ({ editingTemplate, setEditingTemplate, handleSaveTemplate, workers, saveData, deleteData, templates, lots = [], handleExcelImport, handleExcelDownload, handleBackupExport, handleBackupImport, excelInputRef, backupInputRef, settings, saveSettings, mapZones, deleteSettingsFields }) => {
   const [newProcessOpt, setNewProcessOpt] = useState('');
   const defectProcessOptions = settings?.defectProcessOptions || DEFAULT_DEFECT_PROCESS_OPTIONS;
   const [localZones, setLocalZones] = useState(mapZones || INITIAL_MAP_ZONES);
@@ -8074,9 +14305,54 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
   useEffect(() => { setComplaintOptionsText((settings?.complaintOptions || DEFAULT_COMPLAINT_OPTIONS).join('\n')); }, [settings?.complaintOptions]);
   useEffect(() => { setLocalVoiceCommands(settings?.voiceCommands || DEFAULT_VOICE_COMMANDS); }, [settings?.voiceCommands]);
 
+  // 矩形の重なり判定
+  const rectsOverlap = (a, b) => !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+
   const handleAddZone = () => {
-    const newZone = { id: `zone_${generateId()}`, name: '新しいエリア', x: 10, y: 10, w: 20, h: 30, color: ZONE_COLORS[0].class };
+    // 既存ゾーンと被らない位置を探す: 4列×複数行のグリッドで候補位置を試す
+    const newW = 24;
+    const newH = 30;
+    let placed = null;
+    // 候補グリッド: 列=0,25,50,75% / 行=0,30,60,90%...
+    outer:
+    for (let row = 0; row < 10; row++) {
+      const y = row * 30;
+      if (y + newH > 100) break;
+      for (let col = 0; col < 4; col++) {
+        const x = col * 25;
+        if (x + newW > 100) break;
+        const candidate = { x, y, w: newW, h: newH };
+        const overlap = localZones.some(z => rectsOverlap(candidate, { x: z.x, y: z.y, w: z.w, h: z.h }));
+        if (!overlap) { placed = candidate; break outer; }
+      }
+    }
+    // 空きスペースなし → 末尾に積む (高さ調整)
+    if (!placed) {
+      const maxBottom = Math.max(0, ...localZones.map(z => z.y + z.h));
+      placed = { x: 0, y: Math.min(70, maxBottom), w: newW, h: newH };
+    }
+    const newZone = { id: `zone_${generateId()}`, name: '新しいエリア', ...placed, color: ZONE_COLORS[0].class };
     setLocalZones([...localZones, newZone]);
+  };
+
+  // 既存ゾーンを自動でタイル詰め配置 (重なり解消用)
+  const handleAutoArrangeZones = () => {
+    if (localZones.length === 0) return;
+    if (!confirm(`${localZones.length}件のエリアを自動でタイル詰め配置します。\n現在の x,y,w,h は上書きされます。続行しますか？`)) return;
+    // 4列の自動グリッド (件数に応じて自動調整)
+    const n = localZones.length;
+    const cols = n <= 4 ? n : (n <= 8 ? 4 : Math.ceil(Math.sqrt(n)));
+    const rows = Math.ceil(n / cols);
+    const w = 100 / cols;
+    const h = 100 / rows;
+    const arranged = localZones.map((z, i) => ({
+      ...z,
+      x: (i % cols) * w,
+      y: Math.floor(i / cols) * h,
+      w,
+      h,
+    }));
+    setLocalZones(arranged);
   };
   const handleUpdateZone = (id, field, value) => { setLocalZones(localZones.map(z => z.id === id ? { ...z, [field]: value } : z)); };
   const handleDeleteZone = (id) => { if (confirm('このエリアを削除しますか？')) setLocalZones(localZones.filter(z => z.id !== id)); };
@@ -8200,7 +14476,7 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
                        ))}
                      </div>
                      <div className="flex gap-2">
-                       <input id={`combo-preset-add-${preset.id}`} className="flex-1 border rounded px-2 py-1.5 text-sm" placeholder="値を追加..." onKeyDown={e => { if (e.key === 'Enter') { const el = e.target; if (el.value.trim()) { const np = [...localComboPresets]; np[pIdx] = { ...np[pIdx], values: [...(np[pIdx].values || []), el.value.trim()] }; setLocalComboPresets(np); el.value = ''; } } }}/>
+                       <input id={`combo-preset-add-${preset.id}`} className="flex-1 border rounded px-2 py-1.5 text-sm" placeholder="値を追加..." onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { const el = e.target; if (el.value.trim()) { const np = [...localComboPresets]; np[pIdx] = { ...np[pIdx], values: [...(np[pIdx].values || []), el.value.trim()] }; setLocalComboPresets(np); el.value = ''; } } }}/>
                        <button onClick={() => { const el = document.getElementById(`combo-preset-add-${preset.id}`); if (el && el.value.trim()) { const np = [...localComboPresets]; np[pIdx] = { ...np[pIdx], values: [...(np[pIdx].values || []), el.value.trim()] }; setLocalComboPresets(np); el.value = ''; } }} className="bg-amber-500 text-white px-3 py-1.5 rounded text-sm font-bold hover:bg-amber-600">追加</button>
                      </div>
                      <div className="flex gap-2 pt-1 border-t">
@@ -8232,6 +14508,45 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><Type className="w-5 h-5 text-blue-600" /> 文字サイズ設定</h3>
            <p className="text-xs text-slate-400 mb-4">各エリアの文字サイズを調整できます（100%が標準）</p>
+
+           {/* 現場マップのエリア名サイズ (px 単位で直接指定) */}
+           <div className="mb-4 p-3 bg-blue-50/50 rounded-lg border border-blue-200">
+             <div className="flex items-center gap-4">
+               <div className="w-40 shrink-0">
+                 <div className="text-sm font-bold text-slate-700">現場マップ エリア名</div>
+                 <div className="text-[10px] text-slate-400">中間分割 / 完品分割 などのゾーン見出し</div>
+               </div>
+               <input
+                 type="range"
+                 min={10} max={28} step={1}
+                 value={settings.mapZoneNameSize || 14}
+                 onChange={e => saveSettings({ mapZoneNameSize: parseInt(e.target.value) })}
+                 className="flex-1 h-2 accent-blue-600"
+               />
+               <div className="w-20 flex items-center gap-1">
+                 <input
+                   type="number" min={10} max={28} step={1}
+                   value={settings.mapZoneNameSize || 14}
+                   onChange={e => {
+                     const v = Math.min(28, Math.max(10, parseInt(e.target.value) || 14));
+                     saveSettings({ mapZoneNameSize: v });
+                   }}
+                   className="w-14 border rounded p-1 text-center text-sm"
+                 />
+                 <span className="text-xs text-slate-400">px</span>
+               </div>
+               {(settings.mapZoneNameSize || 14) !== 14 && (
+                 <button
+                   onClick={() => saveSettings({ mapZoneNameSize: 14 })}
+                   className="text-xs text-slate-400 hover:text-blue-600 px-1"
+                   title="リセット (14px)"
+                 >
+                   <Undo2 className="w-3.5 h-3.5" />
+                 </button>
+               )}
+             </div>
+           </div>
+
            <div className="space-y-4">
              {FONT_SIZE_AREAS.map(area => {
                const currentVal = (settings.fontSizes || {})[area.key] || area.default;
@@ -8294,16 +14609,117 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
            </div>
          </div>
 
-         {/* 型式別 公差・基準値オーバーライド設定 */}
+         {/* 型式別 公差・基準値オーバーライド設定 (レガシー) */}
+         {/* 勤務時間マスタ (始業・定時・残業・休憩) — 負荷計算で使用 */}
+         <WorkScheduleSettingsPanel workSchedule={settings.workSchedule} saveSettings={saveSettings} workloadEffectiveWorkers={settings.workloadEffectiveWorkers} registeredWorkerCount={workers.length} />
+
+         {/* 作業順ガイド・厳密モード推奨しきい値 (管理者向け) */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
+             <ShieldCheck className="w-5 h-5 text-rose-600" /> 作業順ガイド・厳密モード
+           </h3>
+           <p className="text-xs text-slate-500 mb-4">
+             同じテンプレートの<b>完了ロット</b>がこの件数以上たまると、作業画面と管理ダッシュボードで「厳密モードを推奨」と通知します（実際の有効化は管理者がテンプレ単位で行います）。<br/>
+             <b>厳密モード ON</b> = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。
+           </p>
+           <div className="flex items-end gap-3 flex-wrap">
+             <div>
+               <label className="block text-xs font-bold text-slate-600 mb-1">厳密モード推奨しきい値（完了ロット数）</label>
+               <input type="number" min="1" max="999"
+                 value={settings.strictModeThreshold ?? 5}
+                 onChange={e => saveSettings({ strictModeThreshold: Math.max(1, Math.min(999, Number(e.target.value) || 1)) })}
+                 className="border rounded p-2 text-sm w-32" />
+             </div>
+             <span className="text-xs text-slate-400 pb-2.5">現在: 同テンプレ完了 <b>{settings.strictModeThreshold ?? 5}</b> 件以上で推奨通知</span>
+           </div>
+         </div>
+
          <MeasurementOverridesPanel templates={templates} lots={lots} measurementOverrides={settings.measurementOverrides || {}} saveSettings={saveSettings} />
+
+         {/* 品質規格マスタ (新方式: 型式 → 品質規格 → 公差/測定条件) */}
+         <div data-qs-panel>
+           <QualityStandardsPanel
+             templates={templates}
+             lots={lots}
+             qualityStandards={settings.qualityStandards || {}}
+             modelStandardMap={settings.modelStandardMap || {}}
+             saveSettings={saveSettings}
+             deleteSettingsFields={deleteSettingsFields}
+           />
+         </div>
+
+         {/* ロットカード表示項目設定 */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
+             <LayoutGrid className="w-5 h-5 text-blue-600" /> ロットカード 表示項目
+           </h3>
+           <p className="text-xs text-slate-500 mb-4">
+             現場マップ・作業予定・検査リストなどで表示するロットカードの内容をカスタマイズできます。<br/>
+             OFF にした項目は表示されなくなり、カードがコンパクトになります。
+           </p>
+           {(() => {
+             const cur = { ...DEFAULT_LOT_CARD_DISPLAY, ...(settings.lotCardDisplay || {}) };
+             const updateField = (key, val) => {
+               saveSettings({ lotCardDisplay: { ...cur, [key]: val } });
+             };
+             const fieldList = [
+               { key: 'orderNo', label: '指図番号' },
+               { key: 'model', label: '型式' },
+               { key: 'quantity', label: '台数' },
+               { key: 'templateName', label: 'テンプレ名' },
+               { key: 'entryTime', label: '入荷時刻' },
+               { key: 'workerBadge', label: '担当者バッジ' },
+               { key: 'elapsedTime', label: '経過/合計時間' },
+               { key: 'progressPct', label: '進捗 %' },
+               { key: 'nextStep', label: '次工程名' },
+               { key: 'timeRange', label: '予測時間範囲 (開始〜ETA)' },
+               { key: 'delayStatus', label: '遅延ラベル' },
+               { key: 'progressBar', label: '下部の進捗バー' },
+             ];
+             return (
+               <>
+                 <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-4">
+                   {fieldList.map(f => (
+                     <label key={f.key} className="flex items-center gap-2 p-2 border rounded hover:bg-slate-50 cursor-pointer">
+                       <input
+                         type="checkbox"
+                         checked={cur[f.key] !== false}
+                         onChange={e => updateField(f.key, e.target.checked)}
+                         className="w-4 h-4 accent-blue-600"
+                       />
+                       <span className="text-sm font-bold text-slate-700">{f.label}</span>
+                     </label>
+                   ))}
+                 </div>
+                 <div className="flex gap-2 justify-end">
+                   <button
+                     type="button"
+                     onClick={() => saveSettings({ lotCardDisplay: { orderNo: true, model: true, quantity: true, workerBadge: true, progressBar: true, templateName: false, entryTime: false, elapsedTime: false, progressPct: false, nextStep: false, timeRange: false, delayStatus: false } })}
+                     className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded font-bold"
+                   >
+                     最小表示 (5項目)
+                   </button>
+                   <button
+                     type="button"
+                     onClick={() => saveSettings({ lotCardDisplay: { ...DEFAULT_LOT_CARD_DISPLAY } })}
+                     className="text-xs bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 px-3 py-1.5 rounded font-bold flex items-center gap-1"
+                   >
+                     <Undo2 className="w-3 h-3"/> 全表示 (デフォルト)
+                   </button>
+                 </div>
+               </>
+             );
+           })()}
+         </div>
 
          {/* 作業エリア設定 */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <div className="flex justify-between items-center mb-6">
              <h3 className="text-xl font-bold flex items-center gap-2 text-slate-800"><MapIcon className="w-6 h-6 text-blue-600" /> 作業エリア設定</h3>
            </div>
-           <div className="mb-6 flex gap-2">
+           <div className="mb-6 flex gap-2 flex-wrap">
              <button onClick={handleAddZone} className="bg-emerald-600 text-white px-4 py-2 rounded-lg font-bold shadow hover:bg-emerald-700 flex items-center gap-2 text-sm"><Plus className="w-4 h-4" /> 新しいエリアを追加</button>
+             <button onClick={handleAutoArrangeZones} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold shadow hover:bg-blue-700 flex items-center gap-2 text-sm" title="全エリアを自動でタイル詰め配置 (重なり解消)"><LayoutGrid className="w-4 h-4" /> 自動タイル配置</button>
            </div>
            <div className="space-y-3">
              {localZones.map((zone, idx) => (
@@ -8445,33 +14861,379 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
 };
 
 // --- Completed History View ---
+// =====================================================================
+// 作業順最適化モーダル
+// - ルールベース: 自動工程の所要時間内に手動工程を詰める
+// - AI モード: Gemini に最適順を生成させる (VITE_GEMINI_API_KEY 必須)
+// - シミュレーション: シーケンシャル vs 最適化 のバー比較
+// =====================================================================
+const WorkOrderOptimizerModal = ({ lot, lots, templates = [], currentExecutionType = 'custom', onSwitchToCustom = null, onApplyToTemplate = null, onApplyToLot = null, onClose }) => {
+  const [mode, setMode] = useState('rule'); // 'rule' | 'ai' | 'sim'
+  const [aiResult, setAiResult] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState(null);
+  const [applyStatus, setApplyStatus] = useState(null); // 'applying' | 'applied' | 'error:...'
+  // 現在のモードに応じた表示制御
+  const isSequential = currentExecutionType === 'sequential';
+  const isInitial = currentExecutionType === 'initial';
+  // テンプレ情報
+  const lotTemplate = (templates || []).find(t => t.id === lot?.templateId);
+
+  // 同テンプレートの完了ロットを実績データソースに
+  const sameTemplateLots = useMemo(() => {
+    if (!lot) return [];
+    return (lots || []).filter(l =>
+      l.id !== lot.id &&
+      l.status === 'completed' &&
+      l.templateId === lot.templateId
+    );
+  }, [lot, lots]);
+
+  const analysis = useMemo(() => {
+    if (!lot?.steps) return null;
+    return analyzeWorkOrder(lot.steps, sameTemplateLots, { quantity: lot.quantity || 1 });
+  }, [lot, sameTemplateLots]);
+
+  const handleRunAi = async () => {
+    if (!analysis) return;
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const result = await requestGeminiWorkOrder(analysis);
+      setAiResult(result);
+    } catch (e) {
+      setAiError(e.message || String(e));
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  if (!lot) return null;
+
+  const fmtSec = (sec) => {
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return m > 0 ? `${m}分${s > 0 ? s + '秒' : ''}` : `${s}秒`;
+  };
+
+  // バー描画用最大値
+  const maxBarSec = analysis ? Math.max(analysis.serialTotalSec, analysis.optimalTotalSec, 1) : 1;
+  const barW = (sec) => `${Math.round((sec / maxBarSec) * 100)}%`;
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-[140] flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-4 border-b flex items-center justify-between bg-gradient-to-r from-indigo-50 to-purple-50">
+          <div>
+            <div className="text-xs text-indigo-700 font-bold">作業順最適化</div>
+            <div className="text-lg font-black text-slate-800">{lot.orderNo} {lot.model} <span className="text-sm font-normal text-slate-500">/ {lot.quantity || 1}台</span></div>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-lg"><X className="w-5 h-5"/></button>
+        </div>
+
+        <div className="px-5 pt-3 flex gap-2 border-b">
+          {[
+            { id: 'rule', label: '🧮 ルールベース', desc: '実績データから自動算出' },
+            { id: 'ai', label: '🤖 AI生成', desc: 'Gemini に提案させる' },
+            { id: 'sim', label: '📊 シミュレーション', desc: '時短効果を可視化' },
+          ].map(t => (
+            <button key={t.id} onClick={() => setMode(t.id)}
+              className={`px-4 py-2 -mb-px border-b-2 text-sm font-bold transition-colors ${mode === t.id ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-slate-500 hover:text-slate-700'}`}
+              title={t.desc}>{t.label}</button>
+          ))}
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-5">
+          {!analysis && <div className="text-center text-slate-400 py-12">テンプレートデータがありません</div>}
+
+          {analysis && (
+            <>
+              {/* モード警告: 順序実行モードでは並列化できない (モード仕様上) */}
+              {isSequential && (
+                <div className="mb-4 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg p-3 flex items-start gap-3">
+                  <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5"/>
+                  <div className="flex-1">
+                    <div className="font-bold text-amber-900 text-sm">⚠ 現在「順序実行モード」です</div>
+                    <div className="text-xs text-amber-800 mt-1 leading-relaxed">
+                      順序実行モードは <b>Step 1 → 2 → 3 と固定順</b>で進める仕様なので <b>並列作業はできません</b>。
+                      でも下の「<b>適用</b>」を押せばテンプレ自体の<b>工程順が最適順に書き換わる</b>ので、順序実行モードのままでも効率UPに使えます。
+                      並列化までやるなら <b>カスタムモード</b>を選んでください。
+                    </div>
+                    {onSwitchToCustom && (
+                      <button onClick={() => { onSwitchToCustom(); onClose(); }}
+                        className="mt-2 inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-3 py-1.5 rounded shadow">
+                        <Zap className="w-3 h-3"/> カスタムモードに切替えて並列活用
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+              {/* モード選択画面で開いた場合: カスタム推奨 */}
+              {isInitial && (
+                <div className="mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3 flex items-start gap-3">
+                  <Zap className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5"/>
+                  <div className="flex-1">
+                    <div className="font-bold text-emerald-900 text-sm">💡 並列活用するなら「カスタムモード」推奨</div>
+                    <div className="text-xs text-emerald-800 mt-1 leading-relaxed">
+                      下のオススメ順は <b>自動測定中に手動工程を並行する</b>前提です。
+                      順序実行モードでは並列化できないので、<b>カスタムモード</b>を選んでください。
+                    </div>
+                  </div>
+                </div>
+              )}
+              {/* 共通: データ量サマリ */}
+              <div className="mb-4 flex flex-wrap gap-3 text-sm">
+                <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+                  <div className="text-[10px] text-indigo-600 font-bold">サンプルロット</div>
+                  <div className="text-lg font-black text-indigo-900">{analysis.sampleLotCount}件</div>
+                  {!analysis.hasEnoughData && <div className="text-[10px] text-amber-600">⚠ データが少ないため精度は限定的</div>}
+                </div>
+                <div className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+                  <div className="text-[10px] text-purple-600 font-bold">自動工程</div>
+                  <div className="text-lg font-black text-purple-900">{analysis.autoCount}件</div>
+                </div>
+                <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                  <div className="text-[10px] text-blue-600 font-bold">手動工程</div>
+                  <div className="text-lg font-black text-blue-900">{analysis.manualCount}件</div>
+                </div>
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                  <div className="text-[10px] text-emerald-600 font-bold">想定時短</div>
+                  <div className="text-lg font-black text-emerald-900">{fmtSec(analysis.timeSavedSec)} ({analysis.timeSavedPercent}%)</div>
+                </div>
+              </div>
+
+              {/* ルールベース表示 (現実的モデル: 「他の台」での並行作業) */}
+              {mode === 'rule' && (
+                <div className="space-y-4">
+                  <div className="text-xs text-slate-700 leading-relaxed bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                    💡 <b>物理ルール</b>: テンプレ順は変えません。1台目が自動測定中はその台に触れないため、その間は <b>他の台 (2台目以降) の機械独立な作業</b> を進めます。<br/>
+                    候補に入る条件: ①過去ロットで実際に並列された実績あり ②テンプレで <b>「機械独立」</b>タグが付いている ③別リソースを使う工程。<br/>
+                    ⚠ タグが未設定の工程は「機械占有の可能性アリ」とみなして候補から除外。<b>テンプレ編集で工程ごとに「機械独立 / 測定機を占有」をタグ付け</b>してください。
+                  </div>
+                  {(analysis.opportunities || []).length === 0 && (
+                    <div className="text-center py-8 text-slate-400 text-sm">自動工程が無いので並行機会がありません</div>
+                  )}
+                  {(analysis.opportunities || []).map((op, i) => (
+                    <div key={i} className="border-2 border-purple-300 rounded-lg overflow-hidden">
+                      <div className="bg-purple-100 px-3 py-2 flex items-center gap-2">
+                        <span className="bg-purple-700 text-white text-xs font-bold px-2 py-0.5 rounded">機会 {i+1}</span>
+                        <span className="text-sm font-black text-purple-900">⏱ #{op.autoUnitIdx + 1}台目「{op.autoStep.title}」 (自動 / 約{fmtSec(op.autoDurationSec)})</span>
+                        <span className="ml-auto text-xs bg-white px-2 py-0.5 rounded-full font-bold text-purple-700">時間利用 {op.utilizationPct}%</span>
+                      </div>
+                      <div className="p-3 bg-blue-50/30">
+                        <div className="text-xs text-slate-600 mb-2 font-bold">→ #{op.autoUnitIdx + 1}台目が機械占有中、この時間でやれる他の台の作業:</div>
+                        {op.parallelTasks.length === 0 ? (
+                          <div className="text-xs text-amber-700 italic bg-amber-50 px-2 py-2 rounded border border-amber-200">
+                            並行候補なし。<br/>
+                            原因 (考えられる順): ①過去に並行実績がない ②テンプレで「機械独立」とタグ付けされた工程がない ③全工程が同じ機械を占有する設定。<br/>
+                            <b>テンプレ編集</b>で「機械独立」タグを付けてください。
+                          </div>
+                        ) : (
+                          <div className="space-y-1">
+                            {op.parallelTasks.map((t, j) => {
+                              const evLabel = t.evidence === 'observed' ? `実績${t.observedCount}回` :
+                                              t.evidence === 'machine-independent' ? '機械独立' :
+                                              t.evidence === 'different-resource' ? '別リソース' : '並行可フラグ';
+                              const evColor = t.evidence === 'observed' ? 'bg-emerald-100 text-emerald-700' :
+                                              t.evidence === 'machine-independent' ? 'bg-blue-100 text-blue-700' :
+                                              t.evidence === 'different-resource' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600';
+                              return (
+                                <div key={j} className="bg-white border border-blue-200 rounded px-2 py-1 flex items-center gap-2 text-sm">
+                                  <span className="text-blue-600 text-xs font-bold w-6">{j+1}.</span>
+                                  <span className="bg-blue-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded shrink-0">#{t.unitIdx + 1}台目</span>
+                                  <span className="font-bold text-slate-800 flex-1">{t.step.title}</span>
+                                  <span className="text-xs text-slate-500 font-mono">{fmtSec(t.durationSec)}</span>
+                                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${evColor}`} title="この候補が認められた根拠">{evLabel}</span>
+                                </div>
+                              );
+                            })}
+                            <div className="text-[10px] text-emerald-700 mt-2 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 font-bold">
+                              合計 {fmtSec(op.filledSec)} を並行 → 自動測定 {fmtSec(op.autoDurationSec)} の間に他の台の作業がここまで進む
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* AI モード */}
+              {mode === 'ai' && (
+                <div className="space-y-4">
+                  <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 border rounded-lg px-3 py-2">
+                    💡 ルールベースの結果と実績データを Gemini に投げて、より高度な提案を取得します。VITE_GEMINI_API_KEY が必要。
+                  </div>
+                  {!aiResult && !aiLoading && !aiError && (
+                    <div className="text-center py-8">
+                      <button onClick={handleRunAi} className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold px-6 py-3 rounded-lg shadow hover:shadow-lg transition">
+                        🤖 Gemini に最適順を生成させる
+                      </button>
+                      <div className="text-xs text-slate-400 mt-2">サンプル {analysis.sampleLotCount}件 / 工程 {analysis.autoCount + analysis.manualCount}件 を送信</div>
+                    </div>
+                  )}
+                  {aiLoading && (
+                    <div className="text-center py-8">
+                      <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
+                      <div className="text-sm text-slate-600 mt-2">Gemini が思考中…</div>
+                    </div>
+                  )}
+                  {aiError && (
+                    <div className="bg-rose-50 border border-rose-200 rounded-lg p-4 text-rose-800 text-sm">
+                      <div className="font-bold">❌ AI 生成失敗</div>
+                      <div className="mt-1 text-xs">{aiError}</div>
+                      <button onClick={handleRunAi} className="mt-2 text-xs bg-white border border-rose-300 px-3 py-1 rounded hover:bg-rose-50">再試行</button>
+                    </div>
+                  )}
+                  {aiResult && (
+                    <div className="space-y-3">
+                      {aiResult.summary && (
+                        <div className="bg-indigo-50 border-l-4 border-indigo-500 px-3 py-2 text-sm text-indigo-900">
+                          <div className="font-bold text-xs text-indigo-600 mb-1">🤖 Gemini の所見</div>
+                          {aiResult.summary}
+                        </div>
+                      )}
+                      {aiResult.expectedTotalSec && (
+                        <div className="text-xs text-slate-600">想定合計時間: <span className="font-bold">{fmtSec(aiResult.expectedTotalSec)}</span></div>
+                      )}
+                      {(aiResult.suggestions || []).map((sug, i) => {
+                        const autoStep = sug.autoKey ? analysis.stepStats[sug.autoKey]?.step : null;
+                        const manuals = (sug.manualKeys || (sug.manualKey ? [sug.manualKey] : [])).map(k => analysis.stepStats[k]?.step).filter(Boolean);
+                        return (
+                          <div key={i} className="border rounded-lg overflow-hidden">
+                            <div className={`px-3 py-2 ${sug.kind === 'parallel' ? 'bg-purple-100 border-b border-purple-300' : 'bg-slate-100 border-b border-slate-300'}`}>
+                              <span className={`text-white text-xs font-bold px-2 py-0.5 rounded ${sug.kind === 'parallel' ? 'bg-purple-700' : 'bg-slate-600'}`}>STEP {i+1}</span>
+                              <span className="ml-2 text-sm font-black">
+                                {sug.kind === 'parallel' ? `🔧 ${autoStep?.title || sug.autoKey} (自動)` : `📝 ${manuals[0]?.title || sug.manualKey}`}
+                              </span>
+                            </div>
+                            <div className="p-3 text-sm">
+                              {sug.kind === 'parallel' && manuals.length > 0 && (
+                                <ul className="list-disc list-inside text-slate-700 space-y-0.5">
+                                  {manuals.map((m, j) => <li key={j}>{m.title}</li>)}
+                                </ul>
+                              )}
+                              {sug.reason && <div className="text-xs text-slate-500 mt-2 italic">💬 {sug.reason}</div>}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <button onClick={handleRunAi} className="text-xs text-indigo-600 hover:underline">↻ もう一度生成する</button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* シミュレーション */}
+              {mode === 'sim' && (
+                <div className="space-y-4">
+                  <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 border rounded-lg px-3 py-2">
+                    💡 全部シーケンシャル vs 並列化した場合の合計時間を比較します。
+                  </div>
+                  <div className="space-y-3">
+                    <div>
+                      <div className="text-xs font-bold text-slate-600 mb-1">シーケンシャル (全部順番に)</div>
+                      <div className="bg-slate-100 rounded h-8 overflow-hidden relative">
+                        <div className="bg-rose-500 h-full flex items-center px-2 text-white font-bold text-xs" style={{ width: barW(analysis.serialTotalSec) }}>
+                          {fmtSec(analysis.serialTotalSec)}
+                        </div>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs font-bold text-slate-600 mb-1">最適化 (並列活用)</div>
+                      <div className="bg-slate-100 rounded h-8 overflow-hidden relative">
+                        <div className="bg-emerald-500 h-full flex items-center px-2 text-white font-bold text-xs" style={{ width: barW(analysis.optimalTotalSec) }}>
+                          {fmtSec(analysis.optimalTotalSec)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
+                      <div className="text-xs text-emerald-600 font-bold">⏱ 時短効果</div>
+                      <div className="text-2xl font-black text-emerald-700">{fmtSec(analysis.timeSavedSec)}</div>
+                      <div className="text-sm text-emerald-600">全体の {analysis.timeSavedPercent}% 短縮</div>
+                    </div>
+                  </div>
+                  <div className="mt-4">
+                    <div className="text-xs font-bold text-slate-600 mb-2">工程ごとの平均時間 (実績ベース)</div>
+                    <div className="space-y-1">
+                      {Object.values(analysis.stepStats).map(s => (
+                        <div key={s.key} className="flex items-center gap-2 text-xs">
+                          <span className={`w-1.5 h-4 ${s.isAuto ? 'bg-purple-500' : 'bg-blue-500'}`}></span>
+                          <span className="flex-1 truncate">{s.step.title}</span>
+                          <span className="font-mono text-slate-600">{fmtSec(s.avgSec)}</span>
+                          <span className="text-[10px] text-slate-400 w-12 text-right">n={s.sampleCount}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* === 「適用」ボタン撤去 (2026-05-30) ===
+            理由: 「テンプレ全体に適用」「このロットに適用」はテンプレ/ロットの正規工程順を物理的に書き換える破壊的操作だった。
+            ユーザー指示により、オススメ順は「自動測定中の並列作業の参考表示」のみに留め、データには触らない方針に変更。
+            撤去前の被害: lot 1001456619 の optimizedStepOrder フィールドが残存していたが、steps 配列自体は元のまま (=復旧可能)。 */}
+        {analysis && analysis.timeSavedSec > 0 && (
+          <div className="px-5 py-3 border-t bg-slate-50/60">
+            <div className="text-xs text-slate-500 leading-relaxed">
+              💡 上記は<b>自動測定中に並行できる手動工程の提案</b>です。テンプレや工程の順序は<b>変更しません</b>。<br/>
+              作業者が自動測定中に画面を確認して、提案された手動工程を進めることで時短になります。
+            </div>
+          </div>
+        )}
+
+        <div className="px-5 py-3 border-t bg-slate-50 flex justify-end">
+          <button onClick={onClose} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded font-bold text-sm">閉じる</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // 検査リストからロットを選択 → 担当者/エリア指定 → 作業開始 の多段フロー
 // - 使用者選択 = 特定の作業者 (管理者/フリー以外): 「自分で作業しますか?」確認 → 自分に割当 → エリア選択 → 作業開始確認
 // - 管理者/フリー: 「どの担当者?」選択 → 「エリアも指定?」(任意) → 作業開始確認
 const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, saveData, setExecutionLotId }) => {
   const isWorkerMode = currentUserName && !['フリー', '管理者', ''].includes(currentUserName);
-  const myWorker = useMemo(() => workers.find(w => w.name === currentUserName), [workers, currentUserName]);
+  const myWorker = useMemo(() => (workers || []).find(w => w.name === currentUserName), [workers, currentUserName]);
 
   // フロー: 'confirm-self' | 'pick-worker' | 'pick-zone' | 'confirm-start'
   const initialStep = isWorkerMode && myWorker ? 'confirm-self' : 'pick-worker';
   const [step, setStep] = useState(initialStep);
-  const [selectedWorker, setSelectedWorker] = useState(myWorker || (lot.workerId ? workers.find(w => w.id === lot.workerId) : null));
-  const [selectedZone, setSelectedZone] = useState(lot.mapZoneId ? mapZones.find(z => z.id === lot.mapZoneId) : null);
+  const [selectedWorker, setSelectedWorker] = useState(myWorker || (lot?.workerId ? (workers || []).find(w => w.id === lot.workerId) : null));
+  const [selectedZone, setSelectedZone] = useState(lot?.mapZoneId ? (mapZones || []).find(z => z.id === lot.mapZoneId) : null);
+  const [busy, setBusy] = useState(false); // 二重クリック・遷移中の白画面防止
 
-  const personalZones = (mapZones || []).filter(z => !z.isPersonal || z.name === selectedWorker?.name).concat(
-    (mapZones || []).filter(z => z.isPersonal && z.name !== selectedWorker?.name)
+  // lot や mapZones が一時的に undefined になっても落ちないようガード
+  if (!lot) return null;
+  const safeMapZones = Array.isArray(mapZones) ? mapZones : [];
+  const safeWorkers = Array.isArray(workers) ? workers : [];
+
+  const personalZones = safeMapZones.filter(z => !z.isPersonal || z.name === selectedWorker?.name).concat(
+    safeMapZones.filter(z => z.isPersonal && z.name !== selectedWorker?.name)
   );
   // 重複排除
   const sortedZones = Array.from(new Map(personalZones.map(z => [z.id, z])).values());
 
-  const saveAndContinue = async (updateData, nextStep) => {
+  // 保存して次ステップへ。エラー時は alert を出して途中で抜けるため、
+  // 呼び出し側で `await saveAndContinue(...); setStep(...);` と書くと
+  // 保存失敗時にも遷移してしまう不具合があった (画面が白くなる原因の 1 つ)。
+  // → 返り値で成功/失敗を返す形に修正。
+  const saveAndContinue = async (updateData) => {
+    if (busy) return false;
+    setBusy(true);
     try {
       await saveData('lots', lot.id, updateData);
+      return true;
     } catch (e) {
       alert('保存失敗: ' + (e.message || e));
-      return;
+      return false;
+    } finally {
+      setBusy(false);
     }
-    if (nextStep) setStep(nextStep);
   };
 
   const handleStartWork = () => {
@@ -8499,7 +15261,14 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
             <div className="flex justify-end gap-2">
               <button onClick={onClose} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
               <button onClick={() => setStep('pick-worker')} className="px-4 py-2 bg-slate-200 text-slate-700 rounded font-bold hover:bg-slate-300" title="別の作業者を選ぶ">いいえ・別の人</button>
-              <button onClick={async () => { await saveAndContinue({ workerId: myWorker.id, location: lot.location === 'arrival' ? 'planned' : lot.location }); setStep('pick-zone'); }} className="px-6 py-2 bg-emerald-600 text-white rounded font-bold shadow hover:bg-emerald-700">はい・進む</button>
+              <button disabled={busy || !myWorker} onClick={async () => {
+                if (!myWorker) return;
+                // 担当者割当時は location を 'planned' に正規化 (zone ID が入った旧データも修正)
+                // ただし 'completed' なら触らない
+                const newLocation = lot.location === 'completed' ? 'completed' : 'planned';
+                const ok = await saveAndContinue({ workerId: myWorker.id, location: newLocation });
+                if (ok) setStep('pick-zone');
+              }} className="px-6 py-2 bg-emerald-600 disabled:bg-slate-300 text-white rounded font-bold shadow hover:bg-emerald-700">{busy ? '保存中…' : 'はい・進む'}</button>
             </div>
           </>
         )}
@@ -8509,7 +15278,7 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
           <>
             <h3 className="text-lg font-bold mb-2">どの担当者に作業させますか？</h3>
             <div className="grid grid-cols-2 gap-2 mb-4 max-h-72 overflow-y-auto">
-              {workers.map(w => (
+              {safeWorkers.map(w => (
                 <button key={w.id} type="button"
                   onClick={() => setSelectedWorker(w)}
                   className={`p-3 rounded-lg border-2 text-left font-bold transition-all ${selectedWorker?.id === w.id ? 'border-blue-500 bg-blue-50 ring-2 ring-blue-200' : 'border-slate-200 hover:border-blue-300 bg-white'}`}>
@@ -8519,7 +15288,13 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={onClose} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
-              <button onClick={async () => { if (!selectedWorker) return; await saveAndContinue({ workerId: selectedWorker.id, location: lot.location === 'arrival' ? 'planned' : lot.location }); setStep('pick-zone'); }} disabled={!selectedWorker} className="px-6 py-2 bg-emerald-600 disabled:bg-slate-300 text-white rounded font-bold shadow hover:bg-emerald-700">次へ</button>
+              <button onClick={async () => {
+                if (!selectedWorker) return;
+                // 担当者割当時は location を 'planned' に正規化 (zone ID が入った旧データも修正)
+                const newLocation = lot.location === 'completed' ? 'completed' : 'planned';
+                const ok = await saveAndContinue({ workerId: selectedWorker.id, location: newLocation });
+                if (ok) setStep('pick-zone');
+              }} disabled={busy || !selectedWorker} className="px-6 py-2 bg-emerald-600 disabled:bg-slate-300 text-white rounded font-bold shadow hover:bg-emerald-700">{busy ? '保存中…' : '次へ'}</button>
             </div>
           </>
         )}
@@ -8544,12 +15319,16 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setStep(initialStep)} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">戻る</button>
-              <button onClick={async () => {
+              <button disabled={busy} onClick={async () => {
                 if (selectedZone) {
-                  await saveAndContinue({ mapZoneId: selectedZone.id, location: selectedZone.id });
+                  // location は 'planned' を維持 (作業予定リストに残るように)。zone は mapZoneId で管理。
+                  // ※ 完了済みロットを再開する場合は location='completed' を保持
+                  const newLocation = lot?.location === 'completed' ? 'completed' : 'planned';
+                  const ok = await saveAndContinue({ mapZoneId: selectedZone.id, location: newLocation });
+                  if (!ok) return;
                 }
                 setStep('confirm-start');
-              }} className="px-6 py-2 bg-emerald-600 text-white rounded font-bold shadow hover:bg-emerald-700">次へ</button>
+              }} className="px-6 py-2 bg-emerald-600 disabled:bg-slate-300 text-white rounded font-bold shadow hover:bg-emerald-700">{busy ? '保存中…' : '次へ'}</button>
             </div>
           </>
         )}
@@ -8578,11 +15357,22 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
   const [assignmentLot, setAssignmentLot] = useState(null);
   const [viewMode, setViewMode] = useState('grid');
   const [searchQuery, setSearchQuery] = useState('');
+  // 指図 / 型式 / テンプレ をそれぞれ個別に絞り込む
+  const [searchOrderNo, setSearchOrderNo] = useState('');
+  const [searchModel, setSearchModel] = useState('');
+  const [searchTemplate, setSearchTemplate] = useState('');
   const [selectedZoneFilter, setSelectedZoneFilter] = useState('all');
   const [sortOrder, setSortOrder] = useState('entry_asc');
   const [onlyMine, setOnlyMine] = useState(false);
   // 担当者絞り込み (管理者/代理作業者向け): '' = 全員, 'me' = 自分のみ, workerId = 指定作業者
   const [workerFilter, setWorkerFilter] = useState('');
+
+  // 詳細フィルタ (multi-select)
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+  const [templateFilter, setTemplateFilter] = useState([]);    // テンプレートID配列 (空=全て)
+  const [statusFilter, setStatusFilter] = useState([]);        // ['waiting','processing','paused'] etc (空=全て)
+  const [priorityFilter, setPriorityFilter] = useState([]);    // ['normal','high'] (空=全て)
+  const [delayFilter, setDelayFilter] = useState([]);          // ['ontime','warning','critical','ahead'] (空=全て)
 
   const mapZones = settings?.mapZones || INITIAL_MAP_ZONES;
   const myWorkerId = useMemo(() => workers?.find(w => w.name === currentUserName)?.id || null, [workers, currentUserName]);
@@ -8590,6 +15380,9 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
   const activeLots = useMemo(() => {
     return lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
   }, [lots]);
+
+  // toggle 関数: 配列内の値を追加 / 削除
+  const toggleInArray = (arr, val) => arr.includes(val) ? arr.filter(x => x !== val) : [...arr, val];
 
   const filteredLots = useMemo(() => {
     let result = activeLots;
@@ -8604,15 +15397,77 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
     if (selectedZoneFilter !== 'all') {
       result = result.filter(l => l.mapZoneId === selectedZoneFilter);
     }
+    // 3つの個別検索 (AND結合): 指図 / 型式 / テンプレ
+    if (searchOrderNo) {
+      const q = searchOrderNo.toLowerCase();
+      result = result.filter(l => l.orderNo && l.orderNo.toLowerCase().includes(q));
+    }
+    if (searchModel) {
+      const q = searchModel.toLowerCase();
+      result = result.filter(l => l.model && l.model.toLowerCase().includes(q));
+    }
+    if (searchTemplate) {
+      const q = searchTemplate.toLowerCase();
+      result = result.filter(l => {
+        const tplName = (templates?.find(t => t.id === l.templateId)?.name || '').toLowerCase();
+        const tplLabel = l.templateId === 'demo' ? '詳細デモ手順' : tplName;
+        return tplLabel && tplLabel.includes(q);
+      });
+    }
+    // 旧 searchQuery (互換): 残っていれば 3カラム OR で動く
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      result = result.filter(l =>
-        (l.orderNo && l.orderNo.toLowerCase().includes(q)) ||
-        (l.model && l.model.toLowerCase().includes(q))
-      );
+      result = result.filter(l => {
+        const tplName = (templates?.find(t => t.id === l.templateId)?.name || '').toLowerCase();
+        const tplLabel = l.templateId === 'demo' ? '詳細デモ手順' : tplName;
+        return (
+          (l.orderNo && l.orderNo.toLowerCase().includes(q)) ||
+          (l.model && l.model.toLowerCase().includes(q)) ||
+          (tplLabel && tplLabel.toLowerCase().includes(q))
+        );
+      });
+    }
+    // テンプレートフィルタ (1つ以上選択時のみ適用)
+    if (templateFilter.length > 0) {
+      result = result.filter(l => templateFilter.includes(l.templateId || ''));
+    }
+    // 状態フィルタ
+    if (statusFilter.length > 0) {
+      result = result.filter(l => {
+        const hasPaused = Object.values(l.tasks || {}).some(t => t.status === 'paused');
+        const hasProcessing = checkLotProcessing(l);
+        const hasProgress = Object.values(l.tasks || {}).some(t => t.status === 'completed');
+        if (statusFilter.includes('paused') && hasPaused) return true;
+        if (statusFilter.includes('processing') && hasProcessing && !hasPaused) return true;
+        if (statusFilter.includes('progress') && hasProgress && !hasProcessing && !hasPaused) return true;
+        if (statusFilter.includes('waiting') && !hasProcessing && !hasPaused && !hasProgress) return true;
+        return false;
+      });
+    }
+    // 優先度フィルタ
+    if (priorityFilter.length > 0) {
+      result = result.filter(l => priorityFilter.includes(l.priority || 'normal'));
+    }
+    // 遅延状況フィルタ
+    if (delayFilter.length > 0) {
+      result = result.filter(l => {
+        const p = computeLotProgress(l);
+        const level = p?.delayLevel || 'ontime';
+        return delayFilter.includes(level);
+      });
     }
     return result;
-  }, [activeLots, selectedZoneFilter, searchQuery, onlyMine, myWorkerId, workerFilter]);
+  }, [activeLots, selectedZoneFilter, searchQuery, searchOrderNo, searchModel, searchTemplate, onlyMine, myWorkerId, workerFilter, templateFilter, statusFilter, priorityFilter, delayFilter, templates]);
+
+  // アクティブな詳細フィルタ数 (バッジ表示用)
+  const activeAdvancedCount = templateFilter.length + statusFilter.length + priorityFilter.length + delayFilter.length;
+
+  const clearAllAdvancedFilters = () => {
+    setTemplateFilter([]);
+    setStatusFilter([]);
+    setPriorityFilter([]);
+    setDelayFilter([]);
+  };
 
   const sortedLots = useMemo(() => {
     return [...filteredLots].sort((a, b) => {
@@ -8646,15 +15501,70 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
               <option value="due_asc">納期 (近い順)</option>
             </select>
           </div>
-          <div className="flex items-center gap-2 bg-white px-2 py-1 rounded-lg border shadow-sm ml-2">
-            <Search className="w-4 h-4 text-slate-400" />
-            <input
-              type="text"
-              placeholder="指図・型式で検索..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="text-sm outline-none w-32 md:w-48 font-bold text-slate-700"
-            />
+          {/* 検索: 指図 / 型式 / テンプレ をそれぞれ個別に絞り込む (AND結合) */}
+          <div className="flex items-center gap-1.5 ml-2">
+            <Search className="w-4 h-4 text-slate-400 shrink-0" />
+            {/* 指図 */}
+            <div className={`flex items-center gap-1 bg-white px-2 py-1 rounded-lg border shadow-sm ${searchOrderNo ? 'border-blue-400 ring-1 ring-blue-100' : ''}`}>
+              <span className="text-[10px] font-bold text-slate-400 shrink-0">指図</span>
+              <input
+                type="text"
+                placeholder="番号..."
+                value={searchOrderNo}
+                onChange={(e) => setSearchOrderNo(e.target.value)}
+                className="text-sm outline-none w-20 md:w-28 font-bold text-slate-700"
+                list="search-orderno-list"
+              />
+              {searchOrderNo && (
+                <button onClick={() => setSearchOrderNo('')} className="text-slate-400 hover:text-slate-600" title="クリア">
+                  <X className="w-3 h-3"/>
+                </button>
+              )}
+            </div>
+            {/* 型式 */}
+            <div className={`flex items-center gap-1 bg-white px-2 py-1 rounded-lg border shadow-sm ${searchModel ? 'border-blue-400 ring-1 ring-blue-100' : ''}`}>
+              <span className="text-[10px] font-bold text-slate-400 shrink-0">型式</span>
+              <input
+                type="text"
+                placeholder="モデル..."
+                value={searchModel}
+                onChange={(e) => setSearchModel(e.target.value)}
+                className="text-sm outline-none w-20 md:w-28 font-bold text-slate-700"
+                list="search-model-list"
+              />
+              {searchModel && (
+                <button onClick={() => setSearchModel('')} className="text-slate-400 hover:text-slate-600" title="クリア">
+                  <X className="w-3 h-3"/>
+                </button>
+              )}
+            </div>
+            {/* テンプレ */}
+            <div className={`flex items-center gap-1 bg-white px-2 py-1 rounded-lg border shadow-sm ${searchTemplate ? 'border-blue-400 ring-1 ring-blue-100' : ''}`}>
+              <span className="text-[10px] font-bold text-slate-400 shrink-0">テンプレ</span>
+              <input
+                type="text"
+                placeholder="名前..."
+                value={searchTemplate}
+                onChange={(e) => setSearchTemplate(e.target.value)}
+                className="text-sm outline-none w-20 md:w-28 font-bold text-slate-700"
+                list="search-template-list"
+              />
+              {searchTemplate && (
+                <button onClick={() => setSearchTemplate('')} className="text-slate-400 hover:text-slate-600" title="クリア">
+                  <X className="w-3 h-3"/>
+                </button>
+              )}
+            </div>
+            {/* 候補 datalist (各入力に対応) */}
+            <datalist id="search-orderno-list">
+              {Array.from(new Set(activeLots.map(l => l.orderNo).filter(Boolean))).sort().map(v => <option key={v} value={v}/>)}
+            </datalist>
+            <datalist id="search-model-list">
+              {Array.from(new Set(activeLots.map(l => l.model).filter(Boolean))).sort().map(v => <option key={v} value={v}/>)}
+            </datalist>
+            <datalist id="search-template-list">
+              {Array.from(new Set([{id:'demo',name:'詳細デモ手順 (4工程)'}, ...(templates || [])].map(t => t.name).filter(Boolean))).sort().map(v => <option key={v} value={v}/>)}
+            </datalist>
           </div>
           {/* 担当者絞り込み: 自分のみ / 全員 / 指定作業者 を選択可能 (管理者・代理作業向け) */}
           <select value={workerFilter || (onlyMine ? 'me' : '')} onChange={(e) => { setWorkerFilter(e.target.value); setOnlyMine(e.target.value === 'me'); }} className="bg-white border rounded-lg px-2 py-1.5 text-sm font-bold text-slate-700 shadow-sm">
@@ -8664,12 +15574,176 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
               {workers.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
             </optgroup>
           </select>
+          {/* 詳細フィルタ toggle */}
+          <button
+            onClick={() => setShowAdvancedFilters(!showAdvancedFilters)}
+            className={`relative bg-white border rounded-lg px-3 py-1.5 text-sm font-bold shadow-sm flex items-center gap-1.5 ${showAdvancedFilters || activeAdvancedCount > 0 ? 'border-indigo-400 text-indigo-700 bg-indigo-50' : 'text-slate-700 hover:bg-slate-50'}`}
+            title="テンプレート・状態・優先度・遅延状況などの詳細フィルタ"
+          >
+            <Filter className="w-4 h-4"/> 詳細フィルタ
+            {activeAdvancedCount > 0 && (
+              <span className="bg-indigo-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full min-w-[18px] text-center">{activeAdvancedCount}</span>
+            )}
+          </button>
         </div>
         <div className="flex bg-slate-100 rounded p-1">
           <button onClick={() => setViewMode('grid')} className={`p-1.5 rounded ${viewMode === 'grid' ? 'bg-white shadow text-blue-600' : 'text-slate-400 hover:text-slate-600'}`} title="グリッド表示"><LayoutGrid className="w-5 h-5" /></button>
           <button onClick={() => setViewMode('list')} className={`p-1.5 rounded ${viewMode === 'list' ? 'bg-white shadow text-blue-600' : 'text-slate-400 hover:text-slate-600'}`} title="リスト表示"><List className="w-5 h-5" /></button>
         </div>
       </div>
+
+      {/* 詳細フィルタパネル */}
+      {showAdvancedFilters && (
+        <div className="bg-white border border-indigo-200 rounded-lg shadow-sm p-3 shrink-0 space-y-3">
+          <div className="flex items-center justify-between border-b pb-2">
+            <div className="text-sm font-black text-indigo-700 flex items-center gap-1"><Filter className="w-4 h-4"/> 詳細フィルタ</div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-500">該当 {filteredLots.length} 件 / 全 {activeLots.length} 件</span>
+              {activeAdvancedCount > 0 && (
+                <button onClick={clearAllAdvancedFilters} className="text-xs text-rose-600 hover:bg-rose-50 px-2 py-1 rounded font-bold border border-rose-200 flex items-center gap-1">
+                  <X className="w-3 h-3"/> 全クリア
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* テンプレート */}
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1 flex items-center gap-1">
+              <ClipboardList className="w-3 h-3"/> テンプレート (複数選択可)
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                onClick={() => setTemplateFilter([])}
+                className={`px-2.5 py-1 rounded-full text-xs font-bold border transition-colors ${templateFilter.length === 0 ? 'bg-slate-700 text-white border-slate-700' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+              >すべて</button>
+              {[{id:'demo',name:'詳細デモ手順 (4工程)'}, ...([...(templates || [])].sort((a, b) => new Intl.Collator('ja').compare(a.name || '', b.name || '')))].map(t => {
+                const active = templateFilter.includes(t.id);
+                const count = activeLots.filter(l => (l.templateId || '') === t.id).length;
+                return (
+                  <button
+                    key={t.id}
+                    onClick={() => setTemplateFilter(toggleInArray(templateFilter, t.id))}
+                    className={`px-2.5 py-1 rounded-full text-xs font-bold border transition-colors inline-flex items-center gap-1 ${active ? 'bg-indigo-600 text-white border-indigo-700' : 'bg-white text-slate-600 border-slate-200 hover:bg-indigo-50 hover:border-indigo-300'}`}
+                  >
+                    {t.name}
+                    <span className={`text-[10px] px-1 rounded ${active ? 'bg-white/20' : 'bg-slate-100 text-slate-500'}`}>{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 状態 */}
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1 flex items-center gap-1">
+              <Clock className="w-3 h-3"/> 状態 (複数選択可)
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                {key:'waiting', label:'未着手', color:'slate'},
+                {key:'progress', label:'進捗あり (待機)', color:'amber'},
+                {key:'processing', label:'作業中', color:'blue'},
+                {key:'paused', label:'一時停止', color:'orange'},
+              ].map(s => {
+                const active = statusFilter.includes(s.key);
+                return (
+                  <button
+                    key={s.key}
+                    onClick={() => setStatusFilter(toggleInArray(statusFilter, s.key))}
+                    className={`px-2.5 py-1 rounded-full text-xs font-bold border transition-colors ${active ? `bg-${s.color}-600 text-white border-${s.color}-700` : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                    style={active ? { backgroundColor: s.color === 'slate' ? '#475569' : s.color === 'amber' ? '#d97706' : s.color === 'blue' ? '#2563eb' : s.color === 'orange' ? '#ea580c' : '#475569', color: 'white', borderColor: 'transparent' } : {}}
+                  >{s.label}</button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 優先度 */}
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1 flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3"/> 優先度 (複数選択可)
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                onClick={() => setPriorityFilter(toggleInArray(priorityFilter, 'high'))}
+                className={`px-2.5 py-1 rounded-full text-xs font-bold border transition-colors ${priorityFilter.includes('high') ? 'bg-rose-600 text-white border-rose-700' : 'bg-white text-slate-600 border-slate-200 hover:bg-rose-50 hover:border-rose-300'}`}
+              >🔥 急ぎ</button>
+              <button
+                onClick={() => setPriorityFilter(toggleInArray(priorityFilter, 'normal'))}
+                className={`px-2.5 py-1 rounded-full text-xs font-bold border transition-colors ${priorityFilter.includes('normal') ? 'bg-slate-700 text-white border-slate-700' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+              >通常</button>
+            </div>
+          </div>
+
+          {/* 遅延状況 */}
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1 flex items-center gap-1">
+              <Clock className="w-3 h-3"/> 遅延状況 (複数選択可)
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                {key:'critical', label:'⚠ 大幅遅延', bg:'bg-rose-600', border:'border-rose-700'},
+                {key:'warning', label:'遅れ気味', bg:'bg-amber-500', border:'border-amber-600'},
+                {key:'ontime', label:'予定通り', bg:'bg-blue-600', border:'border-blue-700'},
+                {key:'ahead', label:'前倒し', bg:'bg-emerald-600', border:'border-emerald-700'},
+              ].map(d => {
+                const active = delayFilter.includes(d.key);
+                return (
+                  <button
+                    key={d.key}
+                    onClick={() => setDelayFilter(toggleInArray(delayFilter, d.key))}
+                    className={`px-2.5 py-1 rounded-full text-xs font-bold border transition-colors ${active ? `${d.bg} text-white ${d.border}` : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                  >{d.label}</button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* アクティブなフィルタチップ (パネル閉じた時に何が掛かっているかを一目で見えるように) */}
+      {!showAdvancedFilters && activeAdvancedCount > 0 && (
+        <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-2 shrink-0 flex flex-wrap items-center gap-1.5">
+          <span className="text-xs font-bold text-indigo-700">適用中:</span>
+          {templateFilter.map(tid => {
+            const t = tid === 'demo' ? {id:'demo',name:'詳細デモ手順 (4工程)'} : templates.find(x => x.id === tid);
+            return (
+              <span key={`tpl-${tid}`} className="bg-white border border-indigo-300 text-indigo-700 text-[11px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-1">
+                {t?.name || tid}
+                <button onClick={() => setTemplateFilter(templateFilter.filter(x => x !== tid))} className="hover:bg-indigo-100 rounded-full"><X className="w-3 h-3"/></button>
+              </span>
+            );
+          })}
+          {statusFilter.map(s => {
+            const label = s === 'waiting' ? '未着手' : s === 'progress' ? '進捗あり' : s === 'processing' ? '作業中' : '一時停止';
+            return (
+              <span key={`st-${s}`} className="bg-white border border-indigo-300 text-indigo-700 text-[11px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-1">
+                {label}
+                <button onClick={() => setStatusFilter(statusFilter.filter(x => x !== s))} className="hover:bg-indigo-100 rounded-full"><X className="w-3 h-3"/></button>
+              </span>
+            );
+          })}
+          {priorityFilter.map(p => (
+            <span key={`pr-${p}`} className="bg-white border border-indigo-300 text-indigo-700 text-[11px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-1">
+              {p === 'high' ? '急ぎ' : '通常'}
+              <button onClick={() => setPriorityFilter(priorityFilter.filter(x => x !== p))} className="hover:bg-indigo-100 rounded-full"><X className="w-3 h-3"/></button>
+            </span>
+          ))}
+          {delayFilter.map(d => {
+            const label = d === 'critical' ? '大幅遅延' : d === 'warning' ? '遅れ気味' : d === 'ontime' ? '予定通り' : '前倒し';
+            return (
+              <span key={`dl-${d}`} className="bg-white border border-indigo-300 text-indigo-700 text-[11px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-1">
+                {label}
+                <button onClick={() => setDelayFilter(delayFilter.filter(x => x !== d))} className="hover:bg-indigo-100 rounded-full"><X className="w-3 h-3"/></button>
+              </span>
+            );
+          })}
+          <button onClick={clearAllAdvancedFilters} className="ml-auto text-[11px] text-rose-600 hover:bg-rose-50 px-2 py-0.5 rounded font-bold border border-rose-200 flex items-center gap-1">
+            <X className="w-3 h-3"/> 全クリア
+          </button>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto min-h-0">
         {sortedLots.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-slate-400">
@@ -8683,19 +15757,47 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                 const isPaused = Object.values(lot.tasks || {}).some(t => t.status === 'paused');
                 const zoneName = mapZones.find(z => z.id === lot.mapZoneId)?.name || '';
                 const workerName = workers.find(w => w.id === lot.workerId)?.name || '';
+                const templateName = templates?.find(t => t.id === lot.templateId)?.name || '';
+                // 進捗計算 (computeLotProgress を活用)
+                const prog = computeLotProgress(lot);
+                const progressPct = prog?.progressPct ?? 0;
+                const completedCount = prog?.completedCount ?? 0;
+                const totalTasks = prog?.totalTasks ?? 0;
+                const delayLevel = prog?.delayLevel || 'ontime';
                 return (
-                  <div key={lot.id} onClick={() => setAssignmentLot(lot)} className="bg-white border rounded-xl p-4 shadow-sm flex flex-col gap-2 hover:shadow-md transition-shadow cursor-pointer group relative">
-                    <div className="absolute top-1 right-1 flex gap-1 z-20 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div key={lot.id} onClick={() => setAssignmentLot(lot)} className={`bg-white border-2 rounded-xl p-4 shadow-sm flex flex-col gap-2 hover:shadow-md transition-shadow cursor-pointer group relative ${lot.status === 'processing' && !isPaused ? 'border-blue-500 ring-4 ring-blue-200 animate-pulse' : isPaused ? 'border-amber-500 ring-2 ring-amber-100' : 'border-slate-200'}`}>
+                    {/* タッチデバイス (iPad/タブレット) では :hover が発火しないため常時表示。マウス搭載端末では sm: ブレークポイントで hover 動作 */}
+                    <div className="absolute top-1 right-1 flex gap-1 z-20 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                       <button onClick={(e) => { e.stopPropagation(); onEditLot(lot); }} className="p-1 bg-white rounded border hover:bg-blue-50 text-slate-500"><Pencil className="w-3 h-3" /></button>
                       <button onClick={(e) => { e.stopPropagation(); onDeleteLot(lot.id); }} className="p-1 bg-white rounded border hover:bg-red-50 text-red-400"><Trash2 className="w-3 h-3" /></button>
                     </div>
                     <div className="flex justify-between items-start">
-                      <div>
-                        <div className="text-xs text-slate-500 font-bold">指図: {lot.orderNo}</div>
-                        <div className="text-lg font-black text-slate-800">{lot.model}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs text-slate-500 font-bold truncate">指図: {lot.orderNo}</div>
+                        <div className="text-lg font-black text-slate-800 truncate">{lot.model}</div>
                       </div>
-                      <span className="text-xs font-bold bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">{lot.quantity}台</span>
+                      <span className="text-xs font-bold bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 shrink-0">{lot.quantity}台</span>
                     </div>
+                    {/* テンプレート名 */}
+                    {templateName && (
+                      <div className="text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1 truncate w-fit max-w-full" title={templateName}>
+                        <ClipboardList className="w-3 h-3 shrink-0"/> <span className="truncate">{templateName}</span>
+                      </div>
+                    )}
+                    {/* 停止理由バッジ */}
+                    {lot.pauseReason && lot.pauseReason.category && (() => {
+                      const cm = getPauseReasonColor(lot.pauseReason.category);
+                      const startTime = lot.pauseReason.startTime;
+                      const elapsedDisplay = startTime ? formatWorkElapsed(startTime, settings?.workSchedule) : '';
+                      return (
+                        <div className={`text-[10px] ${cm.bg} ${cm.border} ${cm.text} border rounded px-1.5 py-0.5 inline-flex items-center gap-1 w-fit max-w-full font-bold`} title={lot.pauseReason.note || lot.pauseReason.label}>
+                          <span>{cm.emoji}</span>
+                          <span>{lot.pauseReason.label}</span>
+                          {startTime && <span className="font-mono opacity-70">{elapsedDisplay}</span>}
+                          {lot.pauseReason.note && <span className="opacity-70 truncate">— {lot.pauseReason.note}</span>}
+                        </div>
+                      );
+                    })()}
                     <div className="text-xs text-slate-500">
                       {lot.entryAt && <span>入庫: {toDateShort(lot.entryAt)}</span>}
                       {lot.dueDate && <span className="ml-2 text-blue-600 font-bold">納期: {lot.dueDate}</span>}
@@ -8706,10 +15808,41 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                         {workerName && <WorkerBadge id={lot.workerId} workers={workers} />}
                       </div>
                     )}
-                    <div className="mt-1">
-                      <span className={`px-2 py-1 rounded-full text-xs font-bold ${lot.status === 'processing' ? (isPaused ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700') : 'bg-slate-100 text-slate-500'}`}>
-                        {lot.status === 'processing' ? (isPaused ? '一時停止' : '作業中') : '待機'}
+                    {/* 進捗バー */}
+                    {totalTasks > 0 && (
+                      <div>
+                        <div className="flex items-center justify-between text-[10px] mb-0.5">
+                          <span className="text-slate-500">進捗</span>
+                          <span className="font-mono font-bold text-slate-700">{completedCount}/{totalTasks} ({progressPct}%)</span>
+                        </div>
+                        <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full transition-all ${
+                              progressPct >= 100 ? 'bg-emerald-500' :
+                              delayLevel === 'critical' ? 'bg-rose-500' :
+                              delayLevel === 'warning' ? 'bg-amber-500' :
+                              lot.status === 'processing' ? 'bg-blue-500' : 'bg-slate-400'
+                            }`}
+                            style={{ width: `${Math.min(100, progressPct)}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    <div className="mt-1 flex items-center justify-between">
+                      <span className={`px-2 py-1 rounded-full text-xs font-bold inline-flex items-center gap-1 ${lot.status === 'processing' ? (isPaused ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700 ring-2 ring-blue-300 animate-pulse') : 'bg-slate-100 text-slate-500'}`}>
+                        {lot.status === 'processing' && !isPaused && <span className="w-2 h-2 bg-blue-500 rounded-full animate-ping"/>}
+                        {lot.status === 'processing' ? (isPaused ? '⏸ 一時停止' : '▶ 作業中') : '待機'}
                       </span>
+                      {/* 遅延ステータス */}
+                      {prog?.isProcessing && delayLevel && delayLevel !== 'ontime' && delayLevel !== 'completed' && (
+                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                          delayLevel === 'critical' ? 'bg-rose-100 text-rose-700' :
+                          delayLevel === 'warning' ? 'bg-amber-100 text-amber-700' :
+                          delayLevel === 'ahead' ? 'bg-emerald-100 text-emerald-700' : ''
+                        }`}>
+                          {delayLevel === 'critical' ? '⚠遅延' : delayLevel === 'warning' ? '遅れ' : delayLevel === 'ahead' ? '前倒し' : ''}
+                        </span>
+                      )}
                     </div>
                   </div>
                 );
@@ -8722,10 +15855,13 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                   <tr>
                     <th className="p-3 font-bold border-b">指図番号</th>
                     <th className="p-3 font-bold border-b">型式</th>
+                    <th className="p-3 font-bold border-b">テンプレート</th>
                     <th className="p-3 font-bold border-b text-center">台数</th>
                     <th className="p-3 font-bold border-b">入荷日時</th>
                     <th className="p-3 font-bold border-b">納期</th>
-                    <th className="p-3 font-bold border-b">場所/担当</th>
+                    <th className="p-3 font-bold border-b">場所</th>
+                    <th className="p-3 font-bold border-b">担当</th>
+                    <th className="p-3 font-bold border-b w-44">進捗</th>
                     <th className="p-3 font-bold border-b text-center">状態</th>
                     <th className="p-3 font-bold border-b text-right">操作</th>
                   </tr>
@@ -8733,20 +15869,118 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                 <tbody className="divide-y divide-slate-100 text-sm">
                   {sortedLots.map(lot => {
                     const isPaused = Object.values(lot.tasks || {}).some(t => t.status === 'paused');
+                    const templateName = templates?.find(t => t.id === lot.templateId)?.name || '-';
+                    const prog = computeLotProgress(lot);
+                    const progressPct = prog?.progressPct ?? 0;
+                    const completedCount = prog?.completedCount ?? 0;
+                    const totalTasks = prog?.totalTasks ?? 0;
+                    const delayLevel = prog?.delayLevel || 'ontime';
                     return (
-                      <tr key={lot.id} onClick={() => setAssignmentLot(lot)} className="hover:bg-blue-50 cursor-pointer transition-colors">
-                        <td className="p-3 font-bold text-slate-800">{lot.orderNo}</td>
+                      <tr key={lot.id} onClick={() => setAssignmentLot(lot)} className={`hover:bg-blue-50 cursor-pointer transition-colors ${lot.status === 'processing' && !isPaused ? 'bg-blue-50/40' : ''}`}>
+                        <td className="p-3 font-bold text-slate-800">
+                          <span className="inline-flex items-center gap-1.5">
+                            {lot.status === 'processing' && !isPaused && (
+                              <span className="relative inline-flex items-center justify-center shrink-0" title="作業中">
+                                <span className="absolute inline-flex h-3 w-3 rounded-full bg-blue-400 opacity-75 animate-ping"/>
+                                <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500"/>
+                              </span>
+                            )}
+                            {lot.orderNo}
+                          </span>
+                        </td>
                         <td className="p-3">
                           <div className="font-bold text-slate-700">{lot.model}</div>
+                        </td>
+                        <td className="p-3">
+                          {templateName !== '-' ? (
+                            <span className="text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1 max-w-[160px]" title={templateName}>
+                              <ClipboardList className="w-3 h-3 shrink-0"/>
+                              <span className="truncate">{templateName}</span>
+                            </span>
+                          ) : <span className="text-slate-300">-</span>}
                         </td>
                         <td className="p-3 text-center">{lot.quantity}</td>
                         <td className="p-3 text-slate-500 text-xs">{lot.entryAt ? `${toDateShort(lot.entryAt)} ${new Date(lot.entryAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}` : '-'}</td>
                         <td className="p-3 text-xs font-bold text-blue-600">{lot.dueDate || '-'}</td>
-                        <td className="p-3 text-xs text-slate-500">{mapZones.find(z => z.id === lot.mapZoneId)?.name || '-'}</td>
+                        {/* 場所 (エリア) */}
+                        <td className="p-3 text-xs">
+                          {(() => {
+                            const zone = mapZones.find(z => z.id === lot.mapZoneId);
+                            if (!zone) return <span className="text-slate-300">-</span>;
+                            return (
+                              <span className="bg-blue-50 text-blue-700 border border-blue-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1 font-bold whitespace-nowrap" title={zone.name}>
+                                <MapPin className="w-3 h-3 shrink-0"/>{zone.name}
+                              </span>
+                            );
+                          })()}
+                        </td>
+                        {/* 担当 (作業者 or 個人エリア由来) */}
+                        <td className="p-3 text-xs">
+                          {(() => {
+                            const zone = mapZones.find(z => z.id === lot.mapZoneId);
+                            // 個人エリアならエリア名が担当者名 (zone.isPersonal の時)
+                            const fromPersonalZone = zone?.isPersonal ? zone.name : null;
+                            const worker = workers.find(w => w.id === lot.workerId);
+                            const workerName = worker?.name || null;
+                            const finalName = workerName || fromPersonalZone;
+                            if (!finalName) return <span className="text-slate-300">未割当</span>;
+                            return (
+                              <span className="bg-emerald-50 text-emerald-700 border border-emerald-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1 font-bold whitespace-nowrap" title={fromPersonalZone && !workerName ? `${finalName} (個人エリア由来)` : finalName}>
+                                <User className="w-3 h-3 shrink-0"/>{finalName}
+                              </span>
+                            );
+                          })()}
+                        </td>
+                        <td className="p-3">
+                          {totalTasks > 0 ? (
+                            <div className="min-w-[150px]">
+                              <div className="flex items-center justify-between text-[10px] mb-0.5">
+                                <span className="font-mono font-bold text-slate-700">{completedCount}/{totalTasks}</span>
+                                <span className="font-mono font-bold text-slate-700">{progressPct}%</span>
+                              </div>
+                              <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full transition-all ${
+                                    progressPct >= 100 ? 'bg-emerald-500' :
+                                    delayLevel === 'critical' ? 'bg-rose-500' :
+                                    delayLevel === 'warning' ? 'bg-amber-500' :
+                                    lot.status === 'processing' ? 'bg-blue-500' : 'bg-slate-400'
+                                  }`}
+                                  style={{ width: `${Math.min(100, progressPct)}%` }}
+                                />
+                              </div>
+                              {prog?.isProcessing && delayLevel && delayLevel !== 'ontime' && delayLevel !== 'completed' && (
+                                <div className={`text-[9px] font-bold mt-0.5 ${
+                                  delayLevel === 'critical' ? 'text-rose-700' :
+                                  delayLevel === 'warning' ? 'text-amber-700' :
+                                  delayLevel === 'ahead' ? 'text-emerald-700' : 'text-slate-600'
+                                }`}>
+                                  {delayLevel === 'critical' ? '⚠ 大幅遅延' : delayLevel === 'warning' ? '遅れ気味' : delayLevel === 'ahead' ? '前倒し' : '予定通り'}
+                                </div>
+                              )}
+                            </div>
+                          ) : <span className="text-slate-300 text-xs">-</span>}
+                        </td>
                         <td className="p-3 text-center">
-                          <span className={`px-2 py-1 rounded-full text-xs font-bold ${lot.status === 'processing' ? (isPaused ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700') : 'bg-slate-100 text-slate-500'}`}>
-                            {lot.status === 'processing' ? (isPaused ? '一時停止' : '作業中') : '待機'}
-                          </span>
+                          <div className="flex flex-col items-center gap-1">
+                            <span className={`px-2 py-1 rounded-full text-xs font-bold inline-flex items-center gap-1 ${lot.status === 'processing' ? (isPaused ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700 ring-2 ring-blue-300 animate-pulse') : 'bg-slate-100 text-slate-500'}`}>
+                              {lot.status === 'processing' && !isPaused && <span className="w-2 h-2 bg-blue-500 rounded-full animate-ping"/>}
+                              {lot.status === 'processing' ? (isPaused ? '⏸ 一時停止' : '▶ 作業中') : '待機'}
+                            </span>
+                            {/* 停止理由バッジ */}
+                            {lot.pauseReason && lot.pauseReason.category && (() => {
+                              const cm = getPauseReasonColor(lot.pauseReason.category);
+                              const startTime = lot.pauseReason.startTime;
+                              const elapsedDisplay = startTime ? formatWorkElapsed(startTime, settings?.workSchedule) : '';
+                              return (
+                                <span className={`text-[10px] ${cm.bg} ${cm.border} ${cm.text} border rounded px-1.5 py-0.5 inline-flex items-center gap-1 font-bold whitespace-nowrap`} title={lot.pauseReason.note || lot.pauseReason.label}>
+                                  <span>{cm.emoji}</span>
+                                  <span>{lot.pauseReason.label}</span>
+                                  {startTime && <span className="font-mono opacity-70">{elapsedDisplay}</span>}
+                                </span>
+                              );
+                            })()}
+                          </div>
                         </td>
                         <td className="p-3 text-right">
                           <div className="flex justify-end gap-2" onClick={e => e.stopPropagation()}>
@@ -8783,48 +16017,129 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
 // --- EditTimeModal: 作業時間の編集 ---
 const EditTimeModal = ({ lot, onClose, onSave }) => {
   const [localTasks, setLocalTasks] = useState(() => JSON.parse(JSON.stringify(lot.tasks || {})));
+  const steps = lot.steps || [];
+  const qty = lot.quantity || 1;
+  // 一貫したタスクキー: 新形式 (stepId-unitIdx) を優先、旧形式 (stepIdx-unitIdx) もフォールバック
+  const getTaskAndKey = (step, sIdx, unitIdx) => {
+    const idKey = `${step.id}-${unitIdx}`;
+    const idxKey = `${sIdx}-${unitIdx}`;
+    if (localTasks[idKey]) return { task: localTasks[idKey], key: idKey };
+    if (localTasks[idxKey]) return { task: localTasks[idxKey], key: idxKey };
+    return { task: null, key: idKey };
+  };
   const handleDurationChange = (key, value) => {
     const val = parseInt(value, 10);
     if (!isNaN(val) && val >= 0) setLocalTasks(prev => ({ ...prev, [key]: { ...prev[key], duration: val } }));
   };
   const handleSave = () => { onSave({ tasks: localTasks }); onClose(); };
-  const taskKeys = Object.keys(localTasks).filter(k => localTasks[k].status === 'completed' || localTasks[k].status === 'skipped');
+
+  // 工程ごとの合計時間
+  const stepTotal = (step, sIdx) => {
+    let total = 0;
+    for (let u = 0; u < qty; u++) {
+      const { task } = getTaskAndKey(step, sIdx, u);
+      if (task && (task.status === 'completed' || task.status === 'ng') && task.duration > 0) total += task.duration;
+    }
+    return total;
+  };
+  // ユニットごとの合計時間
+  const unitTotal = (u) => {
+    let total = 0;
+    steps.forEach((step, sIdx) => {
+      const { task } = getTaskAndKey(step, sIdx, u);
+      if (task && (task.status === 'completed' || task.status === 'ng') && task.duration > 0) total += task.duration;
+    });
+    return total;
+  };
+  const fmtMin = (sec) => sec >= 60 ? `${Math.floor(sec/60)}分${sec%60 > 0 ? (sec%60)+'秒' : ''}` : `${sec}秒`;
+
   return (
     <div className="fixed inset-0 z-[100] bg-black/50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
-        <div className="p-4 border-b bg-slate-50 font-bold flex justify-between items-center">
-          <div className="flex items-center gap-2"><Clock className="w-5 h-5 text-blue-600" /> 作業時間の編集: {lot.orderNo}</div>
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-6xl max-h-[90vh] flex flex-col">
+        <div className="p-4 border-b bg-slate-50 font-bold flex justify-between items-center shrink-0">
+          <div className="flex items-center gap-2"><Clock className="w-5 h-5 text-blue-600" /> 作業時間の編集: {lot.orderNo} <span className="text-xs font-normal text-slate-500">/ {qty}台</span></div>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5" /></button>
         </div>
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          <div className="text-sm text-slate-500 mb-2">各項目の作業時間（秒）を修正できます。</div>
-          <table className="w-full text-left border-collapse text-sm">
-            <thead><tr className="bg-slate-100 border-b"><th className="p-2 font-bold">項目</th><th className="p-2 font-bold">ユニット</th><th className="p-2 font-bold w-32 text-right">時間(秒)</th></tr></thead>
+        <div className="flex-1 overflow-auto p-4">
+          <div className="text-xs text-slate-500 mb-3">各セルの作業時間 (秒) を直接修正できます。行=工程、列=台数。空白セルは未着手/該当なし。</div>
+          <table className="w-full text-xs border-collapse">
+            <thead className="sticky top-0 z-10">
+              <tr className="bg-slate-100 border-b-2 border-slate-300">
+                <th className="p-2 text-left font-bold sticky left-0 bg-slate-100 min-w-[180px]">工程</th>
+                {Array.from({ length: qty }).map((_, i) => (
+                  <th key={i} className="p-2 text-center font-bold min-w-[80px] border-l border-slate-200">
+                    #{i+1}
+                    {lot.unitSerialNumbers?.[i] && <div className="font-normal text-slate-400 text-[10px]">{lot.unitSerialNumbers[i]}</div>}
+                  </th>
+                ))}
+                <th className="p-2 text-right font-bold bg-slate-200 min-w-[80px] border-l-2 border-slate-300">工程計</th>
+              </tr>
+            </thead>
             <tbody>
-              {taskKeys.map(key => {
-                const parts = key.split('-');
-                const unitIdxStr = parts.pop();
-                const stepIdOrIdx = parts.join('-');
-                const step = (lot.steps || []).find(s => s.id === stepIdOrIdx) || (lot.steps || [])[parseInt(stepIdOrIdx)];
-                const title = step ? step.title : '不明な項目';
-                const isSkipped = localTasks[key].status === 'skipped';
+              {steps.map((step, sIdx) => {
+                const isAuto = step.executionMode === 'batch' || (step.title || '').includes('自動');
+                const sTotal = stepTotal(step, sIdx);
                 return (
-                  <tr key={key} className="border-b">
-                    <td className="p-2 truncate max-w-[200px]" title={title}>{title}</td>
-                    <td className="p-2 font-mono text-slate-600">#{parseInt(unitIdxStr) + 1}</td>
-                    <td className="p-2 text-right">
-                      {isSkipped ? <span className="text-slate-400 text-xs">該当なし</span> : (
-                        <input type="number" value={localTasks[key].duration || 0} onChange={(e) => handleDurationChange(key, e.target.value)} className="w-20 border rounded p-1 text-right font-mono focus:ring-2 focus:ring-blue-500 outline-none" min="0" />
-                      )}
+                  <tr key={step.id || sIdx} className="border-b hover:bg-blue-50/30">
+                    <td className="p-2 sticky left-0 bg-white border-r border-slate-200">
+                      <div className="flex items-center gap-1.5">
+                        {isAuto && <span className="bg-purple-500 text-white text-[9px] font-bold px-1 rounded shrink-0">自動</span>}
+                        <span className="font-bold text-slate-700 truncate" title={step.title}>{step.title}</span>
+                      </div>
+                      {step.category && <div className="text-[10px] text-slate-400 mt-0.5">{step.category}</div>}
+                    </td>
+                    {Array.from({ length: qty }).map((_, u) => {
+                      const { task, key } = getTaskAndKey(step, sIdx, u);
+                      if (!task) return <td key={u} className="p-2 text-center text-slate-300 border-l border-slate-100">–</td>;
+                      const isSkipped = task.status === 'skipped';
+                      const isNg = task.status === 'ng';
+                      const isCompleted = task.status === 'completed';
+                      if (isSkipped) {
+                        return <td key={u} className="p-1 text-center bg-slate-50 border-l border-slate-100">
+                          <span className="text-slate-400 text-[10px] font-bold">該当なし</span>
+                        </td>;
+                      }
+                      if (!isCompleted && !isNg) {
+                        return <td key={u} className="p-1 text-center bg-amber-50 border-l border-slate-100">
+                          <span className="text-amber-600 text-[10px]" title={task.status}>{task.status === 'paused' ? '停止' : task.status === 'processing' ? '進行中' : task.status === 'waiting' ? '未着手' : task.status}</span>
+                        </td>;
+                      }
+                      return (
+                        <td key={u} className={`p-1 text-center border-l border-slate-100 ${isNg ? 'bg-rose-50' : ''}`}>
+                          <input
+                            type="number"
+                            value={task.duration || 0}
+                            onChange={(e) => handleDurationChange(key, e.target.value)}
+                            className={`w-16 border rounded px-1 py-0.5 text-right font-mono text-xs focus:ring-2 focus:ring-blue-500 outline-none ${isNg ? 'border-rose-300 bg-white' : 'border-slate-300'}`}
+                            min="0"
+                            title={isNg ? 'NG タスクの実時間' : '作業時間 (秒)'}
+                          />
+                          {isNg && <div className="text-[9px] text-rose-600 font-bold mt-0.5">NG</div>}
+                        </td>
+                      );
+                    })}
+                    <td className="p-2 text-right font-mono font-bold bg-slate-50 border-l-2 border-slate-300">
+                      {sTotal > 0 ? fmtMin(sTotal) : <span className="text-slate-300">–</span>}
                     </td>
                   </tr>
                 );
               })}
-              {taskKeys.length === 0 && <tr><td colSpan="3" className="p-4 text-center text-slate-500">編集可能なタスクがありません</td></tr>}
+              {/* 台数別合計 */}
+              <tr className="bg-slate-200 border-t-2 border-slate-400 font-bold">
+                <td className="p-2 sticky left-0 bg-slate-200">台数別 合計</td>
+                {Array.from({ length: qty }).map((_, u) => {
+                  const t = unitTotal(u);
+                  return <td key={u} className="p-2 text-center font-mono text-xs border-l border-slate-300">{t > 0 ? fmtMin(t) : '–'}</td>;
+                })}
+                <td className="p-2 text-right font-mono bg-slate-300 border-l-2 border-slate-400">
+                  {fmtMin(Array.from({ length: qty }).reduce((acc, _, u) => acc + unitTotal(u), 0))}
+                </td>
+              </tr>
+              {steps.length === 0 && <tr><td colSpan={qty + 2} className="p-4 text-center text-slate-500">工程がありません</td></tr>}
             </tbody>
           </table>
         </div>
-        <div className="p-4 border-t flex justify-end gap-2 bg-slate-50">
+        <div className="p-4 border-t flex justify-end gap-2 bg-slate-50 shrink-0">
           <button onClick={onClose} className="px-4 py-2 text-slate-600 font-bold border rounded hover:bg-white">キャンセル</button>
           <button onClick={handleSave} className="px-6 py-2 bg-blue-600 text-white font-bold rounded shadow hover:bg-blue-700">保存して更新</button>
         </div>
@@ -9016,12 +16331,14 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
           )}
           {inputs.map(inp => {
             const val = measValues?.[inp.id];
-            const isFilled = val != null && val !== '';
+            // 数値変換できない値 (空白・文字列等) は "---" 表示にして NaN を成績表に出さないようにする
+            const numVal = Number(val);
+            const isFilled = val != null && val !== '' && Number.isFinite(numVal);
             // 設定プレビューと同じ並び順 (上が値, 下がラベル) で位置を一致させる
             return (
               <div key={inp.id} className="absolute flex flex-col items-center" style={{ left: `${inp.x}%`, top: `${inp.y}%`, transform: 'translate(-50%, -50%)' }}>
                 <div className={`text-[9px] font-mono font-bold rounded border px-1 py-0.5 whitespace-nowrap shadow-sm leading-none ${isFilled ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-300 bg-slate-100 text-slate-400'}`}>
-                  {isFilled ? Number(val).toFixed(3) : '---'}
+                  {isFilled ? numVal.toFixed(3) : '---'}
                 </div>
                 <span className="text-[8px] font-bold text-slate-600 mt-0.5 bg-white/90 px-0.5 rounded leading-none whitespace-nowrap">{inp.label}</span>
               </div>
@@ -9113,11 +16430,50 @@ const TableReportDiagram = ({ config, measValues, calcResults, unitLabel }) => {
   );
 };
 
-const ReportPreview = ({ lot, workers, onClose }) => {
-  const [customReportNo, setCustomReportNo] = useState(lot.orderNo || '');
+const ReportPreview = ({ lot: _originalLot, workers, onClose }) => {
+  const [customReportNo, setCustomReportNo] = useState(_originalLot.orderNo || '');
   const [reportMode, setReportMode] = useState('table'); // 'table' | 'multi' | 'visual'
   // ビジュアル成績表のページ構成: 'compact' = 1ページ詰め込み、'standard' = 2列・自然改ページ、'spread' = 1台ずつ
   const [pageLayout, setPageLayout] = useState('standard');
+  // 表示する機番フィルタ (null = 全台、数値 = その台のみ)
+  // 検査中の途中経過プレビューで「1台目だけ見たい」というケースに対応
+  const [unitFilter, setUnitFilter] = useState(null);
+
+  // unitFilter が指定されている場合、その台のみのデータに絞った lot オブジェクトを構築。
+  // 既存のレンダリングコードは多数の「lot.tasks[stepId-unitIdx]」「lot.measurementResults[stepId-unitIdx-values]」
+  // に依存しているので、データを「unit 0」にリキーすることで全 JSX を改修せずに 1 台表示を実現する。
+  const lot = useMemo(() => {
+    if (unitFilter === null || unitFilter === undefined) return _originalLot;
+    const idx = Number(unitFilter);
+    const totalUnits = _originalLot.quantity || 1;
+    if (isNaN(idx) || idx < 0 || idx >= totalUnits) return _originalLot;
+    const filterAndRekey = (obj) => {
+      if (!obj) return obj;
+      const result = {};
+      Object.entries(obj).forEach(([key, val]) => {
+        // パターン: <prefix>-<unitIdx> または <prefix>-<unitIdx>-<suffix>
+        const m = key.match(/^(.+?)-(\d+)(?:-(.+))?$/);
+        if (m) {
+          const unitIdx = parseInt(m[2]);
+          if (unitIdx === idx) {
+            const newKey = m[3] ? `${m[1]}-0-${m[3]}` : `${m[1]}-0`;
+            result[newKey] = val;
+          }
+        } else {
+          result[key] = val;
+        }
+      });
+      return result;
+    };
+    return {
+      ..._originalLot,
+      quantity: 1,
+      unitSerialNumbers: [_originalLot.unitSerialNumbers?.[idx] || `#${idx + 1}`],
+      tasks: filterAndRekey(_originalLot.tasks),
+      measurementResults: filterAndRekey(_originalLot.measurementResults),
+    };
+  }, [_originalLot, unitFilter]);
+
   const toMs = (val) => {
     if (!val) return 0;
     if (typeof val === 'number') return val;
@@ -9128,7 +16484,8 @@ const ReportPreview = ({ lot, workers, onClose }) => {
   };
   const worker = workers.find(w => w.id === lot.workerId)?.name || '未割当';
   const steps = lot.steps || [];
-  const displayQuantity = Math.max(10, lot.quantity || 1);
+  // unitFilter が指定されている時は 1 列のみ表示、それ以外は最低 10 列確保
+  const displayQuantity = unitFilter !== null && unitFilter !== undefined ? 1 : Math.max(10, lot.quantity || 1);
   const formatSec = (s) => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
   const toDateTimeJp = (ts) => { const m = toMs(ts); if (!m) return '-'; const d = new Date(m); return isNaN(d.getTime()) ? '-' : d.toLocaleString('ja-JP'); };
 
@@ -9234,6 +16591,12 @@ const ReportPreview = ({ lot, workers, onClose }) => {
     R += 2;
 
     const infoItems = [['指図番号', lot.orderNo || ''], ['型式', lot.model || ''], ['台数', `${lot.quantity || 1} 台`], ['作業者', worker], ['完了日時', toDateTimeJp(lot.updatedAt)]];
+    // 適用品質規格 (ロット作成時のスナップショット) を情報行に追加
+    if (lot.appliedStandard?.standardNo && lot.appliedStandard.source === 'qualityStandard') {
+      const rev = lot.appliedStandard.revision ? ` Rev.${lot.appliedStandard.revision}` : '';
+      const date = lot.appliedStandard.appliedAt ? ` (適用: ${toDateShort(lot.appliedStandard.appliedAt)})` : '';
+      infoItems.push(['適用品質規格', `${lot.appliedStandard.standardNo}${rev}  ${lot.appliedStandard.name || ''}${date}`]);
+    }
     infoItems.forEach(([label, value]) => {
       const lbl = ws.getRow(R).getCell(1); lbl.value = label; lbl.font = { size: 9, bold: true }; lbl.fill = grayFill; lbl.border = allBorder;
       const val = ws.getRow(R).getCell(2); val.value = value; val.font = { size: 10, bold: true }; val.border = allBorder;
@@ -9295,6 +16658,22 @@ const ReportPreview = ({ lot, workers, onClose }) => {
           mhRow.getCell(1).value = `📐 ${step.title}`;
           mhRow.getCell(1).font = { size: 8, bold: true }; mhRow.getCell(1).fill = blueFill; mhRow.getCell(1).border = allBorder;
           R++;
+
+          // 測定条件 (あれば 1 行追加)
+          const cp = step.measurementConfig.conditionPreset;
+          if (cp && ((cp.params && cp.params.length > 0) || cp.note)) {
+            ws.mergeCells(R, 1, R, totalCols);
+            const condRow = ws.getRow(R);
+            const purpleFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3E8FF' } };
+            const parts = (cp.params || []).filter(p => p.key || p.value).map(p => `${p.key}: ${p.value}`);
+            const text = `測定条件: ${parts.join(' / ')}${cp.note ? `  — ${cp.note.replace(/\n/g, ' ')}` : ''}`;
+            condRow.getCell(1).value = text;
+            condRow.getCell(1).font = { size: 7, color: { argb: 'FF6B21A8' }, italic: true };
+            condRow.getCell(1).fill = purpleFill;
+            condRow.getCell(1).border = allBorder;
+            condRow.getCell(1).alignment = { wrapText: true, vertical: 'middle' };
+            R++;
+          }
 
           // 入力値行
           measInputs.forEach(inp => {
@@ -9361,6 +16740,31 @@ const ReportPreview = ({ lot, workers, onClose }) => {
             <span className="text-xs font-bold text-slate-300">帳票番号:</span>
             <input type="text" value={customReportNo} onChange={(e) => setCustomReportNo(e.target.value)} className="bg-slate-800 text-white border border-slate-600 rounded px-2 py-0.5 text-sm w-40 focus:outline-none focus:border-blue-500" />
           </div>
+          {/* 表示する機番フィルタ (途中経過プレビュー時の「1台目だけ見たい」用) */}
+          {(() => {
+            const totalUnits = Number(_originalLot.quantity) || 1;
+            if (totalUnits <= 1) return null;
+            return (
+              <div className="flex items-center gap-2 bg-slate-700 p-1 rounded px-3">
+                <span className="text-xs font-bold text-slate-300">表示:</span>
+                <select
+                  value={unitFilter === null ? 'all' : String(unitFilter)}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setUnitFilter(v === 'all' ? null : Number(v));
+                  }}
+                  className="bg-slate-800 text-white border border-slate-600 rounded px-2 py-0.5 text-sm focus:outline-none focus:border-blue-500"
+                >
+                  <option value="all">全台 ({totalUnits}台)</option>
+                  {Array.from({ length: totalUnits }, (_, i) => {
+                    const sn = Array.isArray(_originalLot.unitSerialNumbers) ? _originalLot.unitSerialNumbers[i] : null;
+                    const label = `#${i + 1}${sn ? ` (${sn})` : ''}`;
+                    return <option key={`unit-${i}`} value={String(i)}>{label}</option>;
+                  })}
+                </select>
+              </div>
+            );
+          })()}
         </div>
         <div className="flex gap-4">
           <button onClick={onClose} className="px-4 py-2 text-slate-300 hover:text-white font-bold">閉じる</button>
@@ -9392,6 +16796,16 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                 <div className="border-r border-black flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">担当</span><span className="px-2 truncate">{worker}</span></div>
                 <div className="flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">備考</span><span className="px-2 truncate">{defects ? <span className="text-red-700 font-bold">{defects.replace(/\n/g, ' / ')}</span> : ''}</span></div>
               </div>
+              {/* 適用品質規格 (ロット作成時に焼き付けたスナップショット) */}
+              {lot.appliedStandard?.standardNo && lot.appliedStandard.source === 'qualityStandard' && (
+                <div className="flex border border-black mb-2 text-[10px]">
+                  <span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-black">適用規格</span>
+                  <span className="font-bold px-2 border-r border-gray-300">{lot.appliedStandard.standardNo}</span>
+                  {lot.appliedStandard.revision && <span className="px-2 border-r border-gray-300">Rev.{lot.appliedStandard.revision}</span>}
+                  <span className="px-2 flex-1 truncate text-slate-700">{lot.appliedStandard.name}</span>
+                  {lot.appliedStandard.appliedAt && <span className="px-2 text-slate-500 border-l border-gray-300 text-[9px]">適用: {toDateShort(lot.appliedStandard.appliedAt)}</span>}
+                </div>
+              )}
               {/* 大テーブル: 行=計算、列=機番 */}
               <table className="w-full border-collapse border border-black text-[8px]">
                 <thead>
@@ -9422,10 +16836,22 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                         const lowStr = calc.toleranceLower >= 0 ? `+${fmt(calc.toleranceLower)}` : fmt(calc.toleranceLower);
                         rangeText = `${fmt(calc.nominal)} (${upStr}/${lowStr})`;
                       } else rangeText = `${fmt(calc.toleranceLower)}〜${fmt(calc.toleranceUpper)} ${calc.unit || ''}`;
+                      const cp = step.measurementConfig?.conditionPreset;
+                      const hasCondition = cp && ((cp.params && cp.params.length > 0) || cp.note);
                       return (
                         <tr key={`${step.id}_${calc.id || ci}`}>
                           {ci === 0 && (
-                            <td rowSpan={calcs.length} className="border border-black px-1 py-0.5 font-bold align-top bg-blue-50 text-[8px]">{step.title}</td>
+                            <td rowSpan={calcs.length} className="border border-black px-1 py-0.5 font-bold align-top bg-blue-50 text-[8px]">
+                              <div>{step.title}</div>
+                              {hasCondition && (
+                                <div className="text-[6px] font-normal text-purple-800 mt-0.5 leading-tight">
+                                  {cp.params?.filter(p => p.key || p.value).map((p, i) => (
+                                    <div key={i}>{p.key}: <span className="font-mono font-bold">{p.value}</span></div>
+                                  ))}
+                                  {cp.note && <div className="italic text-purple-700">{cp.note}</div>}
+                                </div>
+                              )}
+                            </td>
                           )}
                           <td className="border border-black px-1 py-0.5 font-bold text-slate-700">{calc.label || '計算結果'}</td>
                           <td className="border border-black px-1 py-0.5 text-center text-slate-500 text-[7px]">{rangeText}</td>
@@ -9454,8 +16880,10 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                       </tr>
                       {steps.filter(s => s.type !== 'measurement').map(step => {
                         const stepIdx = steps.findIndex(s => s.id === step.id);
+                        const hasChecklist = Array.isArray(step.checklistItems) && step.checklistItems.length > 0;
                         return (
-                          <tr key={step.id}>
+                          <React.Fragment key={step.id}>
+                          <tr>
                             <td colSpan={3} className="border border-black px-1 py-0.5 font-bold text-slate-700">{step.title}</td>
                             {Array.from({ length: lot.quantity || 1 }).map((_, i) => {
                               const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${stepIdx}-${i}`];
@@ -9470,6 +16898,28 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                               );
                             })}
                           </tr>
+                          {/* チェックリスト結果 */}
+                          {hasChecklist && step.checklistItems.map(item => (
+                            <tr key={`${step.id}-chk-${item.id}`} className="bg-purple-50/40">
+                              <td colSpan={3} className="border border-black px-1 py-0.5 text-[8px] text-purple-900">
+                                <span className="font-bold mr-1">☑</span>{item.label || '(無題)'}
+                                {item.required === false && <span className="text-slate-400 ml-1 text-[7px]">(任意)</span>}
+                              </td>
+                              {Array.from({ length: lot.quantity || 1 }).map((_, i) => {
+                                const chkKey = `${step.id}-${i}-checklist`;
+                                const checked = lot.measurementResults?.[chkKey] || {};
+                                const isChecked = !!checked[item.id];
+                                return (
+                                  <td key={i} className="border border-black px-0.5 py-0.5 text-center">
+                                    <span className={`text-[10px] font-bold ${isChecked ? 'text-emerald-700' : item.required === false ? 'text-slate-400' : 'text-rose-500'}`}>
+                                      {isChecked ? '✓' : item.required === false ? '－' : '×'}
+                                    </span>
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                          </React.Fragment>
                         );
                       })}
                     </>
@@ -9510,6 +16960,17 @@ const ReportPreview = ({ lot, workers, onClose }) => {
                 <div className="bg-slate-50 rounded-lg p-3"><div className="text-[10px] text-slate-400 font-bold">台数</div><div className="font-bold text-lg">{lot.quantity || 1} 台</div></div>
                 <div className="bg-slate-50 rounded-lg p-3"><div className="text-[10px] text-slate-400 font-bold">担当</div><div className="font-bold text-lg">{worker}</div></div>
               </div>
+              {/* 適用品質規格 */}
+              {lot.appliedStandard?.standardNo && lot.appliedStandard.source === 'qualityStandard' && (
+                <div className="mt-3 bg-indigo-50 border border-indigo-200 rounded-lg p-3 flex items-center gap-3 text-sm">
+                  <ClipboardCheck className="w-4 h-4 text-indigo-700"/>
+                  <div className="text-[10px] text-indigo-700 font-bold">適用品質規格</div>
+                  <div className="font-bold text-indigo-900">{lot.appliedStandard.standardNo}</div>
+                  {lot.appliedStandard.revision && <div className="text-indigo-700">Rev.{lot.appliedStandard.revision}</div>}
+                  <div className="flex-1 text-indigo-800">{lot.appliedStandard.name}</div>
+                  {lot.appliedStandard.appliedAt && <div className="text-[10px] text-indigo-600">適用: {toDateShort(lot.appliedStandard.appliedAt)}</div>}
+                </div>
+              )}
             </div>
 
             {/* 測定ステップごとのビジュアル表示 */}
@@ -9522,12 +16983,33 @@ const ReportPreview = ({ lot, workers, onClose }) => {
               const gridCols = pageLayout === 'a4-row' ? 'grid-cols-1' : (pageLayout === 'compact' ? 'grid-cols-2 md:grid-cols-3' : pageLayout === 'spread' ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2');
               const cellPad = pageLayout === 'a4-row' ? 'p-2 gap-2' : (pageLayout === 'compact' ? 'p-2 gap-2' : 'p-5 gap-5');
 
+              const cp = step.measurementConfig?.conditionPreset;
+              const hasCondition = cp && ((cp.params && cp.params.length > 0) || cp.note);
               return (
                 <div key={step.id} className="meas-step bg-white rounded-xl shadow-lg overflow-hidden">
                   <div className={`bg-blue-600 text-white ${pageLayout === 'compact' ? 'px-3 py-1.5 text-sm' : 'px-5 py-3'} font-bold flex items-center gap-2`}>
                     <Ruler className="w-4 h-4" /> {step.title}
                     {step.description && pageLayout !== 'compact' && <span className="text-blue-200 text-sm font-normal ml-2">— {step.description}</span>}
                   </div>
+                  {/* 測定条件 */}
+                  {hasCondition && (
+                    <div className={`bg-purple-50 border-b border-purple-200 ${pageLayout === 'compact' ? 'px-3 py-1' : 'px-5 py-2'} text-purple-900`}>
+                      <div className={`flex flex-wrap items-center gap-2 ${pageLayout === 'compact' ? 'text-[10px]' : 'text-xs'}`}>
+                        <ListChecks className={pageLayout === 'compact' ? 'w-3 h-3' : 'w-3.5 h-3.5'}/>
+                        <span className="font-bold">測定条件:</span>
+                        {cp.params?.filter(p => p.key || p.value).map((p, i) => (
+                          <span key={i} className="bg-white border border-purple-200 rounded px-1.5 py-0.5">
+                            {p.key}: <span className="font-mono font-bold">{p.value}</span>
+                          </span>
+                        ))}
+                      </div>
+                      {cp.note && (
+                        <div className={`mt-1 italic ${pageLayout === 'compact' ? 'text-[10px]' : 'text-xs'} whitespace-pre-wrap`}>
+                          {cp.note}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* ユニット別のダイアグラム＋結果カード */}
                   <div className={`grid ${gridCols} ${cellPad}`}>
@@ -9748,6 +17230,16 @@ const ReportPreview = ({ lot, workers, onClose }) => {
               <div className="border-r border-black flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">機番</span><span className="px-2 truncate font-mono">{(lot.unitSerialNumbers || []).join(' / ') || '-'}</span></div>
               <div className="flex items-center flex-1 min-w-0"><span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-gray-300 shrink-0">備考</span><span className="px-2 truncate">{defects ? <span className="text-red-700 font-bold">{defects.replace(/\n/g, ' / ')}</span> : ''}</span></div>
             </div>
+            {/* 適用品質規格 */}
+            {lot.appliedStandard?.standardNo && lot.appliedStandard.source === 'qualityStandard' && (
+              <div className="flex border border-black mb-2 text-[10px] items-stretch">
+                <span className="bg-gray-100 px-1 py-1 text-[9px] font-bold border-r border-black">適用規格</span>
+                <span className="font-bold px-2 border-r border-gray-300">{lot.appliedStandard.standardNo}</span>
+                {lot.appliedStandard.revision && <span className="px-2 border-r border-gray-300">Rev.{lot.appliedStandard.revision}</span>}
+                <span className="px-2 flex-1 truncate text-slate-700">{lot.appliedStandard.name}</span>
+                {lot.appliedStandard.appliedAt && <span className="px-2 text-slate-500 border-l border-gray-300 text-[9px]">適用: {toDateShort(lot.appliedStandard.appliedAt)}</span>}
+              </div>
+            )}
             <table className="w-full border-collapse border border-black text-[10px]">
               <tbody>
                 {Object.entries(stepsByCategory).map(([cat, catSteps]) => (
@@ -9791,12 +17283,26 @@ const ReportPreview = ({ lot, workers, onClose }) => {
 
                       // 測定項目: 各台分を [プレビュー(値オーバーレイ) | 計算結果] の 8:2 横並び1行
                       const cfg = step.measurementConfig;
+                      const cp = cfg?.conditionPreset;
+                      const hasCondition = cp && ((cp.params && cp.params.length > 0) || cp.note);
                       return (
                         <React.Fragment key={step.id}>
                           {/* 測定項目ヘッダー */}
                           <tr className="bg-blue-50">
                             <td className="border border-black p-1 font-bold text-[9px] pl-2">📐 {step.title} {step.description ? `— ${step.description}` : ''}</td>
                           </tr>
+                          {/* 測定条件 */}
+                          {hasCondition && (
+                            <tr className="bg-purple-50">
+                              <td className="border border-black px-2 py-0.5 text-[8px] text-purple-900">
+                                <span className="font-bold">測定条件:</span>
+                                {cp.params?.filter(p => p.key || p.value).map((p, i) => (
+                                  <span key={i} className="ml-2">{p.key}: <span className="font-mono font-bold">{p.value}</span></span>
+                                ))}
+                                {cp.note && <span className="ml-2 italic">— {cp.note.replace(/\n/g, ' ')}</span>}
+                              </td>
+                            </tr>
+                          )}
                           {/* 各ユニットを1行ずつ: 左にプレビュー+値、右に計算結果 */}
                           {Array.from({ length: lot.quantity || 1 }).map((_, unitIdx) => {
                             const meas = getMeasForUnit(step.id, unitIdx);
@@ -9833,285 +17339,1117 @@ const ReportPreview = ({ lot, workers, onClose }) => {
 };
 
 // ===========================
-// 全体進捗ビュー: ガントチャート風タイムライン + サマリー + 遅延アラート
+// 全体進捗ビュー: 作業者中心の現状ビュー + 納期ベース週次/月次仕事量
+// 入荷タイミングが不確かなので、納期から逆算した負荷見積もりに方針転換。
+// ・各作業者の現状 (作業中/待機/アイドル) を一目で把握 → 次の指示を判断
+// ・週次/月次の必要時間と必要人数を可視化 → 採用判断・残業計画に活用
 // ===========================
-const ProgressOverviewView = ({ lots, workers, settings }) => {
-  const [tickN, setTickN] = useState(0);
-  // リアルタイム更新 (10秒ごと)
+// 1日の作業者活動を時間軸で可視化するガントチャート
+const DailyWorkerGantt = ({ lots, workers, workSchedule }) => {
+  const localDateStr = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const [selectedDate, setSelectedDate] = useState(() => localDateStr(new Date()));
+  const [tick, setTick] = useState(0);
+  // 1分毎に再描画 (進行中タスクのバーを延ばす)
   useEffect(() => {
-    const id = setInterval(() => setTickN(n => n + 1), 10000);
+    const iv = setInterval(() => setTick(t => t + 1), 60000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // 今日 / 選択日が今日か (workerActivities useMemo より前に必要 — TDZ 回避)。ローカル日付で統一 (UTC変換で1日ズレるのを防ぐ)
+  const todayStr = localDateStr(new Date());
+  const isToday = selectedDate === todayStr;
+
+  const sch = { ...DEFAULT_WORK_SCHEDULE, ...(workSchedule || {}) };
+  const bizStartMin = timeStrToMinutes(sch.dayStart);
+  const schDayEndMin = timeStrToMinutes(sch.dayEnd);
+  const schOvertimeEndMin = sch.overtimeEnd ? timeStrToMinutes(sch.overtimeEnd) : schDayEndMin;
+  const includeOT = sch.includeOvertimeInCapacity ?? false;
+  const bizEndMin = includeOT ? schOvertimeEndMin : schDayEndMin;
+  const selectedDayBase = new Date(`${selectedDate}T00:00:00`).getTime();
+  const toLocalDateStr = (ms) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
+
+  // 自動工程判定 (executionMode='batch' or 工程名に「自動」を含む)
+  const isAutoStep = (step) => step?.executionMode === 'batch' || (step?.title || '').includes('自動');
+
+  // === 純粋表示: 各タスク(項目×台)を、記録された実開始→実終了でそのまま配置する ===
+  //   start = firstStartTime || startTime / end = 進行中/修正中:現在 / endTime || (start+所要)
+  //   このアプリは task.workerName が無いため、ロットの担当(lot.workerId)に全タスクを帰属させる。
+  //   開始時刻が無いタスクは時間軸に置けないので除外し「時刻記録なし」として数える。
+  const buildTaskBars = (lot) => {
+    const tasks = lot.tasks || {}; const steps = lot.steps || []; const qty = lot.quantity || 1;
+    const auto = [], manual = []; let noTimeCount = 0;
+    steps.forEach((step, sIdx) => {
+      const au = isAutoStep(step);
+      for (let u = 0; u < qty; u++) {
+        const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`];
+        if (!t) continue;
+        const done = t.status === 'completed' || t.status === 'ng' || t.status === 'reworking' || t.status === 'rework-done';
+        const start = (typeof t.firstStartTime === 'number') ? t.firstStartTime
+          : (typeof t.startTime === 'number') ? t.startTime : null;
+        if (start == null) { if (done && (t.duration || 0) > 0) noTimeCount++; continue; }
+        let end;
+        if (t.status === 'processing' || t.status === 'reworking') end = Date.now();
+        else if (typeof t.endTime === 'number') end = t.endTime;
+        else end = start + (t.duration || 0) * 1000;
+        if (!(end > start)) end = start + Math.max(t.duration || 0, 1) * 1000;
+        (au ? auto : manual).push({ start, end, status: t.status, stepTitle: step.title, unit: u + 1, dur: t.duration || 0, orderNo: lot.orderNo, model: lot.model, isAuto: au });
+      }
+    });
+    return { auto, manual, noTimeCount };
+  };
+  // 時刻が重なるバーだけ縦に積む (greedy サブレーン割当)
+  const packLanes = (bars) => {
+    const sorted = [...bars].sort((a, b) => a.start - b.start || a.end - b.end);
+    const laneEnds = [];
+    sorted.forEach(bar => {
+      let lane = laneEnds.findIndex(e => e <= bar.start);
+      if (lane === -1) { lane = laneEnds.length; laneEnds.push(bar.end); } else { laneEnds[lane] = bar.end; }
+      bar.lane = lane;
+    });
+    return { bars: sorted, laneCount: Math.max(1, laneEnds.length) };
+  };
+  // 同一タイムスタンプ(一括補正等)で同時刻に刻まれた項目は1本に集約し、無駄な段積みを防ぐ
+  const mergeSameSpan = (arr) => {
+    const groups = new Map();
+    arr.forEach(b => { const k = `${Math.round(b.start/1000)}_${Math.round(b.end/1000)}`; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(b); });
+    const out = [];
+    groups.forEach(g => {
+      if (g.length === 1) { out.push(g[0]); return; }
+      const names = g.map(x => `${x.stepTitle} #${x.unit}`);
+      out.push({ ...g[0], count: g.length, label: `同時刻に記録された ${g.length} 項目`, lotInfo: `${g[0].orderNo} ${g[0].model} / ${names.slice(0,4).join('、')}${g.length>4?` 他${g.length-4}項目`:''}` });
+    });
+    return out;
+  };
+
+  // 軸 = 当日の実バーの最小開始〜最大終了 (分単位フィット)。実バーが無ければ営業時間。
+  const dayBounds = (() => {
+    let minS = null, maxE = null;
+    (workers || []).forEach(w => (lots || []).filter(l => l.workerId === w.id).forEach(lot => {
+      const { auto, manual } = buildTaskBars(lot);
+      [...auto, ...manual].forEach(b => { if (toLocalDateStr(b.start) !== selectedDate) return; if (minS == null || b.start < minS) minS = b.start; if (maxE == null || b.end > maxE) maxE = b.end; });
+    }));
+    return { minS, maxE };
+  })();
+  let dayStartMin, dayEndMin;
+  if (dayBounds.minS != null && dayBounds.maxE != null) {
+    const sMin = (dayBounds.minS - selectedDayBase) / 60000, eMin = (dayBounds.maxE - selectedDayBase) / 60000;
+    const pad = Math.max(10, (eMin - sMin) * 0.08);
+    dayStartMin = Math.max(0, Math.floor((sMin - pad) / 15) * 15);
+    dayEndMin = Math.ceil((eMin + pad) / 15) * 15;
+    if (dayEndMin - dayStartMin < 30) dayEndMin = dayStartMin + 30;
+  } else { dayStartMin = bizStartMin; dayEndMin = bizEndMin; }
+  const totalMin = Math.max(30, dayEndMin - dayStartMin);
+  const dayStartMs = selectedDayBase + dayStartMin * 60000;
+  const dayEndMs = selectedDayBase + dayEndMin * 60000;
+
+  const realBreaks = (sch.breaks || []).map(b => ({
+    start: selectedDayBase + timeStrToMinutes(b.start) * 60000,
+    end: selectedDayBase + timeStrToMinutes(b.end) * 60000,
+    name: b.name || '休憩',
+  }));
+  const breaks = [
+    ...realBreaks,
+    { start: 0, end: dayStartMs, name: '勤務時間外 (始業前)' },
+    { start: dayEndMs, end: Number.MAX_SAFE_INTEGER, name: '勤務時間外 (終業後)' },
+  ];
+
+  // 完了時刻 (ms) を取得するヘルパー
+  const getCompletedMs = (lot) => {
+    const raw = lot?.completedAt || lot?.updatedAt;
+    if (!raw) return null;
+    if (typeof raw === 'number') return raw;
+    if (typeof raw === 'object' && raw.seconds) return raw.seconds * 1000;
+    const d = new Date(raw).getTime();
+    return isNaN(d) ? null : d;
+  };
+  // ロット内のタスクから 自動/手動 の duration 合計を返す
+  // 新フィールド firstStartTime/endTime/firstWorkStartTime があれば「実時刻」を返す
+  const lotDurationsBy = (lot) => {
+    const tasks = lot.tasks || {};
+    const steps = lot.steps || [];
+    const qty = lot.quantity || 1;
+    let autoSec = 0, manualSec = 0;
+    let hasRealStartTime = false;
+    // 真の開始時刻と終了時刻 (タスクの firstStartTime/endTime のうち最小・最大)
+    let earliestStartMs = null;
+    let latestEndMs = null;
+    steps.forEach((step, sIdx) => {
+      const auto = isAutoStep(step);
+      for (let u = 0; u < qty; u++) {
+        const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`];
+        if (!t) continue;
+        const dur = t.duration || 0;
+        if ((t.status === 'completed' || t.status === 'ng') && dur > 0) {
+          if (auto) autoSec += dur; else manualSec += dur;
+          if (t.startTime || t.firstStartTime) hasRealStartTime = true;
+        }
+        // タスクの実時刻を集計 (時間取りの本分: 開始/終了は必ず残す)
+        if (typeof t.firstStartTime === 'number') {
+          if (earliestStartMs === null || t.firstStartTime < earliestStartMs) earliestStartMs = t.firstStartTime;
+        } else if (typeof t.startTime === 'number') {
+          if (earliestStartMs === null || t.startTime < earliestStartMs) earliestStartMs = t.startTime;
+        }
+        if (typeof t.endTime === 'number') {
+          if (latestEndMs === null || t.endTime > latestEndMs) latestEndMs = t.endTime;
+        }
+      }
+    });
+    // lot.firstWorkStartTime も候補に
+    if (typeof lot.firstWorkStartTime === 'number') {
+      if (earliestStartMs === null || lot.firstWorkStartTime < earliestStartMs) earliestStartMs = lot.firstWorkStartTime;
+      hasRealStartTime = true;
+    }
+    return { autoSec, manualSec, hasRealStartTime, earliestStartMs, latestEndMs };
+  };
+  // 休憩を避けて end から逆方向に durSec を配置 → セグメント分割を返す
+  const placeBackwards = (end, durSec, breaks, lowerLimit) => {
+    const segments = [];
+    let pos = end;
+    let remaining = durSec * 1000;
+    let safety = 100;
+    while (remaining > 0 && safety-- > 0) {
+      // 現在位置が休憩中 (例: 終業後 17:00 以降に anchor がある場合) なら、休憩開始時刻まで戻す
+      const currentBreak = breaks.find(b => b.start < pos && b.end >= pos);
+      if (currentBreak) { pos = currentBreak.start; continue; }
+      // pos より前で重ならない最近の休憩
+      const nextBreak = breaks.filter(b => b.end <= pos).sort((a,b) => b.end - a.end)[0];
+      const lower = nextBreak ? nextBreak.end : lowerLimit;
+      const available = pos - lower;
+      if (available >= remaining) {
+        segments.unshift({ start: pos - remaining, end: pos });
+        remaining = 0;
+        break;
+      }
+      if (available > 0) {
+        segments.unshift({ start: lower, end: pos });
+        remaining -= available;
+      }
+      if (!nextBreak || nextBreak.start <= lowerLimit) break;
+      pos = nextBreak.start;
+    }
+    return segments;
+  };
+  // 休憩を避けて start から順方向に durSec を配置
+  const placeForward = (start, durSec, breaks, upperLimit) => {
+    const segments = [];
+    let pos = Math.max(start, 0);
+    let remaining = durSec * 1000;
+    let safety = 100;
+    while (remaining > 0 && safety-- > 0) {
+      const nextBreak = breaks.filter(b => b.start >= pos).sort((a,b) => a.start - b.start)[0];
+      const upper = nextBreak ? nextBreak.start : upperLimit;
+      // pos が休憩中なら休憩終わりまで進める
+      const currentBreak = breaks.find(b => b.start <= pos && b.end > pos);
+      if (currentBreak) { pos = currentBreak.end; continue; }
+      const available = upper - pos;
+      if (available >= remaining) {
+        segments.push({ start: pos, end: pos + remaining });
+        remaining = 0;
+        break;
+      }
+      if (available > 0) {
+        segments.push({ start: pos, end: upper });
+        remaining -= available;
+      }
+      if (!nextBreak || nextBreak.end >= upperLimit) break;
+      pos = nextBreak.end;
+    }
+    return segments;
+  };
+
+  // === 各作業者のガントブロックを集計 ===
+  // 設計:
+  //   - 1ロット = 自動レーンに1〜数本 + 手動レーンに1〜数本 (休憩で分割される場合)
+  //   - 自動と手動は同じ時間帯に並行進行 (作業者は自動を回しながら手動を進める)
+  //   - 完了ロットは completedAt を「ロット作業終了時刻」とし、自動/手動の duration を逆算
+  //   - ロット同士は重ねない: 完了時刻降順に並べ、前のロットの開始時刻が次のロットの完了時刻になる
+  //   - 休憩時間は配置から除外 (休憩中はバーが入らない)
+  //   - 完了タスクで startTime が null の場合は「時刻は推定」マークを付ける
+  //   - 予定 (未着手) は実績の右側に、休憩を避けつつロット単位で配置
+  const workerActivities = useMemo(() => {
+    const breaksMs = breaks; // already computed above as ms ranges
+    // 実績バーの和集合 (秒) = 休憩除外・自動/手動の並行を考慮した実労働時間
+    const unionSec = (bars) => {
+      const iv = bars.filter(b => !b.isPlanned).map(b => [b.start, b.end]).sort((a, b) => a[0] - b[0]);
+      let total = 0, curS = null, curE = null;
+      iv.forEach(([s, e]) => { if (curS === null) { curS = s; curE = e; } else if (s <= curE) { curE = Math.max(curE, e); } else { total += curE - curS; curS = s; curE = e; } });
+      if (curS !== null) total += curE - curS;
+      return Math.round(total / 1000);
+    };
+    const mergeActual = (arr) => { const act = arr.filter(b => !b.isPlanned); const pl = arr.filter(b => b.isPlanned); return [...mergeSameSpan(act), ...pl]; };
+    return (workers || []).map(worker => {
+      const autoRaw = [], manualRaw = [];
+      let autoLaborSec = 0, manualLaborSec = 0, taskCount = 0, lotCountPlanned = 0, noTimeCount = 0;
+      const workerLots = (lots || []).filter(l => l.workerId === worker.id);
+
+      // === 実績: 各タスク(項目×台)を、記録された実開始→実終了でそのまま配置する(再構成しない) ===
+      workerLots.forEach(lot => {
+        const { auto, manual, noTimeCount: ntc } = buildTaskBars(lot);
+        noTimeCount += ntc;
+        const pushBar = (b, arr) => {
+          if (toLocalDateStr(b.start) !== selectedDate) return;
+          const startStr = new Date(b.start).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+          const endStr = new Date(b.end).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+          const color = b.isAuto
+            ? (b.status === 'processing' ? 'bg-purple-500' : 'bg-purple-400')
+            : (b.status === 'ng' ? 'bg-rose-500' : b.status === 'reworking' ? 'bg-orange-500' : b.status === 'processing' ? 'bg-blue-500' : 'bg-emerald-500');
+          const borderColor = b.isAuto ? 'border-purple-700'
+            : (b.status === 'ng' ? 'border-rose-700' : b.status === 'reworking' ? 'border-orange-700' : b.status === 'processing' ? 'border-blue-700' : 'border-emerald-700');
+          arr.push({ start: b.start, end: b.end, type: b.status, isPlanned: false, status: b.status, color, borderColor,
+            stepTitle: b.stepTitle, unit: b.unit, orderNo: b.orderNo, model: b.model,
+            label: `${b.orderNo} ${b.model} / ${b.stepTitle} #${b.unit}台目`,
+            lotInfo: `${startStr}〜${endStr} (実所要 ${Math.max(1, Math.round(b.dur))}秒)` });
+          if (b.isAuto) autoLaborSec += b.dur; else manualLaborSec += b.dur;
+          taskCount++;
+        };
+        auto.forEach(b => pushBar(b, autoRaw));
+        manual.forEach(b => pushBar(b, manualRaw));
+      });
+
+      // === 予定 (未着手) — 当日/未来のみ。実バーの最後 or 現在時刻から前方に概算配置 ===
+      if (selectedDate >= todayStr) {
+        const now = Date.now();
+        const lastEnd = [...autoRaw, ...manualRaw].reduce((mx, b) => Math.max(mx, b.end), 0);
+        let planCursor = (selectedDate === todayStr && now >= dayStartMs && now <= dayEndMs) ? Math.max(lastEnd, now) : (lastEnd > 0 ? lastEnd : dayStartMs);
+        const plannedLots = workerLots.filter(l => l.status !== 'completed').sort((a, b) => (a.entryAt || a.createdAt || 0) - (b.entryAt || b.createdAt || 0));
+        plannedLots.forEach(lot => {
+          const tasks = lot.tasks || {}; const steps = lot.steps || []; const qty = lot.quantity || 1;
+          let autoSec = 0, manualSec = 0;
+          steps.forEach((step, sIdx) => { const au = isAutoStep(step); for (let u = 0; u < qty; u++) { const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`]; if (t && (t.status==='completed'||t.status==='skipped'||t.status==='processing'||t.status==='ng'||t.status==='reworking'||t.status==='rework-done')) continue; if (au) autoSec += (step.targetTime || 60); else manualSec += (step.targetTime || 60); } });
+          if (autoSec === 0 && manualSec === 0) return;
+          const baseLabel = `${lot.orderNo} ${lot.model} (予定)`;
+          if (autoSec > 0) { placeForward(planCursor, autoSec, breaksMs, dayEndMs).forEach(seg => { if (seg.end<=dayStartMs||seg.start>=dayEndMs) return; autoRaw.push({ start: Math.max(seg.start,dayStartMs), end: Math.min(seg.end,dayEndMs), type:'planned', isPlanned:true, status:'planned', color:'bg-purple-200', borderColor:'border-purple-400', label: `${baseLabel} / 自動工程 計${Math.round(autoSec/60)}分`, lotInfo: `${qty}台 × 自動 (概算)` }); }); }
+          if (manualSec > 0) { placeForward(planCursor, manualSec, breaksMs, dayEndMs).forEach(seg => { if (seg.end<=dayStartMs||seg.start>=dayEndMs) return; manualRaw.push({ start: Math.max(seg.start,dayStartMs), end: Math.min(seg.end,dayEndMs), type:'planned', isPlanned:true, status:'planned', color:'bg-blue-200', borderColor:'border-blue-400', label: `${baseLabel} / 手動工程 計${Math.round(manualSec/60)}分`, lotInfo: `${qty}台 × 手動 (概算)` }); }); }
+          lotCountPlanned++;
+          planCursor = [...autoRaw, ...manualRaw].filter(b => b.isPlanned).reduce((mx, b) => Math.max(mx, b.end), planCursor);
+        });
+      }
+
+      const realLaborSec = unionSec([...autoRaw, ...manualRaw]);
+      const autoPacked = packLanes(mergeActual(autoRaw));
+      const manualPacked = packLanes(mergeActual(manualRaw));
+      return { worker, autoBlocks: autoPacked.bars, autoLaneCount: autoPacked.laneCount, manualBlocks: manualPacked.bars, manualLaneCount: manualPacked.laneCount, realLaborSec, autoLaborSec, manualLaborSec, taskCount, lotCountActual: taskCount, lotCountPlanned, noTimeCount };
+    });
+  }, [workers, lots, dayStartMs, dayEndMs, tick, todayStr, selectedDate]);
+
+  const totalActuals = workerActivities.reduce((sum, w) => sum + (w.taskCount || 0), 0);
+  const totalPlanned = workerActivities.reduce((sum, w) => sum + (w.lotCountPlanned || 0), 0);
+  const totalNoTime = workerActivities.reduce((sum, w) => sum + (w.noTimeCount || 0), 0);
+  const totalActivities = totalActuals + totalPlanned;
+
+  // 時刻ラベル用 (表示幅に応じて間隔を自動: 狭いほど細かく)
+  const markStep = totalMin <= 90 ? 15 : totalMin <= 240 ? 30 : 60;
+  const hourMarks = [];
+  for (let m = Math.ceil(dayStartMin / markStep) * markStep; m <= dayEndMin; m += markStep) {
+    const left = ((m - dayStartMin) / totalMin) * 100;
+    hourMarks.push({ left, label: `${String(Math.floor(m / 60)).padStart(2,'0')}:${String(((m % 60) + 60) % 60).padStart(2,'0')}` });
+  }
+
+  // 現在時刻のライン (選択日が今日の時のみ) — today/todayStr/isToday は冒頭で定義済
+  const nowMin = isToday ? (new Date().getHours() * 60 + new Date().getMinutes()) : null;
+  const nowLeft = (nowMin != null && nowMin >= dayStartMin && nowMin <= dayEndMin)
+    ? ((nowMin - dayStartMin) / totalMin) * 100 : null;
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
+      <div className="p-3 border-b flex flex-wrap items-center justify-between gap-2">
+        <h3 className="font-bold text-lg flex items-center gap-2"><Activity className="w-5 h-5 text-emerald-600"/> 作業者タイムライン <span className="text-xs font-normal text-slate-500">(各項目の実際の開始〜終了時刻)</span></h3>
+        <div className="flex items-center gap-2">
+          <input
+            type="date"
+            value={selectedDate}
+            onChange={e => setSelectedDate(e.target.value)}
+            className="border rounded px-2 py-1 text-sm bg-slate-50 font-mono"
+          />
+          <button onClick={() => setSelectedDate(todayStr)} className="text-xs bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 px-2 py-1 rounded font-bold">今日</button>
+          <span className="text-[10px] text-slate-500">実績 {totalActuals}件 / 予定 {totalPlanned}件</span>
+        </div>
+      </div>
+      <div className="p-3">
+        {workers.length === 0 ? (
+          <div className="text-center text-slate-400 py-8">作業者が登録されていません</div>
+        ) : (
+          <div className="space-y-1">
+            {/* 時刻ヘッダ */}
+            <div className="flex gap-2 items-center mb-1">
+              <div className="w-24 shrink-0"></div>
+              <div className="flex-1 relative h-5 border-b border-slate-200">
+                {hourMarks.map(m => (
+                  <div key={m.label} className="absolute top-0 bottom-0 border-l border-slate-300 text-[9px] text-slate-500 pl-0.5 font-mono" style={{ left: `${m.left}%` }}>{m.label}</div>
+                ))}
+                {/* 休憩のグレー帯 */}
+                {breaks.map((b, i) => {
+                  const bStartMin = (b.start - new Date(`${selectedDate}T00:00:00`).getTime()) / 60000;
+                  const bEndMin = (b.end - new Date(`${selectedDate}T00:00:00`).getTime()) / 60000;
+                  if (bEndMin < dayStartMin || bStartMin > dayEndMin) return null;
+                  const left = Math.max(0, ((bStartMin - dayStartMin) / totalMin) * 100);
+                  const width = Math.min(100 - left, ((bEndMin - bStartMin) / totalMin) * 100);
+                  return <div key={i} className="absolute top-0 bottom-0 bg-slate-200/50" style={{ left: `${left}%`, width: `${width}%` }} title={b.name}/>;
+                })}
+              </div>
+            </div>
+            {/* 各作業者の行: 上=自動レーン (紫系) / 下=手動レーン (青/緑系)。同じ時刻に両方バーが並べば「並列作業」が可視化される。
+                予定 (未着手) は半透明 + 点線枠で実績の右に配置。 */}
+            {workerActivities.map(({ worker, autoBlocks, autoLaneCount, manualBlocks, manualLaneCount, realLaborSec, autoLaborSec, manualLaborSec, taskCount, lotCountPlanned, noTimeCount }) => {
+              const laneH = 16;
+              const renderBlock = (b, i, laneClass) => {
+                const startMinOfDay = (b.start - selectedDayBase) / 60000;
+                const endMinOfDay = (b.end - selectedDayBase) / 60000;
+                const left = ((startMinOfDay - dayStartMin) / totalMin) * 100;
+                const rawWidth = ((endMinOfDay - startMinOfDay) / totalMin) * 100;
+                const width = Math.max(rawWidth, 0.6);
+                const startTimeStr = new Date(b.start).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+                const endTimeStr = new Date(b.end).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+                const isPlanned = b.isPlanned;
+                return (
+                  <div
+                    key={`${laneClass}-${i}`}
+                    className={`absolute ${b.color} ${b.status === 'processing' || b.status === 'reworking' ? 'animate-pulse ring-1 ring-blue-300' : ''} border ${b.borderColor} ${isPlanned ? 'border-dashed opacity-70' : 'shadow-sm'} ${b.count > 1 ? 'ring-1 ring-white' : ''} rounded cursor-help flex items-center justify-center overflow-hidden`}
+                    style={{ left: `${Math.max(0, left)}%`, width: `${Math.min(100 - Math.max(0, left), width)}%`, minWidth: b.count > 1 ? '16px' : '5px', top: `${b.lane * laneH + 1}px`, height: `${laneH - 2}px` }}
+                    title={`${startTimeStr}〜${endTimeStr}${isPlanned ? ' [予定]' : ''}\n${b.label}\n${b.lotInfo}`}
+                  >
+                    {b.count > 1 && <span className="text-[8px] leading-none font-black text-white">{b.count}</span>}
+                  </div>
+                );
+              };
+              const renderBreaksAndLines = (keyPrefix) => (
+                <>
+                  {breaks.map((b, i) => {
+                    const bStartMin = (b.start - new Date(`${selectedDate}T00:00:00`).getTime()) / 60000;
+                    const bEndMin = (b.end - new Date(`${selectedDate}T00:00:00`).getTime()) / 60000;
+                    if (bEndMin < dayStartMin || bStartMin > dayEndMin) return null;
+                    const left = Math.max(0, ((bStartMin - dayStartMin) / totalMin) * 100);
+                    const width = Math.min(100 - left, ((bEndMin - bStartMin) / totalMin) * 100);
+                    return <div key={`${keyPrefix}-brk-${i}`} className="absolute top-0 bottom-0 bg-slate-200/40" style={{ left: `${left}%`, width: `${width}%` }} title={b.name}/>;
+                  })}
+                  {hourMarks.map(m => (
+                    <div key={`${keyPrefix}-hl-${m.label}`} className="absolute top-0 bottom-0 border-l border-slate-200" style={{ left: `${m.left}%` }}/>
+                  ))}
+                </>
+              );
+              return (
+              <div key={worker.id} className="flex gap-2 items-stretch border-b border-slate-100 pb-1">
+                {/* 作業者サマリ: 実労働時間 (休憩除外, 自動と手動の最大) と 完了/予定 ロット数 */}
+                <div className="w-32 shrink-0 flex flex-col justify-center gap-0.5">
+                  <div className="flex items-center gap-1">
+                    <div className="w-5 h-5 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center"><User className="w-3 h-3"/></div>
+                    <span className="text-xs font-bold text-slate-700 truncate" title={worker.name}>{worker.name}</span>
+                  </div>
+                  <div className="text-[10px] text-slate-700 ml-6 leading-tight font-mono font-bold" title="実労働時間 (休憩除外・自動と手動の並行進行を考慮)">
+                    実労 {formatTime(realLaborSec)}
+                  </div>
+                  <div className="text-[9px] text-slate-500 ml-6 leading-tight font-mono">
+                    自{formatTime(autoLaborSec)} / 手{formatTime(manualLaborSec)}
+                  </div>
+                  <div className="text-[9px] text-slate-400 ml-6 leading-tight">
+                    {taskCount}項目 / 予{lotCountPlanned}ロット
+                  </div>
+                  {noTimeCount > 0 && (
+                    <div className="text-[9px] text-amber-500 ml-6 leading-tight font-bold" title="開始時刻が記録されていないため時間軸に表示できない項目数">時刻なし{noTimeCount}</div>
+                  )}
+                </div>
+                <div className="flex-1 flex flex-col gap-0.5">
+                  {/* 自動レーン */}
+                  <div className="relative bg-purple-50/40 rounded border border-purple-100 overflow-hidden" style={{ height: `${Math.max(1, autoLaneCount) * laneH + 2}px` }}>
+                    {renderBreaksAndLines('auto')}
+                    {autoBlocks.map((b, i) => renderBlock(b, i, 'auto'))}
+                    {nowLeft != null && (<div className="absolute top-0 bottom-0 border-l-2 border-rose-500 z-10" style={{ left: `${nowLeft}%` }}/>)}
+                    <div className="absolute left-1 top-0.5 text-[8px] text-purple-400 font-bold pointer-events-none">自動</div>
+                  </div>
+                  {/* 手動レーン */}
+                  <div className="relative bg-blue-50/40 rounded border border-blue-100 overflow-hidden" style={{ height: `${Math.max(1, manualLaneCount) * laneH + 2}px` }}>
+                    {renderBreaksAndLines('manual')}
+                    {manualBlocks.map((b, i) => renderBlock(b, i, 'manual'))}
+                    {nowLeft != null && (
+                      <div className="absolute top-0 bottom-0 border-l-2 border-rose-500 z-10" style={{ left: `${nowLeft}%` }} title="現在時刻">
+                        <div className="absolute -bottom-1 -translate-x-1/2 left-0 w-2 h-2 bg-rose-500 rounded-full"/>
+                      </div>
+                    )}
+                    <div className="absolute left-1 top-0.5 text-[8px] text-blue-400 font-bold pointer-events-none">手動</div>
+                  </div>
+                </div>
+              </div>
+            );})}
+          </div>
+        )}
+        {/* 凡例 */}
+        <div className="mt-3 flex flex-wrap gap-3 text-[10px] text-slate-500">
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-purple-400"/>自動工程 (完了)</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-purple-500"/>自動工程 (進行中)</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-emerald-500"/>手動工程 (完了)</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-blue-500 animate-pulse"/>手動 (進行中)</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-orange-500"/>修正作業</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-rose-500"/>NG/再作業</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 border border-dashed border-slate-400 bg-slate-100"/>予定 (未着手)</span>
+          <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded bg-slate-200"/>休憩</span>
+          <span className="ml-auto text-[10px] text-slate-400">各バー=1項目の実開始〜実終了。同時刻に自動+手動が並ぶ＝並列作業。{totalNoTime > 0 ? ` 時刻記録のない ${totalNoTime} 項目は非表示。` : ''}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
+  const [tickN, setTickN] = useState(0);
+  // 週次仕事量で展開中の週 (null = なし)
+  const [expandedWeekIdx, setExpandedWeekIdx] = useState(null);
+  // カテゴリ別表示モード: 'all' = 全体, 'split' = 中間 vs 完品
+  const [splitMode, setSplitMode] = useState('all');
+
+  // ロットを「中間 / 完品」に分類
+  //   テンプレート名に「中間」が含まれていれば中間検査、それ以外は完品検査
+  const categorizeLot = (lot) => {
+    const tpl = templates.find(t => t.id === lot.templateId);
+    const tplName = tpl?.name || (lot.templateId === 'demo' ? '詳細デモ手順' : '');
+    return tplName.includes('中間') ? 'intermediate' : 'final';
+  };
+  const CATEGORY_LABELS = { intermediate: '中間検査', final: '完品検査' };
+  const CATEGORY_COLORS = {
+    intermediate: { bar: 'bg-cyan-500', text: 'text-cyan-700', bg: 'bg-cyan-50', border: 'border-cyan-300' },
+    final:        { bar: 'bg-violet-500', text: 'text-violet-700', bg: 'bg-violet-50', border: 'border-violet-300' },
+  };
+  // リアルタイム更新 (30秒ごと)
+  useEffect(() => {
+    const id = setInterval(() => setTickN(n => n + 1), 30000);
     return () => clearInterval(id);
   }, []);
 
-  // 今日の範囲 (昼勤想定で 6:00-22:00、はみ出る場合は自動拡張)
-  const now = Date.now();
-  const today = new Date(); today.setHours(0,0,0,0);
-  const todayMs = today.getTime();
-  const startOfShiftMs = todayMs + 6 * 60 * 60 * 1000;     // 6:00
-  const endOfShiftMs = todayMs + 22 * 60 * 60 * 1000;       // 22:00
+  // 想定稼働時間 (設定があれば使う、デフォルトは 8h/日・5日/週)
+  // 勤務スケジュールから 1 日の実働時間を算出 (設定で休憩・定時・残業をカスタマイズ可能)
+  const workHours = useMemo(() => computeWorkHours(settings?.workSchedule), [settings?.workSchedule]);
+  const includeOT = settings?.workSchedule?.includeOvertimeInCapacity ?? false;
+  const HOURS_PER_DAY = settings?.workloadHoursPerDay ?? (includeOT ? workHours.totalHours : workHours.regularHours);
+  const DAYS_PER_WEEK = settings?.workloadDaysPerWeek || settings?.workSchedule?.daysPerWeek || 5;
+  const DAYS_PER_MONTH = settings?.workloadDaysPerMonth || settings?.workSchedule?.daysPerMonth || 20;
+  const HOURS_PER_WEEK = HOURS_PER_DAY * DAYS_PER_WEEK;     // 40h
+  const HOURS_PER_MONTH = HOURS_PER_DAY * DAYS_PER_MONTH;   // 160h
 
   const activeLots = useMemo(() => {
     return lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
   }, [lots]);
 
-  // 各ロットの進捗計算
-  const lotsWithProgress = useMemo(() => {
-    return activeLots.map(lot => ({
-      lot,
-      progress: computeLotProgress(lot),
-      worker: workers.find(w => w.id === lot.workerId),
-    })).filter(x => x.progress).sort((a, b) => {
-      // 遅延優先 → 進行中優先 → 開始時刻順
-      const order = { critical: 0, warning: 1, ontime: 2, ahead: 3, completed: 4 };
-      const da = order[a.progress.delayLevel] ?? 5;
-      const db = order[b.progress.delayLevel] ?? 5;
-      if (da !== db) return da - db;
-      return (b.progress.startMs || 0) - (a.progress.startMs || 0);
+  // 各作業者の現在の状況
+  const workerStatuses = useMemo(() => {
+    return workers.map(w => {
+      const myLots = activeLots.filter(l => l.workerId === w.id);
+      const processing = myLots.find(l => l.status === 'processing');
+      const paused = myLots.find(l => l.status === 'paused' && (!processing || l.id !== processing.id));
+      const activeLot = processing || paused;
+      const queued = myLots.filter(l => l !== activeLot);
+
+      // 残り推定時間 (全担当ロットの未完了タスク × 想定時間)
+      const remainingSec = myLots.reduce((acc, lot) => {
+        const p = computeLotProgress(lot);
+        if (!p) return acc + calculateLotEstimatedTime(lot);
+        return acc + (p.remainingTasks * (p.avgTaskTime || 60));
+      }, 0);
+
+      let state, stateLabel, stateColor;
+      if (processing) { state = 'processing'; stateLabel = '作業中'; stateColor = 'emerald'; }
+      else if (paused) { state = 'paused'; stateLabel = '一時停止'; stateColor = 'amber'; }
+      else if (queued.length > 0) { state = 'waiting'; stateLabel = '待機'; stateColor = 'blue'; }
+      else { state = 'idle'; stateLabel = 'アイドル'; stateColor = 'slate'; }
+
+      const activeProgress = activeLot ? computeLotProgress(activeLot) : null;
+
+      // 推奨アクション (UI ヒント)
+      let hint = '';
+      if (state === 'idle') hint = '空いています → 次のロットを割当できます';
+      else if (state === 'waiting') hint = `待ち ${queued.length} 件 → 作業開始を促せます`;
+      else if (state === 'paused') hint = '一時停止中 → 再開を促しましょう';
+      else if (activeProgress?.delayLevel === 'critical') hint = '⚠ 大幅遅延中 → サポートが必要かも';
+      else if (activeProgress?.delayLevel === 'warning') hint = '遅れ気味 → 進捗確認を';
+
+      return { worker: w, state, stateLabel, stateColor, processing, paused, queued, myLots, remainingSec, activeProgress, hint, activeLot };
     });
   }, [activeLots, workers, tickN]);
 
-  // 今日完了したロット (サマリー用)
-  const todayCompletedCount = useMemo(() =>
-    lots.filter(l => {
-      if (l.status !== 'completed' && l.location !== 'completed') return false;
-      const t = (typeof l.updatedAt === 'number') ? l.updatedAt : (l.updatedAt?.seconds ? l.updatedAt.seconds * 1000 : 0);
-      return t >= todayMs && t <= todayMs + 86400000;
-    }).length, [lots, todayMs]);
+  // 未割当ロット (workerId なし)
+  const unassignedLots = useMemo(() => activeLots.filter(l => !l.workerId), [activeLots]);
+  const unassignedSec = unassignedLots.reduce((a, l) => a + calculateLotEstimatedTime(l), 0);
 
-  // サマリー集計
-  const summary = useMemo(() => {
-    const inProgress = lotsWithProgress.filter(x => x.progress.isProcessing).length;
-    const delayed = lotsWithProgress.filter(x => x.progress.delayLevel === 'critical' || x.progress.delayLevel === 'warning').length;
-    const waiting = lotsWithProgress.filter(x => !x.progress.isProcessing && !x.progress.isCompleted).length;
-    return { inProgress, delayed, waiting, completed: todayCompletedCount, total: lotsWithProgress.length + todayCompletedCount };
-  }, [lotsWithProgress, todayCompletedCount]);
+  // 入荷待ち (location='arrival')
+  const arrivalLots = useMemo(() => activeLots.filter(l => l.location === 'arrival'), [activeLots]);
+  const arrivalSec = arrivalLots.reduce((a, l) => a + calculateLotEstimatedTime(l), 0);
 
-  // 「全体感」サマリ: 進捗率・完了見込み・シフト終了予測
-  const overall = useMemo(() => {
-    const totalTasks = lotsWithProgress.reduce((acc, x) => acc + (x.progress.totalTasks || 0), 0);
-    const completedTasks = lotsWithProgress.reduce((acc, x) => acc + (x.progress.completedCount || 0), 0);
-    const overallPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-    // シフト終了 (22時) 時点の予測: 進行中ロットの ETA を最大とする
-    const latestEta = lotsWithProgress.reduce((max, x) => x.progress.etaMs > max ? x.progress.etaMs : max, 0);
-    const expectedFinishCount = lotsWithProgress.filter(x => x.progress.etaMs > 0 && x.progress.etaMs <= endOfShiftMs).length + todayCompletedCount;
-    const willMissCount = lotsWithProgress.filter(x => x.progress.etaMs > endOfShiftMs).length;
-    // 全体ステータス: 大幅遅延が1件でもあれば critical、遅延気味なら warning、前倒し多ければ ahead、それ以外 ontime
-    let level = 'ontime';
-    if (lotsWithProgress.some(x => x.progress.delayLevel === 'critical')) level = 'critical';
-    else if (lotsWithProgress.filter(x => x.progress.delayLevel === 'warning').length >= 2) level = 'warning';
-    else if (lotsWithProgress.filter(x => x.progress.delayLevel === 'ahead').length > lotsWithProgress.filter(x => x.progress.delayLevel === 'warning').length) level = 'ahead';
-    return { overallPct, totalTasks, completedTasks, latestEta, expectedFinishCount, willMissCount, level };
-  }, [lotsWithProgress, endOfShiftMs, todayCompletedCount]);
+  // 週次仕事量 (納期ベース): 今週から 8週先まで
+  const weeklyWorkload = useMemo(() => {
+    const today = new Date(); today.setHours(0,0,0,0);
+    // 今週月曜
+    const monday = new Date(today);
+    const dow = today.getDay(); // 日=0, 月=1, ...
+    const diff = dow === 0 ? -6 : 1 - dow;
+    monday.setDate(today.getDate() + diff);
 
-  // タイムラインの x軸範囲を動的に決定 (作業中のロットの開始/予測完了に合わせる)
-  const timelineRange = useMemo(() => {
-    const starts = lotsWithProgress.map(x => x.progress.startMs).filter(Boolean);
-    const etas = lotsWithProgress.map(x => x.progress.etaMs).filter(Boolean);
-    const min = starts.length > 0 ? Math.min(...starts) : startOfShiftMs;
-    const max = etas.length > 0 ? Math.max(...etas, now) : endOfShiftMs;
-    // 8時間以上の場合は 8時間に圧縮、最低 4時間幅
-    const span = Math.max(max - min, 4 * 60 * 60 * 1000);
-    return { min: Math.min(min, startOfShiftMs), max: min + span, span };
-  }, [lotsWithProgress, now, startOfShiftMs, endOfShiftMs]);
+    const weeks = [];
+    for (let i = 0; i < 8; i++) {
+      const ws = new Date(monday); ws.setDate(monday.getDate() + i * 7);
+      const we = new Date(ws); we.setDate(ws.getDate() + 6); we.setHours(23,59,59,999);
+      weeks.push({
+        start: ws, end: we, label: i === 0 ? '今週' : i === 1 ? '来週' : `${i}週後`,
+        lots: [], totalSec: 0, totalQty: 0,
+        // カテゴリ別集計
+        byCategory: {
+          intermediate: { lots: [], sec: 0, qty: 0 },
+          final:        { lots: [], sec: 0, qty: 0 },
+        },
+      });
+    }
 
-  // 時刻軸の目盛り (1時間ごと)
-  const timeMarks = useMemo(() => {
-    const marks = [];
-    const start = new Date(timelineRange.min); start.setMinutes(0, 0, 0);
-    let t = start.getTime();
-    if (t < timelineRange.min) t += 3600000;
-    while (t <= timelineRange.max) { marks.push(t); t += 3600000; }
-    return marks;
-  }, [timelineRange]);
+    let noDueCount = 0, noDueSec = 0;
+    let overdueCount = 0, overdueSec = 0;
 
-  // 作業者別 現在のステータス
-  const workerStatus = useMemo(() => {
-    return workers.map(w => {
-      const myLots = lotsWithProgress.filter(x => x.lot.workerId === w.id);
-      const active = myLots.find(x => x.progress.isProcessing);
-      return { worker: w, active, allLots: myLots };
-    }).filter(s => s.allLots.length > 0 || s.active);
-  }, [workers, lotsWithProgress]);
+    const pushToWeek = (wk, lot, sec) => {
+      wk.lots.push(lot);
+      wk.totalSec += sec;
+      wk.totalQty += (lot.quantity || 1);
+      const cat = categorizeLot(lot);
+      wk.byCategory[cat].lots.push(lot);
+      wk.byCategory[cat].sec += sec;
+      wk.byCategory[cat].qty += (lot.quantity || 1);
+    };
 
-  const delayBg = (level) => level === 'critical' ? 'bg-rose-500' : level === 'warning' ? 'bg-amber-500' : level === 'ahead' ? 'bg-emerald-500' : 'bg-blue-500';
-  const delayLabel = (level) => level === 'critical' ? '大幅遅延' : level === 'warning' ? '遅延気味' : level === 'ahead' ? '前倒し' : '予定通り';
-  const delayTextClass = (level) => level === 'critical' ? 'text-rose-600' : level === 'warning' ? 'text-amber-600' : level === 'ahead' ? 'text-emerald-600' : 'text-blue-600';
+    activeLots.forEach(lot => {
+      if (!lot.dueDate) { noDueCount++; noDueSec += calculateLotEstimatedTime(lot); return; }
+      const due = new Date(lot.dueDate); due.setHours(0,0,0,0);
+      const sec = calculateLotEstimatedTime(lot);
+      const wk = weeks.find(w => due >= w.start && due <= w.end);
+      if (wk) pushToWeek(wk, lot, sec);
+      else if (due < weeks[0].start) {
+        // 期限切れ: 今週に積む
+        overdueCount++; overdueSec += sec;
+        pushToWeek(weeks[0], lot, sec);
+      }
+      // 8週より先は範囲外として無視
+    });
+
+    return { weeks, noDueCount, noDueSec, overdueCount, overdueSec };
+  }, [activeLots, tickN, templates]);
+
+  // 月次仕事量 (納期ベース): 今月から 6ヶ月先まで
+  const monthlyWorkload = useMemo(() => {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const thisMonthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+
+    const months = [];
+    for (let i = 0; i < 6; i++) {
+      const ms = new Date(thisMonthStart.getFullYear(), thisMonthStart.getMonth() + i, 1);
+      const me = new Date(thisMonthStart.getFullYear(), thisMonthStart.getMonth() + i + 1, 0);
+      me.setHours(23,59,59,999);
+      months.push({ start: ms, end: me, label: `${ms.getFullYear()}/${String(ms.getMonth()+1).padStart(2,'0')}`, lots: [], totalSec: 0 });
+    }
+
+    activeLots.forEach(lot => {
+      if (!lot.dueDate) return;
+      const due = new Date(lot.dueDate); due.setHours(0,0,0,0);
+      const sec = calculateLotEstimatedTime(lot);
+      const mo = months.find(m => due >= m.start && due <= m.end);
+      if (mo) { mo.lots.push(lot); mo.totalSec += sec; }
+      else if (due < months[0].start) {
+        months[0].lots.push(lot); months[0].totalSec += sec;
+      }
+    });
+
+    return months;
+  }, [activeLots, tickN]);
+
+  // 負荷計算で使う「想定作業者数」
+  //   登録された全作業者がいつもいるとは限らないため、マスタ設定で人数を上書き可能
+  //   未設定なら workers.length にフォールバック
+  const registeredWorkers = workers.length || 1;
+  const overrideWorkers = settings?.workloadEffectiveWorkers;
+  const totalWorkers = (overrideWorkers && Number(overrideWorkers) > 0) ? Number(overrideWorkers) : registeredWorkers;
+  const isWorkerOverride = (overrideWorkers && Number(overrideWorkers) > 0 && Number(overrideWorkers) !== registeredWorkers);
+
+  // ヘルパー
+  const fmtHours = (sec) => {
+    const h = sec / 3600;
+    if (h < 1) return `${Math.round(sec/60)}分`;
+    if (h < 10) return `${h.toFixed(1)}h`;
+    return `${Math.round(h)}h`;
+  };
+  const requiredWorkersWeek = (sec) => (sec / 3600) / HOURS_PER_WEEK;
+  const requiredWorkersMonth = (sec) => (sec / 3600) / HOURS_PER_MONTH;
+  const capLevel = (req, capacity) => {
+    // 必要人数 vs 在籍人数
+    if (req <= capacity * 0.5) return { color: 'emerald', label: '余裕あり' };
+    if (req <= capacity * 0.85) return { color: 'blue', label: '適正' };
+    if (req <= capacity) return { color: 'amber', label: '満稼働' };
+    return { color: 'rose', label: '人員不足' };
+  };
+  const colorMap = {
+    emerald: { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-700', badge: 'bg-emerald-500' },
+    amber: { bg: 'bg-amber-50', border: 'border-amber-300', text: 'text-amber-700', badge: 'bg-amber-500' },
+    blue: { bg: 'bg-blue-50', border: 'border-blue-300', text: 'text-blue-700', badge: 'bg-blue-500' },
+    slate: { bg: 'bg-slate-50', border: 'border-slate-200', text: 'text-slate-600', badge: 'bg-slate-400' },
+    rose: { bg: 'bg-rose-50', border: 'border-rose-300', text: 'text-rose-700', badge: 'bg-rose-500' },
+  };
+
+  // 週次・月次最大値 (バー幅算出用)
+  const weekMaxSec = Math.max(...weeklyWorkload.weeks.map(w => w.totalSec), totalWorkers * HOURS_PER_WEEK * 3600);
+  const monthMaxSec = Math.max(...monthlyWorkload.map(m => m.totalSec), totalWorkers * HOURS_PER_MONTH * 3600);
 
   return (
     <div className="p-4 max-w-screen-2xl mx-auto h-full overflow-y-auto space-y-4">
-      {/* 全体感パネル: 一目で「今日の作業全体の状況」が分かる */}
-      <div className={`rounded-xl shadow-md p-4 border-2 ${overall.level === 'critical' ? 'bg-rose-50 border-rose-300' : overall.level === 'warning' ? 'bg-amber-50 border-amber-300' : overall.level === 'ahead' ? 'bg-emerald-50 border-emerald-300' : 'bg-blue-50 border-blue-200'}`}>
-        <div className="flex items-center justify-between flex-wrap gap-4">
-          {/* 左: ステータス + 全体進捗率 */}
-          <div className="flex items-center gap-4">
-            <div className={`w-16 h-16 rounded-full flex items-center justify-center font-black text-2xl shadow-lg shrink-0 ${overall.level === 'critical' ? 'bg-rose-500 text-white animate-pulse' : overall.level === 'warning' ? 'bg-amber-500 text-white' : overall.level === 'ahead' ? 'bg-emerald-500 text-white' : 'bg-blue-500 text-white'}`}>
-              {overall.level === 'critical' ? <AlertTriangle className="w-8 h-8"/> : overall.level === 'warning' ? <Clock className="w-8 h-8"/> : overall.level === 'ahead' ? <CheckCircle2 className="w-8 h-8"/> : <Activity className="w-8 h-8"/>}
-            </div>
-            <div>
-              <div className="text-xs font-bold text-slate-500">本日の全体状況</div>
-              <div className={`text-2xl font-black ${overall.level === 'critical' ? 'text-rose-700' : overall.level === 'warning' ? 'text-amber-700' : overall.level === 'ahead' ? 'text-emerald-700' : 'text-blue-700'}`}>
-                {overall.level === 'critical' ? '⚠ 大幅遅延あり' : overall.level === 'warning' ? '遅延気味' : overall.level === 'ahead' ? '前倒し進行中 ✓' : '予定通り'}
-              </div>
-              <div className="text-xs text-slate-600 mt-0.5">タスク進捗 <span className="font-bold">{overall.completedTasks}/{overall.totalTasks}</span> ({overall.overallPct}%)</div>
-            </div>
-          </div>
-          {/* 中央: 全体進捗バー (大きく) */}
-          <div className="flex-1 min-w-[200px] mx-4">
-            <div className="text-xs font-bold text-slate-600 mb-1">全体進捗</div>
-            <div className="h-6 bg-white rounded-full overflow-hidden border border-slate-200 shadow-inner">
-              <div className={`h-full transition-all flex items-center justify-end pr-2 text-xs font-black ${overall.level === 'critical' ? 'bg-gradient-to-r from-rose-400 to-rose-600 text-white' : overall.level === 'warning' ? 'bg-gradient-to-r from-amber-400 to-amber-600 text-white' : overall.level === 'ahead' ? 'bg-gradient-to-r from-emerald-400 to-emerald-600 text-white' : 'bg-gradient-to-r from-blue-400 to-blue-600 text-white'}`} style={{ width: `${overall.overallPct}%` }}>
-                {overall.overallPct >= 10 && `${overall.overallPct}%`}
-              </div>
-            </div>
-            <div className="text-[10px] text-slate-500 mt-1">本日完了 {summary.completed}件 / 進行中 {summary.inProgress}件 / 未着手 {summary.waiting}件</div>
-          </div>
-          {/* 右: シフト終了予測 */}
-          <div className="text-right">
-            <div className="text-xs font-bold text-slate-500">シフト終了 (22:00) までに</div>
-            <div className="flex items-baseline gap-1 justify-end mt-1">
-              <span className="text-3xl font-black text-emerald-700">{overall.expectedFinishCount}</span>
-              <span className="text-sm text-slate-600">/ {summary.total} 件完了見込み</span>
-            </div>
-            {overall.willMissCount > 0 && (
-              <div className="text-xs font-bold text-rose-600 mt-0.5">⚠ シフト内未完: <span className="text-base">{overall.willMissCount}</span> 件</div>
-            )}
-            {overall.latestEta > 0 && (
-              <div className="text-[10px] text-slate-500 mt-0.5">最終完了予測: <span className="font-mono font-bold">{formatHHMM(overall.latestEta)}</span></div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* サマリー */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <div className="bg-white border-2 border-slate-200 rounded-xl p-3 text-center">
-          <div className="text-xs text-slate-500 font-bold">本日の対象</div>
-          <div className="text-3xl font-black text-slate-800 mt-1">{summary.total}</div>
-        </div>
-        <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-3 text-center">
-          <div className="text-xs text-blue-600 font-bold">進行中</div>
-          <div className="text-3xl font-black text-blue-700 mt-1 flex items-center justify-center gap-1"><Activity className="w-6 h-6 animate-pulse"/>{summary.inProgress}</div>
-        </div>
-        <div className="bg-slate-50 border-2 border-slate-200 rounded-xl p-3 text-center">
-          <div className="text-xs text-slate-500 font-bold">未着手</div>
-          <div className="text-3xl font-black text-slate-700 mt-1">{summary.waiting}</div>
-        </div>
-        <div className={`border-2 rounded-xl p-3 text-center ${summary.delayed > 0 ? 'bg-rose-50 border-rose-300 animate-pulse' : 'bg-slate-50 border-slate-200'}`}>
-          <div className={`text-xs font-bold ${summary.delayed > 0 ? 'text-rose-700' : 'text-slate-500'}`}>遅延</div>
-          <div className={`text-3xl font-black mt-1 flex items-center justify-center gap-1 ${summary.delayed > 0 ? 'text-rose-700' : 'text-slate-700'}`}>
-            {summary.delayed > 0 && <AlertTriangle className="w-6 h-6"/>}
-            {summary.delayed}
-          </div>
-        </div>
-        <div className="bg-emerald-50 border-2 border-emerald-200 rounded-xl p-3 text-center">
-          <div className="text-xs text-emerald-700 font-bold">本日完了</div>
-          <div className="text-3xl font-black text-emerald-700 mt-1 flex items-center justify-center gap-1"><CheckCircle2 className="w-6 h-6"/>{summary.completed}</div>
-        </div>
-      </div>
-
-      {/* タイムライン */}
+      {/* セクション 1: 作業者の現状 */}
       <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
-        <div className="p-4 border-b">
-          <div className="flex items-center justify-between">
-            <h3 className="font-bold text-lg flex items-center gap-2"><Clock className="w-5 h-5 text-blue-600"/> ロット別タイムライン</h3>
-            <span className="text-xs text-slate-500">10秒ごとに自動更新 ・現在時刻: <span className="font-mono font-bold">{formatHHMM(now)}</span></span>
-          </div>
+        <div className="p-3 border-b flex items-center justify-between">
+          <h3 className="font-bold text-lg flex items-center gap-2"><Users className="w-5 h-5 text-blue-600"/> 作業者の現状 <span className="text-xs font-normal text-slate-500 ml-2">(次にどう指示するかを判断)</span></h3>
+          <span className="text-[10px] text-slate-500">30秒ごとに自動更新</span>
         </div>
-        {lotsWithProgress.length === 0 ? (
-          <div className="p-12 text-center text-slate-400">
-            <Activity className="w-12 h-12 mx-auto mb-2 opacity-50"/>
-            <div>進行中のロットはありません</div>
-          </div>
-        ) : (
-          <div className="p-4">
-            {/* 時刻軸ヘッダー */}
-            <div className="flex items-center mb-2 text-xs text-slate-500 font-mono font-bold pl-[180px]">
-              <div className="flex-1 relative h-5">
-                {timeMarks.map((t, i) => {
-                  const left = ((t - timelineRange.min) / timelineRange.span) * 100;
-                  return <div key={i} className="absolute" style={{ left: `${left}%`, transform: 'translateX(-50%)' }}>{formatHHMM(t)}</div>;
-                })}
-              </div>
-            </div>
-            {/* 各ロットの行 */}
-            <div className="space-y-1.5 max-h-[60vh] overflow-y-auto pr-2">
-              {lotsWithProgress.map(({ lot, progress, worker }) => {
-                const startPct = progress.startMs ? Math.max(0, ((progress.startMs - timelineRange.min) / timelineRange.span) * 100) : 0;
-                const nowPct = Math.max(0, ((now - timelineRange.min) / timelineRange.span) * 100);
-                const etaPct = Math.min(100, ((progress.etaMs - timelineRange.min) / timelineRange.span) * 100);
-                const standardEtaPct = Math.min(100, ((progress.standardEtaMs - timelineRange.min) / timelineRange.span) * 100);
-                const actualWidth = Math.max(0, nowPct - startPct);
-                const projectedWidth = Math.max(0, etaPct - nowPct);
-                const isStarted = progress.startMs && progress.completedCount > 0;
-                return (
-                  <div key={lot.id} className={`flex items-center group hover:bg-slate-50 rounded-lg p-1 ${progress.delayLevel === 'critical' ? 'bg-rose-50' : ''}`}>
-                    {/* 左ラベル */}
-                    <div className="w-[180px] shrink-0 pr-3">
-                      <div className="font-bold text-sm text-slate-800 truncate">{lot.model}</div>
-                      <div className="text-[10px] text-slate-500 truncate">指図 {lot.orderNo} ・{lot.quantity}台 ・{worker?.name || '未割当'}</div>
+        <div className="p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2">
+          {workerStatuses.length === 0 && (
+            <div className="col-span-full text-center text-slate-400 py-8">作業者が登録されていません</div>
+          )}
+          {workerStatuses.map(({ worker, state, stateLabel, stateColor, queued, remainingSec, activeProgress, activeLot, hint }) => {
+            const c = colorMap[stateColor] || colorMap.slate;
+            return (
+              <div key={worker.id} className={`border-2 rounded-lg p-2.5 ${c.bg} ${c.border}`}>
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="font-bold flex items-center gap-1.5 min-w-0">
+                    <div className={`w-7 h-7 rounded-full ${c.badge} text-white flex items-center justify-center shrink-0`}><User className="w-4 h-4"/></div>
+                    <span className="text-sm truncate">{worker.name}</span>
+                  </div>
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${c.badge} text-white whitespace-nowrap ${state === 'processing' ? 'animate-pulse' : ''}`}>{stateLabel}</span>
+                </div>
+                {activeLot && activeProgress && (
+                  <div className="bg-white/80 rounded p-1.5 mb-1.5 border border-white/60">
+                    <div className="font-bold text-xs text-slate-800 truncate">{activeLot.model}</div>
+                    <div className="text-[10px] text-slate-500 truncate">{activeLot.orderNo} ・{activeLot.quantity}台</div>
+                    <div className="mt-1 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                      <div className={`h-full ${c.badge}`} style={{ width: `${activeProgress.progressPct}%` }}/>
                     </div>
-                    {/* バー */}
-                    <div className="flex-1 relative h-10 bg-slate-100 rounded">
-                      {/* 標準予定時刻マーカー */}
-                      {progress.standardEtaMs > 0 && progress.startMs && (
-                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-400" style={{ left: `${standardEtaPct}%` }} title={`標準予定 ${formatHHMM(progress.standardEtaMs)}`}/>
-                      )}
-                      {/* 実績バー (開始 → 現在) */}
-                      {isStarted && (
-                        <div className={`absolute top-1.5 bottom-1.5 ${delayBg(progress.delayLevel)} rounded-l opacity-90`} style={{ left: `${startPct}%`, width: `${actualWidth}%` }}>
-                          <div className="text-[10px] text-white font-bold px-1.5 truncate leading-9">{progress.progressPct}% ({progress.completedCount}/{progress.totalTasks})</div>
-                        </div>
-                      )}
-                      {/* 予測バー (現在 → ETA) */}
-                      {!progress.isCompleted && progress.remainingTasks > 0 && (
-                        <div className={`absolute top-2 bottom-2 ${delayBg(progress.delayLevel)} opacity-30 rounded-r`} style={{ left: `${Math.max(startPct, nowPct)}%`, width: `${projectedWidth}%` }}/>
-                      )}
-                      {/* 現在時刻ライン */}
-                      <div className="absolute top-0 bottom-0 w-0.5 bg-blue-600 z-10" style={{ left: `${nowPct}%` }} title={`現在 ${formatHHMM(now)}`}>
-                        <div className="absolute -top-1 -left-1 w-2 h-2 rounded-full bg-blue-600 animate-pulse"/>
-                      </div>
-                    </div>
-                    {/* 右情報 */}
-                    <div className="w-[140px] shrink-0 pl-3 text-[10px] font-mono text-right">
-                      <div className={`font-black text-xs ${delayTextClass(progress.delayLevel)}`}>{delayLabel(progress.delayLevel)}</div>
-                      <div className="text-slate-500">開始 {formatHHMM(progress.startMs)}</div>
-                      <div className="text-slate-700 font-bold">予測 {formatHHMM(progress.etaMs)}</div>
+                    <div className="flex items-center justify-between mt-0.5 text-[10px]">
+                      <span className="font-bold">{activeProgress.progressPct}%</span>
+                      {activeProgress.etaMs > 0 && <span className="font-mono text-slate-500">予測 {formatHHMM(activeProgress.etaMs)}</span>}
                     </div>
                   </div>
-                );
-              })}
-            </div>
+                )}
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-slate-600">待ち <span className="font-bold text-slate-800">{queued.length}</span> 件</span>
+                  <span className="text-slate-600">残り <span className={`font-bold ${c.text}`}>{fmtHours(remainingSec)}</span></span>
+                </div>
+                {hint && (
+                  <div className={`mt-1 text-[10px] font-bold ${c.text} flex items-center gap-1`}>
+                    <ArrowRight className="w-3 h-3"/> <span className="truncate">{hint}</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {/* 未割当・入荷待ち */}
+        {(unassignedLots.length > 0 || arrivalLots.length > 0) && (
+          <div className="px-3 pb-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {unassignedLots.length > 0 && (
+              <div className="bg-amber-50 border border-amber-200 rounded p-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-amber-600"/>
+                  <span className="text-xs font-bold text-amber-800">未割当ロット</span>
+                </div>
+                <div className="text-xs font-bold text-amber-700"><span className="text-base">{unassignedLots.length}</span> 件 / {fmtHours(unassignedSec)}</div>
+              </div>
+            )}
+            {arrivalLots.length > 0 && (
+              <div className="bg-slate-50 border border-slate-200 rounded p-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Package className="w-4 h-4 text-slate-500"/>
+                  <span className="text-xs font-bold text-slate-700">入荷待ち</span>
+                </div>
+                <div className="text-xs font-bold text-slate-700"><span className="text-base">{arrivalLots.length}</span> 件 / {fmtHours(arrivalSec)}</div>
+              </div>
+            )}
           </div>
         )}
       </div>
 
-      {/* 作業者別ステータス */}
+      {/* セクション 1.5: 今日の作業者タイムライン (ガントチャート) */}
+      <DailyWorkerGantt
+        lots={lots}
+        workers={workers}
+        workSchedule={settings?.workSchedule}
+      />
+
+      {/* セクション 2: 週次仕事量 (納期ベース) */}
       <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
-        <div className="p-4 border-b">
-          <h3 className="font-bold text-lg flex items-center gap-2"><Users className="w-5 h-5 text-purple-600"/> 作業者ステータス</h3>
-        </div>
-        <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          {workerStatus.length === 0 && <div className="col-span-full text-slate-400 text-center py-6">割り当て中の作業者はいません</div>}
-          {workerStatus.map(({ worker, active, allLots }) => (
-            <div key={worker.id} className={`border rounded-lg p-3 ${active ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
-              <div className="flex items-center justify-between mb-2">
-                <div className="font-bold flex items-center gap-1"><User className="w-4 h-4"/> {worker.name}</div>
-                {active && <span className="text-[10px] font-bold bg-emerald-500 text-white px-2 py-0.5 rounded-full animate-pulse">作業中</span>}
-              </div>
-              {active ? (
-                <div className="text-xs space-y-0.5">
-                  <div className="font-bold text-slate-700">{active.lot.model} ({active.lot.orderNo})</div>
-                  <div className="text-slate-500">進捗: {active.progress.progressPct}% ({active.progress.completedCount}/{active.progress.totalTasks})</div>
-                  <div className="text-slate-500">予測完了: <span className="font-mono font-bold text-slate-700">{formatHHMM(active.progress.etaMs)}</span></div>
-                </div>
-              ) : (
-                <div className="text-xs text-slate-500">
-                  担当 {allLots.length} 件 (待機中)
-                </div>
-              )}
+        <div className="p-3 border-b flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-3">
+            <h3 className="font-bold text-lg flex items-center gap-2"><CalendarDays className="w-5 h-5 text-purple-600"/> 週次仕事量 <span className="text-xs font-normal text-slate-500">(納期ベース)</span></h3>
+            {/* カテゴリ別表示モード切替 */}
+            <div className="inline-flex bg-slate-100 rounded-lg p-0.5">
+              <button
+                onClick={() => setSplitMode('all')}
+                className={`px-2.5 py-1 rounded text-xs font-bold transition-colors ${splitMode === 'all' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
+              >全体</button>
+              <button
+                onClick={() => setSplitMode('split')}
+                className={`px-2.5 py-1 rounded text-xs font-bold transition-colors inline-flex items-center gap-1 ${splitMode === 'split' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
+                title="テンプレ名に「中間」が含まれるロットを中間検査、それ以外を完品検査として分けて表示"
+              >
+                <span className="inline-block w-2 h-2 rounded-full bg-cyan-500"/>
+                <span className="inline-block w-2 h-2 rounded-full bg-violet-500 -ml-0.5"/>
+                中間・完品 別
+              </button>
             </div>
-          ))}
+          </div>
+          <div className="text-[11px] text-slate-500">
+            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_WEEK}日</span> = {HOURS_PER_WEEK.toFixed(1)}h/週 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → チーム上限 <span className="font-bold">{(totalWorkers * HOURS_PER_WEEK).toFixed(1)}h/週</span>
+          </div>
         </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-600 text-[11px]">
+              <tr>
+                <th className="p-2 text-left font-bold w-8"></th>
+                <th className="p-2 text-left font-bold">週</th>
+                <th className="p-2 text-left font-bold">納期範囲</th>
+                <th className="p-2 text-right font-bold">ロット</th>
+                <th className="p-2 text-right font-bold">台数</th>
+                <th className="p-2 text-right font-bold">必要時間</th>
+                <th className="p-2 text-right font-bold">必要人数</th>
+                <th className="p-2 text-left font-bold w-[32%]">負荷バー</th>
+                <th className="p-2 text-center font-bold">状態</th>
+              </tr>
+            </thead>
+            <tbody>
+              {weeklyWorkload.weeks.map((wk, idx) => {
+                const req = requiredWorkersWeek(wk.totalSec);
+                const lv = capLevel(req, totalWorkers);
+                const c = colorMap[lv.color];
+                const barPct = Math.min(100, (wk.totalSec / weekMaxSec) * 100);
+                const capLinePct = Math.min(100, (totalWorkers * HOURS_PER_WEEK * 3600 / weekMaxSec) * 100);
+                const isExpanded = expandedWeekIdx === idx;
+                const teamDayCapH = totalWorkers * HOURS_PER_DAY; // 1日のチーム上限 (h)
+
+                // 日別の負荷を計算 (この週の月〜金 = 平日のみ表示)
+                // 土日は会社休なので非表示。週末納期のロットは月曜にまとめる。
+                const days = [];
+                // 月曜から金曜まで (d=0..4)
+                for (let d = 0; d < 5; d++) {
+                  const ds = new Date(wk.start); ds.setDate(wk.start.getDate() + d);
+                  ds.setHours(0,0,0,0);
+                  const de = new Date(ds); de.setHours(23,59,59,999);
+                  const dayLots = wk.lots.filter(l => {
+                    if (!l.dueDate) return false;
+                    const due = new Date(l.dueDate); due.setHours(0,0,0,0);
+                    return due.getTime() === ds.getTime();
+                  });
+                  // 月曜セルに以下を集める:
+                  //   - 期限超過 (今週のみ)
+                  //   - 同週の土日納期分 (会社休なので前倒し)
+                  if (d === 0) {
+                    if (idx === 0 && weeklyWorkload.overdueCount > 0) {
+                      wk.lots.forEach(l => {
+                        if (!l.dueDate) return;
+                        const due = new Date(l.dueDate); due.setHours(0,0,0,0);
+                        if (due < wk.start) dayLots.push(l);
+                      });
+                    }
+                    // 土日納期分をこの週の月曜に集約
+                    wk.lots.forEach(l => {
+                      if (!l.dueDate) return;
+                      const due = new Date(l.dueDate); due.setHours(0,0,0,0);
+                      const dow = due.getDay();
+                      if ((dow === 0 || dow === 6) && due >= wk.start && due <= wk.end) {
+                        dayLots.push(l);
+                      }
+                    });
+                  }
+                  const sec = dayLots.reduce((a, l) => a + calculateLotEstimatedTime(l), 0);
+                  days.push({ ds, dayLots, sec });
+                }
+                const weekDayMaxSec = Math.max(teamDayCapH * 3600, ...days.map(d => d.sec));
+                const dowJp = ['日','月','火','水','木','金','土'];
+
+                return (
+                  <React.Fragment key={idx}>
+                  <tr
+                    onClick={() => setExpandedWeekIdx(isExpanded ? null : idx)}
+                    className={`border-b last:border-b-0 hover:bg-purple-50/40 cursor-pointer transition-colors ${isExpanded ? 'bg-purple-50/60' : ''}`}
+                    title="クリックで日別負荷を表示"
+                  >
+                    <td className="p-2 text-purple-500">
+                      {isExpanded ? <ChevronDown className="w-4 h-4"/> : <ChevronRight className="w-4 h-4"/>}
+                    </td>
+                    <td className="p-2 font-bold text-slate-700">{wk.label}</td>
+                    <td className="p-2 text-[11px] text-slate-500 font-mono whitespace-nowrap">{wk.start.getMonth()+1}/{wk.start.getDate()}〜{wk.end.getMonth()+1}/{wk.end.getDate()}</td>
+                    {/* ロット数: split時は内訳付き */}
+                    <td className="p-2 text-right">
+                      {splitMode === 'split' && wk.lots.length > 0 ? (
+                        <div className="flex flex-col items-end leading-tight">
+                          <span className="font-bold">{wk.lots.length}</span>
+                          <span className="text-[10px] flex gap-1 font-mono">
+                            <span className="text-cyan-700">中{wk.byCategory.intermediate.lots.length}</span>
+                            <span className="text-violet-700">完{wk.byCategory.final.lots.length}</span>
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="font-bold">{wk.lots.length}</span>
+                      )}
+                    </td>
+                    {/* 台数 (new) */}
+                    <td className="p-2 text-right">
+                      {splitMode === 'split' && wk.totalQty > 0 ? (
+                        <div className="flex flex-col items-end leading-tight">
+                          <span className="font-bold text-blue-700">{wk.totalQty}</span>
+                          <span className="text-[10px] flex gap-1 font-mono">
+                            <span className="text-cyan-700">中{wk.byCategory.intermediate.qty}</span>
+                            <span className="text-violet-700">完{wk.byCategory.final.qty}</span>
+                          </span>
+                        </div>
+                      ) : wk.totalQty > 0 ? (
+                        <span className="font-bold text-blue-700">{wk.totalQty}</span>
+                      ) : <span className="text-slate-300">-</span>}
+                    </td>
+                    {/* 必要時間 */}
+                    <td className="p-2 text-right font-mono">
+                      {splitMode === 'split' && wk.totalSec > 0 ? (
+                        <div className="flex flex-col items-end leading-tight">
+                          <span className="font-bold">{fmtHours(wk.totalSec)}</span>
+                          <span className="text-[10px] flex gap-1">
+                            <span className="text-cyan-700">中{fmtHours(wk.byCategory.intermediate.sec)}</span>
+                            <span className="text-violet-700">完{fmtHours(wk.byCategory.final.sec)}</span>
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="font-bold">{wk.totalSec > 0 ? fmtHours(wk.totalSec) : '-'}</span>
+                      )}
+                    </td>
+                    <td className="p-2 text-right">
+                      {wk.totalSec > 0 ? (
+                        <span className={`font-bold ${c.text}`}>{req.toFixed(1)}人</span>
+                      ) : <span className="text-slate-300">-</span>}
+                    </td>
+                    {/* 負荷バー (split時は積み上げ) */}
+                    <td className="p-2">
+                      <div className="relative h-5 bg-slate-100 rounded overflow-hidden flex">
+                        {splitMode === 'split' && wk.totalSec > 0 ? (
+                          <>
+                            <div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, (wk.byCategory.intermediate.sec / weekMaxSec) * 100)}%` }} title={`中間: ${fmtHours(wk.byCategory.intermediate.sec)}`}/>
+                            <div className="h-full bg-violet-500" style={{ width: `${Math.min(100, (wk.byCategory.final.sec / weekMaxSec) * 100)}%` }} title={`完品: ${fmtHours(wk.byCategory.final.sec)}`}/>
+                          </>
+                        ) : (
+                          <div className={`h-full ${c.badge} opacity-80`} style={{ width: `${barPct}%` }}/>
+                        )}
+                        {/* チーム上限ライン */}
+                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-500" style={{ left: `${capLinePct}%` }} title={`チーム上限 ${totalWorkers * HOURS_PER_WEEK}h`}/>
+                      </div>
+                    </td>
+                    <td className="p-2 text-center">
+                      {wk.totalSec > 0 ? (
+                        <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-full ${c.badge} text-white whitespace-nowrap`}>{lv.label}</span>
+                      ) : <span className="text-slate-300 text-xs">空き</span>}
+                    </td>
+                  </tr>
+                  {isExpanded && (
+                    <tr className="bg-purple-50/30">
+                      <td colSpan={9} className="p-3">
+                        <div className="bg-white rounded-lg border-2 border-purple-300 shadow-sm">
+                          <div className="p-3 border-b border-purple-100 bg-purple-50/50 flex items-center justify-between">
+                            <div className="text-base font-bold text-purple-800 flex items-center gap-1.5">
+                              <CalendarDays className="w-5 h-5"/> {wk.label} ({wk.start.getMonth()+1}/{wk.start.getDate()}〜{wk.end.getMonth()+1}/{wk.end.getDate()}) — 日別負荷 (平日のみ)
+                            </div>
+                            <div className="text-xs text-slate-500">
+                              1日のチーム上限: <span className="font-bold text-sm">{teamDayCapH.toFixed(1)}h/日</span> (在籍{totalWorkers}人×{HOURS_PER_DAY.toFixed(1)}h)
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-5 gap-2 p-3">
+                            {days.map((d, di) => {
+                              const dayReq = d.sec / 3600 / HOURS_PER_DAY;
+                              const dayLv = d.sec === 0 ? { color: 'slate', label: '空き' } : capLevel(dayReq, totalWorkers);
+                              const dayC = colorMap[dayLv.color];
+                              const dayBarPct = Math.min(100, (d.sec / weekDayMaxSec) * 100);
+                              const dayCapPct = Math.min(100, (teamDayCapH * 3600 / weekDayMaxSec) * 100);
+                              const dowIdx = d.ds.getDay();
+                              // カテゴリ別の日別集計
+                              const dayCatAgg = { intermediate: { sec: 0, qty: 0, count: 0 }, final: { sec: 0, qty: 0, count: 0 } };
+                              d.dayLots.forEach(l => {
+                                const cat = categorizeLot(l);
+                                const lotSec = calculateLotEstimatedTime(l);
+                                dayCatAgg[cat].sec += lotSec;
+                                dayCatAgg[cat].qty += (l.quantity || 1);
+                                dayCatAgg[cat].count += 1;
+                              });
+                              const dayTotalQty = d.dayLots.reduce((a, l) => a + (l.quantity || 1), 0);
+                              return (
+                                <div key={di} className={`border-2 rounded-lg p-3 flex flex-col gap-1.5 ${dayC.bg} ${dayC.border}`}>
+                                  <div className="flex items-center justify-between">
+                                    <div className="text-sm font-bold text-slate-700">
+                                      <span className="text-base">{dowJp[dowIdx]}</span>
+                                      <span className="ml-1.5 text-slate-500 text-xs">{d.ds.getMonth()+1}/{d.ds.getDate()}</span>
+                                    </div>
+                                    <span className={`text-[11px] font-bold px-1.5 py-0.5 rounded-full ${dayC.badge} text-white`}>{dayLv.label}</span>
+                                  </div>
+                                  <div className="text-sm text-slate-500">
+                                    <span className="font-mono font-black text-base text-slate-800">{d.sec > 0 ? fmtHours(d.sec) : '-'}</span>
+                                    {d.sec > 0 && <span className="ml-1.5 text-xs text-slate-600">({dayReq.toFixed(1)}人)</span>}
+                                    {dayTotalQty > 0 && <span className="ml-1.5 text-xs text-blue-700 font-bold">{dayTotalQty}台</span>}
+                                  </div>
+                                  {/* カテゴリ別内訳 (split時) */}
+                                  {splitMode === 'split' && d.sec > 0 && (
+                                    <div className="grid grid-cols-2 gap-1 text-[10px]">
+                                      {dayCatAgg.intermediate.sec > 0 && (
+                                        <div className="bg-cyan-50 border border-cyan-200 rounded px-1 py-0.5">
+                                          <div className="font-bold text-cyan-700">中間</div>
+                                          <div className="font-mono">{fmtHours(dayCatAgg.intermediate.sec)} / {dayCatAgg.intermediate.qty}台</div>
+                                        </div>
+                                      )}
+                                      {dayCatAgg.final.sec > 0 && (
+                                        <div className="bg-violet-50 border border-violet-200 rounded px-1 py-0.5">
+                                          <div className="font-bold text-violet-700">完品</div>
+                                          <div className="font-mono">{fmtHours(dayCatAgg.final.sec)} / {dayCatAgg.final.qty}台</div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                  <div className="relative h-2 bg-slate-200 rounded overflow-hidden flex">
+                                    {splitMode === 'split' && d.sec > 0 ? (
+                                      <>
+                                        <div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, (dayCatAgg.intermediate.sec / weekDayMaxSec) * 100)}%` }}/>
+                                        <div className="h-full bg-violet-500" style={{ width: `${Math.min(100, (dayCatAgg.final.sec / weekDayMaxSec) * 100)}%` }}/>
+                                      </>
+                                    ) : (
+                                      <div className={`h-full ${dayC.badge}`} style={{ width: `${dayBarPct}%` }}/>
+                                    )}
+                                    <div className="absolute top-0 bottom-0 border-l border-dashed border-slate-500" style={{ left: `${dayCapPct}%` }} title={`チーム上限 ${teamDayCapH.toFixed(1)}h`}/>
+                                  </div>
+                                  {/* ロット詳細 */}
+                                  {d.dayLots.length > 0 && (
+                                    <div className="mt-1 space-y-1 max-h-48 overflow-y-auto">
+                                      {d.dayLots.map(l => {
+                                        const sec = calculateLotEstimatedTime(l);
+                                        const tplName = l.templateId === 'demo' ? '詳細デモ手順' : (templates.find(t => t.id === l.templateId)?.name || '');
+                                        const cat = categorizeLot(l);
+                                        const catC = CATEGORY_COLORS[cat];
+                                        return (
+                                          <div key={l.id} className={`bg-white border-l-2 ${catC.border} border-y border-r border-slate-200 rounded px-1.5 py-1 text-xs leading-tight`}>
+                                            <div className="flex items-center justify-between gap-1">
+                                              <span className="font-bold text-slate-800 truncate" title={`${l.orderNo} ${l.model}`}>{l.orderNo}</span>
+                                              <span className="text-[10px] text-blue-600 font-bold shrink-0">{l.quantity || 1}台</span>
+                                              <span className="font-mono font-bold text-slate-600 shrink-0">{fmtHours(sec)}</span>
+                                            </div>
+                                            <div className="text-[11px] text-slate-600 truncate" title={`${l.model} ${tplName}`}>
+                                              <span className="font-bold">{l.model}</span>{tplName && <span className={catC.text}> / {tplName}</span>}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {/* 凡例 */}
+                          <div className="px-3 pb-3 text-xs text-slate-500 flex flex-wrap gap-3 border-t pt-2">
+                            {splitMode === 'split' ? (
+                              <>
+                                <span className="inline-flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-cyan-500"/>中間検査</span>
+                                <span className="inline-flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-violet-500"/>完品検査</span>
+                                <span className="text-slate-300 mx-1">|</span>
+                              </>
+                            ) : (
+                              <>
+                                <span className="inline-flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500"/>余裕</span>
+                                <span className="inline-flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-blue-500"/>適正</span>
+                                <span className="inline-flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-500"/>満稼働</span>
+                                <span className="inline-flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-rose-500"/>人員不足</span>
+                              </>
+                            )}
+                            <span className="ml-auto">破線 = チーム上限ライン / 土日納期は月曜セルに集約</span>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {(weeklyWorkload.overdueCount > 0 || weeklyWorkload.noDueCount > 0) && (
+          <div className="p-3 border-t bg-slate-50/60 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+            {weeklyWorkload.overdueCount > 0 && (
+              <div className="bg-rose-50 border border-rose-200 rounded p-2 flex items-center justify-between">
+                <span className="font-bold text-rose-700">⚠ 納期超過済 (今週に集計)</span>
+                <span className="font-bold text-rose-700">{weeklyWorkload.overdueCount}件 / {fmtHours(weeklyWorkload.overdueSec)}</span>
+              </div>
+            )}
+            {weeklyWorkload.noDueCount > 0 && (
+              <div className="bg-slate-50 border border-slate-200 rounded p-2 flex items-center justify-between">
+                <span className="font-bold text-slate-600">納期未設定 (集計対象外)</span>
+                <span className="font-bold text-slate-700">{weeklyWorkload.noDueCount}件 / {fmtHours(weeklyWorkload.noDueSec)}</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* セクション 3: 月次仕事量 (納期ベース) */}
+      <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
+        <div className="p-3 border-b flex flex-wrap items-center justify-between gap-2">
+          <h3 className="font-bold text-lg flex items-center gap-2"><Calendar className="w-5 h-5 text-teal-600"/> 月次仕事量 <span className="text-xs font-normal text-slate-500">(納期ベース)</span></h3>
+          <div className="text-[11px] text-slate-500">
+            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_MONTH}日</span> = {HOURS_PER_MONTH.toFixed(1)}h/月 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → チーム上限 <span className="font-bold">{(totalWorkers * HOURS_PER_MONTH).toFixed(1)}h/月</span>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-600 text-[11px]">
+              <tr>
+                <th className="p-2 text-left font-bold">月</th>
+                <th className="p-2 text-right font-bold">ロット</th>
+                <th className="p-2 text-right font-bold">必要時間</th>
+                <th className="p-2 text-right font-bold">必要人数</th>
+                <th className="p-2 text-left font-bold w-[42%]">負荷バー</th>
+                <th className="p-2 text-center font-bold">状態</th>
+              </tr>
+            </thead>
+            <tbody>
+              {monthlyWorkload.map((mo, idx) => {
+                const req = requiredWorkersMonth(mo.totalSec);
+                const lv = capLevel(req, totalWorkers);
+                const c = colorMap[lv.color];
+                const barPct = Math.min(100, (mo.totalSec / monthMaxSec) * 100);
+                const capLinePct = Math.min(100, (totalWorkers * HOURS_PER_MONTH * 3600 / monthMaxSec) * 100);
+                return (
+                  <tr key={idx} className="border-b last:border-b-0 hover:bg-slate-50">
+                    <td className="p-2 font-bold text-slate-700 font-mono">{mo.label}</td>
+                    <td className="p-2 text-right font-bold">{mo.lots.length}</td>
+                    <td className="p-2 text-right font-mono font-bold">{mo.totalSec > 0 ? fmtHours(mo.totalSec) : '-'}</td>
+                    <td className="p-2 text-right">
+                      {mo.totalSec > 0 ? (
+                        <span className={`font-bold ${c.text}`}>{req.toFixed(1)}人</span>
+                      ) : <span className="text-slate-300">-</span>}
+                    </td>
+                    <td className="p-2">
+                      <div className="relative h-5 bg-slate-100 rounded overflow-hidden">
+                        <div className={`h-full ${c.badge} opacity-80`} style={{ width: `${barPct}%` }}/>
+                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-500" style={{ left: `${capLinePct}%` }} title={`チーム上限 ${totalWorkers * HOURS_PER_MONTH}h`}/>
+                      </div>
+                    </td>
+                    <td className="p-2 text-center">
+                      {mo.totalSec > 0 ? (
+                        <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-full ${c.badge} text-white whitespace-nowrap`}>{lv.label}</span>
+                      ) : <span className="text-slate-300 text-xs">空き</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* 凡例 */}
+      <div className="bg-slate-50 border border-slate-200 rounded-lg p-2 text-[11px] text-slate-600 flex flex-wrap items-center gap-3">
+        <span className="font-bold">負荷状態の見方:</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-emerald-500"/>余裕あり (50%以下)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-blue-500"/>適正 (85%まで)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-amber-500"/>満稼働 (100%まで)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-rose-500"/>人員不足 (100%超)</span>
+        <span className="ml-auto text-slate-500">破線は在籍人数のチーム上限ライン</span>
       </div>
     </div>
   );
@@ -10208,7 +18546,17 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
         const taskKey1 = `${step.id}-${unitIdx}`, taskKey2 = `${stepIndex}-${unitIdx}`;
         const existingTask = updates[matchLot.id].tasks[taskKey1] || updates[matchLot.id].tasks[taskKey2];
         const actualKey = updates[matchLot.id].tasks[taskKey1] ? taskKey1 : taskKey2;
-        updates[matchLot.id].tasks[actualKey] = { ...(existingTask || { startTime: null }), status: 'completed', duration, workerName: workerName !== '-' ? workerName : (existingTask?.workerName || '') };
+        // CSV取込で時刻情報がない場合は、ロットの completedAt or updatedAt を流用
+        const importEnd = (typeof matchLot.completedAt === 'number' ? matchLot.completedAt : null) || Date.now();
+        updates[matchLot.id].tasks[actualKey] = {
+          ...(existingTask || { startTime: null }),
+          status: 'completed',
+          duration,
+          workerName: workerName !== '-' ? workerName : (existingTask?.workerName || ''),
+          // CSV から復元したタスクには時刻が無い → 既存値があれば優先、無ければ ロット完了時刻ベースで埋める
+          firstStartTime: existingTask?.firstStartTime || existingTask?.startTime || (duration > 0 ? importEnd - duration * 1000 : importEnd),
+          endTime: existingTask?.endTime || importEnd,
+        };
       }
       const updateLotIds = Object.keys(updates);
       if (updateLotIds.length === 0) { alert("更新対象のデータが見つかりませんでした。"); return; }
@@ -10307,7 +18655,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                       <button onClick={(e) => {
                         e.stopPropagation();
                         if (!confirm(`このロット（${lot.model} / ${lot.orderNo}）を未完了に戻しますか？\n再度作業ができるようになります。`)) return;
-                        saveData('lots', lot.id, { status: 'paused', location: lot.mapZoneId || 'arrival', completedAt: null });
+                        saveData('lots', lot.id, { status: 'paused', location: lot.mapZoneId ? 'planned' : 'arrival', completedAt: null });
                       }} className="text-xs bg-amber-100 text-amber-700 hover:bg-amber-200 px-2 py-0.5 rounded font-bold flex items-center gap-1 shrink-0" title="完了から30分以内なら未完了に戻せます"><RotateCcw className="w-3 h-3"/> 戻す</button>
                     );
                   })()}
@@ -10390,6 +18738,29 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
       
    // State: App Data
    const [lots, setLots] = useState([]);
+   // === マイグレーション: ロットに残存している optimizedStepOrder フィールドを掃除 ===
+   // ※ 2026-05-30 ユーザー指示で「オススメ順の適用」機能を撤去。
+   //    以前押された結果として lot.optimizedStepOrder が残っているロットがあるので、起動時に自動除去。
+   //    (steps 配列自体は無事だったため、フィールドだけ消せば元通り)
+   const optimizedOrderCleanupDoneRef = useRef(false);
+   useEffect(() => {
+     if (optimizedOrderCleanupDoneRef.current) return;
+     if (!lots || lots.length === 0) return;
+     const dirty = lots.filter(l => l.optimizedStepOrder !== undefined && l.optimizedStepOrder !== null);
+     if (dirty.length === 0) { optimizedOrderCleanupDoneRef.current = true; return; }
+     optimizedOrderCleanupDoneRef.current = true;
+     (async () => {
+       try {
+         console.log(`[migration] removing optimizedStepOrder from ${dirty.length} lots`);
+         for (const lot of dirty) {
+           await saveData('lots', lot.id, { optimizedStepOrder: null });
+         }
+         console.log('[migration] cleanup done');
+       } catch (e) {
+         console.error('[migration] cleanup failed:', e);
+       }
+     })();
+   }, [lots]);
    const [templates, setTemplates] = useState([]);
    const [workers, setWorkers] = useState([]);
    const [logs, setLogs] = useState([]);
@@ -10508,9 +18879,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
    // State: UI
    const [viewMode, setViewMode] = useState('dashboard');
-   const [activeTab, setActiveTab] = useState('main'); 
+   const [activeTab, setActiveTab] = useState('main');
    const [showLotModal, setShowLotModal] = useState(false);
    const [lotFormQty, setLotFormQty] = useState(1);
+   const [showAnomalyPanel, setShowAnomalyPanel] = useState(false);
    const [selectedWorker, setSelectedWorker] = useState(null);
    const [draggedLotId, setDraggedLotId] = useState(null);
    const mapRef = useRef(null);
@@ -10520,6 +18892,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const lotExcelInputRef = useRef(null);
    const excelInputRef = useRef(null);
    const backupInputRef = useRef(null);
+   const progressMgmtInputRef = useRef(null);
+   const [progressImportPreview, setProgressImportPreview] = useState(null);  // 工機進捗管理表 取込プレビュー結果
  
    // State: Execution Modal
    const [executionLotId, setExecutionLotId] = useState(null);
@@ -10555,6 +18929,28 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    }, [announcements]);
    const [showNoteModal, setShowNoteModal] = useState(false);
    const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
+   const [showWorkStandardsLib, setShowWorkStandardsLib] = useState(false);
+   const [editingWorkStandard, setEditingWorkStandard] = useState(null); // null = 編集モーダル非表示, 'NEW' = 新規, object = 既存編集
+   // 作業標準の保存・削除ヘルパー (settings.workStandards 配列を更新)
+   const saveWorkStandard = async (item) => {
+     const list = [...(settings.workStandards || [])];
+     const now = Date.now();
+     if (item.id) {
+       // 既存更新
+       const idx = list.findIndex(s => s.id === item.id);
+       if (idx >= 0) list[idx] = { ...item, updatedAt: now };
+       else list.push({ ...item, updatedAt: now });
+     } else {
+       // 新規
+       list.push({ ...item, id: 'ws-' + now.toString(36) + Math.random().toString(36).slice(2, 6), createdAt: now, updatedAt: now });
+     }
+     await saveSettings({ workStandards: list });
+     setEditingWorkStandard(null);
+   };
+   const deleteWorkStandard = async (id) => {
+     const list = (settings.workStandards || []).filter(s => s.id !== id);
+     await saveSettings({ workStandards: list });
+   };
  
    // State: Template Editor
    const [editingTemplate, setEditingTemplate] = useState(null);
@@ -10600,11 +18996,13 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        }
      };
      initAuth();
- 
-     onAuthStateChanged(auth, (u) => {
+
+     // 認証状態の購読 (HMR や StrictMode で重複登録されないよう cleanup を返す)
+     const unsubAuth = onAuthStateChanged(auth, (u) => {
        setUser(u);
        setIsConnected(!!u);
      });
+     return () => { unsubAuth(); };
    }, []);
  
    // --- Data Sync ---
@@ -10634,7 +19032,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        onSnapshot(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), (snap) => {
          if (snap.exists()) {
             const data = snap.data();
+            // ▼ Firestore 上の全フィールドを取り込んでから既知フィールドだけデフォルト適用。
+            //   こうしないと、ここに明示的に書いてない新規フィールド (qualityStandards,
+            //   modelStandardMap, workStandards など) が保存されているのに読み込まれない
+            //   バグが起きる (= 設定が「登録しても反映されない」と見える)。
             setSettings({
+              ...data, // 新規フィールド (workloadHoursPerDay 等) も自動で取り込み
               mapImage: data.mapImage || null,
               mapZones: data.mapZones || INITIAL_MAP_ZONES,
               defectProcessOptions: data.defectProcessOptions || DEFAULT_DEFECT_PROCESS_OPTIONS,
@@ -10644,6 +19047,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
               targetTimeHistory: data.targetTimeHistory || [],
               customLayouts: data.customLayouts || {},
               measurementOverrides: data.measurementOverrides || {},
+              qualityStandards: data.qualityStandards || {},
+              modelStandardMap: data.modelStandardMap || {},
+              workStandards: data.workStandards || [],
+              lotCardDisplay: data.lotCardDisplay || null, // null=デフォルト全表示
               fontSizes: data.fontSizes || {},
               undoTimeout: data.undoTimeout || 5,
               voiceSettings: data.voiceSettings || {},
@@ -10734,7 +19141,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      if (!user || !db) return;
      try {
        setSyncStatus('syncing');
-       await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), newSettings, { merge: true });
+       // undefined を含むキーが Firestore で例外を投げないよう cleanUndefined を通す
+       await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), cleanUndefined(newSettings), { merge: true });
        setSyncStatus('idle');
        lastFailedPayloadRef.current = null;
      } catch (e) {
@@ -10742,6 +19150,27 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        setSyncStatus('error');
        setErrorMsg(e.message || '設定の保存に失敗しました');
        lastFailedPayloadRef.current = { kind: 'settings', data: newSettings };
+     }
+   };
+
+   // 設定内のネストしたサブキーを削除するヘルパー。
+   // 例) deleteSettingsField('qualityStandards.qs-xxx') → settings.qualityStandards から qs-xxx を完全削除。
+   // Firestore の `setDoc({ merge: true })` ではマップのサブキーを omit しても削除されない (merge 動作)
+   // ので、削除には `updateDoc` + `deleteField()` を使う必要がある。
+   const deleteSettingsFields = async (paths) => {
+     if (!user || !db) return;
+     const list = Array.isArray(paths) ? paths : [paths];
+     if (list.length === 0) return;
+     try {
+       setSyncStatus('syncing');
+       const payload = {};
+       list.forEach(p => { payload[p] = deleteField(); });
+       await updateDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), payload);
+       setSyncStatus('idle');
+     } catch (e) {
+       console.error(e);
+       setSyncStatus('error');
+       setErrorMsg(e.message || '設定の削除に失敗しました');
      }
    };
 
@@ -11013,48 +19442,114 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const handleAddLot = async (formData) => {
      const { model, orderNo, quantity, templateId, priority, dueDate, entryAt } = formData;
 
-     let steps = DEMO_STEPS;
+     // 柔軟な日付パース: "2026/5/15" や "2026-5-15" → "2026-05-15"
+     // 不正な値はそのまま (空 → null)。途中で alert 出さない (フォームのバリデーション任せ)
+     const parseFlexibleDate = (s) => {
+       if (!s || typeof s !== 'string') return '';
+       const trim = s.trim();
+       if (!trim) return '';
+       // YYYY/M/D or YYYY-M-D
+       const m = trim.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+       if (!m) return ''; // パース失敗時は空文字 (NaN 日付を生まないように)
+       const yyyy = m[1];
+       const mm = String(m[2]).padStart(2, '0');
+       const dd = String(m[3]).padStart(2, '0');
+       return `${yyyy}-${mm}-${dd}`;
+     };
+     // 柔軟な日時パース: "2026/5/15 09:30" / "2026/5/15" → timestamp
+     // 時刻省略時は 08:30 を自動設定
+     const parseFlexibleDateTime = (s) => {
+       if (!s || typeof s !== 'string') return null;
+       const trim = s.trim();
+       if (!trim) return null;
+       const m = trim.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[\sT]+(\d{1,2}):(\d{1,2}))?$/);
+       if (!m) {
+         // フォールバック: そのまま new Date でパース
+         const t = new Date(trim).getTime();
+         return isNaN(t) ? null : t;
+       }
+       const yyyy = Number(m[1]);
+       const mm = Number(m[2]) - 1;
+       const dd = Number(m[3]);
+       const hh = m[4] != null ? Number(m[4]) : 8;  // 時刻省略 → 8:30
+       const mi = m[5] != null ? Number(m[5]) : 30;
+       const t = new Date(yyyy, mm, dd, hh, mi, 0, 0).getTime();
+       return isNaN(t) ? null : t;
+     };
+
+     let baseSteps = DEMO_STEPS;
      const template = templates.find(t => t.id === templateId);
      if (template && template.steps) {
-       steps = template.steps;
+       baseSteps = template.steps;
      }
-     // 型式別の公差・基準値オーバーライドを適用 (measurementOverrides[model][stepId][calcId])
-     const overrides = settings.measurementOverrides?.[model];
-     if (overrides && typeof overrides === 'object') {
-       steps = steps.map(s => {
-         const stepOv = overrides[s.id];
-         if (!stepOv || !s.measurementConfig) return s;
-         const newCalcs = (s.measurementConfig.calculations || []).map(c => {
-           const calcOv = stepOv[c.id];
-           if (!calcOv) return c;
-           return {
-             ...c,
-             ...(calcOv.nominal !== undefined ? { nominal: calcOv.nominal } : {}),
-             ...(calcOv.toleranceUpper !== undefined ? { toleranceUpper: calcOv.toleranceUpper } : {}),
-             ...(calcOv.toleranceLower !== undefined ? { toleranceLower: calcOv.toleranceLower } : {}),
-             ...(calcOv.toleranceEnabled !== undefined ? { toleranceEnabled: calcOv.toleranceEnabled } : {})
-           };
-         });
-         return { ...s, measurementConfig: { ...s.measurementConfig, calculations: newCalcs } };
-       });
+
+     // 品質規格 / 型式オーバーライドを適用 (共通ヘルパー)
+     const { steps, appliedStandard } = applyQualityStandardToSteps(model, baseSteps, settings, templateId);
+
+     // 台数を決定:
+     //   編集時: 作業着手済 (tasks あり / processing/paused/completed) なら既存値を強制使用
+     //          着手前 (waiting でタスクなし) なら フォーム値を採用 (機番リストも自動同期)
+     //   新規時: フォーム値
+     const editingHasProgress = !!(editingLot && (
+       (editingLot.tasks && Object.keys(editingLot.tasks).length > 0) ||
+       editingLot.status === 'completed' || editingLot.status === 'processing' || editingLot.status === 'paused'
+     ));
+     const qty = editingLot
+       ? (editingHasProgress ? (Number(editingLot.quantity) || 1) : (Number(quantity) || Number(editingLot.quantity) || 1))
+       : (Number(quantity) || 1);
+     // 着手済なのに台数を変えようとした場合は警告
+     if (editingLot && editingHasProgress && Number(quantity) && Number(quantity) !== Number(editingLot.quantity)) {
+       alert(`⚠ このロットは既に作業着手済みのため、台数 (${editingLot.quantity}) は変更できません。\n変更前の台数で保存します。`);
      }
- 
-     // 機番を収集
-     const qty = Number(quantity) || 1;
+
+     // 機番を収集 (編集時は不足を既存値で埋める)
      const serials = [];
      for (let i = 0; i < qty; i++) {
-       serials.push(formData[`serial_${i}`] || `#${i + 1}`);
+       const fromForm = formData[`serial_${i}`];
+       const fallback = editingLot?.unitSerialNumbers?.[i];
+       serials.push((fromForm !== undefined && fromForm !== '') ? fromForm : (fallback || `#${i + 1}`));
      }
 
      const batchId = generateId();
      const timestamp = Date.now();
-     const entryTimestamp = entryAt ? new Date(entryAt).getTime() : timestamp;
-     
+     // 入庫日時: 柔軟パース (2026/5/15 形式OK、時刻省略時は 08:30)
+     const parsedEntry = parseFlexibleDateTime(entryAt);
+     const entryTimestamp = parsedEntry != null ? parsedEntry : timestamp;
+     // 納期: 柔軟パース (2026/5/15 → 2026-05-15)
+     const parsedDueDate = parseFlexibleDate(dueDate);
+
      if (editingLot) {
-        await saveData('lots', editingLot.id, {
-          model, orderNo, templateId, priority, dueDate, steps, quantity: qty,
-          entryAt: entryTimestamp, unitSerialNumbers: serials
-        });
+        // 編集時の安全策:
+        //   ① 台数 (qty) は既存値を使う (上で計算済)
+        //   ② 機番も既存を fallback
+        //   ③ 作業着手後 (tasks/stepTimes/totalWorkTime あり) のロットで steps を作り直すと、
+        //      step.id 変化で tasks の参照が切れて進捗が消える。
+        //      → 既存ロットの steps はそのまま維持。
+        const hasProgress = !!editingLot.tasks && Object.keys(editingLot.tasks).length > 0;
+        const hasWorkTime = (editingLot.totalWorkTime || 0) > 0 || editingLot.status === 'processing' || editingLot.status === 'paused' || editingLot.status === 'completed';
+        const preserveSteps = hasProgress || hasWorkTime;
+        const templateChanged = !!templateId && templateId !== editingLot.templateId;
+
+        const updates = {
+          model, orderNo, priority, dueDate: parsedDueDate || '', quantity: qty,
+          entryAt: entryTimestamp, unitSerialNumbers: serials,
+        };
+        // テンプレを変えていなくて、かつ作業中なら steps は触らない
+        if (preserveSteps && !templateChanged) {
+          // steps は維持。templateId/appliedStandard も維持。
+        } else {
+          updates.steps = steps;
+          updates.templateId = templateId;
+          // 規格未選択時は明示的に null をセットして古いスナップショットを残さない
+          updates.appliedStandard = appliedStandard ?? null;
+        }
+
+        if (preserveSteps && templateChanged) {
+          // 作業中のロットでテンプレ変更は危険 → 警告だけ出す
+          alert('⚠ 作業着手後のロットでテンプレートを変更しました。\n進捗データは保持されますが、新工程は次回作業から反映されます。');
+        }
+
+        await saveData('lots', editingLot.id, updates);
         setEditingLot(null);
      } else {
         // Single document for the batch, with quantity field
@@ -11065,13 +19560,13 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
             quantity: qty,
             unitSerialNumbers: serials,
             templateId, priority: priority || 'normal',
-            dueDate: dueDate || '',
-            entryAt: entryTimestamp, 
-            status: 'waiting', 
-            location: 'arrival', 
-            mapZoneId: null, 
-            x: 0, y: 0, 
-            workerId: null, 
+            dueDate: parsedDueDate || '',
+            entryAt: entryTimestamp,
+            status: 'waiting',
+            location: 'arrival',
+            mapZoneId: null,
+            x: 0, y: 0,
+            workerId: null,
             createdAt: timestamp,
             currentStepIndex: 0,
             steps: steps,
@@ -11079,39 +19574,274 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
             workStartTime: null,
             tasks: {},
             stepTimes: {},
-            interruptions: []
+            interruptions: [],
+            appliedStandard, // 適用された品質規格のスナップショット (null 可)
         };
         await saveData('lots', id, lot);
-        await saveData('logs', generateId(), { timestamp, type: 'CREATE', batchId, count: Number(quantity), model });
+        await saveData('logs', generateId(), { timestamp, type: 'CREATE', batchId, count: qty, model, ...(appliedStandard?.standardNo ? { standardNo: appliedStandard.standardNo } : {}) });
      }
      setShowLotModal(false);
    };
 
    // === Excel一括登録: テンプレートダウンロード ===
+   // 「型式」を入力すると隣のセル (規格状態) に VLOOKUP で品質規格が自動表示される。
+   // 型式マスタシートに登録済の全型式 + 規格番号を一覧化し、参照用として使う。
    const handleLotExcelDownload = async () => {
      const ExcelJS = await loadExcelJS();
      const wb = new ExcelJS.Workbook();
      const ws = wb.addWorksheet('入荷登録');
-     const headers = ['型式', '指図番号', '台数', 'テンプレートID', '優先度', '納期', '入庫日時', '機番1', '機番2', '機番3', '機番4', '機番5', '機番6', '機番7', '機番8', '機番9', '機番10'];
+     // 「規格状態」列 (B) と「テンプレ名 (自動)」列 (F) を挿入。
+     // ・規格状態 (B): 型式の隣で一目で状態が分かる
+     // ・テンプレ名 (F): テンプレートID を選んだら自動で表示。手入力不要
+     const headers = ['型式', '規格状態 (自動)', '指図番号', '台数', 'テンプレートID', 'テンプレ名 (自動)', '優先度', '納期', '入庫日時', '機番1', '機番2', '機番3', '機番4', '機番5', '機番6', '機番7', '機番8', '機番9', '機番10'];
      ws.addRow(headers);
      const headerRow = ws.getRow(1);
      headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
      headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } };
      headerRow.alignment = { horizontal: 'center' };
      headers.forEach((_, i) => { headerRow.getCell(i + 1).border = { top: { style: 'thin' }, bottom: { style: 'thin' }, left: { style: 'thin' }, right: { style: 'thin' } }; });
+     // 規格状態列のヘッダは別色 (情報のみ列であることを示す)
+     headerRow.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6366F1' } };
+     // テンプレ名 (自動) 列のヘッダも別色
+     headerRow.getCell(6).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6366F1' } };
 
-     // 既存ロットを記載
+     // ▼ 型式マスタシート (品質規格 + レガシーオーバーライドの両方を集約)
+     // 複数テンプレ対応: 1 規格に紐付くテンプレが複数ある場合、
+     //   (1) 型式単独行 (テンプレ未指定時の挙動を示す)
+     //   (2) 型式_テンプレID 組合せ行 (テンプレ指定時の具体的な適用結果)
+     // の両方を書き込み、Excel 側で 型式 + テンプレID の両方を見て VLOOKUP できるようにする。
+     const ws3 = wb.addWorksheet('型式マスタ');
+     ws3.addRow(['Key', '型式', 'テンプレ', '規格番号', 'リビジョン', '規格名', '状態']);
+     const ws3Header = ws3.getRow(1);
+     ws3Header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+     ws3Header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6366F1' } };
+     ws3Header.alignment = { horizontal: 'center' };
+
+     const modelMap = settings?.modelStandardMap || {};
+     const qsMap = settings?.qualityStandards || {};
+     const legacyMap = settings?.measurementOverrides || {};
+
+     // 既知の型式を全て収集 (規格紐付け / レガシー / 既存ロット)
+     const allModels = Array.from(new Set([
+       ...Object.keys(modelMap),
+       ...Object.keys(legacyMap),
+       ...lots.map(l => l.model).filter(Boolean)
+     ])).sort();
+
+     // セル装飾ヘルパー: 状態タイプに応じた背景・文字色
+     const decorateStatusCell = (cell, kind) => {
+       const styles = {
+         ok:   { bg: 'FFD1FAE5', fg: 'FF065F46' }, // 緑
+         warn: { bg: 'FFFEF3C7', fg: 'FF92400E' }, // 黄
+         miss: { bg: 'FFFEE2E2', fg: 'FF991B1B' }, // 赤
+       };
+       const s = styles[kind] || styles.miss;
+       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: s.bg } };
+       cell.font = { color: { argb: s.fg }, bold: true };
+     };
+
+     allModels.forEach(model => {
+       const qsId = modelMap[model];
+       const qs = qsId ? qsMap[qsId] : null;
+
+       if (qs) {
+         // 規格内のテンプレートエントリ一覧 (新旧フォーマット対応)
+         const entries = getQsTemplateEntries(qs);
+         const tplLabels = entries.map(e => {
+           const tpl = templates.find(t => t.id === e.templateId);
+           return tpl?.name || e.templateId || '(未選択)';
+         });
+
+         // (1) 型式単独行: テンプレ未指定 or 一致しない時のフォールバック挙動
+         // テンプレ列にも「N 件: a / b / c」を入れて、一目で何テンプレ紐付いてるか分かるように
+         const tplSummary = entries.length === 0
+           ? '(テンプレ未設定)'
+           : entries.length === 1
+             ? `1 件 (${tplLabels[0]})`
+             : `${entries.length} 件 (${tplLabels.join(' / ')})`;
+         const summaryStatus = entries.length === 1
+           ? `◯ 規格あり (${qs.standardNo || ''} Rev.${qs.revision || ''}) ・対象テンプレ: ${tplLabels[0]}`
+           : entries.length > 1
+             ? `▲ 規格紐付け済 (${qs.standardNo || ''} Rev.${qs.revision || ''}) ・対象テンプレ: ${tplLabels.join(' / ')} ← 取込時はテンプレID 必須`
+             : `▲ 規格紐付け済 (${qs.standardNo || ''}) ・テンプレ未設定`;
+         const r1 = ws3.addRow([`型式:${model}`, model, tplSummary, qs.standardNo || '', qs.revision || '', qs.name || '', summaryStatus]);
+         // まとめ行は薄い背景でグループヘッダー的に
+         r1.getCell(2).font = { bold: true };
+         r1.getCell(3).font = { italic: true, color: { argb: 'FF475569' } };
+         decorateStatusCell(r1.getCell(7), entries.length === 1 ? 'ok' : 'warn');
+
+         // (2) 型式_テンプレID 組合せ行 (テンプレ別の具体的な適用結果)
+         entries.forEach(e => {
+           if (!e.templateId) return;
+           const tpl = templates.find(t => t.id === e.templateId);
+           const status = `◯ 適用可 (${qs.standardNo || ''} Rev.${qs.revision || ''}) — テンプレ: ${tpl?.name || e.templateId}`;
+           const r = ws3.addRow([
+             `組合せ:${model}_${e.templateId}`, model, tpl?.name || e.templateId,
+             qs.standardNo || '', qs.revision || '', qs.name || '', status
+           ]);
+           // インデント感: 組合せ行は型式列を空にして、まとめ行の子要素っぽく見せる
+           r.getCell(2).value = '  ↳ ' + model;
+           r.getCell(2).font = { color: { argb: 'FF94A3B8' }, size: 10 };
+           decorateStatusCell(r.getCell(7), 'ok');
+         });
+       } else if (legacyMap[model]) {
+         const r = ws3.addRow([`型式:${model}`, model, '(レガシー: テンプレ無関係)', '', '', '', '△ レガシーオーバーライド (旧形式・テンプレ依存なし)']);
+         r.getCell(2).font = { bold: true };
+         r.getCell(3).font = { italic: true, color: { argb: 'FF92400E' } };
+         decorateStatusCell(r.getCell(7), 'warn');
+       } else {
+         const r = ws3.addRow([`型式:${model}`, model, '(規格未登録)', '', '', '', '× 未登録 (テンプレデフォルトで動作)']);
+         r.getCell(2).font = { bold: true };
+         r.getCell(3).font = { italic: true, color: { argb: 'FF94A3B8' } };
+         decorateStatusCell(r.getCell(7), 'miss');
+       }
+     });
+     ws3.columns = [{ width: 28 }, { width: 22 }, { width: 32 }, { width: 14 }, { width: 8 }, { width: 24 }, { width: 56 }];
+     ws3.views = [{ state: 'frozen', ySplit: 1 }];
+
+     // シート末尾に補足説明を追加
+     ws3.addRow([]);
+     const noteRow1 = ws3.addRow(['※ 各型式の行構成:']);
+     noteRow1.getCell(1).font = { bold: true, color: { argb: 'FF475569' } };
+     ws3.addRow(['  ・1 行目 (Key=型式:◯◯): まとめ行。「テンプレ」列に紐付いてる全テンプレが一覧表示']);
+     ws3.addRow(['  ・2 行目以降 (Key=組合せ:◯◯_△△): 各テンプレごとの具体的な適用状態']);
+     ws3.addRow(['※ 1 規格に複数テンプレが紐付いてる場合、入荷登録時に「テンプレID」を正しく入力しないと規格が適用されない (▲ 警告)']);
+
+     // 既存ロットを記載 + 規格状態列に VLOOKUP 数式 (2段階フォールバック)
+     // ① テンプレID も入力されてれば「組合せ:型式_テンプレID」で検索 → 一致すれば確実な適用結果
+     // ② ①で見つからなければ「型式:型式」で検索 → 規格紐付け状態 (or レガシー/未登録)
+     // ③ どちらも無ければ「× 未登録 (テンプレデフォルト)」
      const existingLots = lots.filter(l => l.location !== 'completed');
+     const lookupFormula = (rowIdx) => ({
+       formula: `IF(A${rowIdx}="","",IF(E${rowIdx}="",IFERROR(VLOOKUP("型式:"&A${rowIdx},'型式マスタ'!A:G,7,FALSE),"× 未登録 (テンプレデフォルト)"),IFERROR(VLOOKUP("組合せ:"&A${rowIdx}&"_"&E${rowIdx},'型式マスタ'!A:G,7,FALSE),IFERROR(VLOOKUP("型式:"&A${rowIdx},'型式マスタ'!A:G,7,FALSE),"× 未登録 (テンプレデフォルト)"))))`
+     });
+     // テンプレ名 (自動): F 列。E 列のテンプレートID を「テンプレート一覧」シートで引いて名前を表示。
+     const templateNameFormula = (rowIdx) => ({
+       formula: `IF(E${rowIdx}="","",IFERROR(VLOOKUP(E${rowIdx},'テンプレート一覧'!A:B,2,FALSE),"⚠ ID不明"))`
+     });
+
+     // 型式 → 規格内テンプレID リストを取得 (規格が無ければ全テンプレ)
+     const getValidTemplateIdsForModel = (model) => {
+       const qsId = modelMap[model];
+       const qs = qsId ? qsMap[qsId] : null;
+       if (qs) {
+         const entries = getQsTemplateEntries(qs);
+         const ids = entries.map(e => e.templateId).filter(Boolean);
+         if (ids.length > 0) return { ids, fromQs: true };
+       }
+       return { ids: templates.map(t => t.id).filter(Boolean), fromQs: false };
+     };
+     // データ検証 (ドロップダウン) を E 列のセルに付与するヘルパー
+     // Excel の list 検証は カンマ区切り文字列で渡す (1 つの式に 255 文字制限あり)
+     const applyTemplateDropdown = (cell, model) => {
+       const { ids, fromQs } = getValidTemplateIdsForModel(model);
+       if (ids.length === 0) return;
+       // 安全のため 255 文字以内に収まるようカット (Excel 制限)
+       let joined = ids.join(',');
+       if (joined.length > 250) {
+         joined = ids.slice(0, 20).join(','); // 多すぎる場合は先頭 20 件のみ
+       }
+       cell.dataValidation = {
+         type: 'list',
+         allowBlank: true,
+         formulae: [`"${joined}"`],
+         showErrorMessage: false,
+         promptTitle: fromQs ? '規格対応テンプレ' : 'テンプレート選択',
+         prompt: fromQs ? 'この型式の品質規格に登録されているテンプレートから選択' : '使用するテンプレートを選択',
+         showInputMessage: true,
+       };
+     };
+
      if (existingLots.length > 0) {
-       existingLots.forEach(lot => {
-         const row = [lot.model, lot.orderNo, lot.quantity, lot.templateId || '', lot.priority === 'high' ? '急ぎ' : '通常', lot.dueDate || '', lot.entryAt ? new Date(lot.entryAt).toISOString().slice(0, 16).replace('T', ' ') : ''];
+       existingLots.forEach((lot, idx) => {
+         const rowIdx = idx + 2; // 1=header, 2=first data row
+         const row = [
+           lot.model,
+           lookupFormula(rowIdx),
+           lot.orderNo,
+           lot.quantity,
+           lot.templateId || '',
+           templateNameFormula(rowIdx),
+           lot.priority === 'high' ? '急ぎ' : '通常',
+           lot.dueDate || '',
+           lot.entryAt ? new Date(lot.entryAt).toISOString().slice(0, 16).replace('T', ' ') : ''
+         ];
          for (let i = 0; i < (lot.quantity || 1); i++) row.push(lot.unitSerialNumbers?.[i] || `#${i+1}`);
          ws.addRow(row);
+         // テンプレートID セルにドロップダウン付与 (この行の型式に応じた候補)
+         applyTemplateDropdown(ws.getCell(`E${rowIdx}`), lot.model);
        });
      } else {
-       // サンプル行（ロットがない場合のみ）
-       ws.addRow(['A-100', 'M-001', 2, templates[0]?.id || 'demo', '通常', '2026-04-01', '', 'SN-001', 'SN-002']);
+       // サンプル行
+       ws.addRow(['A-100', lookupFormula(2), 'M-001', 2, templates[0]?.id || 'demo', templateNameFormula(2), '通常', '2026-04-01', '', 'SN-001', 'SN-002']);
+       applyTemplateDropdown(ws.getCell('E2'), 'A-100');
      }
+
+     // 空行 50 行分に予め数式を埋める (新規入力時の即時フィードバック用)
+     const dataStartRow = 2;
+     const dataEndRow = Math.max(existingLots.length, 1) + dataStartRow + 50;
+     for (let r = (existingLots.length || 1) + dataStartRow; r < dataEndRow; r++) {
+       ws.getCell(`B${r}`).value = lookupFormula(r);
+       ws.getCell(`F${r}`).value = templateNameFormula(r);
+       // 空行の E 列には「全テンプレ」のドロップダウンを設定 (型式が未入力なので候補を絞れない)
+       applyTemplateDropdown(ws.getCell(`E${r}`), null);
+     }
+
+     // 規格状態列・テンプレ名列のセル装飾 (薄い背景でグレーアウト感)
+     for (let r = dataStartRow; r < dataEndRow; r++) {
+       [`B${r}`, `F${r}`].forEach(addr => {
+         const cell = ws.getCell(addr);
+         cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+         cell.font = { italic: true, size: 10, color: { argb: 'FF475569' } };
+         cell.alignment = { horizontal: 'left', vertical: 'middle' };
+       });
+     }
+
+     // 条件付き書式: テンプレ名 (自動) 列 — エラーは黄色
+     ws.addConditionalFormatting({
+       ref: `F${dataStartRow}:F${dataEndRow}`,
+       rules: [
+         {
+           type: 'containsText', operator: 'containsText', text: '⚠',
+           priority: 1,
+           style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFEF3C7' } }, font: { color: { argb: 'FF92400E' }, bold: true } }
+         }
+       ]
+     });
+     // 条件付き書式: 規格状態列の値で色分け
+     ws.addConditionalFormatting({
+       ref: `B${dataStartRow}:B${dataEndRow}`,
+       rules: [
+         {
+           type: 'containsText',
+           operator: 'containsText',
+           text: '◯',
+           priority: 1,
+           style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFD1FAE5' } }, font: { color: { argb: 'FF065F46' }, bold: true, italic: false } }
+         },
+         {
+           type: 'containsText',
+           operator: 'containsText',
+           text: '▲',
+           priority: 2,
+           style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFEF3C7' } }, font: { color: { argb: 'FF92400E' }, bold: true, italic: false } }
+         },
+         {
+           type: 'containsText',
+           operator: 'containsText',
+           text: '△',
+           priority: 3,
+           style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFEF3C7' } }, font: { color: { argb: 'FF92400E' }, bold: true, italic: false } }
+         },
+         {
+           type: 'containsText',
+           operator: 'containsText',
+           text: '×',
+           priority: 4,
+           style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFEE2E2' } }, font: { color: { argb: 'FF991B1B' }, bold: true, italic: false } }
+         }
+       ]
+     });
 
      // テンプレート一覧シート
      const ws2 = wb.addWorksheet('テンプレート一覧');
@@ -11120,10 +19850,25 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      ws2.addRow(['demo', '詳細デモ手順 (4工程)']);
      templates.forEach(t => ws2.addRow([t.id, t.name]));
 
-     // 列幅
-     ws.columns = headers.map((h, i) => ({ width: i < 7 ? 18 : 12 }));
+     // 列幅 (規格状態列・テンプレ名列は広めに)
+     ws.columns = headers.map((h, i) => {
+       if (i === 0) return { width: 16 };       // 型式
+       if (i === 1) return { width: 32 };       // 規格状態 (テキスト長め)
+       if (i === 4) return { width: 18 };       // テンプレートID
+       if (i === 5) return { width: 28 };       // テンプレ名 (自動) - テンプレ名は長め
+       if (i < 9) return { width: 14 };         // 指図〜入庫日時
+       return { width: 12 };                     // 機番
+     });
+
+     // 先頭行 + 先頭 2 列を固定 (横スクロールしても 型式 / 規格状態 が見える)
+     ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 1 }];
+
      // 注意書き
      ws.addRow([]);
+     ws.addRow(['※ 規格状態・テンプレ名は自動表示列 (入力不要・取込時は無視)']);
+     ws.addRow(['※ テンプレートID 列はクリックでドロップダウンが出ます。規格登録済みの型式は規格に登録されたテンプレのみ、未登録は全テンプレが候補に出ます']);
+     ws.addRow(['※ ◯ = 品質規格 + テンプレ一致 (完全適用) / ▲ = 規格は紐付け済だがテンプレ要確認 (複数候補) / △ = レガシーオーバーライド / × = 未登録 (テンプレデフォルト適用)']);
+     ws.addRow(['※ 1 規格に複数テンプレが紐付いている場合、テンプレID 列を正しく入力しないと規格が適用されません (▲ 表示時は要注意)']);
      ws.addRow(['※ 優先度: 「通常」または「急ぎ」（空欄は通常扱い）']);
      ws.addRow(['※ 納期: yyyy-mm-dd 形式（空欄可）']);
      ws.addRow(['※ 入庫日時: yyyy-mm-dd HH:MM 形式 / 空欄可（空欄=取込実行時刻）']);
@@ -11139,6 +19884,304 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      a.click();
    };
 
+   // === 工機進捗管理表 取込: パース → プレビュー ===
+   const handleProgressMgmtUpload = async (e) => {
+     const file = e.target.files[0];
+     if (!file) return;
+     e.target.value = '';
+     try {
+       const ExcelJS = await loadExcelJS();
+       const wb = new ExcelJS.Workbook();
+       const buf = await file.arrayBuffer();
+       await wb.xlsx.load(buf);
+       const sheet = wb.getWorksheet('進捗管理表');
+       if (!sheet) { alert('「進捗管理表」シートが見つかりません'); return; }
+
+       // 品質規格マスタを参照 (modelStandardMap[model] → qualityStandards[qsId].templates[])
+       const qualityStandards = settings.qualityStandards || {};
+       const modelStandardMap = settings.modelStandardMap || {};
+       if (Object.keys(modelStandardMap).length === 0) {
+         if (!confirm('「型式 → 品質規格」のマッピングが未設定です。\n品質規格マスタで型式に規格を割り当ててください。\n\nそれでも続けますか? (どの行も取り込まれません)')) return;
+       }
+
+       // ヘルパー: cell値を文字列化 (richText対応)
+       const getStr = (cell) => {
+         const v = cell?.value;
+         if (v == null) return '';
+         if (typeof v === 'string') return v.trim();
+         if (typeof v === 'number') return String(v);
+         if (v instanceof Date) return v.toISOString().slice(0,10);
+         if (v && Array.isArray(v.richText)) return v.richText.map(t => t.text).join('').trim();
+         if (v && v.formula && v.result !== undefined) {
+           if (v.result instanceof Date) return v.result.toISOString().slice(0,10);
+           if (typeof v.result === 'object' && v.result?.error) return '';
+           return String(v.result || '').trim();
+         }
+         return String(v).trim();
+       };
+       const getDate = (cell) => {
+         const v = cell?.value;
+         if (v == null) return null;
+         if (v instanceof Date) return v;
+         if (v && v.formula && v.result instanceof Date) return v.result;
+         if (typeof v === 'string') {
+           const s = v.trim();
+           if (s === '' || s === '-' || s === 'ー') return null;
+           // 試しに parse
+           const d = new Date(s);
+           if (!isNaN(d.getTime())) return d;
+         }
+         return null;
+       };
+       // 行のfillが灰色 (出荷済) かを判定
+       const isShippedGray = (row) => {
+         // 行内のセルをいくつか見て、灰色(theme:0 + tint負)が支配的か簡易判定
+         let grayCount = 0, total = 0;
+         for (let c = 1; c <= 10; c++) {
+           const cell = row.getCell(c);
+           const fill = cell?.fill;
+           if (fill?.type === 'pattern' && fill.fgColor) {
+             total++;
+             const fg = fill.fgColor;
+             // 灰色: theme:0 で tint が -0.15 〜 -0.5 の範囲
+             if (fg.theme === 0 && typeof fg.tint === 'number' && fg.tint < -0.1 && fg.tint > -0.5) {
+               grayCount++;
+             }
+           }
+         }
+         return total > 0 && grayCount >= Math.ceil(total / 2);
+       };
+       // 型式 → 品質規格 → テンプレ entry 配列 を解決
+       //   1. 完全一致を最優先
+       //   2. 大文字小文字無視
+       //   3. ハイフン/カンマ/スペース揺れ吸収して再試行
+       const normalize = (s) => (s || '').toString().toUpperCase().replace(/[\s\-_,\.]/g, '');
+       const findQsEntriesForModel = (model) => {
+         const m = (model || '').trim();
+         if (!m) return null;
+         // 直接一致
+         let qsId = modelStandardMap[m];
+         if (!qsId) {
+           // 正規化して照合
+           const norm = normalize(m);
+           for (const [registeredModel, mapped] of Object.entries(modelStandardMap)) {
+             if (normalize(registeredModel) === norm) { qsId = mapped; break; }
+           }
+         }
+         if (!qsId) return null;
+         const qs = qualityStandards[qsId];
+         if (!qs) return null;
+         const entries = getQsTemplateEntries(qs);
+         return { qs, entries };
+       };
+       // 「①Z5/15②Z5/18」のような複数日付文字列から最初の日付を抽出
+       const parseFirstDate = (str) => {
+         if (!str) return null;
+         const s = String(str);
+         // 日付パターン M/D を探す
+         const m = s.match(/(\d{1,2})\/(\d{1,2})/);
+         if (m) {
+           const month = parseInt(m[1]);
+           const day = parseInt(m[2]);
+           const now = new Date();
+           let year = now.getFullYear();
+           // 過去日付すぎたら翌年と仮定
+           let d = new Date(year, month - 1, day);
+           if (d.getTime() < now.getTime() - 90 * 86400000) {
+             d = new Date(year + 1, month - 1, day);
+           }
+           return d;
+         }
+         return null;
+       };
+
+       const result = {
+         createLots: [],   // 新規作成予定
+         updateLots: [],   // 既存更新予定
+         skipped: [],      // スキップ (理由付き)
+         warnings: [],     // 警告 (複数日付など)
+         totalRows: 0,
+       };
+
+       const today = new Date();
+       const totalRows = sheet.rowCount;
+       for (let r = 3; r <= totalRows; r++) {  // 行1,2はヘッダ
+         const row = sheet.getRow(r);
+         const orderNo = getStr(row.getCell('B'));
+         if (!orderNo || !/^\d+$/.test(orderNo)) continue;  // 指図無し or 数値以外はスキップ (静かに)
+         result.totalRows++;
+
+         const productNo = getStr(row.getCell('C'));
+         const model = getStr(row.getCell('D'));
+         const qtyStr = getStr(row.getCell('E'));
+         const quantity = parseInt(qtyStr) || 1;
+         const zVal = row.getCell('Z').value;
+         const zStr = getStr(row.getCell('Z'));
+         const abDate = getDate(row.getCell('AB'));
+
+         // スキップ判定
+         if (zStr === '-' || zStr === 'ー') {
+           result.skipped.push({ row: r, orderNo, model, reason: 'Z列="-": 検査終了済' });
+           continue;
+         }
+         if (isShippedGray(row)) {
+           result.skipped.push({ row: r, orderNo, model, reason: '灰色行: 出荷済の可能性' });
+           continue;
+         }
+         if (!model) {
+           result.skipped.push({ row: r, orderNo, model: '(空)', reason: '型式が空' });
+           continue;
+         }
+         if (productNo && productNo.includes('PARTS')) {
+           result.skipped.push({ row: r, orderNo, model, reason: 'PARTS品 (検査対象外)' });
+           continue;
+         }
+
+         // 基準日決定: Z > AB の優先順
+         let baseDate = getDate(row.getCell('Z'));
+         let baseDateProvisional = false;
+         let multiDateWarning = false;
+         if (!baseDate) {
+           // Z列の文字列から最初の日付を抽出
+           const parsed = parseFirstDate(zStr);
+           if (parsed) {
+             baseDate = parsed;
+             if (zStr.match(/[①②③④⑤]/) || (zStr.match(/\d{1,2}\/\d{1,2}/g) || []).length > 1) {
+               multiDateWarning = true;
+             }
+           }
+         }
+         if (!baseDate) {
+           // Z空 → AB を仮基準日に
+           if (abDate) {
+             baseDate = abDate;
+             baseDateProvisional = true;
+           } else {
+             result.skipped.push({ row: r, orderNo, model, reason: 'Z列・AB列ともに日付なし' });
+             continue;
+           }
+         }
+
+         // 型式 → 品質規格 → テンプレ entry を解決
+         const qsResult = findQsEntriesForModel(model);
+         if (!qsResult) {
+           result.skipped.push({ row: r, orderNo, model, reason: '品質規格マスタに型式の紐付けなし' });
+           continue;
+         }
+         const { qs, entries } = qsResult;
+         const validEntries = entries.filter(e => e.templateId);
+         if (validEntries.length === 0) {
+           result.skipped.push({ row: r, orderNo, model, reason: `品質規格「${qs.standardNo}」にテンプレ未割当` });
+           continue;
+         }
+
+         // 各テンプレ × 指図 でロットを作成 or 更新判定
+         for (const e of validEntries) {
+           const tpl = templates.find(t => t.id === e.templateId);
+           if (!tpl) {
+             result.skipped.push({ row: r, orderNo, model, reason: `テンプレ未存在 (${e.templateId})` });
+             continue;
+           }
+           const daysBefore = e.daysBefore ?? 0;  // 未設定なら 0日 (K33当日)
+           const dueDate = new Date(baseDate);
+           dueDate.setDate(dueDate.getDate() + daysBefore);
+           const dueDateStr = dueDate.toISOString().slice(0, 10);
+
+           // 既存ロット判定 (指図 + テンプレID)
+           const existing = lots.find(l => l.orderNo === orderNo && l.templateId === e.templateId && l.location !== 'completed');
+           const lotData = {
+             orderNo,
+             model,
+             quantity,
+             templateId: e.templateId,
+             templateName: tpl.name,
+             dueDate: dueDateStr,
+             dueDateProvisional: baseDateProvisional,
+             qsName: `${qs.standardNo} ${qs.name}`,
+             baseDate: baseDate.toISOString().slice(0,10),
+             daysBefore,
+           };
+           if (existing) {
+             result.updateLots.push({ ...lotData, existingId: existing.id, oldDueDate: existing.dueDate });
+           } else {
+             result.createLots.push(lotData);
+           }
+           if (multiDateWarning) {
+             result.warnings.push({ row: r, orderNo, model, message: `Z列に複数日付検出: "${zStr.slice(0,40)}" → 最初の日付を採用 (${baseDate.toLocaleDateString()})` });
+           }
+         }
+       }
+
+       setProgressImportPreview(result);
+     } catch (err) {
+       console.error('Progress Mgmt parse error:', err);
+       alert('取込み中にエラーが発生しました: ' + (err.message || err));
+     }
+   };
+
+   // 取込プレビューの確定 (Firebase 一括保存)
+   const confirmProgressImport = async () => {
+     if (!progressImportPreview) return;
+     const { createLots, updateLots } = progressImportPreview;
+     setProgressImportPreview(null);
+     try {
+       const timestamp = Date.now();
+       // 新規作成
+       for (const c of createLots) {
+         const id = generateId();
+         const baseSteps = templates.find(t => t.id === c.templateId)?.steps || DEMO_STEPS;
+         const { steps, appliedStandard } = applyQualityStandardToSteps(c.model, baseSteps, settings, c.templateId);
+         const serials = Array.from({ length: c.quantity }, (_, i) => `#${i + 1}`);
+         await saveData('lots', id, {
+           id, batchId: generateId(),
+           model: c.model, orderNo: c.orderNo,
+           serialNo: c.orderNo,
+           quantity: c.quantity,
+           unitSerialNumbers: serials,
+           templateId: c.templateId,
+           priority: 'normal',
+           dueDate: c.dueDate,
+           dueDateProvisional: c.dueDateProvisional || false,
+           importedFromExcel: true,
+           entryAt: timestamp,
+           status: 'waiting',
+           location: 'arrival',
+           mapZoneId: null,
+           x: 0, y: 0,
+           workerId: null,
+           createdAt: timestamp,
+           currentStepIndex: 0,
+           steps,
+           totalWorkTime: 0,
+           workStartTime: null,
+           tasks: {},
+           stepTimes: {},
+           interruptions: [],
+           appliedStandard,
+         });
+       }
+       // 既存更新 (dueDate / quantity のみ)
+       for (const u of updateLots) {
+         const updates = {
+           dueDate: u.dueDate,
+           dueDateProvisional: u.dueDateProvisional || false,
+         };
+         // quantity が変わってる場合のみ更新 (タスク整合性のため、進捗ありなら quantity は触らない)
+         const existingLot = lots.find(l => l.id === u.existingId);
+         const hasProgress = existingLot && existingLot.tasks && Object.keys(existingLot.tasks).length > 0;
+         if (!hasProgress && existingLot?.quantity !== u.quantity) {
+           updates.quantity = u.quantity;
+           updates.unitSerialNumbers = Array.from({ length: u.quantity }, (_, i) => existingLot?.unitSerialNumbers?.[i] || `#${i + 1}`);
+         }
+         await saveData('lots', u.existingId, updates);
+       }
+       alert(`✓ 取込み完了\n新規作成: ${createLots.length}件\n更新: ${updateLots.length}件`);
+     } catch (err) {
+       console.error(err);
+       alert('保存中にエラーが発生しました: ' + (err.message || err));
+     }
+   };
+
    // === Excel一括登録: アップロード処理 ===
    const handleLotExcelUpload = async (e) => {
      const file = e.target.files[0];
@@ -11152,23 +20195,52 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const ws = wb.getWorksheet('入荷登録') || wb.getWorksheet(1);
        if (!ws) { alert('シートが見つかりません'); return; }
 
+       // ヘッダー行を解析して列名 → インデックスのマップを作る (新旧フォーマット両対応)
+       // 新フォーマット: 規格状態列が 2 列目に挿入されている
+       // 旧フォーマット: 規格状態列なし
+       const headerCellText = (i) => {
+         const v = ws.getRow(1).getCell(i).value;
+         if (v == null) return '';
+         if (typeof v === 'object' && v.richText) return v.richText.map(t => t.text).join('');
+         return String(v).trim();
+       };
+       const colIndex = {};
+       for (let i = 1; i <= 30; i++) {
+         const h = headerCellText(i);
+         if (!h) continue;
+         // 「規格状態 (自動)」のような括弧付きにも対応
+         const normalized = h.replace(/\s*[\(（].*[\)）]\s*/g, '').trim();
+         colIndex[normalized] = i;
+       }
+       // 必須列のフォールバック (ヘッダー解析失敗時は旧フォーマット位置を仮定)
+       const col = (name, fallback) => colIndex[name] || fallback;
+       const C_MODEL = col('型式', 1);
+       const C_ORDER = col('指図番号', 2);
+       const C_QTY = col('台数', 3);
+       const C_TEMPLATE = col('テンプレートID', 4);
+       const C_PRIORITY = col('優先度', 5);
+       const C_DUE = col('納期', 6);
+       const C_ENTRY = col('入庫日時', 7);
+       // 機番は最初の「機番1」列から連続して読む
+       const C_SERIAL_START = col('機番1', 8);
+
        const rows = [];
        ws.eachRow((row, rowNum) => {
          if (rowNum === 1) return; // ヘッダースキップ
-         const model = row.getCell(1).value?.toString?.() || row.getCell(1).value;
-         const orderNo = row.getCell(2).value?.toString?.() || row.getCell(2).value;
+         const model = row.getCell(C_MODEL).value?.toString?.() || row.getCell(C_MODEL).value;
+         const orderNo = row.getCell(C_ORDER).value?.toString?.() || row.getCell(C_ORDER).value;
          if (!model || !orderNo) return; // 空行スキップ
-         const qty = parseInt(row.getCell(3).value) || 1;
-         const templateId = row.getCell(4).value?.toString?.() || 'demo';
-         const priorityRaw = row.getCell(5).value?.toString?.() || '通常';
+         const qty = parseInt(row.getCell(C_QTY).value) || 1;
+         const templateId = row.getCell(C_TEMPLATE).value?.toString?.() || 'demo';
+         const priorityRaw = row.getCell(C_PRIORITY).value?.toString?.() || '通常';
          const priority = priorityRaw === '急ぎ' ? 'high' : 'normal';
-         const dueDate = row.getCell(6).value?.toString?.() || '';
-         const entryAtRaw = row.getCell(7).value;
+         const dueDate = row.getCell(C_DUE).value?.toString?.() || '';
+         const entryAtRaw = row.getCell(C_ENTRY).value;
          const entryAt = entryAtRaw ? new Date(entryAtRaw).getTime() : Date.now();
 
          const serials = [];
          for (let i = 0; i < qty; i++) {
-           const sn = row.getCell(8 + i).value?.toString?.() || '';
+           const sn = row.getCell(C_SERIAL_START + i).value?.toString?.() || '';
            serials.push(sn || `#${i + 1}`);
          }
          rows.push({ model, orderNo, qty, templateId, priority, dueDate, entryAt, serials });
@@ -11180,51 +20252,47 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        let newCount = 0, updateCount = 0, skipCount = 0;
        const details = [];
 
+       const processedKeys = new Set(); // このバッチで作成済みの「指図+テンプレID」(二重作成防止)
        for (const row of rows) {
-         const existing = lots.find(l => l.orderNo === row.orderNo);
+         // 重複判定は「指図番号 + テンプレートID」で行う。
+         //   こうしないと、同じ指図で複数テンプレ(別ロット)を登録しても1つに潰れてしまう。
+         const dupKey = `${row.orderNo}__${row.templateId}`;
+         const existing = lots.find(l => l.orderNo === row.orderNo && l.templateId === row.templateId);
 
          if (existing && existing.status === 'processing') {
            // 作業中のロットは無視
            skipCount++;
-           details.push(`⏭ ${row.orderNo} — 作業中のため無視`);
+           details.push(`⏭ ${row.orderNo} (テンプレ:${row.templateId}) — 作業中のため無視`);
+           continue;
+         }
+         if (!existing && processedKeys.has(dupKey)) {
+           // 同一Excel内に「同じ指図+同じテンプレID」の行が複数 → 2件目以降は無視 (二重作成防止)
+           skipCount++;
+           details.push(`⏭ ${row.orderNo} (テンプレ:${row.templateId}) — 同一ファイル内の重複行`);
            continue;
          }
 
-         let steps = DEMO_STEPS;
+         let baseSteps = DEMO_STEPS;
          const template = templates.find(t => t.id === row.templateId);
-         if (template?.steps) steps = template.steps;
-         // 型式別オーバーライド適用 (Excel 取込もここで適用)
-         const overrides = settings.measurementOverrides?.[row.model];
-         if (overrides && typeof overrides === 'object') {
-           steps = steps.map(s => {
-             const stepOv = overrides[s.id];
-             if (!stepOv || !s.measurementConfig) return s;
-             const newCalcs = (s.measurementConfig.calculations || []).map(c => {
-               const calcOv = stepOv[c.id];
-               if (!calcOv) return c;
-               return {
-                 ...c,
-                 ...(calcOv.nominal !== undefined ? { nominal: calcOv.nominal } : {}),
-                 ...(calcOv.toleranceUpper !== undefined ? { toleranceUpper: calcOv.toleranceUpper } : {}),
-                 ...(calcOv.toleranceLower !== undefined ? { toleranceLower: calcOv.toleranceLower } : {}),
-                 ...(calcOv.toleranceEnabled !== undefined ? { toleranceEnabled: calcOv.toleranceEnabled } : {})
-               };
-             });
-             return { ...s, measurementConfig: { ...s.measurementConfig, calculations: newCalcs } };
-           });
-         }
+         if (template?.steps) baseSteps = template.steps;
+         // 品質規格 / 型式オーバーライドを適用 (共通ヘルパー: ロット登録画面と同じ挙動)
+         const { steps, appliedStandard } = applyQualityStandardToSteps(row.model, baseSteps, settings, row.templateId);
 
          if (existing) {
            // 既存ロットを上書き（作業中以外）
+           // 既存ロットが既に作業開始後 (workStartTime あり) でない場合のみ規格スナップショットも更新
+           const isUntouched = !existing.workStartTime && (!existing.tasks || Object.keys(existing.tasks).length === 0);
            const updates = {
              model: row.model, quantity: row.qty,
              unitSerialNumbers: row.serials,
              templateId: row.templateId, priority: row.priority,
-             dueDate: row.dueDate, entryAt: row.entryAt, steps
+             dueDate: row.dueDate, entryAt: row.entryAt, steps,
+             ...(isUntouched && appliedStandard ? { appliedStandard } : {})
            };
            await saveData('lots', existing.id, updates);
            updateCount++;
-           details.push(`🔄 ${row.orderNo} — 上書き更新`);
+           const stdLabel = appliedStandard?.source === 'qualityStandard' ? ` [${appliedStandard.standardNo} Rev.${appliedStandard.revision}]` : '';
+           details.push(`🔄 ${row.orderNo} — 上書き更新${stdLabel}`);
          } else {
            // 新規登録
            const id = generateId();
@@ -11235,11 +20303,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              entryAt: row.entryAt, status: 'waiting', location: 'arrival',
              mapZoneId: null, x: 0, y: 0, workerId: null, createdAt: Date.now(),
              currentStepIndex: 0, steps, totalWorkTime: 0, workStartTime: null,
-             tasks: {}, stepTimes: {}, interruptions: []
+             tasks: {}, stepTimes: {}, interruptions: [],
+             appliedStandard, // 適用された品質規格のスナップショット
            };
            await saveData('lots', id, lot);
            newCount++;
-           details.push(`✅ ${row.orderNo} — 新規登録`);
+           processedKeys.add(dupKey); // このバッチで作成済みとして記録 (同一ファイル内の二重作成防止)
+           const stdLabel = appliedStandard?.source === 'qualityStandard' ? ` [${appliedStandard.standardNo} Rev.${appliedStandard.revision}]` : '';
+           details.push(`✅ ${row.orderNo} — 新規登録${stdLabel}`);
          }
        }
 
@@ -11252,32 +20323,225 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      }
    };
 
+   // === 異常値検出: ヒューマンエラーを発見してリアルタイム通知 ===
+   // 完了タスクで起こりがちなエラーを検出してユーザーに見せる:
+   //  - duration=0 で完了 (即完了/誤タップ)
+   //  - duration < 5秒 (一瞬で完了 — batch分割 or 押し間違い)
+   //  - duration > 4時間 (押し忘れ - 時刻取り続けっぱなし)
+   //  - status='completed' なのに paused/waiting/processing 残存
+   //  - endTime < firstStartTime (時刻矛盾)
+   const anomalies = useMemo(() => {
+     const results = [];
+     lots.forEach(lot => {
+       const tasks = lot.tasks || {};
+       const steps = lot.steps || [];
+       Object.entries(tasks).forEach(([k, t]) => {
+         const parts = k.split('-');
+         const unitIdxStr = parts.pop();
+         const stepIdOrIdx = parts.join('-');
+         const step = steps.find(s => s.id === stepIdOrIdx) || steps[parseInt(stepIdOrIdx)];
+         const stepTitle = step?.title || '(不明)';
+         const targetTime = step?.targetTime || 0;
+         const unitNo = `#${parseInt(unitIdxStr) + 1}`;
+
+         if (t.status === 'completed') {
+           if (!t.duration || t.duration === 0) {
+             results.push({ kind: 'duration-zero', severity: 'high', lotId: lot.id, orderNo: lot.orderNo, model: lot.model, taskKey: k, stepTitle, unitNo, message: 'duration=0 で完了 (即完了/押し間違い疑い)', suggestion: targetTime > 0 ? `目標時間 ${targetTime}秒 を採用` : '実時間を入力してください', suggestedFix: targetTime || null });
+           } else if (t.duration < 5) {
+             results.push({ kind: 'duration-tiny', severity: 'mid', lotId: lot.id, orderNo: lot.orderNo, model: lot.model, taskKey: k, stepTitle, unitNo, duration: t.duration, message: `${t.duration}秒で完了 (短すぎ - batch分割 or 誤タップ?)`, suggestion: targetTime > 0 ? `目標時間 ${targetTime}秒 を採用` : '実時間を確認', suggestedFix: targetTime || null });
+           } else if (t.duration > 14400) {
+             results.push({ kind: 'duration-huge', severity: 'high', lotId: lot.id, orderNo: lot.orderNo, model: lot.model, taskKey: k, stepTitle, unitNo, duration: t.duration, message: `${Math.round(t.duration/60)}分で完了 (押し忘れ疑い - 4時間超)`, suggestion: targetTime > 0 ? `目標時間 ${targetTime}秒 を採用` : '実時間を入力', suggestedFix: targetTime || null });
+           }
+           if (t.firstStartTime && t.endTime && t.endTime < t.firstStartTime) {
+             results.push({ kind: 'time-inversion', severity: 'high', lotId: lot.id, orderNo: lot.orderNo, model: lot.model, taskKey: k, stepTitle, unitNo, message: '終了時刻が開始時刻より前 (データ矛盾)', suggestion: 'タスクをリセットして再記録' });
+           }
+         }
+       });
+       // ロット status='completed' なのに未完了タスクが残ってる
+       if (lot.status === 'completed') {
+         const stuck = Object.entries(tasks).filter(([, t]) => t.status === 'paused' || t.status === 'waiting' || t.status === 'processing');
+         if (stuck.length > 0) {
+           results.push({ kind: 'lot-status-mismatch', severity: 'mid', lotId: lot.id, orderNo: lot.orderNo, model: lot.model, message: `ロットは完了済みだが ${stuck.length} タスクが未完了状態`, suggestion: '一括で「該当なし」に変換 (理由: ロット完了済)', stuckKeys: stuck.map(([k]) => k) });
+         }
+       }
+     });
+     return results;
+   }, [lots]);
+
+   // === 古いデータの時刻推定マイグレーション ===
+   // 完了ロットで status='completed' のタスクが firstStartTime/endTime を持っていない場合、
+   // ロットの workStartTime と completedAt + duration の累積から推定で埋める。
+   // 推定値には isEstimatedTime: true マークを付ける。
+   const estimateOldTimestamps = async () => {
+     const lotsNeedingMigration = lots.filter(lot => {
+       if (lot.status !== 'completed') return false;
+       const tasks = lot.tasks || {};
+       const completed = Object.values(tasks).filter(t => t.status === 'completed' && t.duration > 0);
+       const withTime = completed.filter(t => t.firstStartTime && t.endTime);
+       return completed.length > 0 && withTime.length === 0;
+     });
+     if (lotsNeedingMigration.length === 0) {
+       alert('時刻推定が必要なロットはありません。');
+       return;
+     }
+     if (!confirm(`時刻情報が無い古い完了ロット ${lotsNeedingMigration.length} 件について、workStartTime + 累積 duration から開始・終了時刻を推定して保存します。\n\n各タスクに isEstimatedTime=true マークを付けます (ガント等で「⚠推定」表示)。\n\n続けますか？`)) return;
+     let success = 0, failed = 0;
+     for (const lot of lotsNeedingMigration) {
+       try {
+         const tasks = { ...(lot.tasks || {}) };
+         const steps = lot.steps || [];
+         const qty = lot.quantity || 1;
+         // 開始時刻: workStartTime → 無ければ completedAt - 総 duration
+         const totalSec = Object.values(tasks).filter(t => t.status === 'completed').reduce((acc, t) => acc + (t.duration || 0), 0);
+         let cursor = (typeof lot.workStartTime === 'number' ? lot.workStartTime : null);
+         if (!cursor && typeof lot.completedAt === 'number') cursor = lot.completedAt - totalSec * 1000;
+         if (!cursor) { failed++; continue; }
+         // 工程順序通りに累積していく
+         steps.forEach((step, sIdx) => {
+           for (let u = 0; u < qty; u++) {
+             const key = `${step.id}-${u}`;
+             const altKey = `${sIdx}-${u}`;
+             const realKey = tasks[key] ? key : (tasks[altKey] ? altKey : key);
+             const t = tasks[realKey];
+             if (!t || t.status !== 'completed' || !t.duration) return;
+             if (t.firstStartTime && t.endTime) return; // 既に時刻あり
+             const start = cursor;
+             const end = cursor + t.duration * 1000;
+             tasks[realKey] = { ...t, firstStartTime: start, endTime: end, isEstimatedTime: true };
+             cursor = end;
+           }
+         });
+         await saveData('lots', lot.id, {
+           tasks,
+           firstWorkStartTime: lot.firstWorkStartTime || lot.workStartTime || (typeof lot.completedAt === 'number' ? lot.completedAt - totalSec * 1000 : null),
+         });
+         success++;
+       } catch (e) {
+         console.error('Migration failed for lot:', lot.id, e);
+         failed++;
+       }
+     }
+     alert(`時刻推定完了: 成功 ${success}件 / 失敗 ${failed}件`);
+   };
+   const oldDataNeedingTimeEstimation = useMemo(() => {
+     return lots.filter(lot => {
+       if (lot.status !== 'completed') return false;
+       const completed = Object.values(lot.tasks || {}).filter(t => t.status === 'completed' && t.duration > 0);
+       if (completed.length === 0) return false;
+       const withTime = completed.filter(t => t.firstStartTime && t.endTime);
+       return withTime.length === 0;
+     }).length;
+   }, [lots]);
+
+   // === 厳密モード推奨テンプレ (管理者向け通知) ===
+   // 実績が閾値以上貯まったのに、まだ厳密モードが設定されていないテンプレを検出
+   const STRICT_REVIEW_THRESHOLD = settings.strictModeThreshold || 5;
+   const strictReviewTemplates = useMemo(() => {
+     const strictSet = settings.strictModeTemplates || {};
+     const countByTemplate = {};
+     lots.forEach(l => {
+       if (l.status === 'completed' && l.templateId) {
+         countByTemplate[l.templateId] = (countByTemplate[l.templateId] || 0) + 1;
+       }
+     });
+     return (templates || [])
+       .map(t => ({ id: t.id, name: t.name, count: countByTemplate[t.id] || 0, decided: strictSet[t.id] !== undefined }))
+       .filter(t => t.count >= STRICT_REVIEW_THRESHOLD && !t.decided)
+       .sort((a, b) => b.count - a.count);
+   }, [lots, templates, settings.strictModeTemplates, settings.strictModeThreshold]);
+   const [showStrictReviewPanel, setShowStrictReviewPanel] = useState(false);
+
+   const anomalyCount = anomalies.length;
+   const fixAnomaly = async (a) => {
+     const lot = lots.find(l => l.id === a.lotId);
+     if (!lot) return;
+     const newTasks = { ...(lot.tasks || {}) };
+     try {
+       if (a.kind === 'duration-zero' || a.kind === 'duration-tiny' || a.kind === 'duration-huge') {
+         const fixVal = a.suggestedFix;
+         if (!fixVal) {
+           const v = prompt(`${a.stepTitle} ${a.unitNo} の実時間 (秒) を入力してください:`, a.duration || 0);
+           if (!v) return;
+           const num = parseInt(v, 10);
+           if (!num || num <= 0) return;
+           newTasks[a.taskKey] = { ...newTasks[a.taskKey], duration: num };
+         } else {
+           newTasks[a.taskKey] = { ...newTasks[a.taskKey], duration: fixVal };
+         }
+       } else if (a.kind === 'lot-status-mismatch') {
+         const now = Date.now();
+         (a.stuckKeys || []).forEach(sk => {
+           const cur = newTasks[sk] || {};
+           newTasks[sk] = {
+             ...cur,
+             status: 'skipped',
+             skipReason: '該当なし (ロット完了後の自動変換)',
+             skipAt: now,
+             firstStartTime: cur.firstStartTime || cur.startTime || now,
+             endTime: cur.endTime || now,
+             startTime: null,
+           };
+         });
+       } else if (a.kind === 'time-inversion') {
+         const cur = newTasks[a.taskKey] || {};
+         newTasks[a.taskKey] = { ...cur, firstStartTime: null, endTime: null };
+       }
+       await saveData('lots', a.lotId, { tasks: newTasks });
+     } catch (e) {
+       console.error('fixAnomaly failed:', e);
+       alert('修正に失敗しました: ' + e.message);
+     }
+   };
+   const fixAllAnomalies = async () => {
+     if (!confirm(`${anomalyCount}件の異常値を一括修正します。継続しますか?`)) return;
+     for (const a of anomalies) await fixAnomaly(a);
+     alert('一括修正完了');
+   };
+
    const handleMoveLot = async (lotId, newLocation, workerId = null) => {
      const lot = lots.find(l => l.id === lotId);
      if (!lot) return;
- 
+
      // Location Logic for Dual Display (List & Map)
      // 1. Move to "Worker Planned" (Buffer)
      if (newLocation === 'planned') {
+        // No-op ガード: 既に planned で workerId も変わらないなら無駄な保存をしない
+        if (lot.location === 'planned' && (!workerId || lot.workerId === workerId)) return;
         // Updates: location='planned', workerId=workerId, mapZoneId=keep existing(if any)
         const updates = { location: 'planned' };
         if (workerId) updates.workerId = workerId;
         await saveData('lots', lotId, updates);
-     } 
+     }
      // 2. Move to Map Zone (from Planned or Map)
      else if (newLocation !== 'arrival' && newLocation !== 'completed' && newLocation !== 'planned') {
+        // 未該当エリア: 作業者割当を解除し、ゾーンを zone_unassigned に
+        // → 作業予定 (作業者割当) の「未割当」カラムと同期される
+        if (newLocation === 'zone_unassigned') {
+          await saveData('lots', lotId, { mapZoneId: 'zone_unassigned', workerId: null, location: 'planned' });
+          return;
+        }
         // This is a zone ID.
+        // No-op ガード: 既に同じゾーンに居て担当者の追加割当も無いなら何もしない (誤タップでの無駄な保存防止)
+        if (lot.mapZoneId === newLocation && (lot.location === 'planned' || lot.location === 'completed') && (lot.workerId || !selectedWorker)) return;
         // Updates: mapZoneId=zoneId, workerId=keep or auto-assign, location='planned' (to keep in list)
         const updates = { mapZoneId: newLocation };
         if (!lot.workerId && selectedWorker) updates.workerId = selectedWorker.id;
         // Ensure it stays in 'planned' list so it's visible in both
-        if (lot.location === 'arrival') updates.location = 'planned'; 
-        
+        // ※ 過去データで location にゾーンIDが直接入っているケースも 'planned' に正規化
+        if (lot.location !== 'planned' && lot.location !== 'completed') updates.location = 'planned';
+
         await saveData('lots', lotId, updates);
      }
      // 3. Move to Completed
      else if (newLocation === 'completed') {
-        await saveData('lots', lotId, { location: 'completed', status: 'completed', workStartTime: null });
+        // 「いつから〜いつまで」を絶対に失わないため firstWorkStartTime / completedAt を保持
+        await saveData('lots', lotId, {
+          location: 'completed',
+          status: 'completed',
+          workStartTime: null,
+          firstWorkStartTime: lot.firstWorkStartTime || lot.workStartTime || null,
+          completedAt: lot.completedAt || Date.now(),
+        });
      }
      // 4. Move back to Arrival
      else if (newLocation === 'arrival') {
@@ -11348,6 +20612,25 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    };
  
    return (
+     <WorkScheduleContext.Provider value={settings.workSchedule || DEFAULT_WORK_SCHEDULE}>
+     <LotCardDisplayContext.Provider value={settings.lotCardDisplay || DEFAULT_LOT_CARD_DISPLAY}>
+     {/* グローバル CSS: 作業中ロット用の強い点滅アニメーション (Tailwind animate-pulse より強力) */}
+     <style>{`
+       @keyframes lotBlink {
+         0%, 100% { box-shadow: 0 0 0 2px rgba(59, 130, 246, 1), 0 0 20px 5px rgba(59, 130, 246, 0.6); background-color: rgb(219, 234, 254); }
+         50%      { box-shadow: 0 0 0 4px rgba(37, 99, 235, 1), 0 0 30px 10px rgba(37, 99, 235, 0.9); background-color: rgb(191, 219, 254); }
+       }
+       .lot-blink {
+         animation: lotBlink 1s ease-in-out infinite !important;
+       }
+       @keyframes lotStripeBlink {
+         0%, 100% { opacity: 0.4; }
+         50%      { opacity: 1; }
+       }
+       .lot-stripe-blink {
+         animation: lotStripeBlink 0.8s ease-in-out infinite !important;
+       }
+     `}</style>
      <div className="h-screen bg-slate-100 font-sans flex flex-col text-slate-900 overflow-hidden relative">
        {showBreakAlert && (
          <div className="absolute top-0 left-0 right-0 bg-orange-500 text-white z-[100] p-4 flex justify-between items-center shadow-lg">
@@ -11441,14 +20724,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
               ))}
            </div>
            <div className="flex items-center gap-1">
+             <button onClick={() => setShowWorkStandardsLib(true)} className="bg-orange-600 hover:bg-orange-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="作業標準ライブラリ (登録された PDF を閲覧)">
+               <BookOpen className="w-3.5 h-3.5" /> 作業標準
+             </button>
              <button onClick={() => activeIndirect ? setShowIndirectModal(true) : setShowIndirectModal(true)} className={`relative px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ${activeIndirect ? 'bg-amber-500 hover:bg-amber-600 text-white animate-pulse' : 'bg-amber-600 hover:bg-amber-700 text-white'}`} title="間接作業">
                <Coffee className="w-3.5 h-3.5" /> {activeIndirect ? `${activeIndirect.category}...` : '間接作業'}
              </button>
              <button onClick={() => setShowDailySummary(true)} className="bg-teal-600 hover:bg-teal-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="日次集計">
                <Clock className="w-3.5 h-3.5" /> 日次集計
-             </button>
-             <button onClick={() => setShowShiftHandover(true)} className="bg-blue-700 hover:bg-blue-800 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="シフト引継ぎ (本日の実績+引継ぎメモを共有ノートに保存)">
-               <ArrowRight className="w-3.5 h-3.5" /> 引継ぎ
              </button>
              <button onClick={() => setShowNoteModal(true)} className="relative bg-slate-600 hover:bg-slate-500 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="個人ノート">
                <FileText className="w-3.5 h-3.5" /> ノート
@@ -11467,6 +20750,28 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                {defectNotifyEnabled ? <BellRing className="w-3.5 h-3.5"/> : <Bell className="w-3.5 h-3.5"/>}
                {defectNotifyEnabled ? '通知ON' : '通知'}
              </button>
+             {/* 異常値検出 (ヒューマンエラー): バッジで件数表示、押すと一覧+修正モーダル */}
+             {anomalyCount > 0 && (
+               <button
+                 onClick={() => setShowAnomalyPanel(true)}
+                 className="relative bg-amber-500 hover:bg-amber-600 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ring-2 ring-amber-300/50 animate-pulse"
+                 title={`異常値 ${anomalyCount} 件を検出 — クリックで一覧表示&修正`}
+               >
+                 <AlertTriangle className="w-3.5 h-3.5"/> 要確認
+                 <span className="absolute -top-1 -right-1 bg-rose-600 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{anomalyCount > 99 ? '99+' : anomalyCount}</span>
+               </button>
+             )}
+             {/* 厳密モード推奨 (管理者のみ): データが貯まったテンプレを通知 */}
+             {currentUserName === '管理者' && strictReviewTemplates.length > 0 && (
+               <button
+                 onClick={() => setShowStrictReviewPanel(true)}
+                 className="relative bg-rose-600 hover:bg-rose-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ring-2 ring-rose-300/50"
+                 title={`${strictReviewTemplates.length} 件のテンプレが厳密モード推奨レベルに達しています`}
+               >
+                 <ShieldCheck className="w-3.5 h-3.5"/> 厳密化推奨
+                 <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{strictReviewTemplates.length}</span>
+               </button>
+             )}
              <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 shadow-sm">
                <Plus className="w-4 h-4" /> 入荷登録
              </button>
@@ -11484,9 +20789,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              {viewMode === 'map-only' && <MapOnlyView onBack={() => setViewMode('dashboard')} lots={lots} workers={workers} templates={templates} handleMoveLot={handleMoveLot} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} setExecutionLotId={setExecutionLotId} settings={settings} handleImageUpload={handleImageUpload} saveSettings={saveSettings} mapZones={settings.mapZones} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
            </div>
          )}
-         {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} />}
+         {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} />}
          {activeTab === 'history' && <HistoryView lots={lots} workers={workers} templates={templates} saveData={saveData} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
          {activeTab === 'template-mgr' && (
            editingTemplate ? (
@@ -11494,36 +20799,23 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                <TemplateEditor template={editingTemplate} onSave={handleSaveTemplate} onCancel={() => setEditingTemplate(null)} customLayouts={settings?.customLayouts || {}} onSaveLayouts={(layouts) => saveSettings({ customLayouts: layouts })} comboPresets={settings?.comboPresets || []} builtInOverrides={settings?.builtInOverrides || {}} hiddenBuiltIns={settings?.hiddenBuiltIns || []} />
              </div>
            ) : (
-             <div className="p-8 max-w-5xl mx-auto space-y-6 h-full overflow-y-auto">
-               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-                 <div className="flex justify-between items-center mb-4">
-                   <h3 className="font-bold text-lg flex items-center gap-2"><ClipboardList className="w-5 h-5" /> 工程テンプレート管理</h3>
-                   <div className="flex gap-2">
-                     <label className="text-xs flex items-center gap-1 cursor-pointer bg-green-50 text-green-700 px-3 py-2 rounded border border-green-200 hover:bg-green-100"><FileUp className="w-4 h-4"/> Excel取込<input type="file" ref={excelInputRef} accept=".xlsx" onChange={handleExcelImport} className="hidden"/></label>
-                     <button onClick={handleBackupExport} className="text-xs flex items-center gap-1 bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><DownloadCloud className="w-4 h-4"/> バックアップ</button>
-                     <label className="text-xs flex items-center gap-1 cursor-pointer bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><RefreshCw className="w-4 h-4"/> 復元<input type="file" ref={backupInputRef} accept=".json" onChange={handleBackupImport} className="hidden"/></label>
-                   </div>
-                 </div>
-                 <button onClick={() => setEditingTemplate({ id: '', name: '', steps: [] })} className="w-full py-3 border-2 border-dashed border-slate-300 rounded-lg text-slate-500 hover:border-blue-500 font-bold mb-4">+ 新規テンプレート作成</button>
-                 <div className="space-y-3">
-                   {templates.map(t => (
-                     <div key={t.id} className="border rounded-lg p-4 flex justify-between items-center group hover:border-blue-300 transition-colors cursor-pointer" onClick={() => setEditingTemplate(t)}>
-                       <div><div className="font-bold text-slate-800 group-hover:text-blue-600">{t.name}</div><div className="text-xs text-slate-500 mt-1">全 {t.steps?.length || 0} 工程</div></div>
-                       <div className="flex items-center gap-2">
-                         <button onClick={(e) => { e.stopPropagation(); handleExcelDownload(t); }} className="p-2 text-slate-400 hover:text-emerald-600 bg-slate-50 rounded" title="Excel出力"><FileSpreadsheet className="w-4 h-4"/></button>
-                         <button onClick={(e) => { e.stopPropagation(); setEditingTemplate({ ...t, id: '', name: t.name + ' (コピー)', steps: t.steps?.map(s => ({...s, id: generateId()})) || [] }); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="複製"><Copy className="w-4 h-4"/></button>
-                         <button onClick={(e) => { e.stopPropagation(); setEditingTemplate(t); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="編集"><Pencil className="w-4 h-4"/></button>
-                         <button onClick={(e) => { e.stopPropagation(); deleteData('templates', t.id); }} className="p-2 text-slate-400 hover:text-rose-600 bg-slate-50 rounded" title="削除"><Trash2 className="w-4 h-4"/></button>
-                       </div>
-                     </div>
-                   ))}
-                 </div>
-               </div>
-             </div>
+             <TemplateListSection
+               templates={templates}
+               lots={lots}
+               settings={settings}
+               setEditingTemplate={setEditingTemplate}
+               deleteData={deleteData}
+               handleExcelImport={handleExcelImport}
+               handleExcelDownload={handleExcelDownload}
+               handleBackupExport={handleBackupExport}
+               handleBackupImport={handleBackupImport}
+               excelInputRef={excelInputRef}
+               backupInputRef={backupInputRef}
+             />
            )
          )}
          {activeTab === 'measurement-settings' && <MeasurementSettingsView settings={settings} saveSettings={saveSettings} comboPresets={settings?.comboPresets || []} templates={templates} />}
-         {activeTab === 'templates' && <TemplatesView editingTemplate={editingTemplate} setEditingTemplate={setEditingTemplate} handleSaveTemplate={handleSaveTemplate} workers={workers} saveData={saveData} deleteData={deleteData} templates={templates} lots={lots} handleExcelImport={handleExcelImport} handleExcelDownload={handleExcelDownload} handleBackupExport={handleBackupExport} handleBackupImport={handleBackupImport} excelInputRef={excelInputRef} backupInputRef={backupInputRef} settings={settings} saveSettings={saveSettings} mapZones={settings.mapZones} />}
+         {activeTab === 'templates' && <TemplatesView editingTemplate={editingTemplate} setEditingTemplate={setEditingTemplate} handleSaveTemplate={handleSaveTemplate} workers={workers} saveData={saveData} deleteData={deleteData} templates={templates} lots={lots} handleExcelImport={handleExcelImport} handleExcelDownload={handleExcelDownload} handleBackupExport={handleBackupExport} handleBackupImport={handleBackupImport} excelInputRef={excelInputRef} backupInputRef={backupInputRef} settings={settings} saveSettings={saveSettings} mapZones={settings.mapZones} deleteSettingsFields={deleteSettingsFields} />}
        </main>
        
        {/* Note Modal */}
@@ -11556,6 +20848,127 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        {/* Announcement Modal */}
        {showAnnouncementModal && <AnnouncementModal announcements={announcements} workers={workers} selectedWorker={selectedWorker} saveData={saveData} deleteData={deleteData} onClose={() => setShowAnnouncementModal(false)} currentUserName={currentUserName} />}
 
+       {/* 異常値検出パネル */}
+       {/* 厳密モード推奨パネル (管理者向け) */}
+       {showStrictReviewPanel && (
+         <div className="fixed inset-0 z-[120] bg-black/50 flex items-center justify-center p-4" onClick={() => setShowStrictReviewPanel(false)}>
+           <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+             <div className="px-5 py-3 border-b bg-rose-50 flex items-center justify-between">
+               <div>
+                 <h3 className="text-lg font-black text-rose-900 flex items-center gap-2"><ShieldCheck className="w-5 h-5"/> 厳密モード推奨テンプレ ({strictReviewTemplates.length}件)</h3>
+                 <div className="text-xs text-rose-700 mt-0.5">実績が {STRICT_REVIEW_THRESHOLD} 件以上貯まり、作業順が安定したテンプレです。厳密モードにすると「1台目から順番」を全端末で強制します。</div>
+               </div>
+               <button onClick={() => setShowStrictReviewPanel(false)} className="p-1.5 hover:bg-rose-100 rounded"><X className="w-5 h-5 text-rose-700"/></button>
+             </div>
+             <div className="flex-1 overflow-auto p-4 space-y-2">
+               {strictReviewTemplates.map(t => (
+                 <div key={t.id} className="border border-slate-200 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50">
+                   <div>
+                     <div className="font-bold text-slate-800">{t.name}</div>
+                     <div className="text-xs text-slate-500">完了実績 <span className="font-bold text-rose-600">{t.count}</span> 件</div>
+                   </div>
+                   <div className="flex gap-2">
+                     <button
+                       onClick={() => { const next = { ...(settings.strictModeTemplates || {}), [t.id]: true }; saveSettings({ strictModeTemplates: next }); }}
+                       className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded shadow flex items-center gap-1"
+                     >🔒 厳密モードON</button>
+                     <button
+                       onClick={() => { const next = { ...(settings.strictModeTemplates || {}), [t.id]: false }; saveSettings({ strictModeTemplates: next }); }}
+                       className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-500 text-xs font-bold rounded border border-slate-300"
+                     >ガイドのまま</button>
+                   </div>
+                 </div>
+               ))}
+               {strictReviewTemplates.length === 0 && (
+                 <div className="text-center py-8 text-emerald-600"><CheckCircle2 className="w-10 h-10 mx-auto mb-2"/> 全テンプレ確認済み</div>
+               )}
+             </div>
+             <div className="px-5 py-3 border-t bg-slate-50 text-xs text-slate-500">
+               💡 厳密モードON = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。後から測定設定で変更できます。
+             </div>
+           </div>
+         </div>
+       )}
+
+       {showAnomalyPanel && (
+         <div className="fixed inset-0 z-[120] bg-black/50 flex items-center justify-center p-4" onClick={() => setShowAnomalyPanel(false)}>
+           <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+             <div className="px-5 py-3 border-b bg-amber-50 flex items-center justify-between">
+               <div>
+                 <h3 className="text-lg font-black text-amber-900 flex items-center gap-2"><AlertTriangle className="w-5 h-5"/> 異常値検出 ({anomalyCount}件)</h3>
+                 <div className="text-xs text-amber-700 mt-0.5">ヒューマンエラー (押し間違い・押し忘れ等) を検出しています。各行の「修正」をタップして直してください。</div>
+               </div>
+               <div className="flex items-center gap-2">
+                 {oldDataNeedingTimeEstimation > 0 && (
+                   <button onClick={estimateOldTimestamps} className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold rounded shadow flex items-center gap-1" title={`古い ${oldDataNeedingTimeEstimation}ロットに開始/終了時刻を推定で埋める`}>
+                     <Clock className="w-3.5 h-3.5"/> 古いデータ時刻推定 ({oldDataNeedingTimeEstimation})
+                   </button>
+                 )}
+                 {anomalyCount > 0 && <button onClick={fixAllAnomalies} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded shadow flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5"/> 一括修正</button>}
+                 <button onClick={() => setShowAnomalyPanel(false)} className="p-1.5 hover:bg-amber-100 rounded"><X className="w-5 h-5 text-amber-700"/></button>
+               </div>
+             </div>
+             <div className="flex-1 overflow-auto p-4">
+               {anomalies.length === 0 ? (
+                 <div className="text-center py-12 text-emerald-600"><CheckCircle2 className="w-12 h-12 mx-auto mb-2"/> 異常値なし — データはクリーンです 🎉</div>
+               ) : (
+                 <table className="w-full text-sm border-collapse">
+                   <thead className="bg-slate-100 sticky top-0">
+                     <tr className="border-b-2 border-slate-200">
+                       <th className="p-2 text-left font-bold text-xs">深刻度</th>
+                       <th className="p-2 text-left font-bold text-xs">ロット</th>
+                       <th className="p-2 text-left font-bold text-xs">型式</th>
+                       <th className="p-2 text-left font-bold text-xs">工程/台</th>
+                       <th className="p-2 text-left font-bold text-xs">内容</th>
+                       <th className="p-2 text-left font-bold text-xs">提案</th>
+                       <th className="p-2 text-right font-bold text-xs">操作</th>
+                     </tr>
+                   </thead>
+                   <tbody>
+                     {anomalies.map((a, i) => (
+                       <tr key={i} className={`border-b border-slate-100 ${a.severity === 'high' ? 'bg-rose-50/40' : a.severity === 'mid' ? 'bg-amber-50/40' : ''}`}>
+                         <td className="p-2 text-xs">{a.severity === 'high' ? '🔴 高' : a.severity === 'mid' ? '🟡 中' : '🟢 低'}</td>
+                         <td className="p-2 text-xs font-mono">{a.orderNo}</td>
+                         <td className="p-2 text-xs">{a.model}</td>
+                         <td className="p-2 text-xs">{a.stepTitle ? <><span className="font-bold">{a.stepTitle}</span>{a.unitNo && <span className="text-slate-500"> {a.unitNo}</span>}</> : '(ロット全体)'}</td>
+                         <td className="p-2 text-xs">{a.message}</td>
+                         <td className="p-2 text-xs text-slate-600">{a.suggestion}</td>
+                         <td className="p-2 text-right">
+                           <button onClick={() => fixAnomaly(a)} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold rounded shadow">修正</button>
+                         </td>
+                       </tr>
+                     ))}
+                   </tbody>
+                 </table>
+               )}
+             </div>
+             <div className="px-5 py-3 border-t bg-slate-50 text-xs text-slate-500">
+               💡 これらの値は時間取りの集計や効率分析に影響します。早めに修正することで正確な実績データが取れます。
+             </div>
+           </div>
+         </div>
+       )}
+
+       {/* 作業標準ライブラリ */}
+       {showWorkStandardsLib && (
+         <WorkStandardsLibraryModal
+           standards={settings.workStandards || []}
+           onClose={() => setShowWorkStandardsLib(false)}
+           onEdit={(item) => setEditingWorkStandard(item || 'NEW')}
+           allowManage={true}
+           currentUserName={currentUserName}
+         />
+       )}
+       {editingWorkStandard && (
+         <WorkStandardEditModal
+           editingItem={editingWorkStandard === 'NEW' ? null : editingWorkStandard}
+           onClose={() => setEditingWorkStandard(null)}
+           onSave={saveWorkStandard}
+           onDelete={deleteWorkStandard}
+           currentUserName={currentUserName}
+         />
+       )}
+
        {/* Execution Modal */}
        {executionLotId && (
          <WorkExecutionModal
@@ -11566,22 +20979,40 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            defectProcessOptions={settings.defectProcessOptions}
            complaintOptions={settings.complaintOptions}
            lots={lots}
+           templates={templates}
            comboPresets={settings.comboPresets || []}
            voiceSettingsConfig={settings.voiceSettings || {}}
            voiceCommandsConfig={settings.voiceCommands || null}
            undoTimeout={settings.undoTimeout || 5}
            sharedNotes={notes.filter(n => !n.isPersonal)}
+           onOpenWorkStandards={() => setShowWorkStandardsLib(true)}
+           workers={workers}
+           mapZones={settings.mapZones}
+           saveData={saveData}
+           currentUserName={currentUserName}
+           execFontScale={settings.fontSizes?.execution || 100}
+           onSetExecFontScale={(v) => saveSettings({ fontSizes: { ...(settings.fontSizes || {}), execution: Math.max(80, Math.min(180, v)) } })}
+           strictModeTemplates={settings.strictModeTemplates || {}}
+           strictModeThreshold={settings.strictModeThreshold || 5}
+           onSaveStrictTemplate={(templateId, enabled) => {
+             const next = { ...(settings.strictModeTemplates || {}), [templateId]: enabled };
+             saveSettings({ strictModeTemplates: next });
+           }}
          />
        )}
- 
+
        {showLotModal && (
          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
            <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-lg my-auto max-h-[90vh] overflow-y-auto">
-             <div className="flex justify-between items-center mb-6">
+             <div className="flex justify-between items-center mb-6 flex-wrap gap-2">
                <h2 className="text-xl font-bold flex items-center gap-2"><Package className="w-6 h-6" /> {editingLot ? 'ロット情報編集' : '新規ロット登録'}</h2>
-               <div className="flex gap-2">
+               <div className="flex gap-2 flex-wrap">
                  <button onClick={handleLotExcelDownload} className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded text-sm font-bold flex items-center gap-1.5 min-h-[40px] shadow-sm"><Download className="w-4 h-4"/> Excel雛形</button>
                  <label className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-2 rounded text-sm font-bold flex items-center gap-1.5 min-h-[40px] cursor-pointer shadow-sm"><Upload className="w-4 h-4"/> Excel取込<input type="file" ref={lotExcelInputRef} accept=".xlsx" onChange={handleLotExcelUpload} className="hidden"/></label>
+                 <label className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded text-sm font-bold flex items-center gap-1.5 min-h-[40px] cursor-pointer shadow-sm" title="工機進捗管理表シートから自動でロットを登録">
+                   <FileSpreadsheet className="w-4 h-4"/> 工機進捗管理表
+                   <input type="file" ref={progressMgmtInputRef} accept=".xlsx" onChange={handleProgressMgmtUpload} className="hidden"/>
+                 </label>
                </div>
              </div>
              <form onSubmit={(e) => {
@@ -11600,15 +21031,40 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                </div>
                <div className="grid grid-cols-2 gap-4">
                  <div>
-                    <label className="block text-sm font-bold text-slate-700 mb-1">台数</label>
-                    {/* 編集時は台数変更不可 */}
-                    <input name="quantity" type="number" min="1" value={lotFormQty} onChange={e => !editingLot && setLotFormQty(Math.max(1, parseInt(e.target.value) || 1))} disabled={!!editingLot} className="w-full border rounded p-2 bg-slate-50 disabled:opacity-50" />
+                    {/* 台数編集ロック条件: 作業が着手済 (tasks あり / processing/paused/completed) のときのみロック
+                        新規 or 着手前の waiting ロットなら自由に変更可能 (機番リストも自動同期) */}
+                    {(() => {
+                      const hasProgress = !!(editingLot && (
+                        (editingLot.tasks && Object.keys(editingLot.tasks).length > 0) ||
+                        editingLot.status === 'completed' || editingLot.status === 'processing' || editingLot.status === 'paused'
+                      ));
+                      const locked = !!editingLot && hasProgress;
+                      return (
+                        <>
+                          <label className="block text-sm font-bold text-slate-700 mb-1">
+                            台数
+                            {locked && <span className="text-xs text-amber-600 font-normal ml-1">(作業着手後は変更不可)</span>}
+                            {editingLot && !locked && <span className="text-xs text-emerald-600 font-normal ml-1">(着手前なので変更可能)</span>}
+                          </label>
+                          <input
+                            name="quantity"
+                            type="number"
+                            min="1"
+                            value={lotFormQty}
+                            onChange={e => !locked && setLotFormQty(Math.max(1, parseInt(e.target.value) || 1))}
+                            disabled={locked}
+                            className="w-full border rounded p-2 bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                            title={locked ? '作業着手済 (tasks あり or processing/paused/completed) のロットは台数を変更できません。機番・タスク・測定結果との整合性を保つため。' : '機番リストも自動で同期されます'}
+                          />
+                        </>
+                      );
+                    })()}
                  </div>
                  <div>
                     <label className="block text-sm font-bold text-slate-700 mb-1">適用テンプレート</label>
                     <select name="templateId" defaultValue={editingLot?.templateId} className="w-full border rounded p-2 bg-slate-50">
                       <option value="demo">詳細デモ手順 (4工程)</option>
-                      {templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                      {[...templates].sort((a, b) => new Intl.Collator('ja').compare(a.name || '', b.name || '')).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
                     </select>
                  </div>
                </div>
@@ -11622,19 +21078,36 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                     </select>
                  </div>
                  <div>
-                    <label className="block text-sm font-bold text-slate-700 mb-1">納期</label>
-                    <input name="dueDate" defaultValue={editingLot?.dueDate} type="date" className="w-full border rounded p-2 bg-slate-50" />
+                    <label className="block text-sm font-bold text-slate-700 mb-1">納期 <span className="text-[10px] font-normal text-slate-400">(2026/5/15 or 2026-05-15)</span></label>
+                    <input
+                      name="dueDate"
+                      type="text"
+                      defaultValue={editingLot?.dueDate || ''}
+                      placeholder="例: 2026/5/15"
+                      pattern="\d{4}[/\-]\d{1,2}[/\-]\d{1,2}"
+                      className="w-full border rounded p-2 bg-slate-50 font-mono"
+                      title="YYYY/M/D または YYYY-M-D 形式"
+                    />
                  </div>
                </div>
- 
+
                {/* Added: Entry Date Field */}
                <div>
-                  <label className="block text-sm font-bold text-slate-700 mb-1">入庫日時</label>
+                  <label className="block text-sm font-bold text-slate-700 mb-1">入庫日時 <span className="text-[10px] font-normal text-slate-400">(時刻省略時は 08:30 を自動設定)</span></label>
                   <input
                     name="entryAt"
-                    type="datetime-local"
-                    defaultValue={editingLot?.entryAt ? toDatetimeLocal(editingLot.entryAt) : toDatetimeLocal(Date.now())}
-                    className="w-full border rounded p-2 bg-slate-50"
+                    type="text"
+                    defaultValue={editingLot?.entryAt ? (() => {
+                      const d = new Date(editingLot.entryAt);
+                      const p = n => String(n).padStart(2, '0');
+                      return `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+                    })() : (() => {
+                      const d = new Date();
+                      return `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()} 08:30`;
+                    })()}
+                    placeholder="例: 2026/5/15 09:30 / 2026/5/15"
+                    className="w-full border rounded p-2 bg-slate-50 font-mono"
+                    title="YYYY/M/D [HH:MM] 形式 (時刻省略可、省略時は 08:30)"
                   />
                </div>
 
@@ -11661,6 +21134,172 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          </div>
        )}
 
+       {/* 工機進捗管理表 取込プレビュー モーダル */}
+       {progressImportPreview && (
+         <div className="fixed inset-0 z-[60] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+           <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden">
+             <div className="bg-indigo-600 text-white p-4 flex justify-between items-center shrink-0">
+               <div className="flex items-center gap-3">
+                 <FileSpreadsheet className="w-6 h-6"/>
+                 <div>
+                   <h2 className="text-lg font-bold">工機進捗管理表 — 取込プレビュー</h2>
+                   <div className="text-xs opacity-90">
+                     データ {progressImportPreview.totalRows}行 / 新規 {progressImportPreview.createLots.length}件 / 更新 {progressImportPreview.updateLots.length}件 / スキップ {progressImportPreview.skipped.length}件
+                   </div>
+                 </div>
+               </div>
+               <button onClick={() => setProgressImportPreview(null)} className="hover:bg-white/10 p-2 rounded-full"><X className="w-5 h-5"/></button>
+             </div>
+
+             <div className="flex-1 overflow-y-auto p-4 space-y-4">
+               {/* 警告 */}
+               {progressImportPreview.warnings.length > 0 && (
+                 <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
+                   <div className="text-sm font-bold text-amber-800 mb-2">⚠ 警告 ({progressImportPreview.warnings.length}件)</div>
+                   <div className="space-y-1 max-h-32 overflow-y-auto">
+                     {progressImportPreview.warnings.map((w, i) => (
+                       <div key={i} className="text-xs text-amber-700">
+                         <span className="font-mono">行{w.row} [{w.orderNo}] {w.model}</span>: {w.message}
+                       </div>
+                     ))}
+                   </div>
+                 </div>
+               )}
+
+               {/* 新規作成 */}
+               {progressImportPreview.createLots.length > 0 && (
+                 <div className="border border-emerald-200 rounded-lg overflow-hidden">
+                   <div className="bg-emerald-50 px-3 py-2 font-bold text-emerald-800 text-sm flex items-center gap-2 border-b border-emerald-200">
+                     <Plus className="w-4 h-4"/> 新規作成 ({progressImportPreview.createLots.length}件)
+                   </div>
+                   <div className="overflow-x-auto max-h-64">
+                     <table className="w-full text-xs">
+                       <thead className="bg-slate-50 text-slate-600">
+                         <tr>
+                           <th className="p-2 text-left">指図</th>
+                           <th className="p-2 text-left">型式</th>
+                           <th className="p-2 text-right">台数</th>
+                           <th className="p-2 text-left">品質規格</th>
+                           <th className="p-2 text-left">テンプレ</th>
+                           <th className="p-2 text-center">基準日(K33)</th>
+                           <th className="p-2 text-center">オフセット</th>
+                           <th className="p-2 text-center">納期</th>
+                         </tr>
+                       </thead>
+                       <tbody className="divide-y divide-slate-100">
+                         {progressImportPreview.createLots.map((c, i) => (
+                           <tr key={i} className="hover:bg-emerald-50/50">
+                             <td className="p-2 font-mono font-bold">{c.orderNo}</td>
+                             <td className="p-2 font-bold">{c.model}</td>
+                             <td className="p-2 text-right text-blue-600 font-bold">{c.quantity}台</td>
+                             <td className="p-2 text-amber-700 truncate max-w-[10rem]" title={c.qsName}>{c.qsName}</td>
+                             <td className="p-2 text-indigo-700 truncate max-w-[12rem]" title={c.templateName}>{c.templateName}</td>
+                             <td className="p-2 text-center font-mono text-slate-600">{c.baseDate}{c.dueDateProvisional && <span className="text-amber-600 ml-1">(仮)</span>}</td>
+                             <td className="p-2 text-center font-mono">{c.daysBefore > 0 ? `+${c.daysBefore}` : c.daysBefore}日</td>
+                             <td className="p-2 text-center font-mono font-bold text-blue-700">{c.dueDate}</td>
+                           </tr>
+                         ))}
+                       </tbody>
+                     </table>
+                   </div>
+                 </div>
+               )}
+
+               {/* 更新 */}
+               {progressImportPreview.updateLots.length > 0 && (
+                 <div className="border border-blue-200 rounded-lg overflow-hidden">
+                   <div className="bg-blue-50 px-3 py-2 font-bold text-blue-800 text-sm flex items-center gap-2 border-b border-blue-200">
+                     <RefreshCw className="w-4 h-4"/> 更新 ({progressImportPreview.updateLots.length}件)
+                   </div>
+                   <div className="overflow-x-auto max-h-64">
+                     <table className="w-full text-xs">
+                       <thead className="bg-slate-50 text-slate-600">
+                         <tr>
+                           <th className="p-2 text-left">指図</th>
+                           <th className="p-2 text-left">型式</th>
+                           <th className="p-2 text-left">テンプレ</th>
+                           <th className="p-2 text-center">旧納期</th>
+                           <th className="p-2 text-center">新納期</th>
+                         </tr>
+                       </thead>
+                       <tbody className="divide-y divide-slate-100">
+                         {progressImportPreview.updateLots.map((u, i) => (
+                           <tr key={i} className="hover:bg-blue-50/50">
+                             <td className="p-2 font-mono font-bold">{u.orderNo}</td>
+                             <td className="p-2 font-bold">{u.model}</td>
+                             <td className="p-2 text-indigo-700 truncate max-w-[12rem]" title={u.templateName}>{u.templateName}</td>
+                             <td className="p-2 text-center font-mono text-slate-500">{u.oldDueDate || '-'}</td>
+                             <td className="p-2 text-center font-mono font-bold text-blue-700">
+                               {u.dueDate}
+                               {u.dueDate !== u.oldDueDate && <span className="ml-1 text-amber-600">変</span>}
+                             </td>
+                           </tr>
+                         ))}
+                       </tbody>
+                     </table>
+                   </div>
+                 </div>
+               )}
+
+               {/* スキップ */}
+               {progressImportPreview.skipped.length > 0 && (
+                 <details className="border border-slate-200 rounded-lg overflow-hidden">
+                   <summary className="bg-slate-50 px-3 py-2 font-bold text-slate-700 text-sm cursor-pointer flex items-center gap-2 hover:bg-slate-100">
+                     <Ban className="w-4 h-4"/> スキップ ({progressImportPreview.skipped.length}件) — クリックで展開
+                   </summary>
+                   <div className="overflow-x-auto max-h-48">
+                     <table className="w-full text-xs">
+                       <thead className="bg-slate-50 text-slate-500">
+                         <tr>
+                           <th className="p-2 text-left">行</th>
+                           <th className="p-2 text-left">指図</th>
+                           <th className="p-2 text-left">型式</th>
+                           <th className="p-2 text-left">理由</th>
+                         </tr>
+                       </thead>
+                       <tbody className="divide-y divide-slate-100">
+                         {progressImportPreview.skipped.map((s, i) => (
+                           <tr key={i}>
+                             <td className="p-2 font-mono text-slate-400">{s.row}</td>
+                             <td className="p-2 font-mono">{s.orderNo}</td>
+                             <td className="p-2">{s.model}</td>
+                             <td className="p-2 text-slate-500">{s.reason}</td>
+                           </tr>
+                         ))}
+                       </tbody>
+                     </table>
+                   </div>
+                 </details>
+               )}
+
+               {progressImportPreview.createLots.length === 0 && progressImportPreview.updateLots.length === 0 && (
+                 <div className="text-center text-slate-400 py-8">
+                   取込み対象がありません。マスタ設定の「Excel取込ルール」を確認してください。
+                 </div>
+               )}
+             </div>
+
+             <div className="border-t bg-slate-50 p-3 flex justify-between items-center shrink-0">
+               <div className="text-xs text-slate-500">
+                 確定すると、新規 {progressImportPreview.createLots.length}件 を作成、更新 {progressImportPreview.updateLots.length}件 を反映します
+               </div>
+               <div className="flex gap-2">
+                 <button onClick={() => setProgressImportPreview(null)} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-white">キャンセル</button>
+                 <button
+                   onClick={confirmProgressImport}
+                   disabled={progressImportPreview.createLots.length === 0 && progressImportPreview.updateLots.length === 0}
+                   className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white rounded font-bold shadow flex items-center gap-2"
+                 >
+                   <Check className="w-4 h-4"/> 取込み確定
+                 </button>
+               </div>
+             </div>
+           </div>
+         </div>
+       )}
+
      </div>
+     </LotCardDisplayContext.Provider>
+     </WorkScheduleContext.Provider>
    );
  }
