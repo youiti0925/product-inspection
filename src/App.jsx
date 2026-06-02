@@ -10687,6 +10687,16 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
         return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
     });
     const [showHistory, setShowHistory] = useState(false);
+    const [alertsOpen, setAlertsOpen] = useState(false); // 乖離アラートは既定で折りたたみ (場所を取らない)
+    const [focusStepKey, setFocusStepKey] = useState(null); // 「開く」で選んだ工程をハイライト+スクロール
+    const cardRefs = useRef({});
+    useEffect(() => {
+        if (focusStepKey && cardRefs.current[focusStepKey]) {
+            cardRefs.current[focusStepKey].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const t = setTimeout(() => setFocusStepKey(null), 2600);
+            return () => clearTimeout(t);
+        }
+    }, [focusStepKey, targetValue]);
 
     const getPeriodDates = () => {
         let start = 0;
@@ -10740,7 +10750,8 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                 }
 
                 for (let i = 0; i < (lot.quantity || 1); i++) {
-                    const task = lot.tasks?.[`${idx}-${i}`];
+                    // 製品アプリは task を step.id ベースのキーで保存する。旧 numeric index キーにもフォールバック。
+                    const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${idx}-${i}`];
                     if (task && task.status === 'completed' && task.duration > 0) {
                         stepTimes[stepKey].times.push(task.duration);
                         const worker = task.workerName || workers.find(w => w.id === task.workerId)?.name || '不明';
@@ -10923,81 +10934,80 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
 
             {!showHistory ? (
                 <>
-                    {/* === 【E】乖離アラート: 目標と実績がズレた工程を全型式から検出 === */}
+                    {/* === 【E】乖離アラート: 目標と実績がズレた工程を全型式から検出 (既定は折りたたみ) === */}
                     {driftAlerts.length > 0 && (
-                        <div className="bg-gradient-to-r from-rose-50 to-amber-50 border-2 border-rose-300 rounded-xl p-3 shrink-0">
-                            <div className="flex items-center gap-2 mb-2">
-                                <AlertOctagon className="w-5 h-5 text-rose-600"/>
+                        <div className="bg-gradient-to-r from-rose-50 to-amber-50 border border-rose-300 rounded-xl shrink-0">
+                            <button onClick={() => setAlertsOpen(o => !o)} className="w-full flex items-center gap-2 px-3 py-2 text-left">
+                                <AlertOctagon className="w-5 h-5 text-rose-600 shrink-0"/>
                                 <span className="font-black text-rose-900 text-sm">⚠ 目標時間の乖離アラート ({driftAlerts.length}件)</span>
-                                <span className="text-[11px] text-rose-700">— 目標と実績が±30%以上ズレています。再較正を検討してください</span>
-                            </div>
-                            <div className="max-h-44 overflow-y-auto space-y-1">
-                                {driftAlerts.slice(0, 20).map((a, i) => (
+                                <span className="text-[11px] text-rose-700 hidden md:inline">— 目標と実績が±30%以上ズレ。「開く」で該当工程へジャンプ</span>
+                                <span className="ml-auto text-[11px] font-bold text-rose-600 shrink-0">{alertsOpen ? '▲ 閉じる' : '▼ 一覧を開く'}</span>
+                            </button>
+                            {alertsOpen && (
+                            <div className="max-h-52 overflow-y-auto space-y-1 px-3 pb-3">
+                                {driftAlerts.slice(0, 30).map((a, i) => (
                                     <div key={i} className="bg-white border border-rose-200 rounded px-2 py-1.5 flex items-center gap-2 text-xs">
-                                        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${a.direction === 'over' ? 'bg-rose-100 text-rose-700' : 'bg-blue-100 text-blue-700'}`}>
+                                        <span className={`text-[10px] font-black px-1.5 py-0.5 rounded shrink-0 ${a.direction === 'over' ? 'bg-rose-100 text-rose-700' : 'bg-blue-100 text-blue-700'}`}>
                                             {a.direction === 'over' ? `${Math.round((a.ratio-1)*100)}% 超過` : `${Math.round((1-a.ratio)*100)}% 短縮`}
                                         </span>
-                                        <span className="font-bold text-slate-700">{a.model}</span>
-                                        <span className="text-slate-500">/ {a.title}</span>
-                                        <span className="ml-auto font-mono text-slate-600">目標{a.target}s → 実績{a.mean}s</span>
-                                        <span className="text-[10px] text-slate-400">n={a.n}{a.calibrated ? ' ✓較正済' : ''}</span>
+                                        <span className="font-bold text-slate-700 shrink-0">{a.model}</span>
+                                        <span className="text-slate-500 truncate">/ {a.title}</span>
+                                        <span className="ml-auto font-mono text-slate-600 shrink-0">目標{a.target}s→実績{a.mean}s</span>
+                                        <span className="text-[10px] text-slate-400 shrink-0">n={a.n}{a.calibrated ? ' ✓' : ''}</span>
                                         <button
-                                            onClick={() => setTargetValue(a.model)}
+                                            onClick={() => { setTargetValue(a.model); setFocusStepKey(a.stepKey); }}
                                             className="text-[10px] bg-indigo-600 hover:bg-indigo-700 text-white px-2 py-0.5 rounded font-bold shrink-0"
-                                            title="この型式の最適化提案を開く"
-                                        >開く</button>
+                                            title="この型式・工程の最適化提案へジャンプ"
+                                        >開く ▸</button>
                                     </div>
                                 ))}
+                                {driftAlerts.length > 30 && <div className="text-[10px] text-rose-500 mt-1 text-center">他 {driftAlerts.length - 30} 件</div>}
                             </div>
-                            {driftAlerts.length > 20 && <div className="text-[10px] text-rose-500 mt-1 text-center">他 {driftAlerts.length - 20} 件</div>}
+                            )}
                         </div>
                     )}
 
-                    <div className="flex flex-wrap items-center gap-4 bg-white p-3 rounded-lg border shadow-sm shrink-0">
-                        <select value={targetValue} onChange={e => setTargetValue(e.target.value)} className="border border-indigo-200 rounded px-3 py-1.5 font-bold text-slate-700 outline-none focus:border-indigo-500 min-w-[200px]">
+                    <div className="flex flex-wrap items-center gap-2 bg-white p-2.5 rounded-lg border shadow-sm shrink-0">
+                        <span className="text-xs font-bold text-slate-500">型式</span>
+                        <select value={targetValue} onChange={e => { setTargetValue(e.target.value); setFocusStepKey(null); }} className="border border-indigo-300 rounded px-3 py-1.5 font-bold text-indigo-800 outline-none focus:border-indigo-500 min-w-[170px]">
                             <option value="">型式を選択...</option>
                             {availableModels.map(opt => <option key={opt} value={opt}>{opt}</option>)}
                         </select>
-
-                        <div className="h-6 w-px bg-slate-300 mx-2"></div>
-
-                        <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm font-bold text-slate-600">集計期間:</span>
-                            <select value={period} onChange={e => setPeriod(e.target.value)} className="border rounded px-3 py-1.5 text-sm font-bold text-slate-700 bg-slate-50 outline-none">
-                                <option value="1m">過去1ヶ月</option>
-                                <option value="3m">過去3ヶ月</option>
-                                <option value="6m">過去6ヶ月</option>
-                                <option value="all">全期間</option>
-                                <option value="custom">期間指定(カスタム)</option>
-                            </select>
-                            {period === 'custom' && (
-                                <div className="flex items-center gap-2 bg-slate-50 p-1.5 rounded border ml-2">
-                                    <input type="date" value={customStartDate} onChange={e => setCustomStartDate(e.target.value)} className="bg-transparent text-sm font-bold text-slate-700 outline-none" />
-                                    <span className="text-slate-400">~</span>
-                                    <input type="date" value={customEndDate} onChange={e => setCustomEndDate(e.target.value)} className="bg-transparent text-sm font-bold text-slate-700 outline-none" />
+                        <span className="text-xs font-bold text-slate-500 ml-1">集計</span>
+                        <select value={period} onChange={e => setPeriod(e.target.value)} className="border rounded px-2 py-1.5 text-sm font-bold text-slate-700 bg-slate-50 outline-none">
+                            <option value="1m">過去1ヶ月</option>
+                            <option value="3m">過去3ヶ月</option>
+                            <option value="6m">過去6ヶ月</option>
+                            <option value="all">全期間</option>
+                            <option value="custom">期間指定</option>
+                        </select>
+                        {period === 'custom' && (
+                            <div className="flex items-center gap-1 bg-slate-50 p-1 rounded border">
+                                <input type="date" value={customStartDate} onChange={e => setCustomStartDate(e.target.value)} className="bg-transparent text-xs font-bold text-slate-700 outline-none" />
+                                <span className="text-slate-400 text-xs">~</span>
+                                <input type="date" value={customEndDate} onChange={e => setCustomEndDate(e.target.value)} className="bg-transparent text-xs font-bold text-slate-700 outline-none" />
+                            </div>
+                        )}
+                        {targetValue && insightsData.length > 0 && (
+                            <>
+                                <span className="text-[11px] text-slate-600 bg-slate-100 rounded px-2 py-1 whitespace-nowrap">工程<b>{insightsData.length}</b>件 / 有効データ計<b>{insightsData.reduce((s,d)=>s+d.stats.validCount,0)}</b>件で判断</span>
+                                <div className="ml-auto flex items-center gap-1.5">
+                                    <span className="text-xs font-bold text-slate-600 whitespace-nowrap">全工程に一括:</span>
+                                    <select value={bulkStrategy} onChange={(e) => setBulkStrategy(e.target.value)} className="border rounded px-2 py-1.5 text-xs font-bold bg-slate-50">
+                                        <option value="standard">標準バランス型</option>
+                                        <option value="aggressive">効率追求型</option>
+                                        <option value="conservative">余裕確保型</option>
+                                    </select>
+                                    <button onClick={applyAllSuggestedTargets} className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded font-bold shadow flex items-center gap-1 text-sm whitespace-nowrap"><Bot className="w-4 h-4" /> 適用</button>
                                 </div>
-                            )}
-                        </div>
+                            </>
+                        )}
                     </div>
 
                     {targetValue ? (
                         <div className="flex-1 overflow-y-auto min-h-0 space-y-4 pr-2">
-                            {insightsData.length > 0 && (
-                                <div className="flex flex-wrap justify-end gap-2 mb-2 items-center bg-white p-3 rounded-lg border shadow-sm">
-                                    <span className="text-sm font-bold text-slate-600">一括適用:</span>
-                                    <select value={bulkStrategy} onChange={(e) => setBulkStrategy(e.target.value)} className="border rounded px-3 py-1.5 text-sm font-bold bg-slate-50">
-                                        <option value="standard">標準バランス型の値を適用</option>
-                                        <option value="aggressive">効率追求型の値を適用</option>
-                                        <option value="conservative">余裕確保型の値を適用</option>
-                                    </select>
-                                    <button onClick={applyAllSuggestedTargets} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-1.5 rounded font-bold shadow flex items-center gap-2 text-sm">
-                                        <Bot className="w-4 h-4" /> 実行
-                                    </button>
-                                </div>
-                            )}
-
                             {insightsData.map((data, idx) => (
-                                <div key={idx} className="bg-white border rounded-xl shadow-sm overflow-hidden flex flex-col md:flex-row">
+                                <div key={idx} ref={el => { if (el) cardRefs.current[data.key] = el; }} className={`bg-white border rounded-xl shadow-sm overflow-hidden flex flex-col md:flex-row transition-all ${focusStepKey === data.key ? 'ring-4 ring-indigo-400 border-indigo-400' : ''}`}>
                                     <div className="p-4 border-b md:border-b-0 md:border-r bg-slate-50 md:w-1/3 flex flex-col justify-center">
                                         <div className="text-xs font-bold text-slate-400 mb-1">{data.category}</div>
                                         <div className="font-bold text-lg text-slate-800 mb-3">{data.title}</div>
