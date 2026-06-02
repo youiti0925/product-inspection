@@ -10795,11 +10795,22 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                 insights.push({ type: 'success', text: `ベストプラクティス: ${bestWorker}さんが安定して早く(${Math.round(bestWorkerAvg)}秒)作業しています。ノウハウ共有が有効です。` });
             }
 
+            // === 推奨3案の値 ===
+            //   標準バランス型 = 平均(mean) / 効率型 = 速い実績ペース / 余裕確保型 = 平均 + ばらつき(標準偏差)
+            //   ※ 効率型: 作業者が1人だけだと「ベスト作業者の平均 = 全体平均」となり標準と同値になるバグ回避のため、
+            //      p25(速い25%)より明確に速いベスト作業者がいる時だけその人基準、それ以外は p25 を使う。
+            const p25 = stats.p25;
+            const effFromWorker = (bestWorker && bestWorkerAvg < p25) ? Math.round(bestWorkerAvg) : null;
+            const efficientValue = effFromWorker != null ? effFromWorker : p25;
+            const conservativeValue = Math.round(stats.mean + stats.stdDev);
             const strategies = [
                 { id: 'standard', name: '標準バランス型', desc: '全体の平均。標準的なスキル想定。', value: stats.mean, color: 'text-blue-800 bg-blue-50 border-blue-200 hover:bg-blue-100' },
-                { id: 'aggressive', name: bestWorker ? `効率型 (${bestWorker}基準)` : '効率追求型 (上位25%)', desc: '最も速い人のペースを基準。', value: bestWorkerAvg !== Infinity ? Math.round(bestWorkerAvg) : stats.p25, color: 'text-emerald-800 bg-emerald-50 border-emerald-200 hover:bg-emerald-100' },
-                { id: 'conservative', name: '余裕確保型', desc: 'バラつきを考慮した余裕あるペース。', value: Math.round(stats.mean + stats.stdDev), color: 'text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100' }
+                { id: 'aggressive', name: effFromWorker != null ? `効率型 (${bestWorker}基準)` : '効率追求型 (速い25%)', desc: effFromWorker != null ? `${bestWorker}さんの速いペースを基準` : '実績の速い25%(p25)を基準', value: efficientValue, color: 'text-emerald-800 bg-emerald-50 border-emerald-200 hover:bg-emerald-100' },
+                { id: 'conservative', name: '余裕確保型', desc: 'バラつきを考慮した余裕あるペース。', value: conservativeValue, color: 'text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100' }
             ];
+            // データが少ない / ばらつきが小さいと3案がほぼ同値になる (バグではない)。その旨を伝えるフラグ。
+            const stratVals = [stats.mean, efficientValue, conservativeValue];
+            const strategiesSimilar = (Math.max(...stratVals) - Math.min(...stratVals)) <= Math.max(1, Math.round(stats.mean * 0.05));
 
             // === 【C】信頼度: 標本数とバラつき (変動係数) で較正値の信頼度を判定 ===
             // 高: n>=10 かつ CV<0.3 / 中: n>=5 かつ CV<0.5 / 低: それ未満
@@ -10810,7 +10821,7 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
             else if (n >= 5 && cv < 0.5) confidence = 'mid';
             const confidenceLabel = confidence === 'high' ? '高' : confidence === 'mid' ? '中' : '低';
 
-            results.push({ key, ...data, stats, currentTarget, insights, strategies, confidence, confidenceLabel, cv });
+            results.push({ key, ...data, stats, currentTarget, insights, strategies, strategiesSimilar, confidence, confidenceLabel, cv });
         });
 
         return results.sort((a, b) => b.stats.mean - a.stats.mean);
@@ -11018,6 +11029,11 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                                         </div>
 
                                         <div className="text-xs font-bold text-indigo-600 mb-1 flex items-center gap-1"><Zap className="w-3 h-3" /> 状況に応じた推奨目標</div>
+                                        {data.strategiesSimilar && (
+                                            <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-1 mb-1.5 leading-tight">
+                                                ※ データが少ない/ばらつきが小さいため、3案の差がほぼありません（バグではありません）。データが貯まると差が出ます。
+                                            </div>
+                                        )}
                                         <div className="grid grid-cols-1 gap-2">
                                             {data.strategies.map(strat => (
                                                 <div key={strat.id} className={`p-2 rounded border flex flex-col justify-between transition-colors ${strat.color}`}>
