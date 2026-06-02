@@ -43,6 +43,11 @@ import {
 
 // 画像を Cloud Storage にアップロードして URL を返す。失敗時は base64 のまま返す (フォールバック)
 // 既存データ (base64 直保存) と互換: <img src={...}> は URL/base64 両方扱える
+// ローカル日付文字列 (UTC変換しない。JST で 1 日ズレるのを防ぐ)。日付の絞り込み・集計・納期計算に使う。
+// ※ ダウンロードファイル名等は従来通り UTC でも実害がないため置換不要。
+const localYMD = (d) => { const x = (d instanceof Date) ? d : new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`; };
+const localYM = (d) => { const x = (d instanceof Date) ? d : new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}`; };
+
 let _storageInstance = null;
 const getStorageInstance = () => {
   if (_storageInstance) return _storageInstance;
@@ -1905,7 +1910,11 @@ JSON で次の形式で返してください:
   const j = await res.json();
   const text = j.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error('Gemini から空のレスポンスが返りました');
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Gemini の応答を JSON として解釈できませんでした（不正な形式）');
+  }
 };
 
 // === AI 深掘り分析: 改善ヒントタブ用の汎用分析 ===
@@ -1961,7 +1970,11 @@ JSON で次の形式で返してください:
   const j = await res.json();
   const text = j.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error('Gemini から空のレスポンスが返りました');
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Gemini の応答を JSON として解釈できませんでした（不正な形式）');
+  }
 };
 
 const WorkerSummaryCard = ({ worker, lots }) => {
@@ -2376,7 +2389,7 @@ const IndirectWorkModal = ({ categories, activeIndirect, onStart, onStop, onClos
 // ===========================
 const ShiftHandoverModal = ({ lots, indirectWork, currentUserName, workers, saveData, onClose }) => {
   const today = new Date();
-  const todayStr = today.toISOString().split('T')[0];
+  const todayStr = localYMD(today);
   const todayMs = today.setHours(0,0,0,0);
   const [memo, setMemo] = useState('');
   const myWorkerId = workers.find(w => w.name === currentUserName)?.id;
@@ -2514,7 +2527,7 @@ const ShiftHandoverModal = ({ lots, indirectWork, currentUserName, workers, save
 };
 
 const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, settings, saveData, onClose }) => {
-  const today = new Date().toISOString().split('T')[0];
+  const today = localYMD(new Date());
   const [tab, setTab] = useState('daily'); // 'daily' | 'analysis'
   const [dateFrom, setDateFrom] = useState(today);
   const [dateTo, setDateTo] = useState(today);
@@ -2565,7 +2578,7 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
         lotId: lot.id, lot: lot.orderNo, model: lot.model,
         stepId: step?.id || key, step: step?.title || key,
         unitIdx: isNaN(unitIdx) ? null : unitIdx, unitSn,
-        duration: task.duration, worker: taskWorker, date: new Date(taskEnd).toISOString().split('T')[0],
+        duration: task.duration, worker: taskWorker, date: localYMD(new Date(taskEnd)),
       };
       if (searchText && !`${detail.model} ${detail.lot} ${detail.step}`.includes(searchText)) return;
       directDetails.push(detail);
@@ -11108,19 +11121,18 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('process');
   const [selectedModel, setSelectedModel] = useState('all');
-  const [targetTolerance, setTargetTolerance] = useState(20); // % for USL/LSL
-  const [dateRange, setDateRange] = useState('week');
+  const [targetTolerance, setTargetTolerance] = useState(20); // % for USL/LSL (analysisData の Excel/PDF 出力で使用)
   // 旧 filterMode/filterStartDate/filterEndDate と isInFilterPeriod は削除。
   // 全タブ共通で defectFilter* と isInDefectPeriod を使う。
-  const [defectFilterMonth, setDefectFilterMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [defectFilterMonth, setDefectFilterMonth] = useState(localYM(new Date()));
   const [defectFilterMode, setDefectFilterMode] = useState('month');
-  const [defectFilterStart, setDefectFilterStart] = useState(new Date().toISOString().split('T')[0].slice(0, 8) + '01');
-  const [defectFilterEnd, setDefectFilterEnd] = useState(new Date().toISOString().split('T')[0]);
+  const [defectFilterStart, setDefectFilterStart] = useState(localYMD(new Date()).slice(0, 8) + '01');
+  const [defectFilterEnd, setDefectFilterEnd] = useState(localYMD(new Date()));
   const isInDefectPeriod = (timestamp) => {
     if (!timestamp) return false;
     const d = new Date(timestamp);
     if (defectFilterMode === 'month') {
-      try { return d.toISOString().slice(0, 7) === defectFilterMonth; } catch { return false; }
+      try { return localYM(d) === defectFilterMonth; } catch { return false; }
     }
     const startMs = new Date(defectFilterStart + 'T00:00:00').getTime();
     const endMs = new Date(defectFilterEnd + 'T23:59:59').getTime();
@@ -11142,7 +11154,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       const prevYm = `${prevDate.getFullYear()}-${String(prevDate.getMonth()+1).padStart(2,'0')}`;
       return (ts) => {
         if (!ts) return false;
-        try { return new Date(ts).toISOString().slice(0, 7) === prevYm; } catch { return false; }
+        try { return localYM(new Date(ts)) === prevYm; } catch { return false; }
       };
     }
     const startMs = new Date(defectFilterStart + 'T00:00:00').getTime();
@@ -11157,79 +11169,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     };
   };
 
-  // --- Step Analysis Data ---
-  const stepAnalysisData = useMemo(() => {
-    if (selectedModel === 'all') return null;
-
-    // Filter lots by model and completed status
-    const targetLots = lots.filter(l => l.model === selectedModel && (l.status === 'completed' || l.location === 'completed'));
-    if (targetLots.length === 0) return null;
-
-    // Use the steps definition from the first lot (assuming consistency for same model)
-    const steps = targetLots[0].steps || [];
-    
-    // Aggregators
-    const stepStats = steps.map((step, idx) => {
-        let totalDuration = 0;
-        let count = 0;
-        const durations = [];
-
-        targetLots.forEach(lot => {
-            // Check Custom Tasks
-            if (lot.tasks) {
-                // Sum all units for this step (step.id ベースの新キー + 数値index 旧キーの両方を集計)
-                let stepSum = 0;
-                let unitCount = 0;
-                const stepIdPrefix = step.id ? `${step.id}-` : null;
-                const idxPrefix = `${idx}-`;
-                // 新旧キーの両方を見るが、同じ unit は重複カウントしないため Set で管理
-                const seenUnits = new Set();
-                Object.keys(lot.tasks).forEach(key => {
-                    let unitIdx = null;
-                    if (stepIdPrefix && key.startsWith(stepIdPrefix)) {
-                        unitIdx = key.slice(stepIdPrefix.length);
-                    } else if (key.startsWith(idxPrefix)) {
-                        unitIdx = key.slice(idxPrefix.length);
-                        // 数値で始まらないなら別ステップ (例: 's1-0' は 'idx=0' とマッチしない)
-                        if (!/^\d+$/.test(unitIdx)) return;
-                    }
-                    if (unitIdx == null) return;
-                    if (seenUnits.has(unitIdx)) return; // 既に新キーで計上済
-                    if (lot.tasks[key].status === 'completed') {
-                        stepSum += lot.tasks[key].duration;
-                        unitCount++;
-                        seenUnits.add(unitIdx);
-                    }
-                });
-                if (unitCount > 0) {
-                    // Average per unit for this lot
-                    const avgPerUnit = stepSum / unitCount;
-                    totalDuration += avgPerUnit;
-                    durations.push(avgPerUnit);
-                    count++;
-                }
-            } 
-            // Check Sequential Step Times (if available)
-            else if (lot.stepTimes && lot.stepTimes[step.id]) {
-                const d = lot.stepTimes[step.id] / 1000; // ms to sec
-                totalDuration += d;
-                durations.push(d);
-                count++;
-            }
-        });
-
-        const avg = count > 0 ? totalDuration / count : 0;
-        return { 
-            stepName: step.title, 
-            avg, 
-            target: step.targetTime || 0,
-            count,
-            durations // for min/max/scatter later if needed
-        };
-    });
-
-    return stepStats;
-  }, [lots, selectedModel]);
 
   const analysisData = useMemo(() => {
     // Basic filtering
@@ -11617,7 +11556,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                 <button onClick={async ()=>{
                   const ExcelJS = await loadExcelJS();
                   const wb = new ExcelJS.Workbook();
-                  const dateStr = new Date().toISOString().slice(0,10);
+                  const dateStr = localYMD(new Date());
                   const styleHeader = (row) => { row.font = { bold: true, color: { argb: 'FFFFFFFF' } }; row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } }; };
                   if (activeMode === 'process') {
                     const ws = wb.addWorksheet('工程改善分析');
@@ -11752,186 +11691,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
        <div className="flex-1 overflow-y-auto p-6">
           {/* 「本日の生産状況」タブ (workerProgress) は全体進捗ビューと機能が重複するため削除した。
               activeMode='daily' 状態のロットを開いていた場合のために、初期値は 'process' に変更済み。 */}
-          {(
-             <div className="space-y-8">
-                {/* 旧「対象型式・許容公差」コントロールと Cpk/ヒストグラム/工程別分析は撤去。
-                    工程改善は下部の ProcessInsightsTab(工程改善・目標時間最適化)に集約。 */}
-                {false && activeMode === 'process' && (
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 _process_reports_wrap">
-                   {/* Overall Report */}
-                   {analysisData.map((report, idx) => (
-                      <div key={idx} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                         <div className="flex justify-between items-start mb-4">
-                            <div>
-                               <div className="text-sm font-bold text-slate-500">総合評価</div>
-                               <div className="text-xl font-black text-slate-800">{report.model}</div>
-                            </div>
-                            <div className="text-right">
-                               <div className="text-xs text-slate-400">サンプル数: {report.count}</div>
-                               <div className={`text-lg font-bold px-2 rounded ${report.cpk < 1.0 ? 'bg-rose-100 text-rose-600' : report.cpk < 1.33 ? 'bg-amber-100 text-amber-600' : 'bg-emerald-100 text-emerald-600'}`}>
-                                  Cpk: {report.cpk.toFixed(2)}
-                               </div>
-                            </div>
-                         </div>
-                         
-                         <div className="grid grid-cols-4 gap-2 mb-6 text-center text-sm">
-                            <div className="bg-slate-50 p-2 rounded"><div className="text-[10px] text-slate-400">平均時間</div><div className="font-bold">{report.avg.toFixed(1)}s</div></div>
-                            <div className="bg-slate-50 p-2 rounded"><div className="text-[10px] text-slate-400">目標時間</div><div className="font-bold">{report.target}s</div></div>
-                            <div className="bg-slate-50 p-2 rounded"><div className="text-[10px] text-slate-400">標準偏差(σ)</div><div className="font-bold">{report.stdDev.toFixed(1)}</div></div>
-                            <div className="bg-slate-50 p-2 rounded"><div className="text-[10px] text-slate-400">目標差</div><div className={`${report.avg > report.target ? 'text-rose-500':'text-emerald-500'} font-bold`}>{(report.avg - report.target).toFixed(1)}s</div></div>
-                         </div>
-
-                         {/* Histogram Visualization (Simple CSS Bars) */}
-                         <div className="h-40 flex items-end gap-1 border-b border-l border-slate-300 relative pt-4">
-                            {report.buckets.map((count, bIdx) => {
-                                const maxCount = Math.max(...report.buckets);
-                                const height = maxCount > 0 ? (count / maxCount) * 100 : 0;
-                                return (
-                                   <div key={bIdx} className="flex-1 bg-blue-500/80 hover:bg-blue-600 transition-all relative group rounded-t-sm" style={{ height: `${height}%` }}>
-                                      <div className="absolute -top-6 left-1/2 -translate-x-1/2 text-xs font-bold text-slate-600 opacity-0 group-hover:opacity-100">{count}</div>
-                                   </div>
-                                );
-                             })}
-                          </div>
-                          <div className="flex justify-between text-xs text-slate-400 mt-1">
-                             <span>{report.min.toFixed(0)}s</span>
-                             <span>{report.max.toFixed(0)}s</span>
-                          </div>
-                          
-                          {/* Improvement Suggestion */}
-                          <div className="mt-4 bg-yellow-50 border border-yellow-200 p-3 rounded-lg flex gap-3 items-start">
-                              <Target className="w-5 h-5 text-yellow-600 shrink-0 mt-0.5"/>
-                              <div>
-                                 <div className="text-xs font-bold text-yellow-700">改善提案</div>
-                                 <div className="text-sm text-slate-700">
-                                    {report.avg > report.target * 1.1 
-                                      ? `目標時間(${report.target}s)に対して実績が大幅に遅れています。工程の見直しまたは目標時間の修正(推奨: ${Math.round(report.avg)}s)を検討してください。`
-                                      : report.stdDev > report.avg * 0.2
-                                      ? `作業時間のバラつきが大きいです(変動係数: ${(report.stdDev/report.avg*100).toFixed(0)}%)。作業手順の標準化が必要です。`
-                                      : `工程は安定しています。さらなる短縮が可能か検討してください。`
-                                    }
-                                 </div>
-                              </div>
-                          </div>
-                       </div>
-                    ))}
- 
-                    {/* Step Breakdown Chart */}
-                    {stepAnalysisData && (
-                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 col-span-1 lg:col-span-2">
-                            <h3 className="font-bold text-lg mb-6 flex items-center gap-2"><Layers className="w-5 h-5"/> 工程別 所要時間分析 ({selectedModel})</h3>
-                            <div className="flex items-end gap-4 h-64 border-b border-slate-200 pb-2 overflow-x-auto">
-                                {stepAnalysisData.map((step, idx) => {
-                                    const maxTime = Math.max(...stepAnalysisData.map(s => Math.max(s.avg, s.target))) * 1.2;
-                                    const height = maxTime > 0 ? (step.avg / maxTime) * 100 : 0;
-                                    const targetHeight = maxTime > 0 ? (step.target / maxTime) * 100 : 0;
-                                    
-                                    return (
-                                        <div key={idx} className="flex-1 min-w-[80px] h-full flex flex-col justify-end relative group">
-                                            {/* Target Line Marker */}
-                                            <div className="absolute w-full border-t-2 border-dashed border-slate-300 z-10" style={{ bottom: `${targetHeight}%` }}></div>
-                                            
-                                            {/* Bar */}
-                                            <div 
-                                              className={`w-full rounded-t-md transition-all duration-500 relative ${step.avg > step.target ? 'bg-rose-400' : 'bg-blue-400'} hover:opacity-80`} 
-                                              style={{ height: `${height}%` }}
-                                            >
-                                                <div className="absolute -top-6 w-full text-center text-xs font-bold text-slate-700">{step.avg.toFixed(0)}s</div>
-                                            </div>
-                                            <div className="text-center mt-2">
-                                                <div className="text-xs font-bold text-slate-700 truncate px-1" title={step.stepName}>{step.stepName}</div>
-                                                <div className="text-[10px] text-slate-400">目標: {step.target}s</div>
-                                            </div>
-                                        </div>
-                                    )
-                                })}
-                            </div>
-                            <div className="mt-4 text-xs text-slate-500 flex gap-4">
-                                <div className="flex items-center gap-1"><div className="w-3 h-3 bg-blue-400 rounded"></div>目標内</div>
-                                <div className="flex items-center gap-1"><div className="w-3 h-3 bg-rose-400 rounded"></div>目標超過 (改善ポイント)</div>
-                                <div className="flex items-center gap-1"><div className="w-3 h-1 border-t-2 border-dashed border-slate-300"></div>目標時間</div>
-                            </div>
-                        </div>
-                    )}
- 
-                    {/* Process Optimization Insights */}
-                    {stepAnalysisData && stepAnalysisData.length > 0 && (
-                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 col-span-1 lg:col-span-2">
-                            <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Zap className="w-5 h-5 text-indigo-600" /> 工程別インサイト ({selectedModel})</h3>
-                            <div className="space-y-3">
-                                {stepAnalysisData.map((step, idx) => {
-                                    const durations = step.durations || [];
-                                    const mean = step.avg;
-                                    const target = step.target;
-                                    let stdDev = 0;
-                                    if (durations.length > 1) {
-                                        const variance = durations.reduce((acc, d) => acc + Math.pow(d - mean, 2), 0) / (durations.length - 1);
-                                        stdDev = Math.sqrt(variance);
-                                    }
-                                    const cv = mean > 0 ? stdDev / mean : 0;
-                                    const cvColor = cv > 0.5 ? 'text-rose-600 bg-rose-50 border-rose-200' : cv > 0.3 ? 'text-amber-600 bg-amber-50 border-amber-200' : 'text-emerald-600 bg-emerald-50 border-emerald-200';
-                                    const cvMessage = cv > 0.5 ? 'バラつきが大きいです。手順の標準化を推奨します。' : cv > 0.3 ? 'やや不安定です。改善の余地があります。' : '安定しています。';
-
-                                    // Strategies
-                                    const sorted = [...durations].sort((a, b) => a - b);
-                                    const p25 = sorted.length > 0 ? sorted[Math.floor(sorted.length * 0.25)] : mean;
-                                    const strategies = [
-                                        { id: 'standard', name: '標準バランス型', desc: '全体の平均値を目標に設定', value: Math.round(mean), color: 'bg-blue-50 border-blue-200 text-blue-800 hover:bg-blue-100' },
-                                        { id: 'aggressive', name: '効率追求型', desc: '上位25%のペースを基準', value: Math.round(p25), color: 'bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100' },
-                                        { id: 'conservative', name: '余裕確保型', desc: 'バラつきを考慮した余裕あるペース', value: Math.round(mean + stdDev), color: 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100' },
-                                    ];
-
-                                    return (
-                                        <div key={idx} className="border rounded-lg p-4">
-                                            <div className="flex justify-between items-center mb-2">
-                                                <div className="font-bold text-slate-800">{step.stepName}</div>
-                                                <span className={`text-xs font-bold px-2 py-0.5 rounded border ${cvColor}`}>
-                                                    変動係数: {(cv * 100).toFixed(0)}%
-                                                </span>
-                                            </div>
-                                            <div className="grid grid-cols-3 gap-3 text-center text-sm mb-3">
-                                                <div className="bg-slate-50 p-2 rounded">
-                                                    <div className="text-[10px] text-slate-400">現在の目標</div>
-                                                    <div className="font-bold">{target}s</div>
-                                                </div>
-                                                <div className="bg-slate-50 p-2 rounded">
-                                                    <div className="text-[10px] text-slate-400">実績平均</div>
-                                                    <div className="font-bold">{mean.toFixed(1)}s</div>
-                                                </div>
-                                                <div className="bg-slate-50 p-2 rounded">
-                                                    <div className="text-[10px] text-slate-400">標準偏差</div>
-                                                    <div className="font-bold">{stdDev.toFixed(1)}s</div>
-                                                </div>
-                                            </div>
-                                            <div className={`text-xs p-2 rounded border mb-3 ${cvColor}`}>
-                                                <AlertCircle className="w-3 h-3 inline mr-1" />{cvMessage}
-                                            </div>
-                                            {step.count >= 2 && (
-                                                <div>
-                                                    <div className="text-xs font-bold text-slate-500 mb-2">最適化提案:</div>
-                                                    <div className="grid grid-cols-3 gap-2">
-                                                        {strategies.map(strat => (
-                                                            <div key={strat.id} className={`border rounded-lg p-2 text-center ${strat.color} cursor-default`}>
-                                                                <div className="text-xs font-bold">{strat.name}</div>
-                                                                <div className="text-lg font-black">{strat.value}s</div>
-                                                                <div className="text-[10px] opacity-70">{strat.desc}</div>
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                </div>
-                                            )}
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        </div>
-                    )}
-
-                    {analysisData.length === 0 && <div className="col-span-full text-center py-20 text-slate-400">分析可能なデータがありません</div>}
-                 </div>
-                )}
-              </div>
-           )}
 
            {/* Defect Analysis Tab — KPI + チャート化 */}
            {activeMode === 'defects' && (() => {
@@ -18527,7 +18286,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
   const [confirmModal, setConfirmModal] = useState({ isOpen: false, title: '', message: '', action: null });
 
   const getTodayStr = () => { const d = new Date(); const pad = (n) => n.toString().padStart(2, '0'); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
-  const [filterStartDate, setFilterStartDate] = useState(() => { const d = new Date(); d.setMonth(d.getMonth() - 1); return d.toISOString().slice(0, 10); });
+  const [filterStartDate, setFilterStartDate] = useState(() => { const d = new Date(); d.setMonth(d.getMonth() - 1); return localYMD(d); });
   const [filterEndDate, setFilterEndDate] = useState(getTodayStr());
   const [searchQuery, setSearchQuery] = useState('');
   const [filterWorker, setFilterWorker] = useState('');
@@ -19827,7 +19586,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            templateNameFormula(rowIdx),
            lot.priority === 'high' ? '急ぎ' : '通常',
            lot.dueDate || '',
-           lot.entryAt ? new Date(lot.entryAt).toISOString().slice(0, 16).replace('T', ' ') : ''
+           lot.entryAt ? (() => { const d = new Date(lot.entryAt); return `${localYMD(d)} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; })() : ''
          ];
          for (let i = 0; i < (lot.quantity || 1); i++) row.push(lot.unitSerialNumbers?.[i] || `#${i+1}`);
          ws.addRow(row);
@@ -19973,10 +19732,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          if (v == null) return '';
          if (typeof v === 'string') return v.trim();
          if (typeof v === 'number') return String(v);
-         if (v instanceof Date) return v.toISOString().slice(0,10);
+         if (v instanceof Date) return localYMD(v);
          if (v && Array.isArray(v.richText)) return v.richText.map(t => t.text).join('').trim();
          if (v && v.formula && v.result !== undefined) {
-           if (v.result instanceof Date) return v.result.toISOString().slice(0,10);
+           if (v.result instanceof Date) return localYMD(v.result);
            if (typeof v.result === 'object' && v.result?.error) return '';
            return String(v.result || '').trim();
          }
@@ -20148,7 +19907,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            const daysBefore = e.daysBefore ?? 0;  // 未設定なら 0日 (K33当日)
            const dueDate = new Date(baseDate);
            dueDate.setDate(dueDate.getDate() + daysBefore);
-           const dueDateStr = dueDate.toISOString().slice(0, 10);
+           const dueDateStr = localYMD(dueDate);
 
            // 既存ロット判定 (指図 + テンプレID)
            const existing = lots.find(l => l.orderNo === orderNo && l.templateId === e.templateId && l.location !== 'completed');
@@ -20161,7 +19920,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              dueDate: dueDateStr,
              dueDateProvisional: baseDateProvisional,
              qsName: `${qs.standardNo} ${qs.name}`,
-             baseDate: baseDate.toISOString().slice(0,10),
+             baseDate: localYMD(baseDate),
              daysBefore,
            };
            if (existing) {
