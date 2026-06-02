@@ -5183,32 +5183,30 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 作業順最適化モーダル
   const [showWorkOrderOptimizer, setShowWorkOrderOptimizer] = useState(false);
   // 推奨順ガイダンス: カスタムモードで「1台目から順番に」のルールを視覚化
-  // 厳密モードの決定権は管理者 (テンプレ単位で settings.strictModeTemplates に保存・全端末共有)。
-  // 個人端末のローカルトグルは「管理者未設定のテンプレ」での一時的な個人利用のみ。
+  // 厳密モード = 「1台目から順番」を強制し、飛ばし(順序外タップ)を防ぐモード。
+  //   OFF (順番ガイド) = 警告のみで飛ばしも可。状況に応じて作業者が現場判断できるよう、
+  //   作業中いつでも ON/OFF を切替可能とし、選択は【型式(model)ごと】に記憶する。
+  //   管理者がテンプレに設定した値は「型式の初期既定」として使い、現場の個人選択があれば優先する。
   const isAdmin = currentUserName === '管理者';
-  const adminStrictForTemplate = strictModeTemplates?.[lot.templateId]; // true=ON / false=明示OFF / undefined=未設定
-  const [localStrictOrderMode, setLocalStrictOrderMode] = useState(() => {
-    try { return localStorage.getItem('strictOrderMode') === 'true'; } catch { return false; }
+  const adminStrictForTemplate = strictModeTemplates?.[lot.templateId]; // true=ON / false=OFF / undefined=未設定 (テンプレ既定)
+  const strictModelKey = lot.model || lot.templateId || '_';
+  const [strictByModel, setStrictByModel] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('strictOrderModeByModel') || '{}'); } catch { return {}; }
   });
-  // 実効: 管理者設定が優先。未設定ならローカルトグル。
-  const strictOrderMode = adminStrictForTemplate === true ? true
+  const personalStrict = strictByModel[strictModelKey]; // true / false / undefined(未選択)
+  // 実効: 型式別の個人選択が最優先。無ければ管理者のテンプレ既定。どちらも無ければ OFF。
+  const strictOrderMode = personalStrict !== undefined ? personalStrict
+    : adminStrictForTemplate === true ? true
     : adminStrictForTemplate === false ? false
-    : localStrictOrderMode;
+    : false;
   const toggleStrictOrderMode = () => {
-    // 管理者: テンプレ単位の共有設定を切り替え (全端末に反映)
-    if (isAdmin && lot.templateId && onSaveStrictTemplate) {
-      onSaveStrictTemplate(lot.templateId, !strictOrderMode);
-      return;
-    }
-    // 作業者 + 管理者がそのテンプレを明示設定済 → 変更不可
-    if (adminStrictForTemplate !== undefined) {
-      alert('このテンプレの厳密モードは管理者が設定しています。変更は管理者のみ可能です。');
-      return;
-    }
-    // 管理者未設定 → 個人ローカルトグル
-    const next = !localStrictOrderMode;
-    setLocalStrictOrderMode(next);
-    try { localStorage.setItem('strictOrderMode', next ? 'true' : 'false'); } catch {}
+    // 作業中いつでも切替可。型式ごとに記憶 (誰でも可)。
+    const next = !strictOrderMode;
+    const updated = { ...strictByModel, [strictModelKey]: next };
+    setStrictByModel(updated);
+    try { localStorage.setItem('strictOrderModeByModel', JSON.stringify(updated)); } catch {}
+    // 管理者が切り替えた場合は、テンプレ既定 (全端末共有) も合わせて更新する。
+    if (isAdmin && lot.templateId && onSaveStrictTemplate) onSaveStrictTemplate(lot.templateId, next);
   };
   // 順序外タップで警告ダイアログ表示用
   const [outOfOrderConfirm, setOutOfOrderConfirm] = useState(null); // { stepIdx, unitIdx, nextRecommendedUnit, action }
@@ -7660,18 +7658,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  >
                    {customViewMode === 'card' ? <><LayoutList className="w-4 h-4"/> 一覧</> : <><LayoutGrid className="w-4 h-4"/> カード</>}
                  </button>
-                 {/* 厳密順序モード: 管理者がテンプレ単位で設定。作業者は管理者設定に従う */}
+                 {/* 厳密順序モード: 型式ごとに、作業中いつでも ON/OFF 切替可能。管理者のテンプレ設定は初期既定。 */}
                  <button
                    onClick={toggleStrictOrderMode}
-                   className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap ${strictOrderMode ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'} ${(!isAdmin && adminStrictForTemplate !== undefined) ? 'opacity-70 cursor-not-allowed' : ''}`}
-                   title={
-                     adminStrictForTemplate !== undefined
-                       ? (isAdmin ? '管理者設定: タップでこのテンプレの厳密モードを切替 (全端末反映)' : '管理者がこのテンプレの厳密モードを設定済 (変更は管理者のみ)')
-                       : (strictOrderMode ? '個人設定: 厳密ON (タップで解除)' : '個人設定: 順番ガイド (タップで厳密ON)')
-                   }
+                   className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap ${strictOrderMode ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'}`}
+                   title={`${lot.model || 'この型式'} の順番モードを切替（作業中いつでも可・型式ごとに記憶）\n🔒厳密=「1台目から順番」を強制 / 🔓ガイド=警告のみで飛ばしも可${adminStrictForTemplate !== undefined ? `\n（管理者の初期既定: ${adminStrictForTemplate ? '厳密' : 'ガイド'}）` : ''}`}
                  >
                    {strictOrderMode ? '🔒' : '🔓'} {strictOrderMode ? '順番厳密' : '順番ガイド'}
-                   {adminStrictForTemplate !== undefined && <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">管理</span>}
+                   <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">型式別</span>
                  </button>
                  {/* 「全作業完了」は誤タップ防止のため、サイズ・色・余白で他ボタンと差別化 */}
                  <div className="ml-1.5 pl-1.5 border-l border-white/20 flex items-center gap-1.5">
@@ -7768,7 +7762,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             <div className="flex-1 overflow-auto p-6 bg-slate-50 pb-4">
                {/* ライブ並行作業ガイド: 自動測定中に「今やれる他の台の作業」をリアルタイム表示 */}
                <LiveParallelGuide guide={liveParallelGuide} fmtTime={formatTime} />
-               {/* 厳密モード推奨バナー: データが十分貯まったテンプレで提案 (有効化は管理者のみ) */}
+               {/* 厳密モード推奨バナー: データが十分貯まったテンプレで提案 (誰でも型式ごとに有効化可・作業中いつでも切替) */}
                {showStrictSuggestion && (
                  <div className="mb-3 bg-gradient-to-r from-rose-50 to-amber-50 border-2 border-rose-300 rounded-xl p-3 flex items-start gap-3">
                    <div className="bg-rose-100 p-2 rounded-full shrink-0"><ShieldCheck className="w-5 h-5 text-rose-600"/></div>
@@ -7777,30 +7771,27 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                      <div className="text-xs text-rose-800 mt-1 leading-relaxed">
                        十分なデータが貯まり、最適な作業順が安定しています。<b>厳密モード</b>にすると「1台目から順番」を強制し、飛ばしによる作業漏れ・混乱を防げます。
                      </div>
-                     {isAdmin ? (
-                       <div className="flex gap-2 mt-2">
-                         <button
-                           onClick={() => { if (onSaveStrictTemplate && lot.templateId) onSaveStrictTemplate(lot.templateId, true); try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
-                           className="bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3 py-1.5 rounded shadow flex items-center gap-1"
-                         >
-                           🔒 厳密モードを有効化 (このテンプレの全端末)
-                         </button>
-                         <button
-                           onClick={() => { try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
-                           className="bg-white hover:bg-slate-50 text-slate-500 text-xs font-bold px-3 py-1.5 rounded border border-slate-300"
-                         >
-                           今はしない
-                         </button>
-                       </div>
-                     ) : (
-                       <div className="mt-2 text-xs text-rose-700 bg-white/70 border border-rose-200 rounded px-2 py-1.5">
-                         👤 厳密モードの有効化は<b>管理者</b>が行います。管理者に連絡してください。
-                         <button
-                           onClick={() => { try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
-                           className="ml-2 text-slate-400 hover:text-slate-600 underline"
-                         >閉じる</button>
-                       </div>
-                     )}
+                     <div className="flex gap-2 mt-2">
+                       <button
+                         onClick={() => {
+                           const updated = { ...strictByModel, [strictModelKey]: true };
+                           setStrictByModel(updated);
+                           try { localStorage.setItem('strictOrderModeByModel', JSON.stringify(updated)); } catch {}
+                           if (isAdmin && onSaveStrictTemplate && lot.templateId) onSaveStrictTemplate(lot.templateId, true);
+                           try { localStorage.setItem(strictSuggestKey, '1'); } catch {}
+                           setStrictSuggestDismissed(true);
+                         }}
+                         className="bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3 py-1.5 rounded shadow flex items-center gap-1"
+                       >
+                         🔒 厳密モードを有効化（この型式{isAdmin ? '・全端末既定も更新' : ''}）
+                       </button>
+                       <button
+                         onClick={() => { try { localStorage.setItem(strictSuggestKey, '1'); } catch {}; setStrictSuggestDismissed(true); }}
+                         className="bg-white hover:bg-slate-50 text-slate-500 text-xs font-bold px-3 py-1.5 rounded border border-slate-300"
+                       >
+                         今はしない
+                       </button>
+                     </div>
                    </div>
                  </div>
                )}
@@ -14441,7 +14432,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
              <ShieldCheck className="w-5 h-5 text-rose-600" /> 作業順ガイド・厳密モード
            </h3>
            <p className="text-xs text-slate-500 mb-4">
-             同じテンプレートの<b>完了ロット</b>がこの件数以上たまると、作業画面と管理ダッシュボードで「厳密モードを推奨」と通知します（実際の有効化は管理者がテンプレ単位で行います）。<br/>
+             同じテンプレートの<b>完了ロット</b>がこの件数以上たまると、作業画面と管理ダッシュボードで「厳密モードを推奨」と通知します。厳密モードの ON/OFF は<b>作業中いつでも・型式ごと</b>に切り替えられ、ここの管理者設定は各型式の<b>初期既定</b>として使われます。<br/>
              <b>厳密モード ON</b> = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。
            </p>
            <div className="flex items-end gap-3 flex-wrap">
