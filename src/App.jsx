@@ -37,9 +37,12 @@ import {
   evaluateFormula, evalArith, BLOCK_GAUGE_PRESETS, CALCULATION_METHODS,
   MAX_CALCULATIONS, groupKeyFor
 } from './measurement-utils';
-import { 
-  getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken 
+import {
+  getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken
 } from "firebase/auth";
+
+// 「❓使い方」全画面マニュアル
+import { HelpManualModal, PRODUCT_HELP_SECTIONS } from './HelpManual.jsx';
 
 // 画像を Cloud Storage にアップロードして URL を返す。失敗時は base64 のまま返す (フォールバック)
 // 既存データ (base64 直保存) と互換: <img src={...}> は URL/base64 両方扱える
@@ -18909,6 +18912,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const [showLotModal, setShowLotModal] = useState(false);
    const [lotFormQty, setLotFormQty] = useState(1);
    const [showAnomalyPanel, setShowAnomalyPanel] = useState(false);
+   // 「❓使い方」マニュアル
+   const [showHelp, setShowHelp] = useState(false);
+   const [helpImages, setHelpImages] = useState({});
    const [selectedWorker, setSelectedWorker] = useState(null);
    const [draggedLotId, setDraggedLotId] = useState(null);
    const mapRef = useRef(null);
@@ -19219,7 +19225,35 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        lastFailedPayloadRef.current = { kind: 'delete', col, id };
      }
    };
- 
+
+   // --- ヘルプ用スクショ (help_images コレクション。開いたときだけ購読して全端末で共有) ---
+   useEffect(() => {
+     if (!showHelp || !db) return;
+     const unsub = onSnapshot(
+       collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'help_images'),
+       (snap) => {
+         const map = {};
+         snap.docs.forEach(d => { if (d.data()?.image) map[d.id] = d.data().image; });
+         setHelpImages(map);
+       },
+       (e) => console.warn('help_images subscribe error', e)
+     );
+     return () => unsub();
+   }, [showHelp]);
+
+   const handleHelpUpload = async (slotKey, file) => {
+     try {
+       const img = await resizeImage(file, { maxDim: 1280, quality: 0.62 });
+       await saveData('help_images', slotKey, { image: img });
+       setHelpImages(prev => ({ ...prev, [slotKey]: img })); // 即時反映
+     } catch (e) { console.error('help upload failed', e); alert('画像の保存に失敗しました'); }
+   };
+   const handleHelpDelete = async (slotKey) => {
+     if (!confirm('この写真を削除しますか？')) return;
+     await deleteData('help_images', slotKey);
+     setHelpImages(prev => { const n = { ...prev }; delete n[slotKey]; return n; });
+   };
+
    // --- Worker Management ---
    const handleAddWorker = () => {
      const name = prompt("新しい作業者の名前を入力してください:");
@@ -20756,6 +20790,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
               ))}
            </div>
            <div className="flex items-center gap-1">
+             <button onClick={() => setShowHelp(true)} className="bg-white text-blue-700 border border-blue-200 hover:bg-blue-50 px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="使い方ガイド (操作マニュアル)">
+               <HelpCircle className="w-3.5 h-3.5" /> 使い方
+             </button>
              <button onClick={() => setShowWorkStandardsLib(true)} className="bg-orange-600 hover:bg-orange-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="作業標準ライブラリ (登録された PDF を閲覧)">
                <BookOpen className="w-3.5 h-3.5" /> 作業標準
              </button>
@@ -20871,6 +20908,19 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          }}
          onClose={() => setShowIndirectModal(false)}
        />}
+       {/* 使い方ガイド (全画面マニュアル) */}
+       {showHelp && (
+         <HelpManualModal
+           appLabel="製品検査アプリ"
+           sections={PRODUCT_HELP_SECTIONS}
+           images={helpImages}
+           canEdit={currentUserName === '管理者'}
+           onUpload={handleHelpUpload}
+           onDelete={handleHelpDelete}
+           onClose={() => setShowHelp(false)}
+         />
+       )}
+
        {/* Daily Summary Modal */}
        {showDailySummary && <DailySummaryModal lots={lots} indirectWork={indirectWork} currentUserName={currentUserName} workers={workers} settings={settings} saveData={saveData} onClose={() => setShowDailySummary(false)} />}
        {showShiftHandover && <ShiftHandoverModal lots={lots} indirectWork={indirectWork} currentUserName={currentUserName} workers={workers} saveData={saveData} onClose={() => setShowShiftHandover(false)} />}
