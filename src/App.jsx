@@ -233,7 +233,28 @@ const toDateShort = (timestamp) => {
 };
 const formatDateSafe = (ts) => ts ? new Date(ts).toLocaleString() : '-';
 
-const resizeImage = (file) => new Promise((resolve) => { const r = new FileReader(); r.onload = (e) => { const i = new Image(); i.onload = () => { const c = document.createElement('canvas'); const MAX = 1000; let w=i.width; let h=i.height; if(w>h){if(w>MAX){h*=MAX/w;w=MAX}}else{if(h>MAX){w*=MAX/h;h=MAX}} c.width=w; c.height=h; const ctx=c.getContext('2d'); if(ctx){ctx.drawImage(i,0,0,w,h); resolve(c.toDataURL('image/jpeg', 0.7));}else resolve(i.src); }; i.src = e.target?.result; }; r.readAsDataURL(file); });
+// === 画像 容量/画質 制御 ===
+// 種別ごとの既定 (低画質スタート=容量節約)。settings.imageQuality で上書きし、syncImageQuality で反映。
+const DEFAULT_IMG_QUALITY = {
+  workStandard: { maxDim: 800,  quality: 0.55 }, // 作業標準
+  defectPhoto:  { maxDim: 1000, quality: 0.6  }, // 不良写真
+  packingPhoto: { maxDim: 800,  quality: 0.55 }, // 荷姿写真
+  serialAI:     { maxDim: 1280, quality: 0.72 }, // 機番AI認識 (精度のため少し高め)
+  diagram:      { maxDim: 1000, quality: 0.6  }, // 測定図
+  default:      { maxDim: 900,  quality: 0.6  },
+};
+let IMG_QUALITY = { ...DEFAULT_IMG_QUALITY };
+// settings.imageQuality を IMG_QUALITY に同期 (アプリ起動時/設定変更時に呼ぶ)
+const syncImageQuality = (cfg) => {
+  const next = { ...DEFAULT_IMG_QUALITY };
+  if (cfg && typeof cfg === 'object') Object.keys(cfg).forEach(k => { next[k] = { ...(next[k] || DEFAULT_IMG_QUALITY.default), ...(cfg[k] || {}) }; });
+  IMG_QUALITY = next;
+};
+// resizeImage(file, type) / resizeImage(file, { maxDim, quality }) の両対応
+const resizeImage = (file, typeOrOpts = 'default') => new Promise((resolve) => {
+  const o = (typeof typeOrOpts === 'object') ? typeOrOpts : (IMG_QUALITY[typeOrOpts] || IMG_QUALITY.default);
+  const MAX = o.maxDim || 900; const Q = (typeof o.quality === 'number') ? o.quality : 0.6;
+  const r = new FileReader(); r.onload = (e) => { const i = new Image(); i.onload = () => { const c = document.createElement('canvas'); let w=i.width; let h=i.height; if(w>h){if(w>MAX){h*=MAX/w;w=MAX}}else{if(h>MAX){w*=MAX/h;h=MAX}} c.width=w; c.height=h; const ctx=c.getContext('2d'); if(ctx){ctx.drawImage(i,0,0,w,h); resolve(c.toDataURL('image/jpeg', Q));}else resolve(i.src); }; i.src = e.target?.result; }; r.readAsDataURL(file); });
 const getBase64 = (file) => new Promise((resolve) => { const r = new FileReader(); r.readAsDataURL(file); r.onload = () => resolve(r.result); r.onerror = () => resolve(""); });
 
 // === 時間ソース一本化 (2026-05-31) ===
@@ -3593,7 +3614,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const handleImageUpload = async (e) => {
     const file = e.target.files?.[0];
     if (file) {
-      const img = await resizeImage(file);
+      const img = await resizeImage(file, 'workStandard');
       // Cloud Storage にアップロードして URL を取得（小さい画像は base64 維持）
       const finalImg = await uploadImageToStorage(img, 'template-images');
       setImages(prev => [...prev, finalImg]);
@@ -4058,7 +4079,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                       <button onClick={() => document.getElementById('diagram-image-upload')?.click()} className="flex-1 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[10px] font-bold rounded flex items-center justify-center gap-1 border"><ImageIcon className="w-3 h-3"/> 画像を選択</button>
                       {measurementConfig.diagramImage && <button onClick={() => setMeasurementConfig({ ...measurementConfig, diagramImage: null })} className="py-1.5 px-3 bg-red-50 hover:bg-red-100 text-red-500 text-[10px] font-bold rounded flex items-center justify-center gap-1 border border-red-200"><Trash2 className="w-3 h-3"/> 削除</button>}
                     </div>
-                    <input id="diagram-image-upload" type="file" className="hidden" accept="image/*" onChange={async (e) => { const file = e.target.files?.[0]; if (file) { const img = await resizeImage(file); setMeasurementConfig({ ...measurementConfig, diagramImage: img }); } e.target.value = ''; }}/>
+                    <input id="diagram-image-upload" type="file" className="hidden" accept="image/*" onChange={async (e) => { const file = e.target.files?.[0]; if (file) { const img = await resizeImage(file, 'diagram'); setMeasurementConfig({ ...measurementConfig, diagramImage: img }); } e.target.value = ''; }}/>
                     {measurementConfig.diagramImage && <img src={measurementConfig.diagramImage} className="mt-2 w-full h-24 object-contain rounded border" alt="diagram"/>}
                   </div>
                   <div className="mt-2 text-[10px] text-slate-400 italic px-1 leading-snug">
@@ -7361,7 +7382,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                           <button onClick={()=>defectPhotoRef.current?.click()} className="w-16 h-16 border-2 border-dashed rounded flex items-center justify-center text-slate-400 hover:text-blue-500 hover:border-blue-300">
                             <Camera className="w-5 h-5"/>
                           </button>
-                          <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" capture="environment" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
+                          <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" capture="environment" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file, 'defectPhoto'); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
                         </div>
                       </div>
                     </div>
@@ -8630,7 +8651,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                   <button onClick={()=>defectPhotoRef.current?.click()} className="w-16 h-16 border-2 border-dashed rounded flex items-center justify-center text-slate-400 hover:text-blue-500 hover:border-blue-300">
                     <Camera className="w-5 h-5"/>
                   </button>
-                  <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" capture="environment" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
+                  <input type="file" ref={defectPhotoRef} className="hidden" accept="image/*" capture="environment" onChange={async(e)=>{const file=e.target.files?.[0]; if(file){const img=await resizeImage(file, 'defectPhoto'); setDefectPhotos(prev=>[...prev, img]);} e.target.value='';}}/>
                 </div>
               </div>
             </div>
@@ -13518,7 +13539,7 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
   const handleDiagramUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const img = await resizeImage(file);
+    const img = await resizeImage(file, 'diagram');
     setDraftDiagram(img);
     e.target.value = '';
   };
@@ -14599,6 +14620,43 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                  className="border rounded p-2 text-sm w-32" />
              </div>
              <span className="text-xs text-slate-400 pb-2.5">現在: 同テンプレ完了 <b>{settings.strictModeThreshold ?? 5}</b> 件以上で推奨通知</span>
+           </div>
+         </div>
+
+         {/* 画像の容量・画質 (種別ごとに最大px・画質を設定。基本は低画質スタート) */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
+             <Camera className="w-5 h-5 text-teal-600" /> 画像の容量・画質
+           </h3>
+           <p className="text-xs text-slate-500 mb-4">
+             登録する画像の<b>最大サイズ(px)</b>と<b>画質(0.3〜0.9)</b>を種別ごとに設定します。低いほど容量が小さく軽くなります。<b>基本は低画質スタート</b>、見づらければ上げてください。<br/>
+             <span className="text-slate-400">※ 既存の画像には影響しません。今後の登録から反映されます。</span>
+           </p>
+           <div className="space-y-2">
+             {[
+               { key: 'workStandard', label: '作業標準の画像' },
+               { key: 'defectPhoto',  label: '不良写真' },
+               { key: 'packingPhoto', label: '荷姿写真' },
+               { key: 'serialAI',     label: '機番AI認識の画像' },
+               { key: 'diagram',      label: '測定図' },
+             ].map(({ key, label }) => {
+               const def = { workStandard:{maxDim:800,quality:0.55}, defectPhoto:{maxDim:1000,quality:0.6}, packingPhoto:{maxDim:800,quality:0.55}, serialAI:{maxDim:1280,quality:0.72}, diagram:{maxDim:1000,quality:0.6} }[key];
+               const cur = { ...def, ...(settings.imageQuality?.[key] || {}) };
+               const set = (patch) => saveSettings({ imageQuality: { ...(settings.imageQuality || {}), [key]: { ...cur, ...patch } } });
+               const tier = (cur.maxDim >= 1280 || cur.quality >= 0.75) ? { t: '鮮明・大', c: 'text-rose-600' } : (cur.maxDim <= 800 && cur.quality <= 0.55) ? { t: '軽量・小', c: 'text-emerald-600' } : { t: '標準', c: 'text-slate-500' };
+               return (
+                 <div key={key} className="flex flex-wrap items-center gap-x-3 gap-y-1 border rounded-lg p-2.5">
+                   <span className="text-sm font-bold text-slate-700 w-36 shrink-0">{label}</span>
+                   <label className="text-[11px] text-slate-500">最大px</label>
+                   <input type="range" min="400" max="2000" step="100" value={cur.maxDim} onChange={e => set({ maxDim: Number(e.target.value) })} className="w-28 accent-teal-600" />
+                   <span className="text-xs font-mono w-14 text-right">{cur.maxDim}px</span>
+                   <label className="text-[11px] text-slate-500 ml-2">画質</label>
+                   <input type="range" min="0.3" max="0.9" step="0.05" value={cur.quality} onChange={e => set({ quality: Number(e.target.value) })} className="w-28 accent-teal-600" />
+                   <span className="text-xs font-mono w-10 text-right">{cur.quality.toFixed(2)}</span>
+                   <span className={`text-[10px] font-bold ${tier.c} w-16 text-right`}>{tier.t}</span>
+                 </div>
+               );
+             })}
            </div>
          </div>
 
@@ -19035,6 +19093,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    useEffect(() => {
      applyFontSizes(settings.fontSizes);
    }, [settings.fontSizes]);
+
+   // --- 画像 容量/画質 設定を反映 (resizeImage が参照する IMG_QUALITY を同期) ---
+   useEffect(() => {
+     syncImageQuality(settings.imageQuality);
+   }, [settings.imageQuality]);
 
    // --- Break Alert Timer ---
    useEffect(() => {
