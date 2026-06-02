@@ -7,4 +7,8 @@ export default defineConfig({
   server: {
     port: 5174,
   },
+  build: {
+    // 古い Safari (iOS 11 / Safari 11) 向け: ?. ?? などの新構文を変換して白画面を防ぐ
+    target: ['es2015', 'safari11'],
+  },
 })
