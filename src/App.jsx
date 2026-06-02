@@ -3478,6 +3478,9 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   // 'measurement-machine' = 測定機を占有 (= 他の台の自動測定中は不可)
   // 'workbench' / その他カスタム
   const [workResource, setWorkResource] = useState('');
+  // 自動測定の既知時間: ON にすると、開始後 autoEndSec 秒の経過で自動的に時間取りを終了(完了)する
+  const [autoEndEnabled, setAutoEndEnabled] = useState(false);
+  const [autoEndSec, setAutoEndSec] = useState(0);
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
   const [pdfData, setPdfData] = useState(null);
@@ -3563,6 +3566,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       title, description, type, targetTime, images, pdfData,
       executionMode,           // 'manual' | 'batch' (自動測定)
       workResource: workResource || null,  // null = 機械独立 (並行可)
+      // 自動測定の既知時間 (経過で自動終了)。自動工程かつ有効かつ正の秒数のときのみ保存。
+      ...(executionMode === 'batch' && autoEndEnabled && autoEndSec > 0 ? { autoEndEnabled: true, autoEndSec: Math.round(autoEndSec) } : {}),
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
       // checklistItems は type 問わず保存可能 (測定 + チェックの併用OK)
       ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {})
@@ -3570,7 +3575,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); }
     resetInput();
   };
-  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); };
+  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); };
   const editStep = (s) => {
     setEditingStepId(s.id);
     setTitle(s.title);
@@ -3583,6 +3588,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     setMeasurementConfig(s.measurementConfig || null);
     setExecutionMode(s.executionMode || (s.title?.includes('自動') ? 'batch' : 'manual'));
     setWorkResource(s.workResource || '');
+    setAutoEndEnabled(!!s.autoEndEnabled);
+    setAutoEndSec(s.autoEndSec || 0);
     setChecklistItems(Array.isArray(s.checklistItems) ? s.checklistItems : []);
   };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
@@ -3678,6 +3685,25 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                   >🤖 自動 (機械が動く)</button>
                 </div>
               </div>
+
+              {/* 自動測定の既知時間 → 経過で自動終了 (自動工程のみ) */}
+              {executionMode === 'batch' && (
+                <div className="bg-purple-50 border border-purple-200 rounded p-2 space-y-1.5">
+                  <label className="flex items-center gap-2 text-xs font-bold text-purple-800 cursor-pointer">
+                    <input type="checkbox" checked={autoEndEnabled} onChange={e => setAutoEndEnabled(e.target.checked)} className="w-4 h-4 accent-purple-600"/>
+                    ⏱️ 測定時間が決まっている（経過したら自動で時間取り終了）
+                  </label>
+                  {autoEndEnabled && (
+                    <div className="flex items-center flex-wrap gap-2 pl-6">
+                      <label className="text-[11px] text-slate-600">自動測定時間</label>
+                      <input type="number" min="1" value={autoEndSec || ''} onChange={e => setAutoEndSec(Math.max(0, Number(e.target.value) || 0))} className="border rounded p-1 text-xs w-20" placeholder="秒"/>
+                      <span className="text-[11px] text-slate-500">秒{autoEndSec > 0 ? `（${Math.floor(autoEndSec/60)}分${autoEndSec%60}秒）` : ''}</span>
+                      {targetTime > 0 && <button type="button" onClick={() => setAutoEndSec(targetTime)} className="text-[10px] text-purple-600 underline">目標時間({targetTime}s)を使う</button>}
+                    </div>
+                  )}
+                  <div className="text-[10px] text-purple-600 leading-relaxed">開始すると自動でカウントし、登録した時間が経過すると「完了」になります。一時停止中はカウントも止まります。</div>
+                </div>
+              )}
 
               {/* 占有リソース */}
               <div>
@@ -6641,6 +6667,38 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     return () => clearInterval(iv);
   }, [otherActiveAutos.length, !!liveParallelGuide]);
 
+  // === 自動測定の既知時間 (step.autoEndSec) が経過したら、その台の時間取りを自動で完了する ===
+  //   対象: executionMode==='batch' かつ autoEndEnabled かつ autoEndSec>0 の工程で processing 中のタスク。
+  //   経過 = duration + (now - startTime)。一時停止中は processing でないのでカウントされない。
+  const tasksRefAE = useRef(tasks); tasksRefAE.current = tasks;
+  const stepsRefAE = useRef(localSteps); stepsRefAE.current = localSteps;
+  const [autoEndToast, setAutoEndToast] = useState(null); // { title } | null
+  useEffect(() => { if (!autoEndToast) return; const id = setTimeout(() => setAutoEndToast(null), 4500); return () => clearTimeout(id); }, [autoEndToast]);
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const cur = tasksRefAE.current || {}; const steps = stepsRefAE.current || []; const qty = lot.quantity || 1; const now = Date.now();
+      let nt = null; let lastTitle = '';
+      steps.forEach((step, sIdx) => {
+        if (!(step?.executionMode === 'batch' && step?.autoEndEnabled && step?.autoEndSec > 0)) return;
+        for (let u = 0; u < qty; u++) {
+          const idKey = step.id ? `${step.id}-${u}` : null;
+          const numKey = `${sIdx}-${u}`;
+          const key = (idKey && cur[idKey]) ? idKey : (cur[numKey] ? numKey : (idKey || numKey));
+          const t = cur[key];
+          if (!t || t.status !== 'processing') continue;
+          const elapsed = (t.duration || 0) + (t.startTime ? Math.floor((now - t.startTime) / 1000) : 0);
+          if (elapsed >= step.autoEndSec) {
+            if (!nt) nt = { ...cur };
+            nt[key] = { ...t, status: 'completed', duration: step.autoEndSec, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, autoEnded: true };
+            lastTitle = step.title;
+          }
+        }
+      });
+      if (nt) { setTasks(nt); onSave({ tasks: nt, status: 'processing' }); setAutoEndToast({ title: lastTitle }); }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [lot.quantity]);
+
   const [completedTaskMenu, setCompletedTaskMenu] = useState(null); // { key, stepIdx, unitIdx }
   // NG 理由ピッカー: { key, stepIdx, unitIdx } | null
   // NG ボタンを押した直後に表示。complaintOptions (気づき報告候補) から選ばせて task.ngReason に保存。
@@ -7212,6 +7270,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   if (isCustom) {
     return (
       <div data-fs="execution" className="fixed inset-0 z-50 bg-slate-900/90 backdrop-blur-sm flex items-center justify-center p-2 overflow-auto">
+        {autoEndToast && (
+          <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[400] bg-purple-600 text-white px-4 py-2 rounded-lg shadow-2xl text-sm font-bold flex items-center gap-2 animate-bounce">
+            🤖 自動測定{autoEndToast.title ? `「${autoEndToast.title}」` : ''}が時間経過で完了しました
+          </div>
+        )}
         {showDefectModal && (
             <div className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
                 <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
