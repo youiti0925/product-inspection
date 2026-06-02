@@ -5204,6 +5204,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
   const lot = _lotProp || {};
+  // この検査を実施している作業者名 = ロットの担当者(lot.workerId)。担当を切替えると以降の完了が新担当で記録される。
+  // これを各タスクの workerName に焼き付けることで、台ごとに別の人が作業しても集計が正しくなる。
+  const inspectorName = (lot.workerId && workers.find(w => w.id === lot.workerId)?.name) || currentUserName || '';
   // ロットが消えた (削除/置換) 場合は自動でモーダルを閉じる
   useEffect(() => {
     if (!_lotProp && onClose) {
@@ -5820,7 +5823,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (!tasks[taskKey] || tasks[taskKey].status !== 'completed') {
       // 開始時刻 = stepUnitStartRef.current の以前値 (= now - unitDuration*1000)、終了 = now
       const firstStart = now - unitDuration * 1000;
-      const newTasks = { ...tasks, [taskKey]: { status: 'completed', duration: unitDuration, startTime: null, firstStartTime: firstStart, endTime: now } };
+      const newTasks = { ...tasks, [taskKey]: { status: 'completed', duration: unitDuration, startTime: null, firstStartTime: firstStart, endTime: now, workerName: inspectorName } };
       // 旧 numeric キーが残っていたら削除（重複防止）
       if (taskKey !== legacyKey && newTasks[legacyKey]) delete newTasks[legacyKey];
       setTasks(newTasks);
@@ -6117,7 +6120,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       } else if (cur.status === 'processing') {
         const now = Date.now();
         const dur = cur.startTime ? Math.floor((now - cur.startTime) / 1000) : 0;
-        const updated = { ...prev, [key]: { ...cur, status: 'completed', duration: cur.duration + dur, startTime: null, endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now } };
+        const updated = { ...prev, [key]: { ...cur, status: 'completed', duration: cur.duration + dur, startTime: null, endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now, workerName: inspectorName } };
         onSave({ tasks: updated, status: 'processing' });
         startUndoTimer({ key, type: 'task', previousTasks: prev });
         return updated;
@@ -6738,7 +6741,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           const elapsed = (t.duration || 0) + (t.startTime ? Math.floor((now - t.startTime) / 1000) : 0);
           if (elapsed >= step.autoEndSec) {
             if (!nt) nt = { ...cur };
-            nt[key] = { ...t, status: 'completed', duration: step.autoEndSec, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, autoEnded: true };
+            nt[key] = { ...t, status: 'completed', duration: step.autoEndSec, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, autoEnded: true, workerName: t.workerName || inspectorName };
             lastTitle = step.title;
           }
         }
@@ -6788,7 +6791,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const dur = currentTask.reworkStartTime ? Math.floor((now - currentTask.reworkStartTime) / 1000) : 0;
       const reworks = [...(currentTask.reworks || [])];
       reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: dur, endTime: now };
-      newTasks[key] = { ...currentTask, status: 'completed', reworkStartTime: null, reworks, endTime: now, firstStartTime: currentTask.firstStartTime || currentTask.startTime || now };
+      newTasks[key] = { ...currentTask, status: 'completed', reworkStartTime: null, reworks, endTime: now, firstStartTime: currentTask.firstStartTime || currentTask.startTime || now, workerName: inspectorName };
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
       startUndoTimer({ key, type: 'task', previousTasks });
@@ -6826,6 +6829,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         // endTime: 完了した時刻 (ガントの「いつ終わったか」を確定するために必須)
         endTime: now,
         firstStartTime: currentTask.firstStartTime || (currentTask.startTime || now),
+        workerName: inspectorName, // 台ごとの作業者を記録 (担当切替に追従)
       };
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
@@ -6871,6 +6875,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         ngAt: nowTs,
         endTime: nowTs,
         firstStartTime: captured.firstStartTime || captured.startTime || nowTs,
+        workerName: inspectorName,
         reworks: captured.reworks || [],
         ...(ngReason ? { ngReason } : (captured.ngReason ? {} : {})),
       };
@@ -6886,6 +6891,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         status: 'completed',
         endTime: okAt,
         firstStartTime: currentTask.firstStartTime || currentTask.startTime || okAt,
+        workerName: inspectorName,
       };
     } else if (action === 'skip') {
       // 該当なし: この工程はこの台に該当しないものとして記録 (作業中なら経過時間を確定してから)
@@ -7019,6 +7025,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                     startTime: null,
                     endTime: now,
                     firstStartTime: currentTask.firstStartTime || currentTask.startTime || batchStart,
+                    workerName: inspectorName,
                 };
             }
         });
