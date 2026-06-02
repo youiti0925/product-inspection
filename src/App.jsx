@@ -404,7 +404,9 @@ const formatHoursMinutes = (totalMin) => {
 const getQsTemplateEntries = (qs) => {
   if (!qs) return [];
   if (Array.isArray(qs.templates) && qs.templates.length > 0) {
+    // ...t で全フィールド (defaultValues / checklistItemsByStep / stepProfile 等) を保持する。
     return qs.templates.map(t => ({
+      ...t,
       templateId: t.templateId || '',
       measurementOverrides: t.measurementOverrides || {},
       measurementConditions: t.measurementConditions || {},
@@ -415,15 +417,19 @@ const getQsTemplateEntries = (qs) => {
       templateId: qs.templateId,
       measurementOverrides: qs.measurementOverrides || {},
       measurementConditions: qs.measurementConditions || {},
+      ...(qs.defaultValues ? { defaultValues: qs.defaultValues } : {}),
+      ...(qs.checklistItemsByStep ? { checklistItemsByStep: qs.checklistItemsByStep } : {}),
+      ...(qs.stepProfile ? { stepProfile: qs.stepProfile } : {}),
     }];
   }
   return [];
 };
 
 const applyQualityStandardToSteps = (model, baseSteps, settings, templateId = null) => {
-  if (!model || !baseSteps) return { steps: baseSteps, appliedStandard: null };
+  if (!model || !baseSteps) return { steps: baseSteps, appliedStandard: null, naStepIds: [] };
   let steps = baseSteps;
   let appliedStandard = null;
+  const naStepIds = []; // 型式別プロファイルで「該当なし」にする step.id (ロット生成時に自動スキップ)
 
   // 時間ソース一本化: 型式別較正済み目標時間 (customTargetTimes) を step.targetTime へ焼き付け。
   // どの規格パスを通っても適用されるよう、関数化して各 return 前に通す。
@@ -463,11 +469,21 @@ const applyQualityStandardToSteps = (model, baseSteps, settings, templateId = nu
       const qsConditions = entry.measurementConditions || {};
       const qsDefaults = entry.defaultValues || {};  // 初期値プリセット (型式群で共有)
       const qsChecklist = entry.checklistItemsByStep || {};  // 確認チェック上書き
+      const qsProfile = entry.stepProfile || {};  // 型式別 工程プロファイル: { [stepId]: { enabled, description?, pdfData?, images?, targetTime? } }
       steps = steps.map(s => {
         let outStep = s;
         // 確認チェック項目の上書き (測定/非測定どちらでも適用)
         if (qsChecklist[s.id] && Array.isArray(qsChecklist[s.id])) {
           outStep = { ...outStep, checklistItems: qsChecklist[s.id] };
+        }
+        // 型式別 工程プロファイル: 該当なし(enabled=false) は naStepIds へ。詳細/PDF/写真/目標時間は型式別に上書き。
+        const prof = qsProfile[s.id];
+        if (prof) {
+          if (prof.enabled === false) naStepIds.push(s.id);
+          if (prof.description != null && prof.description !== '') outStep = { ...outStep, description: prof.description };
+          if (prof.pdfData) outStep = { ...outStep, pdfData: prof.pdfData };
+          if (Array.isArray(prof.images) && prof.images.length > 0) outStep = { ...outStep, images: prof.images };
+          if (typeof prof.targetTime === 'number' && prof.targetTime > 0) outStep = { ...outStep, targetTime: prof.targetTime };
         }
         if (!s.measurementConfig) return outStep;
         let newCfg = s.measurementConfig;
@@ -506,7 +522,7 @@ const applyQualityStandardToSteps = (model, baseSteps, settings, templateId = nu
         appliedAt: Date.now(),
         source: 'qualityStandard',
       };
-      return { steps: applyCalibratedTargets(steps), appliedStandard };
+      return { steps: applyCalibratedTargets(steps), appliedStandard, naStepIds };
     }
     // 規格はあるがこのテンプレ用のエントリ無し → legacy にフォールバック
   }
@@ -541,7 +557,22 @@ const applyQualityStandardToSteps = (model, baseSteps, settings, templateId = nu
   }
 
   // 時間ソース一本化: 較正済み目標時間を焼き付け (規格なし/レガシーパス)
-  return { steps: applyCalibratedTargets(steps), appliedStandard };
+  return { steps: applyCalibratedTargets(steps), appliedStandard, naStepIds };
+};
+
+// 型式別プロファイルの「該当なし」工程を、ロット生成時に各台 skipped で事前生成する。
+// 作業者は検査画面で「解除」して検査することも可能 (融通を残す)。
+const buildProfileSkippedTasks = (steps, naStepIds, qty) => {
+  const tasks = {};
+  if (!Array.isArray(naStepIds) || naStepIds.length === 0) return tasks;
+  const naSet = new Set(naStepIds);
+  (steps || []).forEach(s => {
+    if (!naSet.has(s.id)) return;
+    for (let u = 0; u < (qty || 1); u++) {
+      tasks[`${s.id}-${u}`] = { status: 'skipped', profileSkipped: true, duration: 0, startTime: null, firstStartTime: null, endTime: null, workerName: '規格(該当なし)' };
+    }
+  });
+  return tasks;
 };
 
 // === 進捗・ETA・遅延の計算ヘルパー ===
@@ -4914,7 +4945,9 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
     // 修正中: メインは元の作業時間を保持し、修正の回数/各回の時間は下のチップで表示 (カードと同様)
     if (st === 'reworking') return { mark: '修正', time: formatTime(dur), cls: 'bg-orange-500 text-white animate-pulse' };
     if (st === 'rework-done') return { mark: '✓', time: formatTime(dur), cls: 'bg-emerald-500 text-white' };
-    if (st === 'skipped') return { mark: '–', time: '該当なし', cls: 'bg-slate-100 text-slate-400' };
+    if (st === 'skipped') return task.profileSkipped
+      ? { mark: '規', time: '該当なし(規格)', cls: 'bg-indigo-50 text-indigo-400' }
+      : { mark: '–', time: '該当なし', cls: 'bg-slate-100 text-slate-400' };
     if (st === 'processing') return { mark: '▶', time: formatTime(dur), cls: 'bg-blue-600 text-white animate-pulse' };
     if (st === 'paused') return { mark: '⏸', time: formatTime(dur), cls: 'bg-amber-100 text-amber-700' };
     return { mark: '', time: '', cls: 'bg-white text-slate-300 border border-slate-200' };
@@ -9801,6 +9834,7 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
     const [newTemplateId, setNewTemplateId] = useState('');
     const [newModelInput, setNewModelInput] = useState('');
     const [collapsedEntries, setCollapsedEntries] = useState({}); // { entryIdx: true } で折りたたみ
+    const [profileStepOpen, setProfileStepOpen] = useState({}); // 工程プロファイルの詳細上書きを開いている step
 
     const qsList = useMemo(() => Object.values(qualityStandards || {}).sort((a, b) =>
         (a.standardNo || '').localeCompare(b.standardNo || '')), [qualityStandards]);
@@ -9938,6 +9972,32 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
         }
         const next = [...templateEntries];
         next[idx] = { ...next[idx], checklistItemsByStep: allItems };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+
+    // 型式別 工程プロファイル: { [stepId]: { enabled?, description?, pdfData?, images?, targetTime? } }
+    //   enabled=false → ロット作成時に該当なしで事前スキップ。undefined/空 は除去 (Firestore は undefined 不可)。
+    const updateStepProfile = (idx, stepId, patch) => {
+        if (!selectedQs) return;
+        const cur = { ...(templateEntries[idx]?.stepProfile || {}) };
+        const merged = { ...(cur[stepId] || {}), ...patch };
+        Object.keys(merged).forEach(k => { if (merged[k] === undefined || merged[k] === null) delete merged[k]; });
+        if (Object.keys(merged).length === 0) delete cur[stepId]; else cur[stepId] = merged;
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], stepProfile: cur };
+        writeTemplateEntries(selectedQs.id, next);
+    };
+    // 他の品質規格 (同じテンプレ) から工程プロファイルを丸ごとコピー (セミクロ→フルクロの差分編集を楽に)
+    const copyStepProfileFrom = (idx, fromQsId) => {
+        if (!selectedQs) return;
+        const fromQs = qualityStandards?.[fromQsId];
+        const myTplId = templateEntries[idx]?.templateId;
+        const fromRaw = (fromQs?.templates && fromQs.templates.length > 0) ? fromQs.templates : (fromQs?.templateId ? [fromQs] : []);
+        const fromEntry = fromRaw.find(e => e.templateId === myTplId) || fromRaw.find(e => !e.templateId) || fromRaw[0];
+        if (!fromEntry || !fromEntry.stepProfile || Object.keys(fromEntry.stepProfile).length === 0) { alert('コピー元にこのテンプレの工程プロファイルがありません'); return; }
+        if (!confirm('現在の工程プロファイルをコピー元で上書きします。よろしいですか？')) return;
+        const next = [...templateEntries];
+        next[idx] = { ...next[idx], stepProfile: { ...fromEntry.stepProfile } };
         writeTemplateEntries(selectedQs.id, next);
     };
 
@@ -10494,6 +10554,63 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
                                             })
                                         )}
                                     </div>
+                                )}
+                                {/* === 型式別 工程プロファイル: 使う/該当なし + 詳細/PDF/写真/目標時間 の型式別上書き === */}
+                                {tpl && (tpl.steps || []).length > 0 && (
+                                  <div className="mt-3 border-t-2 border-indigo-100 pt-2">
+                                    <div className="flex items-center justify-between mb-1 flex-wrap gap-1">
+                                      <div className="text-xs font-black text-indigo-700">🧩 工程プロファイル（この型式群で使う工程）</div>
+                                      <select className="text-[11px] border rounded px-1 py-0.5 bg-white" value="" onChange={(e)=>{ if(e.target.value){ copyStepProfileFrom(entryIdx, e.target.value); e.target.value=''; } }}>
+                                        <option value="">他の規格からコピー…</option>
+                                        {Object.values(qualityStandards||{}).filter(q=>q.id!==selectedQs.id).map(q=> <option key={q.id} value={q.id}>{q.standardNo} {q.name}</option>)}
+                                      </select>
+                                    </div>
+                                    <div className="text-[10px] text-slate-500 mb-1.5">「該当なし」にした工程はこの型式群のロット作成時に自動でスキップ（作業者は検査画面で解除可）。詳細/PDF/写真/目標時間も型式別に上書きできます。</div>
+                                    <div className="space-y-1">
+                                      {(tpl.steps||[]).map(step => {
+                                        const prof = entry.stepProfile?.[step.id] || {};
+                                        const enabled = prof.enabled !== false;
+                                        const pkey = `${entryIdx}_${step.id}`;
+                                        const open = !!profileStepOpen[pkey];
+                                        const isAuto = step.executionMode === 'batch' || (step.title||'').includes('自動');
+                                        const hasOv = !!(prof.description || prof.pdfData || (prof.images && prof.images.length) || prof.targetTime);
+                                        return (
+                                          <div key={step.id} className={`rounded border ${enabled ? 'border-slate-200 bg-white' : 'border-slate-300 bg-slate-100'}`}>
+                                            <div className="flex items-center gap-2 px-2 py-1">
+                                              <button onClick={()=>updateStepProfile(entryIdx, step.id, { enabled: enabled ? false : undefined })}
+                                                className={`text-[11px] font-bold px-2 py-0.5 rounded border whitespace-nowrap ${enabled ? 'bg-emerald-600 text-white border-emerald-700' : 'bg-slate-400 text-white border-slate-500'}`}>
+                                                {enabled ? '使う' : '該当なし'}
+                                              </button>
+                                              {isAuto && <span className="text-[9px] bg-purple-100 text-purple-700 px-1 rounded shrink-0">自動</span>}
+                                              <span className={`text-xs font-bold flex-1 truncate ${enabled ? 'text-slate-800' : 'text-slate-400 line-through'}`} title={step.title}>{step.title}</span>
+                                              {hasOv && <span className="text-[9px] text-indigo-500 shrink-0" title="型式別の上書きあり">●上書</span>}
+                                              <button onClick={()=>setProfileStepOpen(p=>({...p, [pkey]: !open}))} className="text-[10px] text-indigo-600 underline shrink-0">{open ? '閉じる' : '詳細'}</button>
+                                            </div>
+                                            {open && (
+                                              <div className="px-2 pb-2 space-y-1.5 border-t border-slate-100 pt-1.5 bg-slate-50">
+                                                <div>
+                                                  <label className="text-[10px] text-slate-500">詳細・注意事項（この型式用に上書き / 空=テンプレ標準）</label>
+                                                  <textarea value={prof.description || ''} onChange={(e)=>updateStepProfile(entryIdx, step.id, { description: e.target.value || undefined })} className="w-full text-xs border rounded p-1 h-14" placeholder="(空=テンプレ標準)"/>
+                                                </div>
+                                                <div className="flex items-center gap-2 flex-wrap">
+                                                  <label className="text-[10px] text-slate-500">目標時間(秒)</label>
+                                                  <input type="number" min="0" value={prof.targetTime ?? ''} onChange={(e)=>updateStepProfile(entryIdx, step.id, { targetTime: e.target.value === '' ? undefined : Math.max(0, Number(e.target.value)||0) })} className="w-20 text-xs border rounded p-1" placeholder="標準"/>
+                                                  <label className="text-[10px] text-indigo-600 underline cursor-pointer">PDF差替
+                                                    <input type="file" accept="application/pdf" className="hidden" onChange={async(e)=>{ const f=e.target.files?.[0]; if(f){ try{ const b=await getBase64(f); updateStepProfile(entryIdx, step.id, { pdfData: b }); alert('PDFを上書きしました'); }catch{ alert('PDFエラー'); } } e.target.value=''; }}/>
+                                                  </label>
+                                                  {prof.pdfData && <button onClick={()=>updateStepProfile(entryIdx, step.id, { pdfData: undefined })} className="text-[10px] text-rose-500 underline">PDF削除</button>}
+                                                  <label className="text-[10px] text-indigo-600 underline cursor-pointer">写真追加
+                                                    <input type="file" accept="image/*" className="hidden" onChange={async(e)=>{ const f=e.target.files?.[0]; if(f){ try{ const b=await getBase64(f); const url=await uploadImageToStorage(b,'qs-profile'); updateStepProfile(entryIdx, step.id, { images: [...(prof.images||[]), url] }); }catch{ alert('画像エラー'); } } e.target.value=''; }}/>
+                                                  </label>
+                                                  {(prof.images||[]).length>0 && <span className="text-[10px] text-slate-500">写真{prof.images.length}枚 <button onClick={()=>updateStepProfile(entryIdx, step.id, { images: undefined })} className="text-rose-500 underline">削除</button></span>}
+                                                </div>
+                                              </div>
+                                            )}
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
                                 )}
                             </div>
                         );
@@ -19302,7 +19419,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      }
 
      // 品質規格 / 型式オーバーライドを適用 (共通ヘルパー)
-     const { steps, appliedStandard } = applyQualityStandardToSteps(model, baseSteps, settings, templateId);
+     const { steps, appliedStandard, naStepIds } = applyQualityStandardToSteps(model, baseSteps, settings, templateId);
 
      // 台数を決定:
      //   編集時: 作業着手済 (tasks あり / processing/paused/completed) なら既存値を強制使用
@@ -19390,7 +19507,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
             steps: steps,
             totalWorkTime: 0,
             workStartTime: null,
-            tasks: {},
+            tasks: buildProfileSkippedTasks(steps, naStepIds, qty), // 型式別プロファイルの該当なし工程を事前スキップ
             stepTimes: {},
             interruptions: [],
             appliedStandard, // 適用された品質規格のスナップショット (null 可)
@@ -19948,7 +20065,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        for (const c of createLots) {
          const id = generateId();
          const baseSteps = templates.find(t => t.id === c.templateId)?.steps || DEMO_STEPS;
-         const { steps, appliedStandard } = applyQualityStandardToSteps(c.model, baseSteps, settings, c.templateId);
+         const { steps, appliedStandard, naStepIds } = applyQualityStandardToSteps(c.model, baseSteps, settings, c.templateId);
          const serials = Array.from({ length: c.quantity }, (_, i) => `#${i + 1}`);
          await saveData('lots', id, {
            id, batchId: generateId(),
@@ -19972,7 +20089,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            steps,
            totalWorkTime: 0,
            workStartTime: null,
-           tasks: {},
+           tasks: buildProfileSkippedTasks(steps, naStepIds, c.quantity), // 型式別プロファイルの該当なし工程を事前スキップ
            stepTimes: {},
            interruptions: [],
            appliedStandard,
@@ -20094,7 +20211,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          const template = templates.find(t => t.id === row.templateId);
          if (template?.steps) baseSteps = template.steps;
          // 品質規格 / 型式オーバーライドを適用 (共通ヘルパー: ロット登録画面と同じ挙動)
-         const { steps, appliedStandard } = applyQualityStandardToSteps(row.model, baseSteps, settings, row.templateId);
+         const { steps, appliedStandard, naStepIds } = applyQualityStandardToSteps(row.model, baseSteps, settings, row.templateId);
 
          if (existing) {
            // 既存ロットを上書き（作業中以外）
@@ -20105,7 +20222,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              unitSerialNumbers: row.serials,
              templateId: row.templateId, priority: row.priority,
              dueDate: row.dueDate, entryAt: row.entryAt, steps,
-             ...(isUntouched && appliedStandard ? { appliedStandard } : {})
+             ...(isUntouched && appliedStandard ? { appliedStandard } : {}),
+             ...(isUntouched && naStepIds && naStepIds.length > 0 ? { tasks: buildProfileSkippedTasks(steps, naStepIds, row.qty) } : {})
            };
            await saveData('lots', existing.id, updates);
            updateCount++;
@@ -20121,7 +20239,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              entryAt: row.entryAt, status: 'waiting', location: 'arrival',
              mapZoneId: null, x: 0, y: 0, workerId: null, createdAt: Date.now(),
              currentStepIndex: 0, steps, totalWorkTime: 0, workStartTime: null,
-             tasks: {}, stepTimes: {}, interruptions: [],
+             tasks: buildProfileSkippedTasks(steps, naStepIds, row.qty), stepTimes: {}, interruptions: [], // 型式別プロファイルの該当なし工程を事前スキップ
              appliedStandard, // 適用された品質規格のスナップショット
            };
            await saveData('lots', id, lot);
