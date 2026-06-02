@@ -6494,6 +6494,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const otherInts = otherLot.interruptions || [];
       const zoneName = mapZones.find(z => z.id === otherLot.mapZoneId)?.name || '';
       const worker = workers.find(w => w.id === otherLot.workerId)?.name || '';
+      // 「自分の作業」だけ対象: 現在の作業者(=自分)が担当する別ロットの自動測定のみ表示。
+      // 別の作業者の自動測定は表示しない (現場のノイズ防止・ユーザー要望)。
+      const myWorkerName = currentUserName || workers.find(w => w.id === lot.workerId)?.name || '';
+      const isMine = (lot.workerId && otherLot.workerId === lot.workerId) || (!!myWorkerName && worker === myWorkerName);
+      if (!isMine) return;
 
       // ① 自動工程の task が processing 状態
       otherSteps.forEach((step, sIdx) => {
@@ -6541,7 +6546,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       });
     });
     return list;
-  }, [lots, lot.id, mapZones, workers, otherAutoTick]);
+  }, [lots, lot.id, lot.workerId, mapZones, workers, currentUserName, otherAutoTick]);
 
   // === データ成熟度: 同テンプレの完了ロット数 (厳密モード推奨の判断材料) ===
   const templateDataMaturity = useMemo(() => {
