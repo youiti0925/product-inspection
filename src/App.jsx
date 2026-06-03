@@ -14,7 +14,7 @@ import {
   Brush, Type, Square, Circle, MoveDiagonal, Undo2, Mic, Sparkles, Image as ImageIcon,
   FileUp, FileJson, DownloadCloud, RefreshCw,
   User, Calendar, LogOut, Users, Edit, Grip, LayoutGrid, MapPin, Eye, Filter, List,
-  Bot, Zap, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool,
+  Bot, Zap, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool, Award,
   Bell, BellRing, Megaphone, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
   ListChecks, ArrowUpDown, Calculator, Ruler, MicOff, Printer, Coffee, ChevronDown,
   Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag
@@ -45,6 +45,8 @@ import {
 import { HelpManualModal, PRODUCT_HELP_SECTIONS } from './HelpManual.jsx';
 // 厳密モードの一元管理（型式×テンプレ・エビデンス・変更履歴）
 import { StrictModeManagerModal, computeStrictEvidence, strictComboKey } from './StrictModeManager.jsx';
+// スキルマップ（作業者×スキル：レベル＋回数）
+import { SkillMapView, DEFAULT_SKILLS } from './SkillMap.jsx';
 
 // 画像を Cloud Storage にアップロードして URL を返す。失敗時は base64 のまま返す (フォールバック)
 // 既存データ (base64 直保存) と互換: <img src={...}> は URL/base64 両方扱える
@@ -20874,12 +20876,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                <div className="flex bg-slate-100 rounded-lg p-1">
                  <button onClick={() => setOptimizeView('target')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'target' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Target className="w-4 h-4" /> 目標時間最適化</button>
                  <button onClick={() => setOptimizeView('strict')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'strict' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><ShieldCheck className="w-4 h-4" /> 厳密モード{strictReviewCount > 0 && <span className="bg-amber-400 text-white text-[9px] rounded-full w-4 h-4 flex items-center justify-center font-black">{strictReviewCount}</span>}</button>
+                 <button onClick={() => setOptimizeView('skill')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'skill' ? 'bg-white shadow text-orange-600' : 'text-slate-500 hover:text-slate-700'}`}><Award className="w-4 h-4" /> スキルマップ</button>
                </div>
-               <span className="text-xs text-slate-400">データから現場を最適化：まず<b>目標時間</b>を整え、順番が確立したら<b>厳密モード</b>で固定。</span>
+               <span className="text-xs text-slate-400">データから現場を最適化：<b>目標時間</b>→<b>厳密モード</b>→<b>スキル</b>。将来は空き人材・エリアから自動配置の土台に。</span>
              </div>
              <div className="flex-1 min-h-0 overflow-hidden">
                {optimizeView === 'target' && <ProcessInsightsTab lots={lots} workers={workers} customTargetTimes={settings.customTargetTimes || {}} onSaveSettings={saveSettings} targetTimeHistory={settings.targetTimeHistory || []} settings={settings} saveData={saveData} currentUserName={currentUserName} />}
                {optimizeView === 'strict' && (currentUserName === '管理者' ? <StrictModeManagerModal embedded lots={lots} templates={templates} rules={settings.strictModeRules || {}} history={strictModeHistory} currentUserName={currentUserName} maturityUnits={strictMaturityUnits} onSetMaturity={(n) => saveSettings({ strictMaturityUnits: n })} onDecide={handleStrictDecide} /> : <div className="bg-white rounded-xl border p-8 text-center text-slate-400">厳密モードの管理は管理者のみです。ヘッダー左上で「管理者」を選択してください。</div>)}
+               {optimizeView === 'skill' && <SkillMapView lots={lots} templates={templates} workers={workers} skills={settings.skills && settings.skills.length ? settings.skills : DEFAULT_SKILLS} workerSkills={settings.workerSkills || {}} canEdit={currentUserName === '管理者'} onSaveSkills={(list) => saveSettings({ skills: list })} onSaveWorkerSkill={(wn, sid, level) => { const ws = settings.workerSkills || {}; saveSettings({ workerSkills: { ...ws, [wn]: { ...(ws[wn] || {}), [sid]: level } } }); }} onSaveTemplateSkills={(tplId, reqSkills) => saveData('templates', tplId, { requiredSkills: reqSkills })} />}
              </div>
            </div>
          )}
