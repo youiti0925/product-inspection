@@ -20493,16 +20493,17 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      }).length;
    }, [lots]);
 
-   // === 厳密モード: 型式×テンプレ 一元管理（エビデンスベース） ===
-   // 「件数が貯まった」では推奨しない。実時刻のある完了ロットで作業順がテンプレ順と
-   // 一致した割合(順番の一貫性)が十分(good)な組み合わせだけを「要レビュー」として数える。
+   // === 厳密モード: 型式×テンプレ 一元管理（エビデンスベース・台数） ===
+   // 「台数が貯まった」だけでは推奨しない。実時刻のある“台”で作業順がテンプレ順と一致した
+   // 割合(順番の一貫性)が十分(good)な組み合わせだけを「要レビュー」として数える。
    const strictRules = settings.strictModeRules || {};
+   const strictMaturityUnits = settings.strictMaturityUnits || 5; // 確立とみなす台数(管理者が設定)
    const strictReviewCount = useMemo(() => {
      try {
-       const rows = computeStrictEvidence(lots, templates);
+       const rows = computeStrictEvidence(lots, templates, strictMaturityUnits);
        return rows.filter(r => r.quality === 'good' && strictRules[r.key]?.enabled == null).length;
      } catch { return 0; }
-   }, [lots, templates, settings.strictModeRules]);
+   }, [lots, templates, settings.strictModeRules, strictMaturityUnits]);
    const [showStrictManager, setShowStrictManager] = useState(false);
    const [strictModeHistory, setStrictModeHistory] = useState([]);
    // 変更履歴は管理画面を開いたときだけ購読（全端末共有・監査ログ）
@@ -20520,7 +20521,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      const key = row.key;
      const prev = (settings.strictModeRules || {})[key];
      const old = prev?.enabled === undefined ? null : prev.enabled;
-     const evidence = { completedCount: row.completedCount, timedCount: row.timedCount, consistentCount: row.consistentCount, consistencyPct: row.consistencyPct, quality: row.quality };
+     const evidence = { completedUnits: row.completedUnits, timedUnits: row.timedUnits, consistentUnits: row.consistentUnits, consistencyPct: row.consistencyPct, quality: row.quality, stepStats: (row.detail?.stepStats || []).map(s => ({ title: s.title, mean: s.mean, std: s.std, n: s.n })) };
      const rule = { enabled, decidedBy: currentUserName || '?', decidedAt: Date.now(), evidence };
      saveSettings({ strictModeRules: { ...(settings.strictModeRules || {}), [key]: rule } });
      saveData('strict_mode_history', generateId(), {
@@ -20952,6 +20953,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            rules={settings.strictModeRules || {}}
            history={strictModeHistory}
            currentUserName={currentUserName}
+           maturityUnits={strictMaturityUnits}
+           onSetMaturity={(n) => saveSettings({ strictMaturityUnits: n })}
            onDecide={handleStrictDecide}
            onClose={() => setShowStrictManager(false)}
          />

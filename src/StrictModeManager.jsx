@@ -1,66 +1,71 @@
 // =============================================================================
 //  StrictModeManager.jsx — 厳密モードの一元管理（型式 × テンプレ）
 // -----------------------------------------------------------------------------
-//  ・単位は「型式(model) × テンプレ(templateId)」の組み合わせ。これで「どの順番を
-//    強制するか」が一意に決まる。
-//  ・「件数が貯まった」では推奨しない。エビデンス＝実時刻のある完了ロットで、実際の
-//    作業順がテンプレ定義順と一致した割合(順番の一貫性)を見て、管理者が判断する。
-//  ・どの組み合わせが 厳密/ガイド/未設定 か、エビデンス、最終変更(誰・いつ)を表で一覧。
-//  ・変更は strict_mode_history に追記(いつ・誰・何を・どのエビデンスで)。
+//  厳密モード＝「1台目から順番」を強制し“飛ばし”を防ぐモード。目的は
+//   ①時間データの信頼性(全員同じ順番でないと比較・改善に使えない)
+//   ②作業漏れ・検査漏れ防止 ③品質の再現性 ④不慣れな人の誘導。
+//  ただし「順番が確立・安定した工程」だけに使うべき(未確立で強制すると融通が利かず逆効果)。
+//  → だから「実際に同じ順番で作業されているか(順番の一貫性)」を“台数(台)”ベースで測り、
+//    確立したものだけ厳密に、揺れてるものはガイドに留める。
+//  ・件数(台数)が揃っただけでは推奨しない。バラつき・作業の流れを見て管理者が納得して決める。
+//  ・決定は settings.strictModeRules[combo]、監査は strict_mode_history に追記。
 // =============================================================================
 import React, { useState, useMemo } from 'react';
-import { ShieldCheck, X, Search, History, Lock, Unlock, Minus, Info, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { ShieldCheck, X, Search, History, Lock, Unlock, Info, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Minus, Cpu, Hand } from 'lucide-react';
 
 export const STRICT_COMBO_SEP = '␟'; // 区切り(通常文字と衝突しない記号)
 export const strictComboKey = (model, templateId) => `${model || ''}${STRICT_COMBO_SEP}${templateId || ''}`;
 export const parseStrictCombo = (key) => { const i = (key || '').indexOf(STRICT_COMBO_SEP); return i < 0 ? [key, ''] : [key.slice(0, i), key.slice(i + 1)]; };
 
-// 1ロットの「時刻のある工程」を返す [{i, start}]
-function lotTimedSteps(lot) {
-  const steps = lot.steps || [], tasks = lot.tasks || {}, q = lot.quantity || 1;
+// 1台(unit u)の「時刻のある工程」を返す [{i,title,category,start,end,dur,isAuto}]
+function unitTimedSteps(lot, u) {
+  const steps = lot.steps || [], tasks = lot.tasks || {};
   const out = [];
   steps.forEach((s, i) => {
-    let min = Infinity;
-    for (let u = 0; u < q; u++) {
-      const t = tasks[`${s.id}-${u}`] || tasks[`${i}-${u}`];
-      const ts = t && (t.firstStartTime || t.startTime);
-      if (ts && ts < min) min = ts;
-    }
-    if (min !== Infinity) out.push({ i, start: min });
+    const t = tasks[`${s.id}-${u}`] || tasks[`${i}-${u}`];
+    const st = t && (t.firstStartTime || t.startTime);
+    if (!st) return;
+    out.push({ i, title: s.title, category: s.category, start: st, end: t.endTime || (st + (t.duration || 0) * 1000), dur: t.duration || 0, isAuto: s.executionMode === 'batch' || (s.title || '').includes('自動') });
   });
   return out;
 }
+const stdev = (a) => { if (a.length < 2) return 0; const m = a.reduce((x, y) => x + y, 0) / a.length; return Math.round(Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / a.length)); };
 
-// === エビデンス算出(純粋関数)。完了ロットを 型式×テンプレ ごとに集計 ===
-export function computeStrictEvidence(lots, templates) {
+// === エビデンス算出(純粋関数・台数ベース)。完了ロットを 型式×テンプレ ごとに集計 ===
+export function computeStrictEvidence(lots, templates, maturityUnits = 5) {
   const tName = (id) => (templates || []).find(t => t.id === id)?.name || '(テンプレ不明)';
   const completed = (lots || []).filter(l => l.status === 'completed');
   const groups = {};
-  completed.forEach(l => {
-    const key = strictComboKey(l.model || '(型式空)', l.templateId || '');
-    (groups[key] = groups[key] || []).push(l);
-  });
+  completed.forEach(l => { const key = strictComboKey(l.model || '(型式空)', l.templateId || ''); (groups[key] = groups[key] || []).push(l); });
   const rows = Object.entries(groups).map(([key, g]) => {
     const [model, tid] = parseStrictCombo(key);
-    let timedCount = 0, consistentCount = 0;
+    let completedUnits = 0, timedUnits = 0, consistentUnits = 0;
+    const durByStep = {};       // title -> [dur...]
+    const samples = [];         // 代表台のタイムライン (最大6台)
     g.forEach(lot => {
-      const arr = lotTimedSteps(lot);
-      if (arr.length < 2) return;            // 順番を語るには2工程以上の実時刻が要る
-      timedCount++;
-      const actual = [...arr].sort((a, b) => a.start - b.start).map(x => x.i);
-      const tmpl = [...arr].sort((a, b) => a.i - b.i).map(x => x.i);
-      if (JSON.stringify(actual) === JSON.stringify(tmpl)) consistentCount++;
+      const q = lot.quantity || 1; completedUnits += q;
+      for (let u = 0; u < q; u++) {
+        const arr = unitTimedSteps(lot, u);
+        arr.forEach(x => { (durByStep[x.title] = durByStep[x.title] || []).push(x.dur); });
+        if (arr.length < 2) continue;
+        timedUnits++;
+        const actual = [...arr].sort((a, b) => a.start - b.start).map(x => x.i);
+        const tmpl = [...arr].sort((a, b) => a.i - b.i).map(x => x.i);
+        const ok = JSON.stringify(actual) === JSON.stringify(tmpl);
+        if (ok) consistentUnits++;
+        if (samples.length < 6) samples.push({ orderNo: lot.orderNo, unitNo: u + 1, ok, steps: arr.map(x => ({ title: x.title, dur: x.dur, isAuto: x.isAuto, start: x.start, end: x.end })) });
+      }
     });
-    const consistencyPct = timedCount > 0 ? Math.round(consistentCount / timedCount * 100) : null;
-    // 判定: 十分なデータ(実時刻3件以上)かつ一貫性80%以上 → 推奨検討可。それ未満は保留/根拠なし。
-    let quality = 'none';                    // none(根拠なし) / thin(データ薄) / unstable(ばらつき) / good(安定)
-    if (timedCount === 0) quality = 'none';
-    else if (timedCount < 3) quality = 'thin';
+    const consistencyPct = timedUnits > 0 ? Math.round(consistentUnits / timedUnits * 100) : null;
+    const stepStats = Object.entries(durByStep).map(([title, a]) => ({ title, n: a.length, mean: Math.round(a.reduce((x, y) => x + y, 0) / a.length), std: stdev(a) }));
+    let quality = 'none';
+    if (timedUnits === 0) quality = 'none';
+    else if (timedUnits < maturityUnits) quality = 'thin';
     else if (consistencyPct >= 80) quality = 'good';
     else quality = 'unstable';
-    return { key, model, templateId: tid, templateName: tName(tid), completedCount: g.length, timedCount, consistentCount, consistencyPct, quality };
+    return { key, model, templateId: tid, templateName: tName(tid), completedUnits, timedUnits, consistentUnits, consistencyPct, quality, detail: { stepStats, samples } };
   });
-  rows.sort((a, b) => (b.timedCount - a.timedCount) || (b.completedCount - a.completedCount) || a.model.localeCompare(b.model));
+  rows.sort((a, b) => (b.timedUnits - a.timedUnits) || (b.completedUnits - a.completedUnits) || a.model.localeCompare(b.model));
   return rows;
 }
 
@@ -70,7 +75,6 @@ const QUALITY = {
   thin:     { cls: 'bg-amber-100 text-amber-800 border-amber-300',       Icon: Info,          label: 'データ薄' },
   none:     { cls: 'bg-slate-100 text-slate-500 border-slate-300',       Icon: Minus,         label: '根拠なし' },
 };
-
 const fmtWhen = (ts) => { if (!ts) return '-'; const d = new Date(ts); return isNaN(d) ? '-' : `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
 
 function StateBadge({ enabled }) {
@@ -79,33 +83,109 @@ function StateBadge({ enabled }) {
   return <span className="text-xs font-bold text-slate-400">未設定</span>;
 }
 
-export function StrictModeManagerModal({ lots, templates, rules = {}, history = [], currentUserName = '', onDecide, onClose }) {
-  const [view, setView] = useState('table');          // 'table' | 'history'
+// 1台の作業の流れ(ミニ・タイムライン)。各工程を実開始〜終了でバー表示。手動=青/自動=紫。
+function UnitTimeline({ steps }) {
+  if (!steps || steps.length === 0) return null;
+  const t0 = Math.min(...steps.map(s => s.start)), t1 = Math.max(...steps.map(s => s.end));
+  const span = Math.max(1, t1 - t0);
+  return (
+    <div className="space-y-0.5">
+      {steps.map((s, i) => {
+        const left = (s.start - t0) / span * 100, width = Math.max(1.2, (s.end - s.start) / span * 100);
+        return (
+          <div key={i} className="flex items-center gap-2 text-[10px]">
+            <div className="w-24 truncate text-slate-600 shrink-0 text-right" title={s.title}>{s.title}</div>
+            <div className="flex-1 relative h-3 bg-slate-100 rounded overflow-hidden">
+              <div className={`absolute top-0 h-3 rounded ${s.isAuto ? 'bg-violet-500' : 'bg-blue-500'}`} style={{ left: left + '%', width: width + '%' }} title={`${s.dur}s`} />
+            </div>
+            <div className="w-9 text-right text-slate-500 shrink-0 font-mono">{s.dur}s</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// 組み合わせのエビデンス詳細(展開時)。工程ごとのバラつき + 台ごとの作業の流れ。
+function EvidenceDetail({ row }) {
+  const { stepStats, samples } = row.detail;
+  return (
+    <div className="bg-slate-50 px-4 py-3 border-t border-slate-200">
+      {row.timedUnits === 0 ? (
+        <div className="text-sm text-slate-500">この組み合わせには<b>実時刻データ（作業の開始・終了の記録）がありません</b>。順番が安定しているかを判断する根拠がないため、厳密モードは推奨できません。まず実際に時間記録された台が貯まるのを待ってください。</div>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          {/* 工程ごとの時間バラつき */}
+          <div>
+            <div className="text-xs font-black text-slate-700 mb-1.5">工程ごとの時間のバラつき（実時刻 {row.timedUnits} 台ぶん）</div>
+            <div className="space-y-1">
+              {stepStats.map(s => {
+                const ratio = s.mean > 0 ? Math.min(1, s.std / s.mean) : 0; // バラつき/平均
+                return (
+                  <div key={s.title} className="flex items-center gap-2 text-[11px]">
+                    <div className="w-28 truncate text-slate-600" title={s.title}>{s.title}</div>
+                    <div className="flex-1 flex items-center gap-1">
+                      <div className="flex-1 h-2 bg-slate-200 rounded overflow-hidden"><div className={`h-2 ${ratio > 0.4 ? 'bg-rose-400' : ratio > 0.15 ? 'bg-amber-400' : 'bg-emerald-400'}`} style={{ width: Math.max(4, ratio * 100) + '%' }} /></div>
+                    </div>
+                    <div className="w-32 text-right font-mono text-slate-600 shrink-0">平均{s.mean}s <span className="text-slate-400">±{s.std}s</span></div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">※ バーが短い(緑)＝時間が安定。長い(赤)＝台ごとにバラつき大。</div>
+          </div>
+          {/* 台ごとの作業の流れ */}
+          <div>
+            <div className="text-xs font-black text-slate-700 mb-1.5 flex items-center gap-2">作業の流れ（代表 {samples.length} 台）
+              <span className="inline-flex items-center gap-1 text-[10px] text-slate-500"><span className="w-2.5 h-2.5 rounded bg-blue-500 inline-block" /><Hand className="w-3 h-3" />手動</span>
+              <span className="inline-flex items-center gap-1 text-[10px] text-slate-500"><span className="w-2.5 h-2.5 rounded bg-violet-500 inline-block" /><Cpu className="w-3 h-3" />自動測定</span>
+            </div>
+            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+              {samples.map((sm, i) => (
+                <div key={i} className="bg-white rounded border border-slate-200 p-2">
+                  <div className="text-[10px] font-bold text-slate-500 mb-1 flex items-center gap-2">
+                    台{sm.unitNo}（指図{sm.orderNo}）
+                    {sm.ok ? <span className="text-emerald-600 inline-flex items-center gap-0.5"><CheckCircle2 className="w-3 h-3" />テンプレ順どおり</span> : <span className="text-rose-600 inline-flex items-center gap-0.5"><AlertTriangle className="w-3 h-3" />順番が違う</span>}
+                  </div>
+                  <UnitTimeline steps={sm.steps} />
+                </div>
+              ))}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">※ 左から時間順。バーの位置＝実際にいつ作業したか。自動測定(紫)中に他工程が動いていれば並行作業。</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function StrictModeManagerModal({ lots, templates, rules = {}, history = [], currentUserName = '', maturityUnits = 5, onSetMaturity, onDecide, onClose }) {
+  const [view, setView] = useState('table');
   const [q, setQ] = useState('');
   const [onlyUndecided, setOnlyUndecided] = useState(false);
+  const [expanded, setExpanded] = useState({}); // key -> bool
 
-  const rows = useMemo(() => computeStrictEvidence(lots, templates), [lots, templates]);
-  const filtered = useMemo(() => {
+  const rows = useMemo(() => computeStrictEvidence(lots, templates, maturityUnits), [lots, templates, maturityUnits]);
+  const filtered = useMemo(() => rows.filter(r => {
     const kw = q.trim();
-    return rows.filter(r => {
-      if (kw && !(`${r.model} ${r.templateName}`.includes(kw))) return false;
-      if (onlyUndecided && rules[r.key]?.enabled != null) return false;
-      return true;
-    });
-  }, [rows, q, onlyUndecided, rules]);
+    if (kw && !(`${r.model} ${r.templateName}`.includes(kw))) return false;
+    if (onlyUndecided && rules[r.key]?.enabled != null) return false;
+    return true;
+  }), [rows, q, onlyUndecided, rules]);
 
   const decided = rows.filter(r => rules[r.key]?.enabled != null).length;
   const strictOn = rows.filter(r => rules[r.key]?.enabled === true).length;
+  const goodUndecided = rows.filter(r => r.quality === 'good' && rules[r.key]?.enabled == null).length;
+  const toggle = (k) => setExpanded(e => ({ ...e, [k]: !e[k] }));
 
   return (
     <div className="fixed inset-0 z-[120] bg-slate-900/60 flex items-stretch justify-center md:p-4" onClick={onClose}>
-      <div className="bg-white w-full md:max-w-6xl md:rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-        {/* ヘッダー */}
+      <div className="bg-white w-full md:max-w-[1100px] md:rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className="shrink-0 bg-gradient-to-r from-rose-700 to-rose-600 text-white px-5 py-3 flex items-center gap-3">
           <ShieldCheck className="w-6 h-6" />
           <div className="flex-1 min-w-0">
             <div className="font-black text-lg leading-tight">厳密モード 一元管理（型式 × テンプレ）</div>
-            <div className="text-[11px] text-rose-100">組み合わせ {rows.length} 件 ／ 決定済み {decided} 件（厳密 {strictOn}）。件数ではなく「順番の一貫性」で判断してください。</div>
+            <div className="text-[11px] text-rose-100">目的＝確立した順番を守らせ、データの信頼性・作業漏れ防止・品質安定。<b>台数</b>と<b>順番の一貫性・バラつき</b>を見て、確立した組み合わせだけ厳密に。</div>
           </div>
           <div className="flex bg-white/15 rounded-lg p-0.5">
             <button onClick={() => setView('table')} className={`px-3 py-1.5 rounded text-xs font-bold ${view === 'table' ? 'bg-white text-rose-700' : 'text-white'}`}>管理表</button>
@@ -116,26 +196,26 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
 
         {view === 'table' ? (
           <>
-            {/* ツール */}
             <div className="shrink-0 px-4 py-2 border-b border-slate-200 bg-slate-50 flex flex-wrap items-center gap-3">
               <div className="relative">
                 <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                <input value={q} onChange={e => setQ(e.target.value)} placeholder="型式・テンプレで絞り込み" className="pl-8 pr-2 py-1.5 text-sm rounded-lg border border-slate-300 outline-none focus:border-rose-500 w-64" />
+                <input value={q} onChange={e => setQ(e.target.value)} placeholder="型式・テンプレで絞り込み" className="pl-8 pr-2 py-1.5 text-sm rounded-lg border border-slate-300 outline-none focus:border-rose-500 w-56" />
               </div>
-              <label className="flex items-center gap-1.5 text-sm font-bold text-slate-600 cursor-pointer">
-                <input type="checkbox" checked={onlyUndecided} onChange={e => setOnlyUndecided(e.target.checked)} /> 未設定のみ
+              <label className="flex items-center gap-1.5 text-sm font-bold text-slate-600 cursor-pointer"><input type="checkbox" checked={onlyUndecided} onChange={e => setOnlyUndecided(e.target.checked)} /> 未設定のみ</label>
+              <label className="flex items-center gap-1.5 text-sm font-bold text-slate-600">確立とみなす台数:
+                <input type="number" min="1" max="999" value={maturityUnits} onChange={e => onSetMaturity && onSetMaturity(Math.max(1, Math.min(999, Number(e.target.value) || 1)))} className="border border-slate-300 rounded px-2 py-1 text-sm w-16" /> 台
               </label>
-              <div className="ml-auto text-[11px] text-slate-500 flex items-center gap-1"><Info className="w-3.5 h-3.5" />エビデンス＝実時刻のある完了ロットで作業順がテンプレ順と一致した割合</div>
+              <div className="ml-auto text-[11px] text-slate-500">決定済み {decided}（厳密 {strictOn}）{goodUndecided > 0 && <span className="ml-1 text-emerald-700 font-bold">・確立し未設定 {goodUndecided}</span>}</div>
             </div>
 
-            {/* 表 */}
             <div className="flex-1 overflow-auto">
               <table className="w-full text-sm border-collapse">
                 <thead className="sticky top-0 bg-slate-100 z-10">
                   <tr className="text-left text-slate-700">
+                    <th className="px-2 py-2 font-black border-b border-slate-300 w-6"></th>
                     <th className="px-3 py-2 font-black border-b border-slate-300">型式</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300">テンプレ（工程の並び）</th>
-                    <th className="px-3 py-2 font-black border-b border-slate-300 text-center">完了</th>
+                    <th className="px-3 py-2 font-black border-b border-slate-300 text-center">完了台数</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300">エビデンス（順番の一貫性）</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300 text-center">状態</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300">最終変更</th>
@@ -144,45 +224,44 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
                 </thead>
                 <tbody>
                   {filtered.map(r => {
-                    const rule = rules[r.key];
-                    const Q = QUALITY[r.quality];
+                    const rule = rules[r.key]; const Q = QUALITY[r.quality]; const isOpen = !!expanded[r.key];
                     return (
-                      <tr key={r.key} className="border-b border-slate-100 hover:bg-rose-50/40 align-top">
-                        <td className="px-3 py-2 font-bold text-slate-800 whitespace-nowrap">{r.model}</td>
-                        <td className="px-3 py-2 text-slate-600">{r.templateName}</td>
-                        <td className="px-3 py-2 text-center font-mono text-slate-700">{r.completedCount}</td>
-                        <td className="px-3 py-2">
-                          <div className="flex items-center gap-2">
-                            <span className={`inline-flex items-center gap-1 text-[11px] font-black px-1.5 py-0.5 rounded border ${Q.cls}`}><Q.Icon className="w-3 h-3" />{Q.label}</span>
-                            <span className="text-xs text-slate-600">
-                              {r.timedCount > 0 ? `実時刻 ${r.timedCount} 件中 ${r.consistentCount} 件が順番どおり（${r.consistencyPct}%）` : '実時刻データなし'}
-                            </span>
-                          </div>
-                        </td>
-                        <td className="px-3 py-2 text-center"><StateBadge enabled={rule?.enabled} /></td>
-                        <td className="px-3 py-2 text-[11px] text-slate-500 whitespace-nowrap">
-                          {rule?.decidedAt ? <>{rule.decidedBy || '?'}<br />{fmtWhen(rule.decidedAt)}</> : '-'}
-                        </td>
-                        <td className="px-3 py-2">
-                          <div className="flex gap-1 justify-center">
-                            <button title="この組み合わせを厳密(順番強制)に" onClick={() => onDecide(r, true)} className={`px-2 py-1 rounded text-[11px] font-bold border ${rule?.enabled === true ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-700 border-rose-300 hover:bg-rose-50'}`}>厳密</button>
-                            <button title="ガイド(警告のみ・飛ばし可)に" onClick={() => onDecide(r, false)} className={`px-2 py-1 rounded text-[11px] font-bold border ${rule?.enabled === false ? 'bg-slate-600 text-white border-slate-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>ガイド</button>
-                            {rule?.enabled != null && <button title="未設定に戻す" onClick={() => onDecide(r, null)} className="px-2 py-1 rounded text-[11px] font-bold border bg-white text-slate-400 border-slate-200 hover:bg-slate-50">解除</button>}
-                          </div>
-                        </td>
-                      </tr>
+                      <React.Fragment key={r.key}>
+                        <tr className="border-b border-slate-100 hover:bg-rose-50/40 align-top">
+                          <td className="px-2 py-2"><button onClick={() => toggle(r.key)} className="text-slate-400 hover:text-rose-600" title="エビデンスを見る">{isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}</button></td>
+                          <td className="px-3 py-2 font-bold text-slate-800 whitespace-nowrap">{r.model}</td>
+                          <td className="px-3 py-2 text-slate-600">{r.templateName}</td>
+                          <td className="px-3 py-2 text-center font-mono text-slate-700">{r.completedUnits}台</td>
+                          <td className="px-3 py-2">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`inline-flex items-center gap-1 text-[11px] font-black px-1.5 py-0.5 rounded border ${Q.cls}`}><Q.Icon className="w-3 h-3" />{Q.label}</span>
+                              <span className="text-xs text-slate-600">{r.timedUnits > 0 ? `実時刻 ${r.timedUnits}台中 ${r.consistentUnits}台が順番どおり（${r.consistencyPct}%）` : '実時刻データなし'}</span>
+                              <button onClick={() => toggle(r.key)} className="text-[11px] text-rose-600 hover:underline font-bold">{isOpen ? '閉じる' : '根拠を見る▼'}</button>
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 text-center"><StateBadge enabled={rule?.enabled} /></td>
+                          <td className="px-3 py-2 text-[11px] text-slate-500 whitespace-nowrap">{rule?.decidedAt ? <>{rule.decidedBy || '?'}<br />{fmtWhen(rule.decidedAt)}</> : '-'}</td>
+                          <td className="px-3 py-2">
+                            <div className="flex gap-1 justify-center">
+                              <button title="この組み合わせを厳密(順番強制)に" onClick={() => onDecide(r, true)} className={`px-2 py-1 rounded text-[11px] font-bold border ${rule?.enabled === true ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-700 border-rose-300 hover:bg-rose-50'}`}>厳密</button>
+                              <button title="ガイド(警告のみ・飛ばし可)に" onClick={() => onDecide(r, false)} className={`px-2 py-1 rounded text-[11px] font-bold border ${rule?.enabled === false ? 'bg-slate-600 text-white border-slate-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>ガイド</button>
+                              {rule?.enabled != null && <button title="未設定に戻す" onClick={() => onDecide(r, null)} className="px-2 py-1 rounded text-[11px] font-bold border bg-white text-slate-400 border-slate-200 hover:bg-slate-50">解除</button>}
+                            </div>
+                          </td>
+                        </tr>
+                        {isOpen && <tr><td colSpan={8} className="p-0"><EvidenceDetail row={r} /></td></tr>}
+                      </React.Fragment>
                     );
                   })}
-                  {filtered.length === 0 && <tr><td colSpan={7} className="text-center py-10 text-slate-400">該当する組み合わせがありません</td></tr>}
+                  {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-slate-400">該当する組み合わせがありません</td></tr>}
                 </tbody>
               </table>
             </div>
             <div className="shrink-0 px-4 py-2 border-t border-slate-200 bg-slate-50 text-[11px] text-slate-500">
-              💡 「厳密」＝この型式×テンプレは既定で「1台目から順番」を強制（作業者は現場で切替も可）。「ガイド」＝警告のみで飛ばし可。判断は<b>エビデンス</b>を見て。データが薄い／根拠なしのまま厳密にするのは非推奨です。
+              💡 「根拠を見る」で、台ごとの作業の流れ・工程ごとの時間バラつきを確認 → 納得して「厳密／ガイド」を選択。決定時のエビデンスは変更履歴に残ります。データが薄い／ばらつき大のまま厳密にするのは非推奨。
             </div>
           </>
         ) : (
-          /* 変更履歴 */
           <div className="flex-1 overflow-auto">
             <table className="w-full text-sm border-collapse">
               <thead className="sticky top-0 bg-slate-100 z-10">
@@ -204,7 +283,7 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
                       <td className="px-3 py-2 font-bold text-slate-700 whitespace-nowrap">{h.by || '?'}</td>
                       <td className="px-3 py-2 text-slate-700">{h.model} <span className="text-slate-400">×</span> {h.templateName || h.templateId}</td>
                       <td className="px-3 py-2 whitespace-nowrap"><span className="text-slate-400">{lbl(h.old)}</span> <span className="text-slate-400">→</span> <b className={h.new === true ? 'text-rose-700' : 'text-slate-700'}>{lbl(h.new)}</b></td>
-                      <td className="px-3 py-2 text-[11px] text-slate-600">{ev ? `完了${ev.completedCount}・実時刻${ev.timedCount}件中${ev.consistentCount}件一致${ev.consistencyPct != null ? `(${ev.consistencyPct}%)` : ''}` : '-'}</td>
+                      <td className="px-3 py-2 text-[11px] text-slate-600">{ev ? `完了${ev.completedUnits ?? ev.completedCount ?? '?'}台・実時刻${ev.timedUnits ?? ev.timedCount ?? '?'}台中${ev.consistentUnits ?? ev.consistentCount ?? '?'}台一致${(ev.consistencyPct != null) ? `(${ev.consistencyPct}%)` : ''}` : '-'}</td>
                     </tr>
                   );
                 })}
