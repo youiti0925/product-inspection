@@ -9,7 +9,7 @@
 //  ・このデータは将来の「自動配置(空いてる得意な人へ)」の土台になる。
 // =============================================================================
 import React, { useState, useMemo } from 'react';
-import { Users, Plus, Trash2, Settings as Cog, ChevronDown, ChevronRight, Award, X } from 'lucide-react';
+import { Users, Plus, Trash2, Settings as Cog, ChevronDown, ChevronUp, ChevronRight, Award, X } from 'lucide-react';
 
 export const DEFAULT_SKILLS = [
   { id: 'sk_rot', name: '回転分割' },
@@ -90,18 +90,23 @@ export function SkillMapView({ lots, templates, workers = [], skills, workerSkil
             {configTab === 'kinds' ? (
               <div>
                 <div className="flex gap-2 mb-2">
-                  <input value={newSkill} onChange={e => setNewSkill(e.target.value)} placeholder="新しいスキル種別名" className="border rounded px-2 py-1 text-sm flex-1" />
+                  <input value={newSkill} onChange={e => setNewSkill(e.target.value)} placeholder="新しいスキル種別名" className="border rounded px-2 py-1 text-sm flex-1" onKeyDown={e => { if (e.key === 'Enter') { const n = newSkill.trim(); if (!n) return; onSaveSkills([...(skillList), { id: 'sk_' + Date.now().toString(36), name: n }]); setNewSkill(''); } }} />
                   <button onClick={() => { const n = newSkill.trim(); if (!n) return; onSaveSkills([...(skillList), { id: 'sk_' + Date.now().toString(36), name: n }]); setNewSkill(''); }} className="bg-orange-500 hover:bg-orange-600 text-white px-3 py-1 rounded text-sm font-bold flex items-center gap-1"><Plus className="w-3.5 h-3.5" />追加</button>
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  {skillList.map(s => (
-                    <span key={s.id} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-200 rounded-full pl-3 pr-1 py-1 text-sm">
-                      {s.name}
-                      <button onClick={() => { if (confirm(`スキル「${s.name}」を削除しますか？`)) onSaveSkills(skillList.filter(x => x.id !== s.id)); }} className="text-slate-400 hover:text-rose-600 p-0.5"><X className="w-3.5 h-3.5" /></button>
-                    </span>
+                <div className="space-y-1">
+                  {skillList.map((s, i) => (
+                    <div key={s.id} className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded px-2 py-1">
+                      <span className="text-[10px] text-slate-400 w-5 text-center">{i + 1}</span>
+                      <div className="flex flex-col leading-none">
+                        <button title="上へ" disabled={i === 0} onClick={() => { const a = [...skillList]; [a[i - 1], a[i]] = [a[i], a[i - 1]]; onSaveSkills(a); }} className="text-slate-400 hover:text-orange-600 disabled:opacity-20"><ChevronUp className="w-4 h-4" /></button>
+                        <button title="下へ" disabled={i === skillList.length - 1} onClick={() => { const a = [...skillList]; [a[i + 1], a[i]] = [a[i], a[i + 1]]; onSaveSkills(a); }} className="text-slate-400 hover:text-orange-600 disabled:opacity-20"><ChevronDown className="w-4 h-4" /></button>
+                      </div>
+                      <input defaultValue={s.name} onBlur={e => { const v = e.target.value.trim(); if (!v || v === s.name) { e.target.value = s.name; return; } onSaveSkills(skillList.map(x => x.id === s.id ? { ...x, name: v } : x)); }} className="border border-slate-200 rounded px-2 py-1 text-sm flex-1 font-bold text-slate-700" title="名前を編集（入力後フォーカスを外すと保存）" />
+                      <button onClick={() => { if (confirm(`スキル「${s.name}」を削除しますか？`)) onSaveSkills(skillList.filter(x => x.id !== s.id)); }} className="text-slate-400 hover:text-rose-600 p-1"><Trash2 className="w-4 h-4" /></button>
+                    </div>
                   ))}
                 </div>
-                <div className="text-[10px] text-slate-400 mt-2">※ 既定: 回転分割/傾斜分割/回転軸一般精度/傾斜回転軸一般精度/ファナック/メルダス/ブラザー。自由に追加・削除できます。</div>
+                <div className="text-[10px] text-slate-400 mt-2">※ ▲▼で並び替え（表の列順に反映）／名前は直接編集（フォーカスを外すと保存）／既定の種別も自由に変更できます。</div>
               </div>
             ) : (
               <div>
