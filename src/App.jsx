@@ -43,6 +43,8 @@ import {
 
 // 「❓使い方」全画面マニュアル
 import { HelpManualModal, PRODUCT_HELP_SECTIONS } from './HelpManual.jsx';
+// 厳密モードの一元管理（型式×テンプレ・エビデンス・変更履歴）
+import { StrictModeManagerModal, computeStrictEvidence, strictComboKey } from './StrictModeManager.jsx';
 
 // 画像を Cloud Storage にアップロードして URL を返す。失敗時は base64 のまま返す (フォールバック)
 // 既存データ (base64 直保存) と互換: <img src={...}> は URL/base64 両方扱える
@@ -5223,7 +5225,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeTemplates = {}, onSaveStrictTemplate = null, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -5245,28 +5247,28 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 推奨順ガイダンス: カスタムモードで「1台目から順番に」のルールを視覚化
   // 厳密モード = 「1台目から順番」を強制し、飛ばし(順序外タップ)を防ぐモード。
   //   OFF (順番ガイド) = 警告のみで飛ばしも可。状況に応じて作業者が現場判断できるよう、
-  //   作業中いつでも ON/OFF を切替可能とし、選択は【型式(model)ごと】に記憶する。
-  //   管理者がテンプレに設定した値は「型式の初期既定」として使い、現場の個人選択があれば優先する。
+  //   作業中いつでも ON/OFF を切替可能とし、選択は【型式 × テンプレの組み合わせ】ごとに記憶する。
+  //   管理者が「厳密モード管理」で組み合わせに設定した値が初期既定。現場の個人選択があれば優先。
+  //   ※ 共有既定の変更・監査は管理表でのみ行う。ここでの切替はこの端末の一時上書き。
   const isAdmin = currentUserName === '管理者';
-  const adminStrictForTemplate = strictModeTemplates?.[lot.templateId]; // true=ON / false=OFF / undefined=未設定 (テンプレ既定)
-  const strictModelKey = lot.model || lot.templateId || '_';
+  const strictComboK = strictComboKey(lot.model, lot.templateId); // 型式×テンプレ
+  const adminStrictForCombo = strictModeRules?.[strictComboK]?.enabled; // true=厳密 / false=ガイド / null|undefined=未設定
+  const strictModelKey = strictComboK; // (互換: 既存コードのキー名)
   const [strictByModel, setStrictByModel] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('strictOrderModeByModel') || '{}'); } catch { return {}; }
+    try { return JSON.parse(localStorage.getItem('strictOrderModeByCombo') || '{}'); } catch { return {}; }
   });
-  const personalStrict = strictByModel[strictModelKey]; // true / false / undefined(未選択)
-  // 実効: 型式別の個人選択が最優先。無ければ管理者のテンプレ既定。どちらも無ければ OFF。
+  const personalStrict = strictByModel[strictComboK]; // true / false / undefined(未選択)
+  // 実効: 個人の一時上書きが最優先。無ければ管理表の組み合わせ既定。どちらも無ければ OFF。
   const strictOrderMode = personalStrict !== undefined ? personalStrict
-    : adminStrictForTemplate === true ? true
-    : adminStrictForTemplate === false ? false
+    : adminStrictForCombo === true ? true
+    : adminStrictForCombo === false ? false
     : false;
   const toggleStrictOrderMode = () => {
-    // 作業中いつでも切替可。型式ごとに記憶 (誰でも可)。
+    // 作業中いつでも切替可。型式×テンプレごとにこの端末で記憶 (誰でも可・共有既定は変えない)。
     const next = !strictOrderMode;
-    const updated = { ...strictByModel, [strictModelKey]: next };
+    const updated = { ...strictByModel, [strictComboK]: next };
     setStrictByModel(updated);
-    try { localStorage.setItem('strictOrderModeByModel', JSON.stringify(updated)); } catch {}
-    // 管理者が切り替えた場合は、テンプレ既定 (全端末共有) も合わせて更新する。
-    if (isAdmin && lot.templateId && onSaveStrictTemplate) onSaveStrictTemplate(lot.templateId, next);
+    try { localStorage.setItem('strictOrderModeByCombo', JSON.stringify(updated)); } catch {}
   };
   // 順序外タップで警告ダイアログ表示用
   const [outOfOrderConfirm, setOutOfOrderConfirm] = useState(null); // { stepIdx, unitIdx, nextRecommendedUnit, action }
@@ -6618,8 +6620,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   const [strictSuggestDismissed, setStrictSuggestDismissed] = useState(() => {
     try { return !!localStorage.getItem(strictSuggestKey); } catch { return false; }
   });
-  const STRICT_MATURITY_THRESHOLD = strictModeThreshold || 5; // 管理者が設定 (settings.strictModeThreshold)。同テンプレ完了ロットがこの数以上で「データ十分」
-  const showStrictSuggestion = templateDataMaturity >= STRICT_MATURITY_THRESHOLD && !strictOrderMode && !strictSuggestDismissed;
+  const STRICT_MATURITY_THRESHOLD = strictModeThreshold || 5;
+  // 件数だけの「貯まったから厳密に」というナッジは廃止（エビデンス不十分でも出てしまうため）。
+  // 厳密モードの判断は管理者の「厳密モード管理」(型式×テンプレ・順番の一貫性エビデンス)で行う。
+  const showStrictSuggestion = false;
 
   // === 「今やるべき唯一のタスク」を決定 (1台目から順番ルール) ===
   // 各工程行ごとに「次」を出すと画面中に「次」が溢れて「どれでも押せる」ように見えてしまう。
@@ -7731,7 +7735,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  <button
                    onClick={toggleStrictOrderMode}
                    className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap ${strictOrderMode ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'}`}
-                   title={`${lot.model || 'この型式'} の順番モードを切替（作業中いつでも可・型式ごとに記憶）\n🔒厳密=「1台目から順番」を強制 / 🔓ガイド=警告のみで飛ばしも可${adminStrictForTemplate !== undefined ? `\n（管理者の初期既定: ${adminStrictForTemplate ? '厳密' : 'ガイド'}）` : ''}`}
+                   title={`${lot.model || 'この型式'} × このテンプレ の順番モードを切替（この端末で一時上書き・組み合わせごとに記憶）\n🔒厳密=「1台目から順番」を強制 / 🔓ガイド=警告のみで飛ばしも可${adminStrictForCombo != null ? `\n（管理者の既定: ${adminStrictForCombo ? '厳密' : 'ガイド'}）` : ''}`}
                  >
                    {strictOrderMode ? '🔒' : '🔓'} {strictOrderMode ? '順番厳密' : '順番ガイド'}
                    <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">型式別</span>
@@ -7843,10 +7847,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                      <div className="flex gap-2 mt-2">
                        <button
                          onClick={() => {
-                           const updated = { ...strictByModel, [strictModelKey]: true };
+                           const updated = { ...strictByModel, [strictComboK]: true };
                            setStrictByModel(updated);
-                           try { localStorage.setItem('strictOrderModeByModel', JSON.stringify(updated)); } catch {}
-                           if (isAdmin && onSaveStrictTemplate && lot.templateId) onSaveStrictTemplate(lot.templateId, true);
+                           try { localStorage.setItem('strictOrderModeByCombo', JSON.stringify(updated)); } catch {}
                            try { localStorage.setItem(strictSuggestKey, '1'); } catch {}
                            setStrictSuggestDismissed(true);
                          }}
@@ -14605,25 +14608,19 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
          {/* 勤務時間マスタ (始業・定時・残業・休憩) — 負荷計算で使用 */}
          <WorkScheduleSettingsPanel workSchedule={settings.workSchedule} saveSettings={saveSettings} workloadEffectiveWorkers={settings.workloadEffectiveWorkers} registeredWorkerCount={workers.length} />
 
-         {/* 作業順ガイド・厳密モード推奨しきい値 (管理者向け) */}
+         {/* 作業順ガイド・厳密モード (管理者向け) — 一元管理は専用画面へ */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
              <ShieldCheck className="w-5 h-5 text-rose-600" /> 作業順ガイド・厳密モード
            </h3>
            <p className="text-xs text-slate-500 mb-4">
-             同じテンプレートの<b>完了ロット</b>がこの件数以上たまると、作業画面と管理ダッシュボードで「厳密モードを推奨」と通知します。厳密モードの ON/OFF は<b>作業中いつでも・型式ごと</b>に切り替えられ、ここの管理者設定は各型式の<b>初期既定</b>として使われます。<br/>
-             <b>厳密モード ON</b> = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。
+             厳密モードは<b>「型式 × テンプレ」の組み合わせごと</b>に設定します（その組み合わせで「どの順番を強制するか」が一意に決まるため）。
+             「件数が貯まったら推奨」はやめ、<b>実時刻のある完了ロットで作業順がテンプレ順と一致した割合（順番の一貫性）</b>をエビデンスとして見て、管理者が判断します。<br/>
+             どの組み合わせが 厳密／ガイド か、その<b>エビデンス</b>と<b>変更履歴（いつ・誰が・何を）</b>は、一元管理画面で一覧できます。
            </p>
-           <div className="flex items-end gap-3 flex-wrap">
-             <div>
-               <label className="block text-xs font-bold text-slate-600 mb-1">厳密モード推奨しきい値（完了ロット数）</label>
-               <input type="number" min="1" max="999"
-                 value={settings.strictModeThreshold ?? 5}
-                 onChange={e => saveSettings({ strictModeThreshold: Math.max(1, Math.min(999, Number(e.target.value) || 1)) })}
-                 className="border rounded p-2 text-sm w-32" />
-             </div>
-             <span className="text-xs text-slate-400 pb-2.5">現在: 同テンプレ完了 <b>{settings.strictModeThreshold ?? 5}</b> 件以上で推奨通知</span>
-           </div>
+           <button onClick={() => setShowStrictManager(true)} className="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 shadow-sm">
+             <ShieldCheck className="w-4 h-4" /> 厳密モード 一元管理を開く
+           </button>
          </div>
 
          {/* 画像の容量・画質 (種別ごとに最大px・画質を設定。基本は低画質スタート) */}
@@ -20499,23 +20496,42 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      }).length;
    }, [lots]);
 
-   // === 厳密モード推奨テンプレ (管理者向け通知) ===
-   // 実績が閾値以上貯まったのに、まだ厳密モードが設定されていないテンプレを検出
-   const STRICT_REVIEW_THRESHOLD = settings.strictModeThreshold || 5;
-   const strictReviewTemplates = useMemo(() => {
-     const strictSet = settings.strictModeTemplates || {};
-     const countByTemplate = {};
-     lots.forEach(l => {
-       if (l.status === 'completed' && l.templateId) {
-         countByTemplate[l.templateId] = (countByTemplate[l.templateId] || 0) + 1;
-       }
+   // === 厳密モード: 型式×テンプレ 一元管理（エビデンスベース） ===
+   // 「件数が貯まった」では推奨しない。実時刻のある完了ロットで作業順がテンプレ順と
+   // 一致した割合(順番の一貫性)が十分(good)な組み合わせだけを「要レビュー」として数える。
+   const strictRules = settings.strictModeRules || {};
+   const strictReviewCount = useMemo(() => {
+     try {
+       const rows = computeStrictEvidence(lots, templates);
+       return rows.filter(r => r.quality === 'good' && strictRules[r.key]?.enabled == null).length;
+     } catch { return 0; }
+   }, [lots, templates, settings.strictModeRules]);
+   const [showStrictManager, setShowStrictManager] = useState(false);
+   const [strictModeHistory, setStrictModeHistory] = useState([]);
+   // 変更履歴は管理画面を開いたときだけ購読（全端末共有・監査ログ）
+   useEffect(() => {
+     if (!showStrictManager || !db) return;
+     const unsub = onSnapshot(
+       collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'strict_mode_history'),
+       (snap) => setStrictModeHistory(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
+       (e) => console.warn('strict_mode_history subscribe error', e)
+     );
+     return () => unsub();
+   }, [showStrictManager]);
+   // 管理表での決定: settings.strictModeRules を更新 + 監査ログを追記
+   const handleStrictDecide = (row, enabled) => {
+     const key = row.key;
+     const prev = (settings.strictModeRules || {})[key];
+     const old = prev?.enabled === undefined ? null : prev.enabled;
+     const evidence = { completedCount: row.completedCount, timedCount: row.timedCount, consistentCount: row.consistentCount, consistencyPct: row.consistencyPct, quality: row.quality };
+     const rule = { enabled, decidedBy: currentUserName || '?', decidedAt: Date.now(), evidence };
+     saveSettings({ strictModeRules: { ...(settings.strictModeRules || {}), [key]: rule } });
+     saveData('strict_mode_history', generateId(), {
+       at: Date.now(), by: currentUserName || '?',
+       model: row.model, templateId: row.templateId, templateName: row.templateName,
+       old, new: enabled, evidence,
      });
-     return (templates || [])
-       .map(t => ({ id: t.id, name: t.name, count: countByTemplate[t.id] || 0, decided: strictSet[t.id] !== undefined }))
-       .filter(t => t.count >= STRICT_REVIEW_THRESHOLD && !t.decided)
-       .sort((a, b) => b.count - a.count);
-   }, [lots, templates, settings.strictModeTemplates, settings.strictModeThreshold]);
-   const [showStrictReviewPanel, setShowStrictReviewPanel] = useState(false);
+   };
 
    const anomalyCount = anomalies.length;
    const fixAnomaly = async (a) => {
@@ -20830,15 +20846,15 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  <span className="absolute -top-1 -right-1 bg-rose-600 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{anomalyCount > 99 ? '99+' : anomalyCount}</span>
                </button>
              )}
-             {/* 厳密モード推奨 (管理者のみ): データが貯まったテンプレを通知 */}
-             {currentUserName === '管理者' && strictReviewTemplates.length > 0 && (
+             {/* 厳密モード 一元管理 (管理者のみ): 型式×テンプレ・エビデンス・変更履歴 */}
+             {currentUserName === '管理者' && (
                <button
-                 onClick={() => setShowStrictReviewPanel(true)}
-                 className="relative bg-rose-600 hover:bg-rose-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ring-2 ring-rose-300/50"
-                 title={`${strictReviewTemplates.length} 件のテンプレが厳密モード推奨レベルに達しています`}
+                 onClick={() => setShowStrictManager(true)}
+                 className="relative bg-rose-600 hover:bg-rose-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm"
+                 title="厳密モードの一元管理（型式×テンプレ・エビデンス・変更履歴）"
                >
-                 <ShieldCheck className="w-3.5 h-3.5"/> 厳密化推奨
-                 <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{strictReviewTemplates.length}</span>
+                 <ShieldCheck className="w-3.5 h-3.5"/> 厳密モード
+                 {strictReviewCount > 0 && <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{strictReviewCount}</span>}
                </button>
              )}
              <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 shadow-sm">
@@ -20931,45 +20947,17 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        {showAnnouncementModal && <AnnouncementModal announcements={announcements} workers={workers} selectedWorker={selectedWorker} saveData={saveData} deleteData={deleteData} onClose={() => setShowAnnouncementModal(false)} currentUserName={currentUserName} />}
 
        {/* 異常値検出パネル */}
-       {/* 厳密モード推奨パネル (管理者向け) */}
-       {showStrictReviewPanel && (
-         <div className="fixed inset-0 z-[120] bg-black/50 flex items-center justify-center p-4" onClick={() => setShowStrictReviewPanel(false)}>
-           <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
-             <div className="px-5 py-3 border-b bg-rose-50 flex items-center justify-between">
-               <div>
-                 <h3 className="text-lg font-black text-rose-900 flex items-center gap-2"><ShieldCheck className="w-5 h-5"/> 厳密モード推奨テンプレ ({strictReviewTemplates.length}件)</h3>
-                 <div className="text-xs text-rose-700 mt-0.5">実績が {STRICT_REVIEW_THRESHOLD} 件以上貯まり、作業順が安定したテンプレです。厳密モードにすると「1台目から順番」を全端末で強制します。</div>
-               </div>
-               <button onClick={() => setShowStrictReviewPanel(false)} className="p-1.5 hover:bg-rose-100 rounded"><X className="w-5 h-5 text-rose-700"/></button>
-             </div>
-             <div className="flex-1 overflow-auto p-4 space-y-2">
-               {strictReviewTemplates.map(t => (
-                 <div key={t.id} className="border border-slate-200 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50">
-                   <div>
-                     <div className="font-bold text-slate-800">{t.name}</div>
-                     <div className="text-xs text-slate-500">完了実績 <span className="font-bold text-rose-600">{t.count}</span> 件</div>
-                   </div>
-                   <div className="flex gap-2">
-                     <button
-                       onClick={() => { const next = { ...(settings.strictModeTemplates || {}), [t.id]: true }; saveSettings({ strictModeTemplates: next }); }}
-                       className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded shadow flex items-center gap-1"
-                     >🔒 厳密モードON</button>
-                     <button
-                       onClick={() => { const next = { ...(settings.strictModeTemplates || {}), [t.id]: false }; saveSettings({ strictModeTemplates: next }); }}
-                       className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-500 text-xs font-bold rounded border border-slate-300"
-                     >ガイドのまま</button>
-                   </div>
-                 </div>
-               ))}
-               {strictReviewTemplates.length === 0 && (
-                 <div className="text-center py-8 text-emerald-600"><CheckCircle2 className="w-10 h-10 mx-auto mb-2"/> 全テンプレ確認済み</div>
-               )}
-             </div>
-             <div className="px-5 py-3 border-t bg-slate-50 text-xs text-slate-500">
-               💡 厳密モードON = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。後から測定設定で変更できます。
-             </div>
-           </div>
-         </div>
+       {/* 厳密モード 一元管理（型式×テンプレ・エビデンス・変更履歴） */}
+       {showStrictManager && (
+         <StrictModeManagerModal
+           lots={lots}
+           templates={templates}
+           rules={settings.strictModeRules || {}}
+           history={strictModeHistory}
+           currentUserName={currentUserName}
+           onDecide={handleStrictDecide}
+           onClose={() => setShowStrictManager(false)}
+         />
        )}
 
        {showAnomalyPanel && (
@@ -21074,12 +21062,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            currentUserName={currentUserName}
            execFontScale={settings.fontSizes?.execution || 100}
            onSetExecFontScale={(v) => saveSettings({ fontSizes: { ...(settings.fontSizes || {}), execution: Math.max(80, Math.min(180, v)) } })}
-           strictModeTemplates={settings.strictModeTemplates || {}}
+           strictModeRules={settings.strictModeRules || {}}
            strictModeThreshold={settings.strictModeThreshold || 5}
-           onSaveStrictTemplate={(templateId, enabled) => {
-             const next = { ...(settings.strictModeTemplates || {}), [templateId]: enabled };
-             saveSettings({ strictModeTemplates: next });
-           }}
          />
        )}
 
