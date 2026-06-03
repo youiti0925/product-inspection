@@ -5223,7 +5223,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeTemplates = {}, onSaveStrictTemplate = null, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeByModel = {}, onSaveStrictModel = null, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -5246,18 +5246,18 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 厳密モード = 「1台目から順番」を強制し、飛ばし(順序外タップ)を防ぐモード。
   //   OFF (順番ガイド) = 警告のみで飛ばしも可。状況に応じて作業者が現場判断できるよう、
   //   作業中いつでも ON/OFF を切替可能とし、選択は【型式(model)ごと】に記憶する。
-  //   管理者がテンプレに設定した値は「型式の初期既定」として使い、現場の個人選択があれば優先する。
+  //   管理者が型式に設定した値は「その型式の初期既定」として使い、現場の個人選択があれば優先する。
   const isAdmin = currentUserName === '管理者';
-  const adminStrictForTemplate = strictModeTemplates?.[lot.templateId]; // true=ON / false=OFF / undefined=未設定 (テンプレ既定)
   const strictModelKey = lot.model || lot.templateId || '_';
+  const adminStrictForModel = strictModeByModel?.[strictModelKey]; // true=ON / false=OFF / undefined=未設定 (型式既定)
   const [strictByModel, setStrictByModel] = useState(() => {
     try { return JSON.parse(localStorage.getItem('strictOrderModeByModel') || '{}'); } catch { return {}; }
   });
   const personalStrict = strictByModel[strictModelKey]; // true / false / undefined(未選択)
-  // 実効: 型式別の個人選択が最優先。無ければ管理者のテンプレ既定。どちらも無ければ OFF。
+  // 実効: 型式別の個人選択が最優先。無ければ管理者の型式別既定。どちらも無ければ OFF。
   const strictOrderMode = personalStrict !== undefined ? personalStrict
-    : adminStrictForTemplate === true ? true
-    : adminStrictForTemplate === false ? false
+    : adminStrictForModel === true ? true
+    : adminStrictForModel === false ? false
     : false;
   const toggleStrictOrderMode = () => {
     // 作業中いつでも切替可。型式ごとに記憶 (誰でも可)。
@@ -5265,8 +5265,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const updated = { ...strictByModel, [strictModelKey]: next };
     setStrictByModel(updated);
     try { localStorage.setItem('strictOrderModeByModel', JSON.stringify(updated)); } catch {}
-    // 管理者が切り替えた場合は、テンプレ既定 (全端末共有) も合わせて更新する。
-    if (isAdmin && lot.templateId && onSaveStrictTemplate) onSaveStrictTemplate(lot.templateId, next);
+    // 管理者が切り替えた場合は、型式別の既定 (全端末共有) も合わせて更新する。
+    if (isAdmin && strictModelKey && onSaveStrictModel) onSaveStrictModel(strictModelKey, next);
   };
   // 順序外タップで警告ダイアログ表示用
   const [outOfOrderConfirm, setOutOfOrderConfirm] = useState(null); // { stepIdx, unitIdx, nextRecommendedUnit, action }
@@ -7727,11 +7727,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  >
                    {customViewMode === 'card' ? <><LayoutList className="w-4 h-4"/> 一覧</> : <><LayoutGrid className="w-4 h-4"/> カード</>}
                  </button>
-                 {/* 厳密順序モード: 型式ごとに、作業中いつでも ON/OFF 切替可能。管理者のテンプレ設定は初期既定。 */}
+                 {/* 厳密順序モード: 型式ごとに、作業中いつでも ON/OFF 切替可能。管理者の型式別設定は初期既定。 */}
                  <button
                    onClick={toggleStrictOrderMode}
                    className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap ${strictOrderMode ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'}`}
-                   title={`${lot.model || 'この型式'} の順番モードを切替（作業中いつでも可・型式ごとに記憶）\n🔒厳密=「1台目から順番」を強制 / 🔓ガイド=警告のみで飛ばしも可${adminStrictForTemplate !== undefined ? `\n（管理者の初期既定: ${adminStrictForTemplate ? '厳密' : 'ガイド'}）` : ''}`}
+                   title={`${lot.model || 'この型式'} の順番モードを切替（作業中いつでも可・型式ごとに記憶）\n🔒厳密=「1台目から順番」を強制 / 🔓ガイド=警告のみで飛ばしも可${adminStrictForModel !== undefined ? `\n（管理者の初期既定: ${adminStrictForModel ? '厳密' : 'ガイド'}）` : ''}`}
                  >
                    {strictOrderMode ? '🔒' : '🔓'} {strictOrderMode ? '順番厳密' : '順番ガイド'}
                    <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">型式別</span>
@@ -7846,7 +7846,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                            const updated = { ...strictByModel, [strictModelKey]: true };
                            setStrictByModel(updated);
                            try { localStorage.setItem('strictOrderModeByModel', JSON.stringify(updated)); } catch {}
-                           if (isAdmin && onSaveStrictTemplate && lot.templateId) onSaveStrictTemplate(lot.templateId, true);
+                           if (isAdmin && onSaveStrictModel && strictModelKey) onSaveStrictModel(strictModelKey, true);
                            try { localStorage.setItem(strictSuggestKey, '1'); } catch {}
                            setStrictSuggestDismissed(true);
                          }}
@@ -14611,8 +14611,8 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
              <ShieldCheck className="w-5 h-5 text-rose-600" /> 作業順ガイド・厳密モード
            </h3>
            <p className="text-xs text-slate-500 mb-4">
-             同じテンプレートの<b>完了ロット</b>がこの件数以上たまると、作業画面と管理ダッシュボードで「厳密モードを推奨」と通知します。厳密モードの ON/OFF は<b>作業中いつでも・型式ごと</b>に切り替えられ、ここの管理者設定は各型式の<b>初期既定</b>として使われます。<br/>
-             <b>厳密モード ON</b> = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。
+             同じ<b>型式</b>の<b>完了ロット</b>がこの件数以上たまると、作業画面と管理ダッシュボードで「厳密モードを推奨」と通知します。厳密モードの ON/OFF は<b>作業中いつでも・型式ごと</b>に切り替えられ、管理者の「厳密化推奨」での決定は各型式の<b>初期既定</b>として使われます（作業者の現場切替が優先）。<br/>
+             <b>厳密モード ON</b> = その型式は既定で「1台目から順番」を強制（作業者は現場で切替も可）。ガイドのまま = 警告のみで飛ばしも可能。
            </p>
            <div className="flex items-end gap-3 flex-wrap">
              <div>
@@ -14622,7 +14622,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                  onChange={e => saveSettings({ strictModeThreshold: Math.max(1, Math.min(999, Number(e.target.value) || 1)) })}
                  className="border rounded p-2 text-sm w-32" />
              </div>
-             <span className="text-xs text-slate-400 pb-2.5">現在: 同テンプレ完了 <b>{settings.strictModeThreshold ?? 5}</b> 件以上で推奨通知</span>
+             <span className="text-xs text-slate-400 pb-2.5">現在: 同型式 完了 <b>{settings.strictModeThreshold ?? 5}</b> 件以上で推奨通知</span>
            </div>
          </div>
 
@@ -20499,22 +20499,22 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      }).length;
    }, [lots]);
 
-   // === 厳密モード推奨テンプレ (管理者向け通知) ===
-   // 実績が閾値以上貯まったのに、まだ厳密モードが設定されていないテンプレを検出
+   // === 厳密モード推奨 (型式単位・管理者向け通知) ===
+   // 実績が閾値以上貯まったのに、まだ厳密モードが設定されていない「型式」を検出
    const STRICT_REVIEW_THRESHOLD = settings.strictModeThreshold || 5;
-   const strictReviewTemplates = useMemo(() => {
-     const strictSet = settings.strictModeTemplates || {};
-     const countByTemplate = {};
+   const strictReviewModels = useMemo(() => {
+     const decidedSet = settings.strictModeByModel || {};
+     const countByModel = {};
      lots.forEach(l => {
-       if (l.status === 'completed' && l.templateId) {
-         countByTemplate[l.templateId] = (countByTemplate[l.templateId] || 0) + 1;
+       if (l.status === 'completed' && l.model) {
+         countByModel[l.model] = (countByModel[l.model] || 0) + 1;
        }
      });
-     return (templates || [])
-       .map(t => ({ id: t.id, name: t.name, count: countByTemplate[t.id] || 0, decided: strictSet[t.id] !== undefined }))
-       .filter(t => t.count >= STRICT_REVIEW_THRESHOLD && !t.decided)
+     return Object.entries(countByModel)
+       .map(([model, count]) => ({ model, count, decided: decidedSet[model] !== undefined }))
+       .filter(x => x.count >= STRICT_REVIEW_THRESHOLD && !x.decided)
        .sort((a, b) => b.count - a.count);
-   }, [lots, templates, settings.strictModeTemplates, settings.strictModeThreshold]);
+   }, [lots, settings.strictModeByModel, settings.strictModeThreshold]);
    const [showStrictReviewPanel, setShowStrictReviewPanel] = useState(false);
 
    const anomalyCount = anomalies.length;
@@ -20830,15 +20830,15 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  <span className="absolute -top-1 -right-1 bg-rose-600 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{anomalyCount > 99 ? '99+' : anomalyCount}</span>
                </button>
              )}
-             {/* 厳密モード推奨 (管理者のみ): データが貯まったテンプレを通知 */}
-             {currentUserName === '管理者' && strictReviewTemplates.length > 0 && (
+             {/* 厳密モード推奨 (管理者のみ): データが貯まった型式を通知 */}
+             {currentUserName === '管理者' && strictReviewModels.length > 0 && (
                <button
                  onClick={() => setShowStrictReviewPanel(true)}
                  className="relative bg-rose-600 hover:bg-rose-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ring-2 ring-rose-300/50"
-                 title={`${strictReviewTemplates.length} 件のテンプレが厳密モード推奨レベルに達しています`}
+                 title={`${strictReviewModels.length} 件の型式が厳密モード推奨レベルに達しています`}
                >
                  <ShieldCheck className="w-3.5 h-3.5"/> 厳密化推奨
-                 <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{strictReviewTemplates.length}</span>
+                 <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{strictReviewModels.length}</span>
                </button>
              )}
              <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 shadow-sm">
@@ -20937,36 +20937,36 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
              <div className="px-5 py-3 border-b bg-rose-50 flex items-center justify-between">
                <div>
-                 <h3 className="text-lg font-black text-rose-900 flex items-center gap-2"><ShieldCheck className="w-5 h-5"/> 厳密モード推奨テンプレ ({strictReviewTemplates.length}件)</h3>
-                 <div className="text-xs text-rose-700 mt-0.5">実績が {STRICT_REVIEW_THRESHOLD} 件以上貯まり、作業順が安定したテンプレです。厳密モードにすると「1台目から順番」を全端末で強制します。</div>
+                 <h3 className="text-lg font-black text-rose-900 flex items-center gap-2"><ShieldCheck className="w-5 h-5"/> 厳密モード推奨 (型式) ({strictReviewModels.length}件)</h3>
+                 <div className="text-xs text-rose-700 mt-0.5">実績が {STRICT_REVIEW_THRESHOLD} 件以上貯まり、作業順が安定した型式です。厳密モードを既定ONにすると、その型式は「1台目から順番」を初期状態で強制します（作業者は現場で型式ごとに切替も可）。</div>
                </div>
                <button onClick={() => setShowStrictReviewPanel(false)} className="p-1.5 hover:bg-rose-100 rounded"><X className="w-5 h-5 text-rose-700"/></button>
              </div>
              <div className="flex-1 overflow-auto p-4 space-y-2">
-               {strictReviewTemplates.map(t => (
-                 <div key={t.id} className="border border-slate-200 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50">
+               {strictReviewModels.map(t => (
+                 <div key={t.model} className="border border-slate-200 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50">
                    <div>
-                     <div className="font-bold text-slate-800">{t.name}</div>
+                     <div className="font-bold text-slate-800">{t.model}</div>
                      <div className="text-xs text-slate-500">完了実績 <span className="font-bold text-rose-600">{t.count}</span> 件</div>
                    </div>
                    <div className="flex gap-2">
                      <button
-                       onClick={() => { const next = { ...(settings.strictModeTemplates || {}), [t.id]: true }; saveSettings({ strictModeTemplates: next }); }}
+                       onClick={() => { const next = { ...(settings.strictModeByModel || {}), [t.model]: true }; saveSettings({ strictModeByModel: next }); }}
                        className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded shadow flex items-center gap-1"
                      >🔒 厳密モードON</button>
                      <button
-                       onClick={() => { const next = { ...(settings.strictModeTemplates || {}), [t.id]: false }; saveSettings({ strictModeTemplates: next }); }}
+                       onClick={() => { const next = { ...(settings.strictModeByModel || {}), [t.model]: false }; saveSettings({ strictModeByModel: next }); }}
                        className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-500 text-xs font-bold rounded border border-slate-300"
                      >ガイドのまま</button>
                    </div>
                  </div>
                ))}
-               {strictReviewTemplates.length === 0 && (
-                 <div className="text-center py-8 text-emerald-600"><CheckCircle2 className="w-10 h-10 mx-auto mb-2"/> 全テンプレ確認済み</div>
+               {strictReviewModels.length === 0 && (
+                 <div className="text-center py-8 text-emerald-600"><CheckCircle2 className="w-10 h-10 mx-auto mb-2"/> 全型式 確認済み</div>
                )}
              </div>
              <div className="px-5 py-3 border-t bg-slate-50 text-xs text-slate-500">
-               💡 厳密モードON = 作業者は「1台目から順番」を飛ばせなくなります。ガイドのまま = 警告のみで飛ばしも可能。後から測定設定で変更できます。
+               💡 厳密モードON ＝ その型式は既定で「1台目から順番」を強制（作業者は現場で型式ごとに切替も可）。ガイドのまま ＝ 警告のみで飛ばしも可能。後から測定設定で変更できます。
              </div>
            </div>
          </div>
@@ -21074,11 +21074,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            currentUserName={currentUserName}
            execFontScale={settings.fontSizes?.execution || 100}
            onSetExecFontScale={(v) => saveSettings({ fontSizes: { ...(settings.fontSizes || {}), execution: Math.max(80, Math.min(180, v)) } })}
-           strictModeTemplates={settings.strictModeTemplates || {}}
+           strictModeByModel={settings.strictModeByModel || {}}
            strictModeThreshold={settings.strictModeThreshold || 5}
-           onSaveStrictTemplate={(templateId, enabled) => {
-             const next = { ...(settings.strictModeTemplates || {}), [templateId]: enabled };
-             saveSettings({ strictModeTemplates: next });
+           onSaveStrictModel={(model, enabled) => {
+             const next = { ...(settings.strictModeByModel || {}), [model]: enabled };
+             saveSettings({ strictModeByModel: next });
            }}
          />
        )}
