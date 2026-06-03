@@ -11289,7 +11289,7 @@ const AIDeepAnalysisSection = ({ payload }) => {
 
 const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [] }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
-  const [activeMode, setActiveMode] = useState('process');
+  const [activeMode, setActiveMode] = useState('defects'); // 工程改善分析は「作業最適化」タブへ移動したため既定を不具合分析に
   const [selectedModel, setSelectedModel] = useState('all');
   const [targetTolerance, setTargetTolerance] = useState(20); // % for USL/LSL (analysisData の Excel/PDF 出力で使用)
   // 旧 filterMode/filterStartDate/filterEndDate と isInFilterPeriod は削除。
@@ -11714,7 +11714,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
             </h2>
             <div className="flex items-center gap-3">
               <div className="flex bg-slate-200 p-1 rounded-lg">
-                 <button onClick={()=>setActiveMode('process')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='process' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><TrendingUp className="w-4 h-4"/> 工程改善分析</button>
+                 {/* 工程改善分析(目標時間最適化)は「作業最適化」タブに移動 */}
                  <button onClick={()=>setActiveMode('defects')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='defects' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><AlertTriangle className="w-4 h-4"/> 不具合分析</button>
                  <button onClick={()=>setActiveMode('complaints')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='complaints' ? 'bg-white shadow text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}><Megaphone className="w-4 h-4"/> 気づき・改善提案</button>
                  <button onClick={()=>setActiveMode('direct-indirect')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='direct-indirect' ? 'bg-white shadow text-teal-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> 直間分析</button>
@@ -20505,17 +20505,19 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      } catch { return 0; }
    }, [lots, templates, settings.strictModeRules, strictMaturityUnits]);
    const [showStrictManager, setShowStrictManager] = useState(false);
+   const [optimizeView, setOptimizeView] = useState('target'); // 作業最適化タブ: 'target'(目標時間) | 'strict'(厳密)
    const [strictModeHistory, setStrictModeHistory] = useState([]);
-   // 変更履歴は管理画面を開いたときだけ購読（全端末共有・監査ログ）
+   const strictPanelActive = showStrictManager || (activeTab === 'optimize' && optimizeView === 'strict');
+   // 変更履歴は厳密モード画面を見ているときだけ購読（全端末共有・監査ログ）
    useEffect(() => {
-     if (!showStrictManager || !db) return;
+     if (!strictPanelActive || !db) return;
      const unsub = onSnapshot(
        collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'strict_mode_history'),
        (snap) => setStrictModeHistory(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
        (e) => console.warn('strict_mode_history subscribe error', e)
      );
      return () => unsub();
-   }, [showStrictManager]);
+   }, [strictPanelActive]);
    // 管理表での決定: settings.strictModeRules を更新 + 監査ログを追記
    const handleStrictDecide = (row, enabled) => {
      const key = row.key;
@@ -20789,6 +20791,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                 { id: 'progress', label: '全体進捗', icon: Activity },
                 { id: 'inspection', label: '検査リスト', icon: ListChecks },
                 { id: 'analysis', label: '分析', icon: BarChart3 },
+                { id: 'optimize', label: '作業最適化', icon: Zap },
                 { id: 'history', label: '完了履歴', icon: CheckSquare },
                 { id: 'template-mgr', label: '工程テンプレート', icon: ClipboardList },
                 { id: 'measurement-settings', label: '測定設定', icon: Ruler },
@@ -20844,17 +20847,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  <span className="absolute -top-1 -right-1 bg-rose-600 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{anomalyCount > 99 ? '99+' : anomalyCount}</span>
                </button>
              )}
-             {/* 厳密モード 一元管理 (管理者のみ): 型式×テンプレ・エビデンス・変更履歴 */}
-             {currentUserName === '管理者' && (
-               <button
-                 onClick={() => setShowStrictManager(true)}
-                 className="relative bg-rose-600 hover:bg-rose-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm"
-                 title="厳密モードの一元管理（型式×テンプレ・エビデンス・変更履歴）"
-               >
-                 <ShieldCheck className="w-3.5 h-3.5"/> 厳密モード
-                 {strictReviewCount > 0 && <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{strictReviewCount}</span>}
-               </button>
-             )}
+             {/* 厳密モードは「作業最適化」タブに統合（ヘッダーボタンは廃止） */}
              <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 shadow-sm">
                <Plus className="w-4 h-4" /> 入荷登録
              </button>
@@ -20875,6 +20868,21 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} />}
+         {activeTab === 'optimize' && (
+           <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
+             <div className="shrink-0 flex items-center gap-3 flex-wrap">
+               <div className="flex bg-slate-100 rounded-lg p-1">
+                 <button onClick={() => setOptimizeView('target')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'target' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Target className="w-4 h-4" /> 目標時間最適化</button>
+                 <button onClick={() => setOptimizeView('strict')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'strict' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><ShieldCheck className="w-4 h-4" /> 厳密モード{strictReviewCount > 0 && <span className="bg-amber-400 text-white text-[9px] rounded-full w-4 h-4 flex items-center justify-center font-black">{strictReviewCount}</span>}</button>
+               </div>
+               <span className="text-xs text-slate-400">データから現場を最適化：まず<b>目標時間</b>を整え、順番が確立したら<b>厳密モード</b>で固定。</span>
+             </div>
+             <div className="flex-1 min-h-0 overflow-hidden">
+               {optimizeView === 'target' && <ProcessInsightsTab lots={lots} workers={workers} customTargetTimes={settings.customTargetTimes || {}} onSaveSettings={saveSettings} targetTimeHistory={settings.targetTimeHistory || []} settings={settings} saveData={saveData} currentUserName={currentUserName} />}
+               {optimizeView === 'strict' && (currentUserName === '管理者' ? <StrictModeManagerModal embedded lots={lots} templates={templates} rules={settings.strictModeRules || {}} history={strictModeHistory} currentUserName={currentUserName} maturityUnits={strictMaturityUnits} onSetMaturity={(n) => saveSettings({ strictMaturityUnits: n })} onDecide={handleStrictDecide} /> : <div className="bg-white rounded-xl border p-8 text-center text-slate-400">厳密モードの管理は管理者のみです。ヘッダー左上で「管理者」を選択してください。</div>)}
+             </div>
+           </div>
+         )}
          {activeTab === 'history' && <HistoryView lots={lots} workers={workers} templates={templates} saveData={saveData} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
          {activeTab === 'template-mgr' && (
            editingTemplate ? (
@@ -20945,20 +20953,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        {showAnnouncementModal && <AnnouncementModal announcements={announcements} workers={workers} selectedWorker={selectedWorker} saveData={saveData} deleteData={deleteData} onClose={() => setShowAnnouncementModal(false)} currentUserName={currentUserName} />}
 
        {/* 異常値検出パネル */}
-       {/* 厳密モード 一元管理（型式×テンプレ・エビデンス・変更履歴） */}
-       {showStrictManager && (
-         <StrictModeManagerModal
-           lots={lots}
-           templates={templates}
-           rules={settings.strictModeRules || {}}
-           history={strictModeHistory}
-           currentUserName={currentUserName}
-           maturityUnits={strictMaturityUnits}
-           onSetMaturity={(n) => saveSettings({ strictMaturityUnits: n })}
-           onDecide={handleStrictDecide}
-           onClose={() => setShowStrictManager(false)}
-         />
-       )}
+       {/* 厳密モードは「作業最適化」タブに内蔵（モーダルは廃止） */}
 
        {showAnomalyPanel && (
          <div className="fixed inset-0 z-[120] bg-black/50 flex items-center justify-center p-4" onClick={() => setShowAnomalyPanel(false)}>

@@ -25,7 +25,9 @@ function unitTimedSteps(lot, u) {
     const t = tasks[`${s.id}-${u}`] || tasks[`${i}-${u}`];
     const st = t && (t.firstStartTime || t.startTime);
     if (!st) return;
-    out.push({ i, title: s.title, category: s.category, start: st, end: t.endTime || (st + (t.duration || 0) * 1000), dur: t.duration || 0, isAuto: s.executionMode === 'batch' || (s.title || '').includes('自動') });
+    // バーは「実開始」から「実作業時間(duration)」ぶん。endTime は休憩・中断を含み実態より長いので使わない。
+    const dur = t.duration || 0;
+    out.push({ i, title: s.title, category: s.category, start: st, end: st + Math.max(1, dur) * 1000, dur, isAuto: s.executionMode === 'batch' || (s.title || '').includes('自動') });
   });
   return out;
 }
@@ -41,7 +43,7 @@ export function computeStrictEvidence(lots, templates, maturityUnits = 5) {
     const [model, tid] = parseStrictCombo(key);
     let completedUnits = 0, timedUnits = 0, consistentUnits = 0;
     const durByStep = {};       // title -> [dur...]
-    const samples = [];         // 代表台のタイムライン (最大6台)
+    const lotUnits = {};        // orderNo -> [{unitNo, ok, steps}]  (複数台ガント用)
     g.forEach(lot => {
       const q = lot.quantity || 1; completedUnits += q;
       for (let u = 0; u < q; u++) {
@@ -53,9 +55,12 @@ export function computeStrictEvidence(lots, templates, maturityUnits = 5) {
         const tmpl = [...arr].sort((a, b) => a.i - b.i).map(x => x.i);
         const ok = JSON.stringify(actual) === JSON.stringify(tmpl);
         if (ok) consistentUnits++;
-        if (samples.length < 6) samples.push({ orderNo: lot.orderNo, unitNo: u + 1, ok, steps: arr.map(x => ({ title: x.title, dur: x.dur, isAuto: x.isAuto, start: x.start, end: x.end })) });
+        (lotUnits[lot.orderNo] = lotUnits[lot.orderNo] || []).push({ unitNo: u + 1, ok, steps: arr.map(x => ({ title: x.title, dur: x.dur, isAuto: x.isAuto, start: x.start, end: x.end })) });
       }
     });
+    // 代表ロット = 実時刻のある台が最も多いロット(最大6台)。複数台の並行作業を見せる。
+    const lotsArr = Object.entries(lotUnits).map(([orderNo, units]) => ({ orderNo, units })).sort((a, b) => b.units.length - a.units.length);
+    const ganttLot = lotsArr[0] ? { orderNo: lotsArr[0].orderNo, units: lotsArr[0].units.slice(0, 6) } : null;
     const consistencyPct = timedUnits > 0 ? Math.round(consistentUnits / timedUnits * 100) : null;
     const stepStats = Object.entries(durByStep).map(([title, a]) => ({ title, n: a.length, mean: Math.round(a.reduce((x, y) => x + y, 0) / a.length), std: stdev(a) }));
     let quality = 'none';
@@ -63,7 +68,7 @@ export function computeStrictEvidence(lots, templates, maturityUnits = 5) {
     else if (timedUnits < maturityUnits) quality = 'thin';
     else if (consistencyPct >= 80) quality = 'good';
     else quality = 'unstable';
-    return { key, model, templateId: tid, templateName: tName(tid), completedUnits, timedUnits, consistentUnits, consistencyPct, quality, detail: { stepStats, samples } };
+    return { key, model, templateId: tid, templateName: tName(tid), completedUnits, timedUnits, consistentUnits, consistencyPct, quality, detail: { stepStats, ganttLot, lotCount: lotsArr.length } };
   });
   rows.sort((a, b) => (b.timedUnits - a.timedUnits) || (b.completedUnits - a.completedUnits) || a.model.localeCompare(b.model));
   return rows;
@@ -83,32 +88,69 @@ function StateBadge({ enabled }) {
   return <span className="text-xs font-bold text-slate-400">未設定</span>;
 }
 
-// 1台の作業の流れ(ミニ・タイムライン)。各工程を実開始〜終了でバー表示。手動=青/自動=紫。
-function UnitTimeline({ steps }) {
-  if (!steps || steps.length === 0) return null;
-  const t0 = Math.min(...steps.map(s => s.start)), t1 = Math.max(...steps.map(s => s.end));
-  const span = Math.max(1, t1 - t0);
+// 大きな空き時間を圧縮した時間軸(broken-axis)。実時刻t(ms)→表示位置(%)に変換。
+// これで「片付けが1.5時間後」のような長い空白でバーが潰れるのを防ぎつつ、実際の前後関係・並行を保つ。
+function buildCompressedAxis(intervals, gapMs = 120000) {
+  const sorted = [...intervals].filter(iv => iv[1] >= iv[0]).sort((a, b) => a[0] - b[0]);
+  if (!sorted.length) return { map: () => 0, breaks: [] };
+  const active = [];
+  for (const [s, e] of sorted) {
+    const last = active[active.length - 1];
+    if (last && s <= last[1] + gapMs) last[1] = Math.max(last[1], e); // 近接は1区間に統合
+    else active.push([s, e]);
+  }
+  const GAP_W = 4; // 圧縮した空き1つの表示幅(%)
+  const nGaps = active.length - 1;
+  const activeTotal = active.reduce((a, [s, e]) => a + Math.max(1, e - s), 0);
+  const activeDisplay = Math.max(10, 100 - nGaps * GAP_W);
+  const segs = []; let cum = 0;
+  active.forEach((seg, i) => {
+    if (i > 0) { segs.push({ gap: true, dispStart: cum, dispW: GAP_W }); cum += GAP_W; }
+    const w = Math.max(1, seg[1] - seg[0]) / activeTotal * activeDisplay;
+    segs.push({ s: seg[0], e: seg[1], dispStart: cum, dispW: w }); cum += w;
+  });
+  const map = (t) => {
+    for (const sd of segs) {
+      if (sd.gap) continue;
+      if (t <= sd.s) return sd.dispStart;
+      if (t <= sd.e) return sd.dispStart + (t - sd.s) / Math.max(1, sd.e - sd.s) * sd.dispW;
+    }
+    return 100;
+  };
+  const breaks = segs.filter(s => s.gap).map(s => s.dispStart + s.dispW / 2);
+  return { map, breaks };
+}
+
+// 複数台の作業の流れ(ガント)。台を行に、工程を実時刻でバー表示(共通の横軸)。手動=青/自動=紫。
+// 同じ横軸なので「台Aの自動測定(紫)中に、台Bで手動(青)が動いている」=並行作業が見える。
+function MultiUnitGantt({ lot }) {
+  if (!lot || !lot.units || !lot.units.length) return null;
+  const allIv = lot.units.flatMap(u => u.steps.map(s => [s.start, s.end]));
+  const { map, breaks } = buildCompressedAxis(allIv);
   return (
-    <div className="space-y-0.5">
-      {steps.map((s, i) => {
-        const left = (s.start - t0) / span * 100, width = Math.max(1.2, (s.end - s.start) / span * 100);
-        return (
-          <div key={i} className="flex items-center gap-2 text-[10px]">
-            <div className="w-24 truncate text-slate-600 shrink-0 text-right" title={s.title}>{s.title}</div>
-            <div className="flex-1 relative h-3 bg-slate-100 rounded overflow-hidden">
-              <div className={`absolute top-0 h-3 rounded ${s.isAuto ? 'bg-violet-500' : 'bg-blue-500'}`} style={{ left: left + '%', width: width + '%' }} title={`${s.dur}s`} />
+    <div>
+      <div className="text-[10px] text-slate-400 mb-1">指図 {lot.orderNo}（代表ロット・{lot.units.length}台）／横軸＝実時間（長い空き時間は ┊ で圧縮）</div>
+      <div className="space-y-1">
+        {lot.units.map((u, ri) => (
+          <div key={ri} className="flex items-center gap-2">
+            <div className="w-9 text-[11px] font-bold text-slate-600 shrink-0 text-right flex items-center justify-end gap-0.5">台{u.unitNo}{u.ok ? <CheckCircle2 className="w-3 h-3 text-emerald-500" /> : <AlertTriangle className="w-3 h-3 text-rose-500" />}</div>
+            <div className="flex-1 relative h-5 bg-slate-100 rounded">
+              {breaks.map((b, i) => <div key={'b' + i} className="absolute top-0 h-5 border-l border-dashed border-slate-300" style={{ left: b + '%' }} />)}
+              {u.steps.map((s, i) => {
+                const l = map(s.start), w = Math.max(0.8, map(s.end) - l);
+                return <div key={i} className={`absolute top-0.5 h-4 rounded ${s.isAuto ? 'bg-violet-500' : 'bg-blue-500'} flex items-center overflow-hidden`} style={{ left: l + '%', width: w + '%' }} title={`${s.title}: ${s.dur}s`}>{w > 7 && <span className="text-[8px] text-white px-1 truncate leading-4">{s.title}</span>}</div>;
+              })}
             </div>
-            <div className="w-9 text-right text-slate-500 shrink-0 font-mono">{s.dur}s</div>
           </div>
-        );
-      })}
+        ))}
+      </div>
     </div>
   );
 }
 
 // 組み合わせのエビデンス詳細(展開時)。工程ごとのバラつき + 台ごとの作業の流れ。
 function EvidenceDetail({ row }) {
-  const { stepStats, samples } = row.detail;
+  const { stepStats, ganttLot } = row.detail;
   return (
     <div className="bg-slate-50 px-4 py-3 border-t border-slate-200">
       {row.timedUnits === 0 ? (
@@ -134,24 +176,16 @@ function EvidenceDetail({ row }) {
             </div>
             <div className="text-[10px] text-slate-400 mt-1">※ バーが短い(緑)＝時間が安定。長い(赤)＝台ごとにバラつき大。</div>
           </div>
-          {/* 台ごとの作業の流れ */}
+          {/* 複数台の作業の流れ（並行作業のイメージ） */}
           <div>
-            <div className="text-xs font-black text-slate-700 mb-1.5 flex items-center gap-2">作業の流れ（代表 {samples.length} 台）
+            <div className="text-xs font-black text-slate-700 mb-1.5 flex items-center gap-2 flex-wrap">作業の流れ（並行作業のイメージ）
               <span className="inline-flex items-center gap-1 text-[10px] text-slate-500"><span className="w-2.5 h-2.5 rounded bg-blue-500 inline-block" /><Hand className="w-3 h-3" />手動</span>
               <span className="inline-flex items-center gap-1 text-[10px] text-slate-500"><span className="w-2.5 h-2.5 rounded bg-violet-500 inline-block" /><Cpu className="w-3 h-3" />自動測定</span>
             </div>
-            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-              {samples.map((sm, i) => (
-                <div key={i} className="bg-white rounded border border-slate-200 p-2">
-                  <div className="text-[10px] font-bold text-slate-500 mb-1 flex items-center gap-2">
-                    台{sm.unitNo}（指図{sm.orderNo}）
-                    {sm.ok ? <span className="text-emerald-600 inline-flex items-center gap-0.5"><CheckCircle2 className="w-3 h-3" />テンプレ順どおり</span> : <span className="text-rose-600 inline-flex items-center gap-0.5"><AlertTriangle className="w-3 h-3" />順番が違う</span>}
-                  </div>
-                  <UnitTimeline steps={sm.steps} />
-                </div>
-              ))}
+            <div className="bg-white rounded border border-slate-200 p-2 max-h-72 overflow-auto">
+              <MultiUnitGantt lot={ganttLot} />
             </div>
-            <div className="text-[10px] text-slate-400 mt-1">※ 左から時間順。バーの位置＝実際にいつ作業したか。自動測定(紫)中に他工程が動いていれば並行作業。</div>
+            <div className="text-[10px] text-slate-400 mt-1">※ 全台が同じ横軸。<b>ある台の自動測定(紫)が動いている間に、別の台で手動(青)が進んでいれば、それが「自動測定中にできる作業」</b>です。台ごとの ✓＝テンプレ順どおり。</div>
           </div>
         </div>
       )}
@@ -159,7 +193,7 @@ function EvidenceDetail({ row }) {
   );
 }
 
-export function StrictModeManagerModal({ lots, templates, rules = {}, history = [], currentUserName = '', maturityUnits = 5, onSetMaturity, onDecide, onClose }) {
+export function StrictModeManagerModal({ lots, templates, rules = {}, history = [], currentUserName = '', maturityUnits = 5, onSetMaturity, onDecide, onClose, embedded = false }) {
   const [view, setView] = useState('table');
   const [q, setQ] = useState('');
   const [onlyUndecided, setOnlyUndecided] = useState(false);
@@ -179,8 +213,8 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
   const toggle = (k) => setExpanded(e => ({ ...e, [k]: !e[k] }));
 
   return (
-    <div className="fixed inset-0 z-[120] bg-slate-900/60 flex items-stretch justify-center md:p-4" onClick={onClose}>
-      <div className="bg-white w-full md:max-w-[1100px] md:rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+    <div className={embedded ? 'h-full flex' : 'fixed inset-0 z-[120] bg-slate-900/60 flex items-stretch justify-center md:p-4'} onClick={embedded ? undefined : onClose}>
+      <div className={embedded ? 'bg-white rounded-xl border border-slate-200 shadow-sm w-full flex flex-col overflow-hidden h-full' : 'bg-white w-full md:max-w-[1100px] md:rounded-2xl shadow-2xl flex flex-col overflow-hidden'} onClick={e => e.stopPropagation()}>
         <div className="shrink-0 bg-gradient-to-r from-rose-700 to-rose-600 text-white px-5 py-3 flex items-center gap-3">
           <ShieldCheck className="w-6 h-6" />
           <div className="flex-1 min-w-0">
@@ -191,7 +225,7 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
             <button onClick={() => setView('table')} className={`px-3 py-1.5 rounded text-xs font-bold ${view === 'table' ? 'bg-white text-rose-700' : 'text-white'}`}>管理表</button>
             <button onClick={() => setView('history')} className={`px-3 py-1.5 rounded text-xs font-bold flex items-center gap-1 ${view === 'history' ? 'bg-white text-rose-700' : 'text-white'}`}><History className="w-3.5 h-3.5" />変更履歴</button>
           </div>
-          <button onClick={onClose} className="bg-white/15 hover:bg-white/30 rounded-full p-2"><X className="w-5 h-5" /></button>
+          {onClose && <button onClick={onClose} className="bg-white/15 hover:bg-white/30 rounded-full p-2"><X className="w-5 h-5" /></button>}
         </div>
 
         {view === 'table' ? (
