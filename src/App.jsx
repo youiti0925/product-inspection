@@ -15,7 +15,7 @@ import {
   FileUp, FileJson, DownloadCloud, RefreshCw,
   User, Calendar, LogOut, Users, Edit, Grip, LayoutGrid, MapPin, Eye, Filter, List,
   Bot, Zap, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool, Award,
-  Bell, BellRing, Megaphone, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
+  Bell, BellRing, Megaphone, Lightbulb, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
   ListChecks, ArrowUpDown, Calculator, Ruler, MicOff, Printer, Coffee, ChevronDown,
   Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag
 } from 'lucide-react';
@@ -44,9 +44,19 @@ import {
 // 「❓使い方」全画面マニュアル
 import { HelpManualModal, PRODUCT_HELP_SECTIONS } from './HelpManual.jsx';
 // 厳密モードの一元管理（型式×テンプレ・エビデンス・変更履歴）
-import { StrictModeManagerModal, computeStrictEvidence, strictComboKey } from './StrictModeManager.jsx';
+import { StrictModeManagerModal, computeStrictEvidence, strictComboKey, MultiUnitGantt } from './StrictModeManager.jsx';
 // スキルマップ（作業者×スキル：レベル＋回数）
 import { SkillMapView, DEFAULT_SKILLS } from './SkillMap.jsx';
+
+// --- 一度だけ実行: 管理者未承認の厳密モード(localStorageの古い残骸)を全消去して既定OFFに戻す ---
+// 厳密モードは「厳密モード一元管理(settings.strictModeRules)」での承認のみを正とする方針。
+// 過去に端末ごとのトグルや旧バナーで残った strictOrderModeByCombo を一掃する(端末ごと1回だけ)。
+try {
+  if (typeof localStorage !== 'undefined' && !localStorage.getItem('strictOrderResetV1')) {
+    localStorage.removeItem('strictOrderModeByCombo');
+    localStorage.setItem('strictOrderResetV1', '1');
+  }
+} catch {}
 
 // 画像を Cloud Storage にアップロードして URL を返す。失敗時は base64 のまま返す (フォールバック)
 // 既存データ (base64 直保存) と互換: <img src={...}> は URL/base64 両方扱える
@@ -273,19 +283,45 @@ const getBase64 = (file) => new Promise((resolve) => { const r = new FileReader(
 //   savedKey = `model_${model}`
 //   stepKey  = `${step.category || ''}_${step.title}`
 const targetTimeStepKey = (step) => `${step?.category || ''}_${step?.title || ''}`;
-const getEffectiveTargetTime = (step, model, customTargetTimes) => {
+const getEffectiveTargetTime = (step, model, customTargetTimes, modelGroups = null) => {
   if (!step) return 0;
   const fallback = step.targetTime || 0;
   if (!model || !customTargetTimes) return fallback;
-  const calibrated = customTargetTimes[`model_${model}`]?.[targetTimeStepKey(step)];
-  return (typeof calibrated === 'number' && calibrated > 0) ? calibrated : fallback;
+  const sk = targetTimeStepKey(step);
+  const own = customTargetTimes[`model_${model}`]?.[sk];
+  if (typeof own === 'number' && own > 0) return own;
+  // 型式グループ: 自型式に較正値が無ければ同グループ型式の値を引き継ぐ(目標時間のデータ共有)
+  if (modelGroups && Array.isArray(modelGroups)) {
+    const g = modelGroups.find(gr => Array.isArray(gr?.models) && gr.models.includes(model));
+    if (g) for (const sm of g.models) {
+      if (sm === model) continue;
+      const v = customTargetTimes[`model_${sm}`]?.[sk];
+      if (typeof v === 'number' && v > 0) return v;
+    }
+  }
+  return fallback;
 };
 
+// === ロット1回(段取り)工程 ===
+// step.lotOnce === true の工程は「台数分」ではなく「実施回数分」のタスクを持つ (準備・片付け等)。
+// タスクキー: `${step.id}-lot-${k}` (k=0,1,2..)。5台ずつ持ち込み等で準備が複数回発生したら「＋もう1回」で回を追加。
+// 目標時間(step.targetTime/較正値)は「1回あたり」の意味になる。
+const LOT_ONCE_RE = /^(.+)-lot-(\d+)$/;
+const lotOnceKeysOf = (tasks, step) => Object.keys(tasks || {})
+  .filter(k => k.startsWith(`${step?.id}-lot-`))
+  .sort((a, b) => parseInt(a.slice(a.lastIndexOf('-') + 1)) - parseInt(b.slice(b.lastIndexOf('-') + 1)));
+const lotOnceCountOf = (tasks, step) => Math.max(1, lotOnceKeysOf(tasks, step).length); // 表示/分母用 (最低1回)
+
 // ロットの推定総時間。customTargetTimes があれば型式別較正値を使う。
+// ロット1回工程は台数を掛けず1回分のみ加算 (段取りは台数に比例しない)。
 const calculateLotEstimatedTime = (lot, customTargetTimes = null) => {
   if (!lot?.steps || !Array.isArray(lot.steps)) return 0;
-  const perUnitTime = lot.steps.reduce((sum, step) => sum + getEffectiveTargetTime(step, lot.model, customTargetTimes), 0);
-  return perUnitTime * (lot.quantity || 1);
+  let perUnitTime = 0, lotOnceTime = 0;
+  lot.steps.forEach(step => {
+    const t = getEffectiveTargetTime(step, lot.model, customTargetTimes);
+    if (step?.lotOnce) lotOnceTime += t; else perUnitTime += t;
+  });
+  return perUnitTime * (lot.quantity || 1) + lotOnceTime;
 };
 
 // === 勤務時間マスタ ===
@@ -463,10 +499,18 @@ const applyQualityStandardToSteps = (model, baseSteps, settings, templateId = nu
   // どの規格パスを通っても適用されるよう、関数化して各 return 前に通す。
   const applyCalibratedTargets = (stepsArr) => {
     const ctt = settings?.customTargetTimes;
-    if (!ctt || !model || !ctt[`model_${model}`]) return stepsArr;
-    const modelCal = ctt[`model_${model}`];
+    if (!ctt || !model) return stepsArr;
+    // 型式グループ: 自型式に較正値が無ければ同グループ型式の値を引き継ぐ(目標時間のデータ共有)
+    const groupModels = sameGroupModels(model, settings);
+    const calOf = (s) => {
+      const sk = `${s.category || ''}_${s.title || ''}`;
+      const own = ctt[`model_${model}`]?.[sk];
+      if (typeof own === 'number' && own > 0) return own;
+      for (const sm of groupModels) { if (sm === model) continue; const v = ctt[`model_${sm}`]?.[sk]; if (typeof v === 'number' && v > 0) return v; }
+      return null;
+    };
     return stepsArr.map(s => {
-      const cal = modelCal[`${s.category || ''}_${s.title || ''}`];
+      const cal = calOf(s);
       if (typeof cal === 'number' && cal > 0 && cal !== s.targetTime) {
         return { ...s, targetTime: cal, targetTimeCalibrated: true };
       }
@@ -596,6 +640,11 @@ const buildProfileSkippedTasks = (steps, naStepIds, qty) => {
   const naSet = new Set(naStepIds);
   (steps || []).forEach(s => {
     if (!naSet.has(s.id)) return;
+    if (s.lotOnce) {
+      // ロット1回工程: 台数分の台キーを作らず、1回分の lot キーのみ skipped
+      tasks[`${s.id}-lot-0`] = { status: 'skipped', profileSkipped: true, duration: 0, startTime: null, firstStartTime: null, endTime: null, workerName: '規格(該当なし)' };
+      return;
+    }
     for (let u = 0; u < (qty || 1); u++) {
       tasks[`${s.id}-${u}`] = { status: 'skipped', profileSkipped: true, duration: 0, startTime: null, firstStartTime: null, endTime: null, workerName: '規格(該当なし)' };
     }
@@ -608,12 +657,21 @@ const buildProfileSkippedTasks = (steps, naStepIds, qty) => {
 const computeLotProgress = (lot) => {
   if (!lot || !lot.steps || lot.steps.length === 0) return null;
 
-  const totalTasks = lot.steps.length * (lot.quantity || 1);
+  let totalTasks = 0;
   let completedCount = 0;
   let totalCompletedDuration = 0;
   const tasks = lot.tasks || {};
 
   lot.steps.forEach((step, sIdx) => {
+    if (step.lotOnce) {
+      // ロット1回工程: 分母は実施回数 (最低1回)。台数では数えない。
+      const keys = lotOnceKeysOf(tasks, step);
+      const n = Math.max(1, keys.length);
+      totalTasks += n;
+      keys.forEach(k => { const t = tasks[k]; if (t && (t.status === 'completed' || t.status === 'skipped')) { completedCount++; totalCompletedDuration += (t.duration || 0); } });
+      return;
+    }
+    totalTasks += (lot.quantity || 1);
     for (let u = 0; u < (lot.quantity || 1); u++) {
       const t = (step.id && tasks[`${step.id}-${u}`]) || tasks[`${sIdx}-${u}`];
       if (t && (t.status === 'completed' || t.status === 'skipped')) {
@@ -648,7 +706,8 @@ const computeLotProgress = (lot) => {
 
   // 標準予定時刻 (targetTime ベースで純粋に算出された理想完了時刻)
   // 未開始の場合は「今すぐ着手した場合の理想完了時刻」を採用する
-  const standardDurationSec = lot.steps.reduce((s, st) => s + (st.targetTime || 60), 0) * (lot.quantity || 1);
+  const standardDurationSec = lot.steps.reduce((s, st) => s + (st.lotOnce ? 0 : (st.targetTime || 60)), 0) * (lot.quantity || 1)
+    + lot.steps.reduce((s, st) => s + (st.lotOnce ? (st.targetTime || 60) : 0), 0); // ロット1回工程は×1
   const standardStartMs = startMs || Date.now();
   const standardEtaMs = standardStartMs + standardDurationSec * 1000;
 
@@ -1729,21 +1788,51 @@ const computeWorkerTimes = (lots, workerId) => {
 //     ]
 //     sampleLotCount, hasEnoughData
 //   }
+
+// === 型式グループ: 同じ製品・工程の型式を束ねてデータを共有する =========================
+// settings.modelGroups = [{ id, name, models: ['RWA/E/H-200L','RWA/E/H-200R', ...] }]
+//   ・製品が同じで型式(サイズ・L/R)が違うものをグループ化 → 作業順・目標時間のデータを合算。
+//   ・名前が変わってもグループに入れれば引き継ぐ。1型式は1グループまで。
+const modelGroupsOf = (settings) => (settings && Array.isArray(settings.modelGroups)) ? settings.modelGroups : [];
+const groupOfModel = (model, settings) => modelGroupsOf(settings).find(g => Array.isArray(g?.models) && g.models.includes(model)) || null;
+// 同グループの全型式(自分含む)。未所属なら [model] のみ。
+const sameGroupModels = (model, settings) => {
+  const g = groupOfModel(model, settings);
+  return (g && g.models && g.models.length) ? g.models : [model];
+};
+
 const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
   const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
   const fallback = opts.fallbackTargetTime ?? 60;
   const quantity = opts.quantity || 1;
 
-  // 1. 工程ごとの実績平均時間 (テンプレ順は保持)
+  // 工程をタイトルで突き合わせるヘルパー。実データは同じテンプレでもロットごとに step.id・工程順が違うため、
+  //   id 直引きだと別ロットを取りこぼす。→ タイトルで一致させて全ロットを正しく拾う。
+  const lotMaps = completedLots.map(lot => {
+    const idByTitle = {};
+    (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) idByTitle[t] = s?.id || `idx-${i}`; });
+    return { lot, idByTitle, qty: lot.quantity || 1 };
+  });
+  const taskOfTitle = (entry, title, u) => {
+    const id = entry.idByTitle[(title || '').trim()];
+    if (id == null) return undefined;
+    return entry.lot.tasks?.[`${id}-${u}`];
+  };
+  // 時刻(firstStartTime)があるロットだけを「時間・並列・まとめ」解析の対象にする。無いロットは件数だけ残す(隠さない)。
+  const timedEntries = lotMaps.filter(entry => {
+    for (const s of (entry.lot.steps || [])) { for (let u = 0; u < entry.qty; u++) { if (taskOfTitle(entry, s.title, u)?.firstStartTime) return true; } }
+    return false;
+  });
+
+  // 1. 工程ごとの実績平均時間 (タイトルで突き合わせ・全ロット対象)
   const stepStats = {};
   steps.forEach((step, idx) => {
     const k = stepKeyOf(step, idx);
     const durations = [];
-    completedLots.forEach(lot => {
-      const qty = lot.quantity || 1;
-      for (let u = 0; u < qty; u++) {
-        const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${idx}-${u}`];
+    lotMaps.forEach(entry => {
+      for (let u = 0; u < entry.qty; u++) {
+        const t = taskOfTitle(entry, step.title, u);
         if (t && (t.status === 'completed' || t.status === 'ng') && t.duration > 0) durations.push(t.duration);
       }
     });
@@ -1755,24 +1844,21 @@ const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
     stepStats[k] = { step, idx, key: k, avgSec: avg, medianSec: median, sampleCount: durations.length, isAuto: isAutoStep(step) };
   });
 
-  // 2. 実績ベース並列観測 (= 「実際に並行できた」ことが証明された組合せ)
-  //    過去に同じ自動工程中、別の台のどの工程が実際に並行実施されたか
-  //    ※ 重要: ここで観測されたペアだけが「物理的に可能」と確定する
-  //       (測定機を共有する工程は実際に並列できないので、観測ゼロのまま残る)
+  // 2. 実績ベース並列観測 (時刻ありロットのみ・タイトル突き合わせ)
   const parallelObservations = {};  // { autoStepKey: { manualStepKey: count } }
-  completedLots.forEach(lot => {
-    const qty = lot.quantity || 1;
+  timedEntries.forEach(entry => {
+    const qty = entry.qty;
     steps.forEach((aStep, ai) => {
       if (!isAutoStep(aStep)) return;
       for (let au = 0; au < qty; au++) {
-        const at = lot.tasks?.[`${aStep.id}-${au}`] || lot.tasks?.[`${ai}-${au}`];
+        const at = taskOfTitle(entry, aStep.title, au);
         if (!at?.firstStartTime || !at?.endTime) continue;
         const aStart = at.firstStartTime, aEnd = at.endTime;
         steps.forEach((mStep, mi) => {
           if (mi === ai || isAutoStep(mStep)) return;
           for (let mu = 0; mu < qty; mu++) {
             if (mu === au) continue;  // ★ 同じ台の手動は物理的に並列不可、除外
-            const mt = lot.tasks?.[`${mStep.id}-${mu}`] || lot.tasks?.[`${mi}-${mu}`];
+            const mt = taskOfTitle(entry, mStep.title, mu);
             if (!mt?.firstStartTime || !mt?.endTime) continue;
             const overlap = Math.min(aEnd, mt.endTime) - Math.max(aStart, mt.firstStartTime);
             if (overlap > 1000) {
@@ -1785,6 +1871,39 @@ const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
         });
       }
     });
+  });
+
+  // 2.5 「まとめて作業(工程まとめ)」検出 — 定義(B): その工程を“全台ぶん連続でやってから”次の工程へ。
+  //   全タスクを firstStartTime 昇順に並べ、各工程の台がその順番列で“連続して固まっているか”を blockScore で判定。
+  //   blockScore = 台数 / (その工程の台が占める順位の幅)。1.0=完全に連続(まとめ)。低い=他工程と入れ替わり(並行ゾーン)。
+  //   同時スタート(まとめて開始ボタン)も連続も、どちらも高 blockScore になり拾える。時刻ありロットのみ対象。
+  const BLOCK_THRESHOLD = 0.7;
+  const batchObservations = {};
+  steps.forEach((step, idx) => { if (!isAutoStep(step)) batchObservations[stepKeyOf(step, idx)] = { batchedLots: 0, totalLots: 0, batchRate: 0, typicalUnits: 0 }; });
+  timedEntries.forEach(entry => {
+    const qty = entry.qty;
+    if (qty < 2) return;
+    const events = [];
+    steps.forEach((step) => {
+      for (let u = 0; u < qty; u++) { const t = taskOfTitle(entry, step.title, u); if (t?.firstStartTime && (t.status === 'completed' || t.status === 'ng')) events.push({ title: (step.title || '').trim(), fst: t.firstStartTime }); }
+    });
+    if (events.length < 2) return;
+    events.sort((a, b) => a.fst - b.fst);
+    const posByTitle = {};
+    events.forEach((e, i) => { (posByTitle[e.title] = posByTitle[e.title] || []).push(i); });
+    steps.forEach((step, idx) => {
+      if (isAutoStep(step)) return;
+      const obs = batchObservations[stepKeyOf(step, idx)];
+      const pos = posByTitle[(step.title || '').trim()];
+      if (!obs || !pos || pos.length < 2) return;
+      obs.totalLots++;
+      const span = pos[pos.length - 1] - pos[0] + 1;
+      if (pos.length / span >= BLOCK_THRESHOLD) { obs.batchedLots++; obs.typicalUnits += pos.length; }
+    });
+  });
+  Object.values(batchObservations).forEach(o => {
+    o.batchRate = o.totalLots > 0 ? o.batchedLots / o.totalLots : 0;
+    o.typicalUnits = o.batchedLots > 0 ? Math.round(o.typicalUnits / o.batchedLots) : 0;
   });
 
   // 3. 並列候補の決定 (現実的)
@@ -1898,18 +2017,222 @@ const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
 
   return {
     stepStats,
-    opportunities,            // ← 新: 自動工程ごとに「他の台でやれる作業」
+    opportunities,            // ← 自動工程ごとに「他の台でやれる作業」
     parallelObservations,
+    batchObservations,        // ← 新: 工程ごとの「まとめて作業」実績
     serialTotalSec: serialTotal,
     optimalTotalSec: optimalTotal,
     timeSavedSec: savedSec,
     timeSavedPercent: serialTotal > 0 ? Math.round((savedSec / serialTotal) * 100) : 0,
     sampleLotCount: completedLots.length,
+    lotsWithTime: timedEntries.length,          // ← 時刻データがあり実際に解析できたロット数
+    lotsNoTime: completedLots.length - timedEntries.length, // ← 時刻なしで解析から外れたロット数
     quantity,
     autoCount: Object.values(stepStats).filter(s => s.isAuto).length,
     manualCount: Object.values(stepStats).filter(s => !s.isAuto).length,
-    hasEnoughData: completedLots.length >= 3,
+    // 「十分」= 時刻ありロットが3件以上(件数だけでなく実データで判定)
+    hasEnoughData: timedEntries.length >= 3,
   };
+};
+
+// === データ最適順: 「次の一手」を返す純関数 ===========================================
+// 承認コンボの厳密モードで、素朴な globalNextTask の代わりに使う「実績データ駆動の次手」。
+// 正直な注記: これは greedy ヒューリスティックで、数学的な最適(最小メイクスパン)を保証するものではない。
+//   ただし「実測時間 + 実績の並列観測 + バッチ実績」だけを根拠に、現実的に最も無駄が少ない手を選ぶ。
+// 方針(優先度順):
+//   ① 手動タスクが進行中 → 作業者は手を動かしてる → null(次は出さない)
+//   ② データが「まとめて作業」を示す工程が複数台で次に控えてる → batch 指示(まとめて開始を強制)
+//   ③ 機械が空いてて自動測定を開始できる台がある → 自動を先に回す(並行枠を作る=最大の時短源)
+//   ④ 機械稼働中は 機械占有台をスキップして他台の手作業(=実績上その自動と並行できる作業)
+//   ⑤ それ以外は 台順 × テンプレ順(台内の工程順は維持。並べ替えはしない=2026-05-30方針)
+// move: { type:'batch', stepIdx, units:[], stepKey } | { type:'auto-start'|'task', stepIdx, unitIdx, stepKey } | null
+const nextOptimalMove = (steps, tasks, quantity, analysis, opts = {}) => {
+  const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+  const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
+  const statusOf = (si, u) => {
+    const s = steps[si];
+    const t = tasks[(s?.id ? `${s.id}-${u}` : `${si}-${u}`)] || tasks[`${si}-${u}`];
+    return t?.status || 'waiting';
+  };
+  const batchObs = analysis?.batchObservations || {};
+  // 「まとめ」を強制するのは“確定”の時だけ: 時刻ありロットが BATCH_MIN_LOTS 件以上 かつ そのうち
+  //   BATCH_THRESHOLD 以上の割合で「全台ぶん連続(B)」が観測された工程だけ。少数/ばらつきは強制しない。
+  const BATCH_THRESHOLD = opts.batchThreshold ?? 0.7;
+  const BATCH_MIN_LOTS = opts.batchMinLots ?? 3;
+  const isConfidentBatch = (o) => !!o && o.totalLots >= BATCH_MIN_LOTS && o.batchRate >= BATCH_THRESHOLD;
+
+  // ① 手動タスク進行中 → 次は出さない
+  for (let si = 0; si < steps.length; si++) {
+    if (isAutoStep(steps[si])) continue;
+    for (let u = 0; u < quantity; u++) if (statusOf(si, u) === 'processing') return null;
+  }
+
+  // 各台: 次工程(テンプレ順で最初の waiting/paused) と 機械占有(自動測定 processing) を求める
+  const unitNext = [], unitBusy = [];
+  for (let u = 0; u < quantity; u++) {
+    let next = -1, busy = false;
+    for (let si = 0; si < steps.length; si++) {
+      const st = statusOf(si, u);
+      if (isAutoStep(steps[si]) && st === 'processing') { busy = true; break; } // 機械占有 → この台は停止
+      if (st === 'waiting' || st === 'paused') { next = si; break; }
+      // completed/skipped/ng → 次へ
+    }
+    unitNext[u] = next; unitBusy[u] = busy;
+  }
+
+  // ② バッチ強制(データ実績): 同一工程を「次」に控える空き台が2台以上 & その工程がバッチ実績工程
+  const stepToUnits = {};
+  for (let u = 0; u < quantity; u++) {
+    if (unitBusy[u]) continue;
+    const si = unitNext[u];
+    if (si < 0 || isAutoStep(steps[si])) continue;
+    (stepToUnits[si] = stepToUnits[si] || []).push(u);
+  }
+  for (const si of Object.keys(stepToUnits).map(Number).sort((a, b) => a - b)) {
+    const units = stepToUnits[si];
+    if (units.length < 2) continue;
+    const bk = stepKeyOf(steps[si], si);
+    if (isConfidentBatch(batchObs[bk])) {
+      return { type: 'batch', stepIdx: si, units, stepKey: bk };
+    }
+  }
+
+  const anyBusy = unitBusy.some(Boolean);
+
+  // ③ 機械が空いてる & 自動を開始できる台がある → 自動を先に回す(並行枠を作る)
+  if (!anyBusy) {
+    for (let u = 0; u < quantity; u++) {
+      if (unitNext[u] >= 0 && isAutoStep(steps[unitNext[u]])) {
+        const si = unitNext[u];
+        return { type: 'auto-start', stepIdx: si, unitIdx: u, stepKey: stepKeyOf(steps[si], si) };
+      }
+    }
+  }
+
+  // ④/⑤ 台順 × テンプレ順 で最初の「手動」未着手(機械占有台はスキップ)
+  //   ★自動の開始は ③ のみが担当する。実データ上 自動測定は同時に1つしか走っていない
+  //     (= 測定機は1台の共有リソース)ので、ここで2台目の自動を始めてはいけない。
+  //     fallback では自動工程は返さず、機械が空くまで他台の手作業で埋める。
+  for (let u = 0; u < quantity; u++) {
+    if (unitBusy[u]) continue;
+    const si = unitNext[u];
+    if (si < 0) continue;
+    if (isAutoStep(steps[si])) continue; // 自動は二重起動しない(③専任)
+    return { type: 'task', stepIdx: si, unitIdx: u, stepKey: stepKeyOf(steps[si], si) };
+  }
+  return null;
+};
+
+// === 強制スケジュール全体(順序付き)を生成: nextOptimalMove を時計付きでシミュレート ===
+// 主に管理画面のエビデンス表示(「この順番で強制します」プレビュー)と検証用。
+// 時間は analysis.stepStats の実測 median/avg を使う近似。makespan は概算。
+const computeEnforcedSchedule = (steps, quantity, analysis, opts = {}) => {
+  const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+  const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
+  const keyOf = (si, u) => { const s = steps[si]; return s?.id ? `${s.id}-${u}` : `${si}-${u}`; };
+  const durOf = (si) => {
+    const st = analysis?.stepStats?.[stepKeyOf(steps[si], si)];
+    return Math.max(1, st ? (st.medianSec || st.avgSec || steps[si]?.targetTime || 60) : (steps[si]?.targetTime || 60));
+  };
+  const tasks = {};
+  const endAt = {};
+  let clock = 0;
+  const moves = [];
+  let guard = 0; const maxGuard = (steps.length * quantity * 6) + 100;
+
+  const completeDue = () => {
+    let nextEvent = Infinity, changed = false;
+    Object.keys(endAt).forEach(k => {
+      if (tasks[k]?.status === 'processing') {
+        if (endAt[k] <= clock + 1e-6) { tasks[k].status = 'completed'; changed = true; }
+        else nextEvent = Math.min(nextEvent, endAt[k]);
+      }
+    });
+    return { nextEvent, changed };
+  };
+
+  while (guard++ < maxGuard) {
+    const mv = nextOptimalMove(steps, tasks, quantity, analysis, opts);
+    if (mv) {
+      const dur = durOf(mv.stepIdx);
+      if (mv.type === 'batch') {
+        moves.push({ type: 'batch', stepIdx: mv.stepIdx, units: mv.units.slice(), title: steps[mv.stepIdx]?.title, durSec: dur, atSec: Math.round(clock) });
+        mv.units.forEach(u => { const k = keyOf(mv.stepIdx, u); tasks[k] = { status: 'processing' }; endAt[k] = clock + dur; });
+        clock += dur; completeDue();
+      } else if (mv.type === 'auto-start') {
+        moves.push({ type: 'auto-start', stepIdx: mv.stepIdx, unitIdx: mv.unitIdx, title: steps[mv.stepIdx]?.title, durSec: dur, atSec: Math.round(clock) });
+        const k = keyOf(mv.stepIdx, mv.unitIdx); tasks[k] = { status: 'processing' }; endAt[k] = clock + dur;
+        // 機械が回る間、作業者は自由 → clock は進めない
+      } else { // task (manual): 作業者が張り付く
+        moves.push({ type: 'task', stepIdx: mv.stepIdx, unitIdx: mv.unitIdx, title: steps[mv.stepIdx]?.title, durSec: dur, atSec: Math.round(clock) });
+        const k = keyOf(mv.stepIdx, mv.unitIdx); tasks[k] = { status: 'processing' }; endAt[k] = clock + dur;
+        clock += dur; completeDue();
+      }
+    } else {
+      // 次手なし(機械待ち) → 次の完了イベントまで時計を飛ばす
+      const { nextEvent, changed } = completeDue();
+      if (!changed) {
+        if (nextEvent === Infinity) break;
+        clock = nextEvent; completeDue();
+      }
+    }
+  }
+  return {
+    moves,
+    makespanSec: Math.round(clock),
+    batchMoveCount: moves.filter(m => m.type === 'batch').length,
+    autoStartCount: moves.filter(m => m.type === 'auto-start').length,
+    taskCount: moves.filter(m => m.type === 'task').length,
+  };
+};
+
+// === 実データ分析(読み取り専用): 1コンボの完了ロットを「実際の作業順」で見比べる =========
+// 目的: 各ロットが実際どう動いたかを並べて、揃い具合・逸脱・改善シグナルを“見えるように”する。
+// 何も書き換えない。判断材料を出すだけ。
+const analyzeLotsForReview = (steps = [], completedLots = []) => {
+  const isAuto = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+  const lotMaps = completedLots.map(lot => {
+    const idByTitle = {}; (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) idByTitle[t] = s?.id || `idx-${i}`; });
+    return { lot, idByTitle, qty: lot.quantity || 1 };
+  });
+  const taskOf = (e, title, u) => { const id = e.idByTitle[(title || '').trim()]; return id != null ? e.lot.tasks?.[`${id}-${u}`] : undefined; };
+  const tmplTitles = steps.map(s => (s.title || '').trim());
+  const autoTitles = new Set(steps.filter(isAuto).map(s => (s.title || '').trim()));
+
+  const perLot = [];
+  lotMaps.forEach(e => {
+    const evs = [];
+    steps.forEach(s => { for (let u = 0; u < e.qty; u++) { const t = taskOf(e, s.title, u); if (t?.firstStartTime && (t.status === 'completed' || t.status === 'ng')) evs.push({ title: (s.title || '').trim(), fst: t.firstStartTime }); } });
+    if (evs.length < 2) return;
+    evs.sort((a, b) => a.fst - b.fst);
+    const posByTitle = {}; evs.forEach((ev, i) => { (posByTitle[ev.title] = posByTitle[ev.title] || []).push(i); });
+    const med = (arr) => arr[Math.floor(arr.length / 2)];
+    const actualOrder = tmplTitles.filter(t => posByTitle[t]).slice().sort((a, b) => med(posByTitle[a]) - med(posByTitle[b]));
+    const tmplOrderTimed = tmplTitles.filter(t => posByTitle[t]);
+    const matchesTemplate = JSON.stringify(actualOrder) === JSON.stringify(tmplOrderTimed);
+    const blocks = {}; Object.entries(posByTitle).forEach(([t, pos]) => { if (pos.length < 2) return; const span = pos[pos.length - 1] - pos[0] + 1; blocks[t] = (pos.length / span >= 0.7); });
+    // 台ごとの実作業(ガント用): MultiUnitGantt が期待する {unitNo, ok, steps:[{title,dur,isAuto,start,end}]}
+    const ganttUnits = [];
+    for (let u = 0; u < e.qty; u++) {
+      const us = [];
+      steps.forEach(s => { const t = taskOf(e, s.title, u); if (t?.firstStartTime && t?.endTime) us.push({ title: (s.title || '').trim(), dur: t.duration || 0, isAuto: isAuto(s), start: t.firstStartTime, end: t.endTime }); });
+      if (us.length) ganttUnits.push({ unitNo: u + 1, ok: true, steps: us });
+    }
+    perLot.push({ orderNo: e.lot.orderNo, model: e.lot.model, qty: e.qty, completedAt: e.lot.completedAt, actualOrder, matchesTemplate, blocks, ganttUnits });
+  });
+  perLot.sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+
+  // 該当なし率(不要工程候補)
+  const skipRate = {};
+  steps.forEach(s => { const t = (s.title || '').trim(); let sk = 0, tot = 0; lotMaps.forEach(e => { for (let u = 0; u < e.qty; u++) { const x = taskOf(e, s.title, u); if (x && (x.status === 'completed' || x.status === 'ng' || x.status === 'skipped')) { tot++; if (x.status === 'skipped') sk++; } } }); if (tot > 0) skipRate[t] = { sk, tot, pct: Math.round(sk / tot * 100) }; });
+  // まとめ率(blockScoreベース)
+  const blockAgg = {};
+  tmplTitles.forEach(t => { if (autoTitles.has(t)) return; let b = 0, n = 0; perLot.forEach(p => { if (t in p.blocks) { n++; if (p.blocks[t]) b++; } }); if (n > 0) blockAgg[t] = { b, n, pct: Math.round(b / n * 100), confident: n >= 3 && (b / n) >= 0.7 }; });
+  // 作業順パターン(揃い具合)
+  const sigs = {}; perLot.forEach(p => { const s = p.actualOrder.join(' > '); (sigs[s] = sigs[s] || { n: 0, lots: [] }); sigs[s].n++; sigs[s].lots.push(p.orderNo); });
+  const orderSignatures = Object.entries(sigs).map(([sig, v]) => ({ sig, n: v.n, lots: v.lots })).sort((a, b) => b.n - a.n);
+
+  return { perLot, tmplTitles, autoTitles: [...autoTitles], skipRate, blockAgg, orderSignatures, lotsWithTime: perLot.length, totalLots: completedLots.length };
 };
 
 // === Gemini AI による作業順提案 (オプション) ===
@@ -1997,7 +2320,7 @@ ${JSON.stringify(payload.parallelRanking || [], null, 2)}
 【4. 全体統計】
 ${JSON.stringify(payload.stats || {}, null, 2)}
 
-【5. 型式別 不具合・気づき】
+【5. 型式別 不具合・軽微不良】
 ${JSON.stringify(payload.modelIssues || {}, null, 2)}
 
 【要件】
@@ -2630,9 +2953,11 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
       if (taskEnd < fromTs.getTime() || taskEnd > toTs.getTime() + 86400000) return;
       const step = lot.steps?.find(s => key.startsWith(s.id + '-')) || lot.steps?.[parseInt(key.split('-')[0])];
       // key 形式: "stepId-unitIdx" → unitIdx を抽出して機番情報を取得
+      // ロット1回キー "stepId-lot-k" の k は台番号ではなく回数なので「N回目」表示にする
       const parts = key.split('-');
-      const unitIdx = parseInt(parts[parts.length - 1]);
-      const unitSn = !isNaN(unitIdx) ? (lot.unitSerialNumbers?.[unitIdx] || `#${unitIdx + 1}`) : '';
+      const isLotKey = parts.length >= 2 && parts[parts.length - 2] === 'lot';
+      const unitIdx = isLotKey ? NaN : parseInt(parts[parts.length - 1]);
+      const unitSn = isLotKey ? `${parseInt(parts[parts.length - 1]) + 1}回目` : (!isNaN(unitIdx) ? (lot.unitSerialNumbers?.[unitIdx] || `#${unitIdx + 1}`) : '');
       const detail = {
         lotId: lot.id, lot: lot.orderNo, model: lot.model,
         stepId: step?.id || key, step: step?.title || key,
@@ -3553,6 +3878,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   // 自動測定の既知時間: ON にすると、開始後 autoEndSec 秒の経過で自動的に時間取りを終了(完了)する
   const [autoEndEnabled, setAutoEndEnabled] = useState(false);
   const [autoEndSec, setAutoEndSec] = useState(0);
+  // ロット1回(段取り)工程: 台数分ではなく回数分の計測 (準備・片付け用)
+  const [lotOnce, setLotOnce] = useState(false);
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
   const [pdfData, setPdfData] = useState(null);
@@ -3640,6 +3967,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       workResource: workResource || null,  // null = 機械独立 (並行可)
       // 自動測定の既知時間 (経過で自動終了)。自動工程かつ有効かつ正の秒数のときのみ保存。
       ...(executionMode === 'batch' && autoEndEnabled && autoEndSec > 0 ? { autoEndEnabled: true, autoEndSec: Math.round(autoEndSec) } : {}),
+      ...(lotOnce ? { lotOnce: true } : {}),  // ロット1回(段取り)工程
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
       // checklistItems は type 問わず保存可能 (測定 + チェックの併用OK)
       ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {})
@@ -3647,7 +3975,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); }
     resetInput();
   };
-  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); };
+  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); };
   const editStep = (s) => {
     setEditingStepId(s.id);
     setTitle(s.title);
@@ -3662,6 +3990,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     setWorkResource(s.workResource || '');
     setAutoEndEnabled(!!s.autoEndEnabled);
     setAutoEndSec(s.autoEndSec || 0);
+    setLotOnce(!!s.lotOnce);
     setChecklistItems(Array.isArray(s.checklistItems) ? s.checklistItems : []);
   };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
@@ -3776,6 +4105,19 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                   <div className="text-[10px] text-purple-600 leading-relaxed">開始すると自動でカウントし、登録した時間が経過すると「完了」になります。一時停止中はカウントも止まります。</div>
                 </div>
               )}
+
+              {/* ロット1回(段取り)工程: 台数分ではなく回数分の計測 */}
+              <div className="bg-teal-50 border border-teal-200 rounded p-2 space-y-1">
+                <label className="flex items-center gap-2 text-xs font-bold text-teal-800 cursor-pointer">
+                  <input type="checkbox" checked={lotOnce} onChange={e => setLotOnce(e.target.checked)} className="w-4 h-4 accent-teal-600"/>
+                  📦 ロットで1回（準備・片付けなどの段取り工程）
+                </label>
+                <div className="text-[10px] text-teal-700 leading-relaxed">
+                  ONにすると、この工程は<b>台数分のボタンではなく「回数」のボタン</b>になります（10台でもボタン1個）。
+                  5台ずつ持ち込み等で準備・片付けが複数回発生する場合は、作業画面の<b>「＋もう1回」</b>で回を追加できます。
+                  目標時間は「1回あたり」の意味になり、1台目に段取り時間が混ざる問題が解消されます。
+                </div>
+              </div>
 
               {/* 占有リソース */}
               <div>
@@ -4880,71 +5222,44 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
 // === ライブ並行作業ガイド (自動測定中にリアルタイム表示) ===
 // 自動測定が走っている間、その経過時間に応じて「今やれる他の台の作業」を表示。
 // 自動測定が予定オーバーしたら、追加でやれる作業を動的に出す。
-const LiveParallelGuide = ({ guide, fmtTime }) => {
+// コンパクト版ライブ並行ガイド: 1行ヘッダー＋細い進捗＋横並びチップ。onHide で非表示にできる。
+const LiveParallelGuide = ({ guide, fmtTime, onHide }) => {
   if (!guide || !guide.runningAuto) return null;
   const { runningAuto, planned, extra, isOverrun, overrunSec, remainingSec } = guide;
   const elapsed = runningAuto.elapsedSec;
   const target = runningAuto.targetSec;
   const pct = target > 0 ? Math.min(100, Math.round((elapsed / target) * 100)) : 0;
+  const Chip = ({ t, kind }) => (
+    <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] border ${kind === 'extra' ? 'bg-amber-50 border-amber-300' : 'bg-blue-50 border-blue-200'}`}>
+      {kind === 'extra' && <span className="text-amber-600 font-black">+</span>}
+      <span className="bg-blue-600 text-white text-[10px] font-black px-1 rounded">#{t.unitIdx + 1}</span>
+      <span className="font-bold text-slate-800">{t.stepTitle}</span>
+      <span className="text-slate-400 font-mono text-[10px]">{fmtTime(t.durationSec)}</span>
+    </span>
+  );
   return (
-    <div className={`mb-3 rounded-xl border-2 shadow-md overflow-hidden ${isOverrun ? 'border-rose-400' : 'border-purple-400'}`}>
-      {/* ヘッダー: 自動測定の進捗 */}
-      <div className={`px-4 py-2.5 ${isOverrun ? 'bg-rose-600' : 'bg-purple-600'} text-white`}>
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <div className="flex items-center gap-2">
-            <Bot className="w-5 h-5 animate-pulse"/>
-            <span className="font-black text-sm">🤖 #{runningAuto.unitIdx + 1}台目「{runningAuto.step.title}」自動測定中</span>
-          </div>
-          <div className="flex items-center gap-2 text-sm">
-            <span className="font-mono font-black text-lg">{fmtTime(elapsed)}</span>
-            {target > 0 && (
-              isOverrun
-                ? <span className="bg-white/25 px-2 py-0.5 rounded font-bold text-xs animate-pulse">⚠ 予定+{fmtTime(overrunSec)} 延長中</span>
-                : <span className="bg-white/20 px-2 py-0.5 rounded font-bold text-xs">残 {fmtTime(remainingSec)} (目安{fmtTime(target)})</span>
-            )}
-          </div>
-        </div>
-        {/* 進捗バー */}
-        {target > 0 && (
-          <div className="mt-1.5 h-1.5 bg-white/20 rounded-full overflow-hidden">
-            <div className={`h-full ${isOverrun ? 'bg-amber-300' : 'bg-white'} transition-all`} style={{ width: `${pct}%` }}/>
-          </div>
-        )}
+    <div className={`mb-2 rounded-lg border shadow-sm overflow-hidden ${isOverrun ? 'border-rose-300' : 'border-purple-300'}`}>
+      {/* 1行ヘッダー(コンパクト) */}
+      <div className={`px-2.5 py-1 ${isOverrun ? 'bg-rose-600' : 'bg-purple-600'} text-white flex items-center gap-2`}>
+        <Bot className="w-4 h-4 animate-pulse shrink-0" />
+        <span className="font-bold text-xs truncate flex-1">🤖 #{runningAuto.unitIdx + 1}「{runningAuto.step.title}」測定中</span>
+        <span className="font-mono font-black text-sm shrink-0">{fmtTime(elapsed)}</span>
+        {target > 0 && (isOverrun
+          ? <span className="bg-white/25 px-1.5 rounded font-bold text-[10px] shrink-0">予定+{fmtTime(overrunSec)}</span>
+          : <span className="bg-white/20 px-1.5 rounded font-bold text-[10px] shrink-0">残{fmtTime(remainingSec)}</span>)}
+        {onHide && <button onClick={onHide} title="並行ガイドを隠す" className="shrink-0 hover:bg-white/20 rounded p-0.5"><X className="w-3.5 h-3.5" /></button>}
       </div>
-      {/* 本体: 今やれる作業 */}
-      <div className="bg-white p-3">
-        <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1">
-          <Zap className="w-3.5 h-3.5 text-purple-600"/> この自動測定中に、別の台でやれる作業:
-        </div>
+      {target > 0 && <div className="h-1 bg-purple-100"><div className={`h-full ${isOverrun ? 'bg-rose-400' : 'bg-purple-400'} transition-all`} style={{ width: `${pct}%` }} /></div>}
+      {/* 本体: 横並びチップ */}
+      <div className="bg-white px-2 py-1.5">
         {planned.length === 0 && extra.length === 0 ? (
-          <div className="text-xs text-slate-400 italic py-2">
-            並行できる作業がありません (他の台がない、または「機械独立」タグの工程がない)
-          </div>
+          <div className="text-[11px] text-slate-400 italic">並行できる作業なし（他台なし／機械独立工程なし）</div>
         ) : (
-          <div className="space-y-1.5">
-            {planned.map((t, i) => (
-              <div key={`p${i}`} className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded px-2.5 py-1.5">
-                <span className="bg-blue-600 text-white text-[11px] font-black px-1.5 py-0.5 rounded shrink-0">#{t.unitIdx + 1}台目</span>
-                <span className="font-bold text-slate-800 text-sm flex-1">{t.stepTitle}</span>
-                <span className="text-xs text-slate-500 font-mono">{fmtTime(t.durationSec)}</span>
-              </div>
-            ))}
-            {/* 延長で追加された候補 */}
-            {extra.length > 0 && (
-              <>
-                <div className="text-[11px] font-bold text-rose-600 mt-2 flex items-center gap-1 pt-1.5 border-t border-rose-100">
-                  ⚡ 自動測定が延長中 → 追加でこの作業もできます:
-                </div>
-                {extra.map((t, i) => (
-                  <div key={`e${i}`} className="flex items-center gap-2 bg-amber-50 border border-amber-300 rounded px-2.5 py-1.5 animate-pulse">
-                    <span className="bg-amber-500 text-white text-[10px] font-black px-1 py-0.5 rounded shrink-0">追加</span>
-                    <span className="bg-blue-600 text-white text-[11px] font-black px-1.5 py-0.5 rounded shrink-0">#{t.unitIdx + 1}台目</span>
-                    <span className="font-bold text-slate-800 text-sm flex-1">{t.stepTitle}</span>
-                    <span className="text-xs text-slate-500 font-mono">{fmtTime(t.durationSec)}</span>
-                  </div>
-                ))}
-              </>
-            )}
+          <div className="flex flex-wrap items-center gap-1">
+            <span className="text-[10px] font-bold text-purple-700 mr-0.5 flex items-center gap-0.5"><Zap className="w-3 h-3" />他の台で並行:</span>
+            {planned.map((t, i) => <Chip key={`p${i}`} t={t} kind="plan" />)}
+            {extra.map((t, i) => <Chip key={`e${i}`} t={t} kind="extra" />)}
+            {extra.length > 0 && <span className="text-[10px] text-amber-600">（<b>+</b>＝測定が延びたら）</span>}
           </div>
         )}
       </div>
@@ -4955,15 +5270,55 @@ const LiveParallelGuide = ({ guide, fmtTime }) => {
 // === カスタムモード コンパクト一覧表示 ===
 // 工程(行) × 台数(列) の高密度テーブル。カードより圧迫感が少なく全体を見渡せる。
 // 各セルをタップすると onCellClick(sIdx, uIdx) — カード版と同じ動作。
-const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNextTask, getTaskStatusColor, formatTime, activeCustomTaskKey, onCellClick, onBatchClick, onSkipRow }) => {
+// 目標時間警告の点滅アニメーション (設定で なし/ゆっくり/はやい を選択)
+if (typeof document !== 'undefined' && !document.getElementById('oa-blink-style')) {
+  const s = document.createElement('style'); s.id = 'oa-blink-style';
+  s.textContent = '@keyframes oaBlink{0%,100%{opacity:1}50%{opacity:.25}} .oa-blink-slow{animation:oaBlink 1.6s ease-in-out infinite} .oa-blink-fast{animation:oaBlink .6s linear infinite} @keyframes oaRotate{from{stroke-dashoffset:0}to{stroke-dashoffset:-100}} .oa-rotate{animation:oaRotate 1.6s linear infinite}';
+  document.head.appendChild(s);
+}
+const oaBlinkCls = (mode) => mode === 'fast' ? 'oa-blink-fast' : mode === 'slow' ? 'oa-blink-slow' : '';
+
+// 目標時間警告の通知音 (Web Audio: 音声ファイル不要の短いビープ。音量控えめ)
+let _beepCtx = null;
+const playOverrunBeep = (kind = 'warn') => {
+  try {
+    _beepCtx = _beepCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _beepCtx; if (ctx.state === 'suspended') ctx.resume();
+    const tone = (freq, t0, dur = 0.14, vol = 0.12) => {
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(vol, ctx.currentTime + t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t0 + dur);
+      o.start(ctx.currentTime + t0); o.stop(ctx.currentTime + t0 + dur + 0.02);
+    };
+    if (kind === 'over') { tone(660, 0); tone(660, 0.2); } // 超過: ピッ・ピッ
+    else tone(880, 0, 0.12, 0.1);                           // 警告: 軽くピッ
+  } catch { /* 音はベストエフォート (初回はユーザー操作後でないと鳴らないブラウザあり) */ }
+};
+
+const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNextTask, getTaskStatusColor, formatTime, activeCustomTaskKey, onCellClick, onBatchClick, onSkipRow, dense = false, effTargets = [], oa = { enabled: true, warnPct: 80, overPct: 100, warnColor: '#F59E0B', overColor: '#E11D48', warnBlink: 'none', overBlink: 'slow' }, onEditReworks = null }) => {
   const qty = lot.quantity || 1;
+  // 密表示(無理やり表示)モード: 工程欄・セル・余白を縮めて多くの台(10台等)を画面に収める
+  const D = dense ? {
+    stepTh: 'p-1.5 min-w-[100px]', stepTd: 'p-1.5', stepTitle: 'text-[12px]', stepMeta: 'hidden sm:flex',
+    unitTh: 'p-1 min-w-[42px]', unitSub: 'hidden', cellBtn: 'py-0.5 px-0', cellMinH: '34px', cellMark: 'text-[11px] font-black', cellTime: 'text-[9px] font-mono',
+    batchTd: 'p-0.5 w-11', batchBtn: 'text-[9px] px-0.5 py-1',
+  } : {
+    stepTh: 'p-3 min-w-[170px]', stepTd: 'p-3', stepTitle: 'text-[15px]', stepMeta: 'flex',
+    unitTh: 'p-2 min-w-[68px]', unitSub: '', cellBtn: 'py-1.5 px-0.5', cellMinH: '52px', cellMark: 'text-sm font-black', cellTime: 'text-xs font-mono',
+    batchTd: 'p-1 w-16', batchBtn: 'text-[11px] px-2 py-1.5',
+  };
   const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const getTask = (step, sIdx, u) => {
-    const k = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
-    return tasks[k] || tasks[`${sIdx}-${u}`] || { status: 'waiting', duration: 0 };
+    // ロット1回工程: u は回数k、キーは lot-k
+    const k = step?.lotOnce ? `${step.id}-lot-${u}` : (step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
+    return tasks[k] || (step?.lotOnce ? null : tasks[`${sIdx}-${u}`]) || { status: 'waiting', duration: 0 };
   };
-  // セルの短い表示 (ステータス記号 + 時間)
-  const cellContent = (task) => {
+  // ロット1回工程の既存回数 (キー昇順)
+  const lotOccCount = (step) => Object.keys(tasks || {}).filter(k => k.startsWith(`${step?.id}-lot-`)).length;
+  // セルの短い表示 (ステータス記号 + 時間)。tgt>0 の作業中は目標オーバー(赤点滅)/80%警告(黄リング)を出す
+  const cellContent = (task, tgt = 0) => {
     const st = task.status;
     const dur = task.status === 'processing' && task.startTime
       ? task.duration + Math.floor((Date.now() - task.startTime) / 1000)
@@ -4976,7 +5331,12 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
     if (st === 'skipped') return task.profileSkipped
       ? { mark: '規', time: '該当なし(規格)', cls: 'bg-indigo-50 text-indigo-400' }
       : { mark: '–', time: '該当なし', cls: 'bg-slate-100 text-slate-400' };
-    if (st === 'processing') return { mark: '▶', time: formatTime(dur), cls: 'bg-blue-600 text-white animate-pulse' };
+    if (st === 'processing') {
+      const pct = tgt > 0 ? Math.min(100, dur / tgt * 100) : null; // 進捗ゲージ用 (経過/目標)
+      if (oa.enabled && tgt > 0 && dur >= tgt * ((oa.overPct || 100) / 100)) return { mark: '⏰', time: formatTime(dur), pct, over: true, cls: `text-white ${oaBlinkCls(oa.overBlink)}`, style: { backgroundColor: oa.overColor, boxShadow: `0 0 0 2px ${oa.overColor}66` } };
+      if (oa.enabled && tgt > 0 && dur >= tgt * ((oa.warnPct || 80) / 100)) return { mark: '▶', time: formatTime(dur), pct, warn: true, cls: `bg-blue-600 text-white ${oaBlinkCls(oa.warnBlink) || 'animate-pulse'}`, style: { boxShadow: `0 0 0 2px ${oa.warnColor}` } };
+      return { mark: '▶', time: formatTime(dur), pct, cls: 'bg-blue-600 text-white animate-pulse' };
+    }
     if (st === 'paused') return { mark: '⏸', time: formatTime(dur), cls: 'bg-amber-100 text-amber-700' };
     return { mark: '', time: '', cls: 'bg-white text-slate-300 border border-slate-200' };
   };
@@ -4985,14 +5345,14 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
       <table className="w-full border-collapse text-sm">
         <thead className="sticky top-0 z-10">
           <tr className="bg-slate-100 border-b-2 border-slate-300">
-            <th className="p-3 text-left font-bold sticky left-0 bg-slate-100 min-w-[170px] z-20">工程</th>
+            <th className={`${D.stepTh} text-left font-bold sticky left-0 bg-slate-100 z-20`}>工程</th>
             {Array.from({ length: qty }).map((_, u) => (
-              <th key={u} className="p-2 text-center font-bold min-w-[68px] border-l border-slate-200">
+              <th key={u} className={`${D.unitTh} text-center font-bold border-l border-slate-200`}>
                 #{u + 1}
-                {lot.unitSerialNumbers?.[u] && <div className="font-normal text-slate-400 text-[10px] truncate max-w-[64px]">{lot.unitSerialNumbers[u]}</div>}
+                {lot.unitSerialNumbers?.[u] && <div className={`font-normal text-slate-400 text-[10px] truncate max-w-[64px] ${D.unitSub}`}>{lot.unitSerialNumbers[u]}</div>}
               </th>
             ))}
-            <th className="p-1 text-center font-bold w-16 bg-slate-200 border-l-2 border-slate-300">一括</th>
+            <th className={`${D.batchTd} text-center font-bold bg-slate-200 border-l-2 border-slate-300`}>一括</th>
           </tr>
         </thead>
         <tbody>
@@ -5003,22 +5363,57 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
             return (
               <tr key={step.id || sIdx} className="border-b border-slate-100 hover:bg-blue-50/20">
                 {/* 工程名 (sticky) */}
-                <td className="p-3 sticky left-0 bg-white border-r border-slate-200 z-10">
+                <td className={`${D.stepTd} sticky left-0 bg-white border-r border-slate-200 z-10`}>
                   <div className="flex items-center gap-1.5">
-                    {isAuto && <span className="bg-purple-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">自動</span>}
-                    <span className="font-bold text-slate-800 text-[15px] leading-tight">{step.title}</span>
+                    {isAuto && <span className="bg-purple-500 text-white text-[10px] font-bold px-1 py-0.5 rounded shrink-0">自</span>}
+                    <span className={`font-bold text-slate-800 ${D.stepTitle} leading-tight`}>{step.title}</span>
                   </div>
-                  <div className="flex items-center gap-1.5 mt-1">
+                  <div className={`items-center gap-1.5 mt-1 ${D.stepMeta}`}>
                     <span className="text-[11px] text-slate-400">Step {sIdx + 1}</span>
+                    {effTargets[sIdx] > 0 && <span className="text-[10px] font-mono font-bold text-slate-400 bg-slate-100 px-1 py-0.5 rounded" title="目標時間 (1台あたり)">🎯{formatTime(effTargets[sIdx])}</span>}
                     {!isAuto && (resTag === null || resTag === '') && <span className="text-[10px] bg-emerald-100 text-emerald-600 px-1.5 py-0.5 rounded">並行可</span>}
                     {!isAuto && resTag === 'measurement-machine' && <span className="text-[10px] bg-rose-100 text-rose-600 px-1.5 py-0.5 rounded">測定機</span>}
                     {!isAuto && resTag && resTag !== 'measurement-machine' && <span className="text-[10px] bg-amber-100 text-amber-600 px-1.5 py-0.5 rounded">占有</span>}
                   </div>
                 </td>
+                {/* ロット1回工程: 台セルの代わりに回数チップ + ＋もう1回 (colSpanで列を潰す) */}
+                {step.lotOnce ? (() => {
+                  const occN = Math.max(1, lotOccCount(step));
+                  const occs = Array.from({ length: occN }, (_, k) => ({ k, t: getTask(step, sIdx, k) }));
+                  const allDone = lotOccCount(step) > 0 && occs.every(o => ['completed', 'skipped'].includes(o.t.status));
+                  return (
+                    <td colSpan={qty} className="p-1 border-l border-slate-100 align-middle">
+                      <div className="flex flex-wrap items-center gap-1">
+                        {occs.map(({ k, t }) => { const c = cellContent(t, effTargets[sIdx] || 0); return (
+                          <button key={k} onClick={() => onCellClick(sIdx, k)}
+                            className={`rounded px-2 relative overflow-hidden flex flex-col items-center justify-center leading-none transition-all ${c.cls}`}
+                            style={{ minHeight: D.cellMinH, minWidth: '64px', ...(c.style || {}) }}
+                            title={`${k + 1}回目 ${step.title} (${t.status})`}>
+                            <span className={D.cellMark}>{k + 1}回目{c.mark ? ` ${c.mark}` : ''}</span>
+                            <span className={`${D.cellTime} ${dense ? '' : 'mt-1'}`}>{c.time}</span>
+                            {c.pct != null && (
+                              <div className="absolute bottom-0 left-0 right-0 h-1 bg-black/25">
+                                <div className="h-full" style={{ width: `${c.pct}%`, backgroundColor: c.over ? '#fff' : c.warn ? oa.warnColor : '#34d399' }} />
+                              </div>
+                            )}
+                          </button>
+                        ); })}
+                        {allDone && (
+                          <button onClick={() => onCellClick(sIdx, occN)} className="rounded px-2 border-2 border-dashed border-teal-400 bg-teal-50 hover:bg-teal-100 text-teal-700 text-[10px] font-bold flex flex-col items-center justify-center" style={{ minHeight: D.cellMinH, minWidth: '52px' }} title="次の持ち込み分を追加して計測開始">
+                            <span className="text-sm leading-none">＋</span><span>もう1回</span>
+                          </button>
+                        )}
+                        <span className="text-[9px] text-teal-600 font-bold">📦ロット1回</span>
+                      </div>
+                    </td>
+                  );
+                })() : null}
                 {/* 各台のセル */}
-                {Array.from({ length: qty }).map((_, u) => {
+                {!step.lotOnce && Array.from({ length: qty }).map((_, u) => {
                   const task = getTask(step, sIdx, u);
-                  const c = cellContent(task);
+                  // 一括(バッチ=同一startTimeのprocessing群)は目標×Nと比較 (完了時に按分されるため)
+                  const bN = (task.status === 'processing' && task.startTime) ? Math.max(1, Array.from({ length: qty }).reduce((n, _, uu) => { const t2 = getTask(step, sIdx, uu); return n + (t2.status === 'processing' && t2.startTime === task.startTime ? 1 : 0); }, 0)) : 1;
+                  const c = cellContent(task, (effTargets[sIdx] || 0) * bN);
                   const isNext = globalNextTask && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === u && (task.status === 'waiting' || task.status === 'paused');
                   const isActive = activeCustomTaskKey === `${sIdx}-${u}`;
                   const reworks = task.reworks || [];
@@ -5030,12 +5425,18 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                       )}
                       <button
                         onClick={() => onCellClick(sIdx, u)}
-                        className={`w-full rounded py-1.5 px-0.5 flex flex-col items-center justify-center leading-none transition-all ${c.cls} ${isNext ? 'ring-2 ring-emerald-400' : ''} ${isActive ? 'ring-2 ring-blue-400' : ''}`}
-                        style={{ minHeight: '52px' }}
-                        title={`#${u + 1}台目 ${step.title} (${task.status})${reworkTotal > 0 ? ` / 修正${reworks.length}回 合計${formatTime(reworkTotal)}` : ''}`}
+                        className={`w-full rounded ${D.cellBtn} relative overflow-hidden flex flex-col items-center justify-center leading-none transition-all ${c.cls} ${isNext ? 'ring-2 ring-emerald-400' : ''} ${isActive ? 'ring-2 ring-blue-400' : ''}`}
+                        style={{ minHeight: D.cellMinH, ...(c.style || {}) }}
+                        title={`#${u + 1}台目 ${step.title} (${task.status})${c.pct != null ? ` / 目標の${Math.round(c.pct)}%経過` : ''}${reworkTotal > 0 ? ` / 修正${reworks.length}回 合計${formatTime(reworkTotal)}` : ''}`}
                       >
-                        {c.mark && <span className="text-sm font-black">{c.mark}</span>}
-                        <span className="text-xs font-mono mt-1">{c.time}</span>
+                        {c.mark && <span className={D.cellMark}>{c.mark}</span>}
+                        <span className={`${D.cellTime} ${dense ? '' : 'mt-1'}`}>{c.time}</span>
+                        {/* 進捗ゲージ: 経過/目標 (緑→警告色→超過で白) */}
+                        {c.pct != null && (
+                          <div className="absolute bottom-0 left-0 right-0 h-1 bg-black/25">
+                            <div className="h-full transition-all duration-500" style={{ width: `${c.pct}%`, backgroundColor: c.over ? '#ffffff' : c.warn ? oa.warnColor : '#34d399' }} />
+                          </div>
+                        )}
                       </button>
                       {reworks.length > 0 && (
                         <div className="mt-0.5 flex flex-col items-stretch gap-0.5">
@@ -5047,10 +5448,12 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                               const live = !rw.endTime && task.status === 'reworking' && rIdx === reworks.length - 1;
                               const t = live ? (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0) : (rw.duration || 0);
                               return (
-                                <span key={rIdx} title={`修正${rIdx + 1}回目: ${formatTime(t)}`}
-                                  className={`inline-flex items-center gap-0.5 leading-none text-[9px] font-bold px-1 py-0.5 rounded ${live ? 'bg-orange-500 text-white animate-pulse' : 'bg-orange-100 text-orange-700 border border-orange-300'}`}>
+                                <span key={rIdx} title={`修正${rIdx + 1}回目: ${formatTime(t)}${rw.reason ? ` / 理由: ${rw.reason}` : ''}${onEditReworks ? ' (タップで編集・削除)' : ''}`}
+                                  onClick={(e) => { if (onEditReworks) { e.stopPropagation(); onEditReworks(sIdx, u); } }}
+                                  className={`inline-flex items-center gap-0.5 leading-none text-[9px] font-bold px-1 py-0.5 rounded ${live ? 'bg-orange-500 text-white animate-pulse' : 'bg-orange-100 text-orange-700 border border-orange-300'} ${onEditReworks ? 'cursor-pointer hover:bg-orange-200' : ''}`}>
                                   <span className="opacity-70">{rIdx + 1}</span>
                                   <span className="font-mono">{formatTime(t)}</span>
+                                  {rw.reason && <span className="max-w-[56px] truncate opacity-80">{rw.reason}</span>}
                                 </span>
                               );
                             })}
@@ -5060,17 +5463,21 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                     </td>
                   );
                 })}
-                {/* 一括ボタン */}
-                <td className="p-1 text-center bg-slate-50 border-l-2 border-slate-300">
+                {/* 一括ボタン (ロット1回工程は対象外) */}
+                <td className={`${D.batchTd} text-center bg-slate-50 border-l-2 border-slate-300`}>
+                  {step.lotOnce ? <span className="text-[10px] text-slate-300">—</span> : (
                   <button
                     onClick={() => onBatchClick(sIdx)}
-                    className={`text-[11px] font-bold px-2 py-1.5 rounded border w-full ${isBatch ? 'bg-orange-500 text-white border-orange-600 animate-pulse' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100'}`}
+                    className={`${D.batchBtn} font-bold rounded border w-full ${isBatch ? 'bg-orange-500 text-white border-orange-600 animate-pulse' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100'}`}
                     title={isBatch ? 'まとめて完了' : 'まとめて開始'}
                   >
                     {isBatch ? '完了' : '一括'}
                   </button>
+                  )}
                   {onSkipRow && (() => {
-                    const anySkipped = Array.from({ length: qty }).some((_, u) => getTask(step, sIdx, u)?.status === 'skipped');
+                    const anySkipped = step.lotOnce
+                      ? Array.from({ length: Math.max(1, lotOccCount(step)) }).some((_, k) => getTask(step, sIdx, k)?.status === 'skipped')
+                      : Array.from({ length: qty }).some((_, u) => getTask(step, sIdx, u)?.status === 'skipped');
                     return (
                       <button
                         onClick={() => onSkipRow(sIdx)}
@@ -5097,20 +5504,18 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
 
 const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   if (!info) return null;
-  const { complaints = [], defects = [], ngTasks = [], relatedLotCount = 0 } = info;
-  const total = complaints.length + defects.length + ngTasks.length;
+  const { complaints = [], defects = [], relatedLotCount = 0 } = info; // NG はこのパネルでは表示しない (軽微不良・不具合のみ)
+  const total = complaints.length + defects.length;
   if (total === 0 && relatedLotCount === 0) return null;
   // 工程関連 (currently editing) と全体 を分ける
   const stepRelated = {
     complaints: stepTitle ? complaints.filter(c => c.isThisStep).slice(0, 5) : [],
     defects: stepTitle ? defects.filter(d => d.isThisStep).slice(0, 5) : [],
-    ngTasks: stepTitle ? ngTasks.filter(n => n.isThisStep).slice(0, 5) : [],
   };
-  const stepRelatedCount = stepRelated.complaints.length + stepRelated.defects.length + stepRelated.ngTasks.length;
+  const stepRelatedCount = stepRelated.complaints.length + stepRelated.defects.length;
   const allRecent = {
-    complaints: complaints.slice(0, 5),
-    defects: defects.slice(0, 5),
-    ngTasks: ngTasks.slice(0, 5),
+    complaints: complaints.slice(0, 3),
+    defects: defects.slice(0, 3),
   };
   const fmtDate = (ts) => {
     if (!ts) return '';
@@ -5143,19 +5548,11 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
         <span className="text-xs text-slate-500">{open ? '▲ 閉じる' : '▼ 開く'}</span>
       </button>
       {open && (
-        <div className="p-3 text-xs space-y-3">
+        <div className="p-2 text-xs space-y-2">
           {/* 工程特化セクション (赤系で強調) */}
           {stepTitle && stepRelatedCount > 0 && (
             <div className="bg-rose-100/60 border border-rose-300 rounded-lg p-2 space-y-1.5">
               <div className="font-bold text-rose-800 mb-1">🔴 この工程「{stepTitle}」の要注意事項:</div>
-              {stepRelated.ngTasks.map((t, i) => (
-                <div key={'sng'+i} className="flex items-start gap-2 bg-white rounded px-2 py-1 border border-rose-200">
-                  <span className="bg-rose-700 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">NG</span>
-                  <span className="flex-1 text-rose-900">{t.ngReason || '理由未記載'}</span>
-                  <span className="text-[10px] text-slate-500">{t.orderNo}</span>
-                  <span className="text-[10px] text-slate-500">{fmtDate(t.ngAt)}</span>
-                </div>
-              ))}
               {stepRelated.defects.map((d, i) => (
                 <div key={'sdf'+i} className="flex items-start gap-2 bg-white rounded px-2 py-1 border border-amber-200">
                   <span className="bg-amber-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">不具合</span>
@@ -5167,7 +5564,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
               ))}
               {stepRelated.complaints.map((c, i) => (
                 <div key={'scp'+i} className="flex items-start gap-2 bg-white rounded px-2 py-1 border border-purple-200">
-                  <span className="bg-purple-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">気づき</span>
+                  <span className="bg-purple-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">軽微不良</span>
                   <span className="flex-1 text-purple-900">{c.label || '内容未記載'}</span>
                   <span className="text-[10px] text-slate-500">{c.lot?.orderNo || c.orderNo}</span>
                   <span className="text-[10px] text-slate-500">{fmtDate(c.timestamp)}</span>
@@ -5181,19 +5578,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
             {total === 0 ? (
               <div className="text-slate-400 italic">問題報告なし</div>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                {/* NG */}
-                <div className="bg-white border border-rose-200 rounded p-2">
-                  <div className="text-rose-700 font-bold mb-1 text-[11px]">🔴 NG ({ngTasks.length})</div>
-                  {allRecent.ngTasks.length === 0 && <div className="text-slate-400 text-[10px]">なし</div>}
-                  {allRecent.ngTasks.map((t, i) => (
-                    <div key={'ng'+i} className="text-[11px] py-0.5 border-b border-rose-100 last:border-b-0">
-                      <div className="font-bold truncate text-slate-700">{t.stepTitle}</div>
-                      <div className="text-rose-700 truncate">{t.ngReason || '理由未記載'}</div>
-                      <div className="text-[9px] text-slate-400">{t.orderNo} · {fmtDate(t.ngAt)}</div>
-                    </div>
-                  ))}
-                </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {/* 不具合 */}
                 <div className="bg-white border border-amber-200 rounded p-2">
                   <div className="text-amber-700 font-bold mb-1 text-[11px]">⚠ 不具合 ({defects.length})</div>
@@ -5205,10 +5590,11 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
                       <div className="text-[9px] text-slate-400">{d.lot?.orderNo || d.orderNo} · {fmtDate(d.timestamp)}</div>
                     </div>
                   ))}
+                  {defects.length > 3 && <div className="text-[9px] text-slate-400 pt-0.5">…他 {defects.length - 3} 件</div>}
                 </div>
                 {/* 気づき */}
                 <div className="bg-white border border-purple-200 rounded p-2">
-                  <div className="text-purple-700 font-bold mb-1 text-[11px]">💡 気づき ({complaints.length})</div>
+                  <div className="text-purple-700 font-bold mb-1 text-[11px]">💡 軽微不良 ({complaints.length})</div>
                   {allRecent.complaints.length === 0 && <div className="text-slate-400 text-[10px]">なし</div>}
                   {allRecent.complaints.map((c, i) => (
                     <div key={'cp'+i} className="text-[11px] py-0.5 border-b border-purple-100 last:border-b-0">
@@ -5217,6 +5603,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
                       <div className="text-[9px] text-slate-400">{c.lot?.orderNo || c.orderNo} · {fmtDate(c.timestamp)}</div>
                     </div>
                   ))}
+                  {complaints.length > 3 && <div className="text-[9px] text-slate-400 pt-0.5">…他 {complaints.length - 3} 件</div>}
                 </div>
               </div>
             )}
@@ -5227,7 +5614,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {} }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -5259,21 +5646,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   const [strictByModel, setStrictByModel] = useState(() => {
     try { return JSON.parse(localStorage.getItem('strictOrderModeByCombo') || '{}'); } catch { return {}; }
   });
-  const personalStrict = strictByModel[strictComboK]; // true / false / undefined(未選択)
-  // 実効: 個人の一時上書きが最優先。無ければ管理表の組み合わせ既定。どちらも無ければ OFF。
-  const strictOrderMode = personalStrict !== undefined ? personalStrict
-    : adminStrictForCombo === true ? true
-    : adminStrictForCombo === false ? false
-    : false;
-  const toggleStrictOrderMode = () => {
-    // 作業中いつでも切替可。型式×テンプレごとにこの端末で記憶 (誰でも可・共有既定は変えない)。
-    const next = !strictOrderMode;
-    const updated = { ...strictByModel, [strictComboK]: next };
-    setStrictByModel(updated);
-    try { localStorage.setItem('strictOrderModeByCombo', JSON.stringify(updated)); } catch {}
-  };
+  const personalStrict = strictByModel[strictComboK]; // (旧)端末ごとの上書き。現在は厳密ON判定には使わない。
+  // 厳密モードは「厳密モード一元管理(settings.strictModeRules)」でエビデンス承認された組み合わせだけ ON。
+  // 作業画面からは有効化できない（現場で勝手に厳密化されるのを防ぐ）。承認は管理者が一元管理画面でのみ行う。
+  // ただし「状況によって厳密順を外す必要がある場面」用に、作業中の一時OFF(ローカルoverride)は許可する。
+  //   ・ON は依然 一元管理の承認のみ。ここで出来るのは“今だけ外す”だけ(このモーダルを開き直すと既定=承認状態に戻る)。
+  //   ・OFF 中は順番強制も最適順/バッチ強制も解除され、自由にタップできる。
+  const [strictOverrideOff, setStrictOverrideOff] = useState(false);
+  const strictApprovedOn = adminStrictForCombo === true;       // 一元管理で承認された厳密
+  const strictOrderMode = strictApprovedOn && !strictOverrideOff; // 実効の厳密モード
+  const toggleStrictOrderMode = () => { if (strictApprovedOn) setStrictOverrideOff(v => !v); }; // 承認コンボのみ一時OFF/復帰
+  // ライブ並行ガイドの表示/非表示(端末の好み)。厳密モード中はそもそも自動非表示(順番が強制されるので不要)。
+  const [parallelGuideHidden, setParallelGuideHidden] = useState(() => { try { return localStorage.getItem('parallelGuideHidden') === '1'; } catch { return false; } });
+  const toggleParallelGuide = () => setParallelGuideHidden(v => { const nv = !v; try { localStorage.setItem('parallelGuideHidden', nv ? '1' : '0'); } catch {} return nv; });
   // 順序外タップで警告ダイアログ表示用
   const [outOfOrderConfirm, setOutOfOrderConfirm] = useState(null); // { stepIdx, unitIdx, nextRecommendedUnit, action }
+  // 厳密モードで順序外を押した時の「非ブロッキング」通知 (alert は画面を固めるため使わない)
+  const [orderHint, setOrderHint] = useState(null);
+  useEffect(() => { if (!orderHint) return; const t = setTimeout(() => setOrderHint(null), 3500); return () => clearTimeout(t); }, [orderHint]);
   // カスタムモードの表示形式: 'card' (従来の大きいカード) | 'compact' (高密度テーブル)
   const [customViewMode, setCustomViewMode] = useState(() => {
     try { return localStorage.getItem('customViewMode') || 'card'; } catch { return 'card'; }
@@ -5282,6 +5672,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     setCustomViewMode(m);
     try { localStorage.setItem('customViewMode', m); } catch {}
   };
+  // 一覧(コンパクト)の密表示モード: 工程欄・セルを縮めて多くの台を画面に収める。気軽に通常へ戻せる。
+  const [gridDense, setGridDense] = useState(() => { try { return localStorage.getItem('gridDense') === '1'; } catch { return false; } });
+  const toggleGridDense = () => setGridDense(v => { const nv = !v; try { localStorage.setItem('gridDense', nv ? '1' : '0'); } catch {} return nv; });
   // 前回モードを復元 (lot.executionType があれば優先)
   const [executionType, setExecutionType] = useState(lot.executionType || 'initial');
   const [currentStepIdx, setCurrentStepIdx] = useState(lot.currentStepIndex || 0);
@@ -5354,10 +5747,23 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   const [defectPhotos, setDefectPhotos] = useState([]);
   const defectPhotoRef = useRef(null);
 
-  // Complaint (observation) state
+  // Complaint (軽微不良 = 品質の不良) state
   const [showComplaintModal, setShowComplaintModal] = useState(false);
   const [complaintLabel, setComplaintLabel] = useState('');
   const [complaintCategory, setComplaintCategory] = useState('');
+  // 気づき・改善 (工程改善の提案: 細分化/追加/変更/削除/その他 + 理由) ― 軽微不良(品質)とは別枠
+  const [showImproveModal, setShowImproveModal] = useState(false);
+  const [improveKind, setImproveKind] = useState('');
+  const [improveReason, setImproveReason] = useState('');
+  const [improveStep, setImproveStep] = useState(''); // 対象工程(空=今見てる工程)
+  const IMPROVE_KINDS = [
+    { id: 'split', label: '工程を細分化' },
+    { id: 'add', label: '工程を追加' },
+    { id: 'change', label: '工程を変更' },
+    { id: 'remove', label: '工程を削除' },
+    { id: 'order', label: '順番を変更' },
+    { id: 'other', label: 'その他' },
+  ];
 
   // Confirmation state
   const [isConfirming, setIsConfirming] = useState(false);
@@ -5416,6 +5822,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 安全に stepIdx/unitIdx を取り出すヘルパー (voice ハンドラ・描画両方で利用)
   const parseActiveTaskKey = (taskKey) => {
     if (!taskKey) return { stepIdx: 0, unitIdx: 0 };
+    // ロット1回キー `${step.id}-lot-${k}` → stepIdx と 回数k(=unitIdx) に分解
+    const lotM = taskKey.match(LOT_ONCE_RE);
+    if (lotM) {
+      const si = localSteps.findIndex(s => s.id === lotM[1]);
+      return { stepIdx: si >= 0 ? si : 0, unitIdx: parseInt(lotM[2]) || 0, isLot: true };
+    }
     const dashIdx = taskKey.lastIndexOf('-');
     if (dashIdx < 0) return { stepIdx: 0, unitIdx: 0 };
     const prefix = taskKey.slice(0, dashIdx);
@@ -5571,10 +5983,60 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     return () => clearInterval(interval);
   }, [isTimerRunning, executionType, startTime, interruptions.length]);
 
+  // === 目標時間オーバー警告の設定 (マスタ設定→目標時間オーバー警告) ===
+  //   enabled / warnPct: 警告開始% / screenEffect: 画面全体 / sound: off|warn|both
+  //   warnColor・overColor: 警告/超過の色 / warnBlink・overBlink: 点滅 none|slow|fast
+  const oaCfg = { enabled: true, warnPct: 80, overPct: 100, screenEffect: true, sound: 'warn', warnColor: '#F59E0B', overColor: '#E11D48', warnBlink: 'none', overBlink: 'slow', gaugeEnabled: true, gaugeColor: '#10B981', gaugeWidth: 24, gaugeTrack: true, gaugeRotate: 'normal', gaugeCometLen: 18, ...(overrunAlertConfig || {}) };
+  // バッチ(まとめて開始)対応: 同一工程で「同じstartTime」のprocessingタスク数 = 一括台数N。
+  //   バッチは完了時に 合計時間÷N で按分されるため、警告も 目標×N と比較する。
+  const batchProcCounts = (taskMap, steps, qty) => steps.map((st, sIdx) => {
+    const m = {};
+    if (st?.lotOnce) return m; // ロット1回工程はバッチ按分なし (常にN=1)
+    for (let u = 0; u < qty; u++) {
+      const k = st?.id ? `${st.id}-${u}` : `${sIdx}-${u}`;
+      const t = taskMap[k] || taskMap[`${sIdx}-${u}`];
+      if (t && t.status === 'processing' && t.startTime) m[t.startTime] = (m[t.startTime] || 0) + 1;
+    }
+    return m;
+  });
+  // 警告音: 各タスクが 警告(1)/超過(2) の段階を跨いだ瞬間に1回だけ鳴らす (連続では鳴らさない)
+  const overrunStageRef = useRef({});
+  useEffect(() => {
+    if (!oaCfg.enabled || oaCfg.sound === 'off' || executionType !== 'custom') return;
+    const nowMs = Date.now(); const qty = lot.quantity || 1; const stages = overrunStageRef.current;
+    const seen = new Set();
+    const procCounts = batchProcCounts(tasks, localSteps || [], qty);
+    (localSteps || []).forEach((st, sIdx) => {
+      const baseTgt = getEffectiveTargetTime(st, lot.model, customTargetTimes, modelGroups); if (!(baseTgt > 0)) return;
+      const isLO = !!st.lotOnce;
+      const loopN = isLO ? lotOnceCountOf(tasks, st) : qty; // ロット1回工程は回数分を走査
+      for (let u = 0; u < loopN; u++) {
+        const idKey = isLO ? `${st.id}-lot-${u}` : (st.id ? `${st.id}-${u}` : null); const numKey = `${sIdx}-${u}`;
+        const key = (idKey && tasks[idKey]) ? idKey : (isLO ? idKey : numKey);
+        const t = tasks[key];
+        if (!t || t.status !== 'processing' || !t.startTime) continue;
+        if (t.workerName && inspectorName && t.workerName !== inspectorName) continue; // 自分の作業のみ
+        seen.add(key);
+        const bN = isLO ? 1 : Math.max(1, procCounts[sIdx]?.[t.startTime] || 1); // 一括ならN台分の合計目標と比較
+        const tgt = baseTgt * bN;
+        const sec = (t.duration || 0) + Math.floor((nowMs - t.startTime) / 1000);
+        const stage = sec >= tgt * ((oaCfg.overPct || 100) / 100) ? 2 : (sec >= tgt * (oaCfg.warnPct / 100) ? 1 : 0);
+        const prev = stages[key] || 0;
+        if (stage > prev) {
+          if (stage >= 2) { if (oaCfg.sound === 'both') playOverrunBeep('over'); else if (prev < 1) playOverrunBeep('warn'); }
+          else playOverrunBeep('warn');
+          stages[key] = stage;
+        }
+      }
+    });
+    // 終わった/止まったタスクは段階リセット (再開時にまた1回鳴る)
+    Object.keys(stages).forEach(k => { if (!seen.has(k)) delete stages[k]; });
+  }, [timerTick]);
+
   // --- Defect & Monitor Logic ---
   // reportOnly=true: 記録だけ残し作業時間計測には影響しない (status='reported')
   // reportOnly=false: 従来通り「対応中」として時間計測開始 (status='active')
-  const startInterruption = (type, label, causeProcess, photos, reportOnly = false) => {
+  const startInterruption = (type, label, causeProcess, photos, reportOnly = false, meta = null) => {
       // 工程の特定:
       //   custom モード: ユーザが画面上で見ている工程 (displayStepIdx) を使う
       //   sequential モード: 現在の工程 (currentStepIdx)
@@ -5590,10 +6052,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           startTime: reportOnly ? null : now,
           duration: 0,
           status: reportOnly ? 'reported' : 'active',
-          workerName: lot.workerId || '',
+          workerName: (workers.find(w => w.id === lot.workerId)?.name) || lot.workerId || '', // ID ではなく名前を保存
           stepInfo: curStep ? { stepId: curStep.id, title: curStep.title } : null,
           causeProcess: causeProcess || '',
-          photos: photos || []
+          photos: photos || [],
+          ...(meta || {}) // 気づき・改善用: { improvementKind, targetStepTitle } 等
       };
       const updated = [...interruptions, newInt];
       setInterruptions(updated);
@@ -5768,8 +6231,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     ngTasks.sort((a, b) => (b.ngAt || 0) - (a.ngAt || 0));
     return { complaints, defects, ngTasks, relatedLotCount: relatedLots.length };
   }, [lot.model, lot.id, lots, currentStep]);
-  // パネル開閉状態
-  const [showQualityInfoPanel, setShowQualityInfoPanel] = useState(true);
+  // パネル開閉状態。指図単位・その日だけ「閉じた」を記憶 → 最初の1回だけ自動表示、以降は閉じた状態で開く。
+  const qpClosedKey = useMemo(() => { const d = new Date(); const ymd = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; return `qpClosed_${lot.orderNo || lot.serialNo || lot.id || ''}_${ymd}`; }, [lot.orderNo, lot.serialNo, lot.id]);
+  const [showQualityInfoPanel, setShowQualityInfoPanel] = useState(() => { try { return localStorage.getItem(qpClosedKey) !== '1'; } catch { return true; } });
+  const toggleQualityInfoPanel = () => setShowQualityInfoPanel(v => { const nv = !v; try { if (!nv) localStorage.setItem(qpClosedKey, '1'); else localStorage.removeItem(qpClosedKey); } catch {} return nv; });
   const handleStart = () => {
     const nowTs = Date.now();
     setIsTimerRunning(true);
@@ -6380,8 +6845,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       if (!Array.isArray(step.checklistItems) || step.checklistItems.length === 0) return;
       const requiredItems = step.checklistItems.filter(it => it.required !== false);
       if (requiredItems.length === 0) return;
-      for (let u = 0; u < totalUnits; u++) {
-        const chkKey = `${step.id}-${u}-checklist`;
+      // ロット1回工程: 台数ではなく実施回数分のチェック (キーは lot-k ベース)
+      const unitsN = step.lotOnce ? lotOnceCountOf(tasksRef.current, step) : totalUnits;
+      for (let u = 0; u < unitsN; u++) {
+        const chkKey = step.lotOnce ? `${step.id}-lot-${u}-checklist` : `${step.id}-${u}-checklist`;
         const checked = measurementResults[chkKey] || {};
         const missing = requiredItems.filter(it => !checked[it.id]);
         // タスクが skipped/completed 以外 (=実作業対象) のみチェック対象
@@ -6398,7 +6865,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     return incomplete;
   };
 
-  const handleCompleteTrigger = () => {
+  const handleCompleteTrigger = (skipTimeCheck = false) => {
       // 確認チェック未完了をブロック
       const incompleteChks = findIncompleteChecklists();
       if (incompleteChks.length > 0) {
@@ -6407,6 +6874,17 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           ).join('\n');
           alert(`⚠ 確認チェック未完了の工程があります。先にチェックを完了してください:\n\n${summary}${incompleteChks.length > 5 ? `\n他 ${incompleteChks.length - 5} 件` : ''}`);
           return;
+      }
+      // 測定時間に異常(0秒/5秒未満/4時間超/時刻逆転)があれば、まず測定時間表を見せて確認/修正を促す
+      if (!skipTimeCheck) {
+          const steps = localSteps || []; const qty = lot.quantity || 1; const tk = tasksRef.current || tasks;
+          const isAnom = (t) => !!(t && t.status === 'completed' && ((t.duration || 0) === 0 || (t.duration || 0) < 5 || (t.duration || 0) > 14400 || (t.firstStartTime && t.endTime && t.endTime < t.firstStartTime)));
+          let hasAnom = false;
+          for (let si = 0; si < steps.length && !hasAnom; si++) {
+            const n = steps[si].lotOnce ? lotOnceCountOf(tk, steps[si]) : qty; // ロット1回工程は回数分
+            for (let u = 0; u < n; u++) { if (isAnom(tk[getTaskKey(si, u)])) { hasAnom = true; break; } }
+          }
+          if (hasAnom) { setShowTimeTable('precomplete'); return; }
       }
       setIsTimerRunning(false);
       onSave({
@@ -6437,6 +6915,18 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           // ※ 旧データ ({sIdx}-{u} 数値キー) のみ存在する場合は、新キーに skipped を書きつつ
           //   旧キーも削除して、両方が tasks 集計で重複カウントされないようにする
           localSteps.forEach((step, sIdx) => {
+              // ロット1回工程: 台キーを作らず、回数キー(lot-k)単位で未完了を skipped 化
+              if (step?.lotOnce) {
+                  const n = lotOnceCountOf(skippedTasks, step);
+                  for (let k = 0; k < n; k++) {
+                      const key = `${step.id}-lot-${k}`;
+                      const t = skippedTasks[key];
+                      if (!t || (t.status !== 'completed' && t.status !== 'skipped')) {
+                          skippedTasks[key] = { status: 'skipped', duration: 0, skipReason: overrideMeta.reason, skipBy: overrideMeta.responsibleBy, skipAt: completedAt, firstStartTime: completedAt, endTime: completedAt };
+                      }
+                  }
+                  return;
+              }
               for (let u = 0; u < totalUnits; u++) {
                   const key = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
                   const numKey = `${sIdx}-${u}`;
@@ -6509,6 +6999,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   //   なので、最後の '-' の前を取り出して両方試す。
   const findStepByTaskKey = (key) => {
     if (!key || typeof key !== 'string') return null;
+    // ロット1回キー `${step.id}-lot-${k}` → step.id 部分で逆引き
+    const lotM = key.match(LOT_ONCE_RE);
+    if (lotM) return localSteps.find(s => s && s.id === lotM[1]) || null;
     const last = key.lastIndexOf('-');
     if (last < 0) return null;
     const ident = key.slice(0, last);
@@ -6627,6 +7120,28 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 厳密モードの判断は管理者の「厳密モード管理」(型式×テンプレ・順番の一貫性エビデンス)で行う。
   const showStrictSuggestion = false;
 
+  // === データ最適順(承認コンボのみ) =====================================================
+  // 管理者が「厳密モード一元管理」で optimalOrder を承認したコンボだけ、実績(同テンプレ完了ロット)
+  // から analyzeWorkOrder → nextOptimalMove で「次の一手」を算出し、厳密モードでそれを強制する。
+  // テンプレ正規順は書き換えず、この“別スケジュール”に従わせる(2026-05-30方針を維持)。
+  const optimalOrderApproved = strictModeRules?.[strictComboK]?.optimalOrder?.enabled === true;
+  const sameTemplateCompletedLots = useMemo(() => {
+    if (!optimalOrderApproved || !lot.templateId) return [];
+    // 型式グループがあれば同グループ型式の完了ロットも合算(データ共有)。なければ自型式のみ。
+    const groupModels = sameGroupModels(lot.model, { modelGroups });
+    return (lots || []).filter(l => l.id !== lot.id && l.status === 'completed' && l.templateId === lot.templateId && groupModels.includes(l.model));
+  }, [optimalOrderApproved, lots, lot.templateId, lot.id, lot.model, modelGroups]);
+  const optimalAnalysis = useMemo(() => {
+    if (!optimalOrderApproved || sameTemplateCompletedLots.length === 0) return null;
+    try { return analyzeWorkOrder(localSteps, sameTemplateCompletedLots, { quantity: lot.quantity || 1 }); }
+    catch (e) { console.warn('optimalAnalysis失敗', e); return null; }
+  }, [optimalOrderApproved, sameTemplateCompletedLots, localSteps, lot.quantity]);
+  // 現在の状態に対する「データ最適の次の一手」。バッチ指示なら {isBatch, batchUnits} を含む。
+  const optimalNextMove = useMemo(() => {
+    if (!optimalAnalysis) return null;
+    return nextOptimalMove(localSteps, tasks, lot.quantity || 1, optimalAnalysis);
+  }, [optimalAnalysis, localSteps, tasks, lot.quantity, otherAutoTick]);
+
   // === 「今やるべき唯一のタスク」を決定 (1台目から順番ルール) ===
   // 各工程行ごとに「次」を出すと画面中に「次」が溢れて「どれでも押せる」ように見えてしまう。
   // → 全体で1個だけ。ルール:
@@ -6636,26 +7151,40 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   const globalNextTask = useMemo(() => {
     const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
     const qty = lot.quantity || 1;
+    // ★データ最適順が承認されたコンボ → 実績データ駆動の nextOptimalMove に従う
+    if (optimalNextMove) {
+      const mv = optimalNextMove;
+      if (mv.type === 'batch') {
+        // バッチ指示: 先頭台を「次」として返しつつ isBatch/batchUnits を添える(個別タップは強制ブロック → まとめて開始へ誘導)
+        return { sIdx: mv.stepIdx, unitIdx: mv.units[0], isAuto: false, isBatch: true, batchUnits: mv.units };
+      }
+      return { sIdx: mv.stepIdx, unitIdx: mv.unitIdx, isAuto: mv.type === 'auto-start' };
+    }
     const getKey = (step, sIdx, u) => (step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
     const statusOf = (step, sIdx, u) => {
       const t = tasks[getKey(step, sIdx, u)] || tasks[`${sIdx}-${u}`];
       return t?.status || 'waiting';
     };
     // 1) 手動タスクが進行中なら 次は出さない (作業者は手を動かしてる)
+    //    ロット1回工程の作業中(lot-キー)もここで検出する
+    const lotOnceRunning = localSteps.some(step => step?.lotOnce && lotOnceKeysOf(tasks, step).some(k => tasks[k]?.status === 'processing'));
+    if (lotOnceRunning) return null;
     for (let si = 0; si < localSteps.length; si++) {
       const step = localSteps[si];
+      if (step?.lotOnce) continue; // ロット1回工程は順序ガイド対象外 (回数は現場判断)
       if (isAutoStepFn(step)) continue;
       for (let u = 0; u < qty; u++) {
         if (statusOf(step, si, u) === 'processing') return null;
       }
     }
     // 各台が「機械占有中 (自動測定 processing)」かどうか
-    const unitHasRunningAuto = (u) => localSteps.some((step, si) => isAutoStepFn(step) && statusOf(step, si, u) === 'processing');
+    const unitHasRunningAuto = (u) => localSteps.some((step, si) => !step?.lotOnce && isAutoStepFn(step) && statusOf(step, si, u) === 'processing');
     // 2)+3) 台順 × テンプレ順で最初の未着手を探す。機械占有中の台はスキップ。
     for (let u = 0; u < qty; u++) {
       if (unitHasRunningAuto(u)) continue; // この台は自動測定中 → 作業者は触れない
       for (let si = 0; si < localSteps.length; si++) {
         const step = localSteps[si];
+        if (step?.lotOnce) continue; // ロット1回工程は「次」の対象にしない
         const st = statusOf(step, si, u);
         if (st === 'waiting' || st === 'paused') {
           return { sIdx: si, unitIdx: u, isAuto: isAutoStepFn(step) };
@@ -6664,7 +7193,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       }
     }
     return null;
-  }, [tasks, localSteps, lot.quantity, otherAutoTick]);
+  }, [tasks, localSteps, lot.quantity, otherAutoTick, optimalNextMove]);
+
+  // データ最適順モードの「タップ可否ゲート」。承認コンボ＋厳密ON時のみ作用。
+  //   返り値: null=タップOK / {hint}=ブロック(理由ヒント)。
+  //   ・バッチ指示中の工程の個別タップ → ブロックして「まとめて開始」へ誘導(バッチ強制)
+  //   ・最適の次の一手 以外の waiting タップ → ブロック(データ最適順を強制)
+  const optimalGate = (sIdx, uIdx) => {
+    if (!optimalNextMove || !strictOrderMode) return null;
+    const gnt = globalNextTask;
+    if (!gnt) return null; // 次が無い(手動進行中など)は通常処理へ委ねる
+    if (gnt.isBatch && sIdx === gnt.sIdx && Array.isArray(gnt.batchUnits) && gnt.batchUnits.includes(uIdx)) {
+      return { hint: `🔒 データ最適順: 「${localSteps[sIdx]?.title || ''}」は実績どおり“まとめて開始”で ${gnt.batchUnits.length}台 一括処理してください` };
+    }
+    const isRec = !gnt.isBatch && sIdx === gnt.sIdx && uIdx === gnt.unitIdx;
+    if (isRec) return null; // 最適の次の一手 → OK
+    const nextTitle = localSteps[gnt.sIdx]?.title || '';
+    return { hint: `🔒 データ最適順: 次は「${nextTitle}」#${gnt.unitIdx + 1}台目${gnt.isBatch ? '（まとめて開始）' : ''} です` };
+  };
 
   // === ライブ並行作業ガイド ===
   // このロットで自動測定 (batch) が走っている間、その経過時間に応じて
@@ -6754,24 +7300,40 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   //   経過 = duration + (now - startTime)。一時停止中は processing でないのでカウントされない。
   const tasksRefAE = useRef(tasks); tasksRefAE.current = tasks;
   const stepsRefAE = useRef(localSteps); stepsRefAE.current = localSteps;
+  // テンプレ参照フォールバック: ロットの工程に自動終了設定が焼き込まれていなくても、
+  // 元テンプレ(同一工程)の設定を参照して発動させる(既存ロットでも効く)。
+  const tplStepsRefAE = useRef([]); tplStepsRefAE.current = (templates.find(t => t.id === lot.templateId)?.steps) || [];
+  const lotStatusRefAE = useRef(lot.status); lotStatusRefAE.current = lot.status; // 完了後に自動終了が status を戻すのを防ぐ
   const [autoEndToast, setAutoEndToast] = useState(null); // { title } | null
   useEffect(() => { if (!autoEndToast) return; const id = setTimeout(() => setAutoEndToast(null), 4500); return () => clearTimeout(id); }, [autoEndToast]);
   useEffect(() => {
     const iv = setInterval(() => {
+      if (lotStatusRefAE.current === 'completed') return; // 完了ロットは触らない(状態巻き戻し防止)
       const cur = tasksRefAE.current || {}; const steps = stepsRefAE.current || []; const qty = lot.quantity || 1; const now = Date.now();
+      const tplSteps = tplStepsRefAE.current || [];
+      // 自動終了の有効秒数を解決: ①ロット工程自身 ②無ければ元テンプレの同一工程(id→題名一致)
+      const autoSecOf = (step) => {
+        if (step?.executionMode === 'batch' && step?.autoEndEnabled && step?.autoEndSec > 0) return step.autoEndSec;
+        const ts = tplSteps.find(x => x.id === step.id) || tplSteps.find(x => (x.title || '') === (step.title || ''));
+        if (ts && ts.executionMode === 'batch' && ts.autoEndEnabled && ts.autoEndSec > 0) return ts.autoEndSec;
+        return 0;
+      };
       let nt = null; let lastTitle = '';
       steps.forEach((step, sIdx) => {
-        if (!(step?.executionMode === 'batch' && step?.autoEndEnabled && step?.autoEndSec > 0)) return;
+        const limitSec = autoSecOf(step);
+        if (!(limitSec > 0)) return;
         for (let u = 0; u < qty; u++) {
           const idKey = step.id ? `${step.id}-${u}` : null;
           const numKey = `${sIdx}-${u}`;
           const key = (idKey && cur[idKey]) ? idKey : (cur[numKey] ? numKey : (idKey || numKey));
           const t = cur[key];
           if (!t || t.status !== 'processing') continue;
-          const elapsed = (t.duration || 0) + (t.startTime ? Math.floor((now - t.startTime) / 1000) : 0);
-          if (elapsed >= step.autoEndSec) {
+          // セッション(今回の連続作業) = now - startTime。これが autoEndSec に達したら自動完了。
+          //   duration は既存に autoEndSec を加算する → 作業続き(追加測定)で 6分→12分。初回は 0+6分=6分。
+          const session = t.startTime ? Math.floor((now - t.startTime) / 1000) : 0;
+          if (session >= limitSec) {
             if (!nt) nt = { ...cur };
-            nt[key] = { ...t, status: 'completed', duration: step.autoEndSec, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, autoEnded: true, workerName: t.workerName || inspectorName };
+            nt[key] = { ...t, status: 'completed', duration: (t.duration || 0) + limitSec, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, autoEnded: true, workerName: t.workerName || inspectorName };
             lastTitle = step.title;
           }
         }
@@ -6782,9 +7344,32 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   }, [lot.quantity]);
 
   const [completedTaskMenu, setCompletedTaskMenu] = useState(null); // { key, stepIdx, unitIdx }
+  const [showTimeTable, setShowTimeTable] = useState(false); // 測定時間表(工程×台数)モーダル
   // NG 理由ピッカー: { key, stepIdx, unitIdx } | null
-  // NG ボタンを押した直後に表示。complaintOptions (気づき報告候補) から選ばせて task.ngReason に保存。
+  // NG ボタンを押した直後に表示。complaintOptions (軽微不良報告候補) から選ばせて task.ngReason に保存。
   const [ngReasonPicker, setNgReasonPicker] = useState(null);
+  // 時間手入力: 押し忘れ等で時間が残らなかった工程に、手入力で時間(秒)を設定して完了にする。
+  //   keys 複数で一括対応 (1台 or 全台)。
+  const [timeInput, setTimeInput] = useState(null); // { keys:[key], label, min, sec } | null
+  // 修正(リワーク)の編集・削除モーダル: 各修正の時間と「修正ごとの理由」を編集、行削除も可。NG理由(タスク全体)も編集。
+  //   draft は state に保持し「保存」で一括コミット (入力中に書き込まない)。
+  const [reworkEditor, setReworkEditor] = useState(null); // { key, label, ngReason, items:[{...rework, min, sec, reason}] } | null
+  const openReworkEditor = (key, label) => {
+    const t = tasks[key] || {};
+    const items = (t.reworks || []).map(r => ({ ...r, min: String(Math.floor((r.duration || 0) / 60)), sec: String((r.duration || 0) % 60), reason: r.reason || '' }));
+    setReworkEditor({ key, label, ngReason: t.ngReason || '', items });
+  };
+  const applyManualTime = (keys, totalSec) => {
+    if (!keys || !keys.length || !(totalSec >= 0)) return;
+    const now = Date.now();
+    const newTasks = { ...tasks };
+    keys.forEach(key => {
+      const t = newTasks[key] || {};
+      newTasks[key] = { ...t, status: 'completed', duration: Math.round(totalSec), startTime: null, endTime: now, firstStartTime: t.firstStartTime || now, manualTime: true, workerName: inspectorName || t.workerName };
+    });
+    setTasks(newTasks);
+    onSave({ tasks: newTasks, status: 'processing' });
+  };
 
   // 全ての hooks 呼び出しが終わったあとで、ロット未定義の場合は何も描画しない
   // (上の useEffect で onClose を呼ぶスケジュールが既に走っている)
@@ -6793,6 +7378,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // タスクキー生成: 既存データとの互換のため、step.id ベースを優先しつつ数値index フォールバック
   const getTaskKey = (stepIdx, unitIdx) => {
     const step = localSteps[stepIdx];
+    // ロット1回工程: 第2引数は「回数k」。キーは `${step.id}-lot-${k}` (新機能なので旧キー互換は不要)
+    if (step?.lotOnce && step.id) return `${step.id}-lot-${unitIdx}`;
     if (step && step.id) {
       // step.id ベースを正準キーとする
       const idKey = `${step.id}-${unitIdx}`;
@@ -6867,9 +7454,19 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     }
   };
 
+  // 自動測定(batch+autoEnd)の予定秒数を解決。ロット工程→無ければ元テンプレの同一工程(id→題名)。
+  const autoEndSecForStep = (step) => {
+    if (!step) return 0;
+    if (step.executionMode === 'batch' && step.autoEndEnabled && step.autoEndSec > 0) return step.autoEndSec;
+    const tpl = templates.find(t => t.id === lot.templateId);
+    const ts = (tpl?.steps || []).find(x => x.id === step.id) || (tpl?.steps || []).find(x => (x.title || '') === (step.title || ''));
+    if (ts && ts.executionMode === 'batch' && ts.autoEndEnabled && ts.autoEndSec > 0) return ts.autoEndSec;
+    return 0;
+  };
+
   // 完了タスクメニューのアクション（メニュー経由 or 直接呼び出し両対応）
   // ngReason: NG 理由 (action='ng' のときに task.ngReason に保存)
-  const handleTaskMenuAction = (action, directKey = null, ngReason = null) => {
+  const handleTaskMenuAction = (action, directKey = null, ngReason = null, ctx = null) => {
     const key = directKey || completedTaskMenu?.key;
     if (!key) return;
     const previousTasks = { ...tasks };
@@ -6889,7 +7486,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
     if (action === 'continue') {
       const nowTs = Date.now();
-      newTasks[key] = { ...currentTask, status: 'processing', startTime: nowTs, firstStartTime: currentTask.firstStartTime || nowTs };
+      // 自動測定(batch+autoEnd)工程を「作業の続き」する場合は『追加測定』:
+      //   duration は保持し、新しいセッションで再び autoEndSec ぶん測って既存に加算する(6分→続き→12分)。
+      //   autoEnded を false に戻して再発動できるようにする。判定はインターバル側(セッション基準)。
+      const contStep = localSteps[completedTaskMenu?.stepIdx];
+      const isAutoCont = autoEndSecForStep(contStep) > 0;
+      newTasks[key] = { ...currentTask, status: 'processing', startTime: nowTs, firstStartTime: currentTask.firstStartTime || nowTs, ...(isAutoCont ? { autoEnded: false } : {}) };
       setActiveCustomTaskKey(key);
     } else if (action === 'restart') {
       // 「最初から作業」: いきなり time-tracking 開始ではなく、まっさら (waiting) に戻す。
@@ -6929,6 +7531,25 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const nowTs = Date.now();
       newTasks[key] = { ...captured, status: 'skipped', duration: captured.duration || 0, endTime: nowTs, firstStartTime: captured.firstStartTime || captured.startTime || null };
       if (activeCustomTaskKey === key) setActiveCustomTaskKey(null);
+    } else if (action === 'redo-unit-all' || action === 'redo-from-here') {
+      // 一括やり直し: 指定台(unitIdx)の「全工程」または「参照工程から下」の実施済みタスクを一括NGに。
+      // ・1回目の作業時間(duration)と修正履歴(reworks)は保持 → 適正時間(初回 duration)を汚さない。
+      // ・2回目以降は各工程の「修正作業 開始」で reworks に記録される。
+      const u = ctx?.unitIdx ?? completedTaskMenu?.unitIdx;
+      const refStep = ctx?.stepIdx ?? completedTaskMenu?.stepIdx ?? 0;
+      const fromHere = action === 'redo-from-here';
+      const nowTs = Date.now();
+      if (u != null) {
+        localSteps.forEach((step, si) => {
+          if (fromHere && si < refStep) return;
+          const k = getTaskKey(si, u);
+          const t = tasks[k];
+          if (!t || t.status === 'waiting' || t.status === 'ng') return; // 未着手/既NGはそのまま
+          const cap = captureSessionIfProcessing(t);
+          // やり直し理由: 選択された理由を優先 (軽微不良の理由ピッカーから)。無ければ既存/既定。
+          newTasks[k] = { ...cap, status: 'ng', ngAt: nowTs, endTime: nowTs, startTime: null, ngReason: ngReason || cap.ngReason || 'やり直し（再測定）', workerName: inspectorName, reworks: cap.reworks || [] };
+        });
+      }
     }
 
     setTasks(newTasks);
@@ -6940,8 +7561,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 工程ごと「該当なし」: その工程の全台を該当なしにする。既に該当なしがあれば解除して未着手へ戻す。
   const handleSkipRow = (stepIdx) => {
     const step = localSteps[stepIdx];
-    const qtyN = lot.quantity || 1;
-    const keyOf = (u) => step?.id ? `${step.id}-${u}` : `${stepIdx}-${u}`;
+    // ロット1回工程: 台数ではなく回数キー(lot-k)を対象にする
+    const qtyN = step?.lotOnce ? lotOnceCountOf(tasks, step) : (lot.quantity || 1);
+    const keyOf = (u) => step?.lotOnce ? `${step.id}-lot-${u}` : (step?.id ? `${step.id}-${u}` : `${stepIdx}-${u}`);
     const previousTasks = { ...tasks };
     const newTasks = { ...tasks };
     const anySkipped = Array.from({ length: qtyN }).some((_, u) => (tasks[keyOf(u)] || {}).status === 'skipped');
@@ -6968,9 +7590,26 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   //   未開始 → 範囲指定モーダルを開く（実台数が見積もりと違う時のため）
   //   開始済 → そのまま完了する
   const handleBatchClick = (stepIdx) => {
+    // ロット1回工程に「台をまとめて開始」は概念矛盾 (誤キーで台数分のゴーストを作る) → ブロック
+    if (localSteps[stepIdx]?.lotOnce) return;
     if (batchStartTimes[stepIdx]) {
       toggleBatch(stepIdx);
       return;
+    }
+    // データ最適順(承認コンボ)＋厳密ON時: まとめて開始は「実績がバッチを示す工程」だけ許可。
+    //   それ以外の工程をまとめて開始しようとしたらブロックして、最適の次の一手へ誘導。
+    if (optimalNextMove && strictOrderMode) {
+      const gnt = globalNextTask;
+      const isRecommendedBatch = gnt && gnt.isBatch && gnt.sIdx === stepIdx;
+      if (!isRecommendedBatch) {
+        if (gnt) {
+          const t = localSteps[gnt.sIdx]?.title || '';
+          setOrderHint(gnt.isBatch
+            ? `🔒 データ最適順: 次は「${t}」を まとめて開始 してください`
+            : `🔒 データ最適順: 次は「${t}」#${gnt.unitIdx + 1}台目 です（この工程の一括はまだ）`);
+        }
+        return;
+      }
     }
     // 未着手 or 一時停止の台のうち、最小/最大番号をデフォルト範囲にする
     // ※ キーは getTaskKey で step.id ベース優先 (新旧両方を見る)
@@ -7087,13 +7726,16 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const task = tasks[key] || {};
     const isNG = task.status === 'ng';
     const isReworkDone = task.status === 'rework-done';
+    // ロット1回キー(`stepId-lot-k`)は台番号ではなく回数として表示する
+    const isLotKey = LOT_ONCE_RE.test(key);
+    const unitLabel = isLotKey ? `${completedTaskMenu.unitIdx + 1}回目` : `#${completedTaskMenu.unitIdx + 1}`;
     return (
       <div className="fixed inset-0 z-[300] bg-black/50 flex items-center justify-center p-4" onClick={() => setCompletedTaskMenu(null)}>
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden" onClick={e => e.stopPropagation()}>
           <div className="bg-slate-800 text-white p-3 text-center font-bold">
-            <div>#{completedTaskMenu.unitIdx + 1} — {task.status === 'waiting' ? '未着手' : task.status === 'skipped' ? '該当なし' : task.status === 'paused' ? '一時停止中' : isNG ? 'NG判定済み' : isReworkDone ? '修正完了' : '完了済み'}</div>
-            {isNG && task.ngReason && (
-              <div className="text-[11px] font-normal bg-red-900/40 mt-1.5 px-2 py-0.5 rounded inline-block">理由: {task.ngReason}</div>
+            <div>{unitLabel} — {task.status === 'waiting' ? '未着手' : task.status === 'skipped' ? '該当なし' : task.status === 'paused' ? '一時停止中' : isNG ? 'NG判定済み' : isReworkDone ? '修正完了' : '完了済み'}</div>
+            {task.ngReason && (
+              <div className="text-[11px] font-normal bg-red-900/40 mt-1.5 px-2 py-0.5 rounded inline-block">{isNG ? '理由' : 'NG理由(修正済)'}: {task.ngReason}</div>
             )}
           </div>
           <div className="p-4 space-y-2">
@@ -7102,7 +7744,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                 <button onClick={() => handleTaskMenuAction('continue')} className="w-full py-3 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-xl text-blue-700 font-bold text-sm flex items-center justify-center gap-2"><PlayCircle className="w-5 h-5"/> 作業の続き</button>
                 <button onClick={() => handleTaskMenuAction('restart')} className="w-full py-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-700 font-bold text-sm flex items-center justify-center gap-2"><RotateCcw className="w-5 h-5"/> 最初から作業</button>
                 <button onClick={() => {
-                  // NG クリック → 気づき報告候補から理由選択モーダルへ
+                  // NG クリック → 軽微不良報告候補から理由選択モーダルへ
                   setNgReasonPicker({ key, stepIdx: completedTaskMenu.stepIdx, unitIdx: completedTaskMenu.unitIdx });
                   setCompletedTaskMenu(null);
                 }} className="w-full py-3 bg-red-600 hover:bg-red-700 border border-red-700 rounded-xl text-white font-black text-lg flex items-center justify-center gap-2"><XCircle className="w-6 h-6"/> NG</button>
@@ -7116,11 +7758,26 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                   <div className="mt-2 p-2 bg-orange-50 rounded-lg border border-orange-200">
                     <div className="text-xs font-bold text-orange-700 mb-1">修正履歴</div>
                     {task.reworks.map((r, i) => (
-                      <div key={i} className="text-xs text-orange-600 flex justify-between"><span>{i+1}回目</span><span className="font-mono">{formatTime(r.duration || 0)}</span></div>
+                      <div key={i} className="text-xs text-orange-600">
+                        <div className="flex justify-between"><span>{i+1}回目</span><span className="font-mono">{formatTime(r.duration || 0)}</span></div>
+                        {r.reason && <div className="text-[10px] text-orange-500 truncate pl-2" title={r.reason}>└ {r.reason}</div>}
+                      </div>
                     ))}
                   </div>
                 )}
               </>
+            )}
+            {(task.reworks?.length > 0 || task.ngReason) && (
+              <button onClick={() => { openReworkEditor(key, unitLabel); setCompletedTaskMenu(null); }} className="w-full py-2.5 bg-orange-50 hover:bg-orange-100 border border-orange-300 rounded-xl text-orange-700 font-bold text-sm flex items-center justify-center gap-2"><Wrench className="w-4 h-4"/> 修正・理由の編集／削除</button>
+            )}
+            <button onClick={() => { setTimeInput({ keys: [key], label: unitLabel, min: String(Math.floor((task.duration || 0) / 60) || ''), sec: String((task.duration || 0) % 60 || '') }); setCompletedTaskMenu(null); }} className="w-full py-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-300 rounded-xl text-indigo-700 font-bold text-sm flex items-center justify-center gap-2"><Timer className="w-4 h-4"/> 時間を手入力（押し忘れ時など）</button>
+            {(task.status === 'completed' || isNG || isReworkDone) && !isLotKey && (
+              <div className="pt-2 mt-1 border-t border-slate-100">
+                <div className="text-[11px] font-bold text-slate-400 mb-1.5 text-center">この台(#{completedTaskMenu.unitIdx + 1})を一括やり直し → 2回目測定へ</div>
+                <button onClick={() => { setNgReasonPicker({ key, stepIdx: completedTaskMenu.stepIdx, unitIdx: completedTaskMenu.unitIdx, bulkAction: 'redo-from-here' }); setCompletedTaskMenu(null); }} className="w-full py-2.5 mb-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-xl text-amber-700 font-bold text-sm flex items-center justify-center gap-2"><Wrench className="w-4 h-4"/> この工程から下をやり直し</button>
+                <button onClick={() => { setNgReasonPicker({ key, stepIdx: completedTaskMenu.stepIdx, unitIdx: completedTaskMenu.unitIdx, bulkAction: 'redo-unit-all' }); setCompletedTaskMenu(null); }} className="w-full py-2.5 bg-amber-100 hover:bg-amber-200 border border-amber-400 rounded-xl text-amber-800 font-bold text-sm flex items-center justify-center gap-2"><RotateCcw className="w-4 h-4"/> 全工程やり直し</button>
+                <div className="text-[10px] text-slate-400 mt-1.5 leading-snug">※ 対象工程を一括NGにします（理由を選択）。1回目の時間は残り、2回目は各工程の「修正作業」で測り直し（適正時間には入りません）。</div>
+              </div>
             )}
           </div>
           <div className="p-3 border-t text-center"><button onClick={() => setCompletedTaskMenu(null)} className="text-slate-400 hover:text-slate-600 font-bold text-sm">閉じる</button></div>
@@ -7129,38 +7786,199 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     );
   })();
 
-  // NG 理由ピッカー: 気づき報告候補から NG 理由を選択
+  // 時間手入力モーダル (単台 or 一括)
+  const timeInputModal = timeInput && (() => {
+    const totalSec = (parseInt(timeInput.min) || 0) * 60 + (parseInt(timeInput.sec) || 0);
+    const n = timeInput.keys.length;
+    return (
+      <div className="fixed inset-0 z-[320] bg-black/50 flex items-center justify-center p-4" onClick={() => setTimeInput(null)}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="bg-indigo-600 text-white p-3 text-center font-bold flex items-center justify-center gap-2"><Timer className="w-5 h-5" /> 時間を手入力 {timeInput.label || ''}</div>
+          <div className="p-4 space-y-3">
+            <div className="text-[11px] text-slate-500 text-center leading-snug">押し忘れ等で時間が残らなかった工程に、分かる範囲で時間を入れます{n > 1 ? `（${n}台 一括）` : ''}。この工程は「完了」になります。</div>
+            <div className="flex items-center justify-center gap-1.5">
+              <input type="number" min="0" value={timeInput.min} onChange={e => setTimeInput(p => ({ ...p, min: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" />
+              <span className="font-bold text-sm">分</span>
+              <input type="number" min="0" max="59" value={timeInput.sec} onChange={e => setTimeInput(p => ({ ...p, sec: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" />
+              <span className="font-bold text-sm">秒</span>
+            </div>
+            <div className="text-center text-xs text-slate-400">= {totalSec} 秒</div>
+            {timeInput.targetSec > 0 && (
+              <button onClick={() => setTimeInput(p => ({ ...p, min: String(Math.floor(timeInput.targetSec / 60)), sec: String(timeInput.targetSec % 60) }))} className="w-full py-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg text-blue-700 font-bold text-xs">目標時間 {timeInput.targetSec}秒（{Math.floor(timeInput.targetSec/60)}分{timeInput.targetSec%60}秒）を入れる</button>
+            )}
+            <div className="flex gap-2 pt-1">
+              <button onClick={() => setTimeInput(null)} className="flex-1 py-2.5 border rounded-xl font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
+              <button disabled={totalSec <= 0} onClick={() => { applyManualTime(timeInput.keys, totalSec); setTimeInput(null); }} className={`flex-1 py-2.5 rounded-xl font-bold text-white ${totalSec > 0 ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-300 cursor-not-allowed'}`}>確定</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  })();
+
+  // 修正(リワーク)の編集・削除モーダル
+  const reworkEditorModal = reworkEditor && (() => {
+    const t = tasks[reworkEditor.key] || {};
+    const setItem = (i, patch) => setReworkEditor(prev => ({ ...prev, items: prev.items.map((it, idx) => idx === i ? { ...it, ...patch } : it) }));
+    const removeItem = (i) => setReworkEditor(prev => ({ ...prev, items: prev.items.filter((_, idx) => idx !== i) }));
+    const save = () => {
+      const newReworks = reworkEditor.items.map(it => {
+        const { min, sec, ...rest } = it;
+        const dur = (parseInt(min) || 0) * 60 + (parseInt(sec) || 0);
+        return { ...rest, duration: it.endTime ? dur : (rest.duration || 0), reason: (it.reason || '').trim() };
+      });
+      // 計測中の修正(endTime無し)を削除した場合は status を ng に戻す
+      const hadActive = (t.reworks || []).some(r => !r.endTime);
+      const hasActive = newReworks.some(r => !r.endTime);
+      const updated = { ...t, reworks: newReworks };
+      if (t.status === 'reworking' && hadActive && !hasActive) { updated.status = 'ng'; updated.reworkStartTime = null; }
+      const ngr = (reworkEditor.ngReason || '').trim();
+      if (ngr) updated.ngReason = ngr; else delete updated.ngReason;
+      const nt = { ...tasks, [reworkEditor.key]: updated };
+      setTasks(nt); onSave({ tasks: nt, status: 'processing' });
+      setReworkEditor(null);
+    };
+    return (
+      <div className="fixed inset-0 z-[320] bg-black/50 flex items-center justify-center p-4" onClick={() => setReworkEditor(null)}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="bg-orange-600 text-white p-3 text-center font-bold flex items-center justify-center gap-2"><Wrench className="w-5 h-5" /> 修正・理由の編集 {reworkEditor.label}</div>
+          <div className="flex-1 overflow-auto p-4 space-y-3">
+            <datalist id="rework-reason-list">{(complaintOptions || []).map(o => <option key={o} value={o} />)}</datalist>
+            <div>
+              <div className="text-xs font-bold text-slate-500 mb-1">NG理由（この工程・台 全体）</div>
+              <input value={reworkEditor.ngReason} onChange={e => setReworkEditor(prev => ({ ...prev, ngReason: e.target.value }))} list="rework-reason-list" placeholder="例: 分割傾き不良（空にすると理由を消去）" className="w-full border rounded-lg p-2 text-sm" />
+            </div>
+            <div className="border-t pt-2">
+              <div className="text-xs font-bold text-slate-500 mb-1.5">修正履歴（{reworkEditor.items.length}件）— 修正ごとに理由を分けられます</div>
+              {reworkEditor.items.length === 0 && <div className="text-xs text-slate-400 text-center py-3">修正はありません（全て削除した状態で保存できます）</div>}
+              <div className="space-y-2">
+                {reworkEditor.items.map((it, i) => (
+                  <div key={i} className={`border rounded-lg p-2.5 ${it.endTime ? 'border-orange-200 bg-orange-50/40' : 'border-orange-400 bg-orange-100/60'}`}>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className="text-xs font-black text-orange-700 shrink-0">修正{i + 1}</span>
+                      {it.endTime ? (
+                        <span className="flex items-center gap-1">
+                          <input type="number" min="0" value={it.min} onChange={e => setItem(i, { min: e.target.value })} className="border rounded p-1 w-14 text-center font-mono text-sm" />
+                          <span className="text-xs font-bold">分</span>
+                          <input type="number" min="0" max="59" value={it.sec} onChange={e => setItem(i, { sec: e.target.value })} className="border rounded p-1 w-14 text-center font-mono text-sm" />
+                          <span className="text-xs font-bold">秒</span>
+                        </span>
+                      ) : (
+                        <span className="text-xs font-bold text-orange-700 animate-pulse">⏱ 計測中（時間は完了後に編集できます）</span>
+                      )}
+                      <button onClick={() => removeItem(i)} className="ml-auto px-2 py-1 rounded bg-rose-50 hover:bg-rose-100 border border-rose-300 text-rose-600 text-[11px] font-bold shrink-0" title={`修正${i + 1}を削除`}>🗑 削除</button>
+                    </div>
+                    <input value={it.reason} onChange={e => setItem(i, { reason: e.target.value })} list="rework-reason-list" placeholder={`修正${i + 1}の理由（任意・修正ごとに別でOK）`} className="w-full border rounded-lg p-1.5 text-xs" />
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="text-[10px] text-slate-400 leading-snug">※ 削除した修正の時間は集計から消えます。計測中の修正を削除すると、この台はNG状態に戻ります。理由は軽微不良の候補から選ぶか自由入力。</div>
+          </div>
+          <div className="p-3 border-t flex gap-2">
+            <button onClick={() => setReworkEditor(null)} className="flex-1 py-2.5 border rounded-xl font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
+            <button onClick={save} className="flex-1 py-2.5 rounded-xl font-bold text-white bg-orange-600 hover:bg-orange-700">保存</button>
+          </div>
+        </div>
+      </div>
+    );
+  })();
+
+  // 測定時間表 (工程×台数): 完了済みの測定時間を一覧。異常(0秒/<5秒/>4時間/時刻逆転)を色分け。
+  //   セルをタップ → 時間手入力モーダル(目標で埋める or 実時間手入力)。
+  const timeTableAnomOf = (t) => { if (!t || t.status !== 'completed') return null; const d = t.duration || 0; if (!d) return { sev: 'high' }; if (d < 5) return { sev: 'mid' }; if (d > 14400) return { sev: 'high' }; if (t.firstStartTime && t.endTime && t.endTime < t.firstStartTime) return { sev: 'high' }; return null; };
+  const timeTableModal = showTimeTable && (() => {
+    const steps = localSteps || [];
+    const qty = lot.quantity || 1;
+    let anomCount = 0;
+    steps.forEach((s, si) => { for (let u = 0; u < qty; u++) { if (timeTableAnomOf(tasks[getTaskKey(si, u)])) anomCount++; } });
+    return (
+      <div className="fixed inset-0 z-[315] bg-black/60 flex items-center justify-center p-3" onClick={() => setShowTimeTable(false)}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="bg-slate-800 text-white px-4 py-3 flex items-center justify-between gap-2">
+            <div className="font-bold flex items-center gap-2 text-sm truncate"><Timer className="w-5 h-5 shrink-0" /> 測定時間表 — {lot.model} <span className="font-mono opacity-70">#{lot.serialNo}</span> ({qty}台)</div>
+            {anomCount > 0 ? <span className="bg-rose-600 px-2 py-0.5 rounded font-bold text-xs shrink-0">要確認 {anomCount}件</span> : <span className="bg-emerald-600 px-2 py-0.5 rounded font-bold text-xs shrink-0">異常なし</span>}
+          </div>
+          <div className="px-4 py-2 text-[11px] text-slate-500 border-b bg-slate-50">赤=0秒/4時間超/時刻矛盾、黄=5秒未満。セルをタップ →「目標で埋める」or「実時間を手入力」で直せます。</div>
+          <div className="flex-1 overflow-auto p-2">
+            <table className="w-full text-xs border-collapse">
+              <thead className="sticky top-0 bg-slate-100 z-10"><tr><th className="px-2 py-1.5 text-left font-bold border-b sticky left-0 bg-slate-100">工程</th><th className="px-1 py-1.5 text-center font-bold border-b">目標</th>{Array.from({ length: qty }, (_, u) => <th key={u} className="px-1 py-1.5 text-center font-bold border-b">#{u + 1}</th>)}</tr></thead>
+              <tbody>
+                {steps.map((s, si) => (
+                  <tr key={si} className="border-b border-slate-50">
+                    <td className="px-2 py-1 font-bold sticky left-0 bg-white truncate max-w-[10rem]" title={s.title}>{s.title}</td>
+                    <td className="px-1 py-1 text-center text-slate-400 font-mono">{s.targetTime || '-'}</td>
+                    {Array.from({ length: qty }, (_, u) => {
+                      const key = getTaskKey(si, u); const t = tasks[key]; const a = timeTableAnomOf(t);
+                      const dur = t?.duration; const isDone = t?.status === 'completed';
+                      const bg = a ? (a.sev === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300');
+                      return (
+                        <td key={u} className="px-0.5 py-0.5 text-center">
+                          <button onClick={() => { setTimeInput({ keys: [key], label: `${s.title} #${u + 1}`, min: String(Math.floor((dur || 0) / 60) || ''), sec: String((dur || 0) % 60 || ''), targetSec: s.targetTime || 0 }); }} className={`w-full min-w-[3rem] rounded px-1 py-1 font-mono font-bold ${bg} hover:opacity-80 transition-opacity`} title={isDone ? 'タップで修正/手入力' : (t?.status || '未着手')}>
+                            {isDone ? formatTime(dur || 0) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : (t?.status === 'processing' ? '測定中' : '·')))}
+                          </button>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="px-4 py-3 border-t flex justify-between items-center gap-2 bg-slate-50">
+            {showTimeTable === 'precomplete' ? <span className="text-[11px] text-rose-600 font-bold leading-tight">⚠ 要確認の測定時間があります。直すか、このまま完了へ進めます。</span> : <span />}
+            <div className="flex gap-2 shrink-0">
+              <button onClick={() => setShowTimeTable(false)} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg font-bold">{showTimeTable === 'precomplete' ? 'まだ完了しない' : '閉じる'}</button>
+              {showTimeTable === 'precomplete' && <button onClick={() => { setShowTimeTable(false); handleCompleteTrigger(true); }} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold flex items-center gap-1"><CheckCircle2 className="w-4 h-4" /> このまま完了へ進む</button>}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  })();
+
+  // NG 理由ピッカー: 軽微不良報告候補から NG 理由を選択
   const ngReasonPickerModal = ngReasonPicker && (() => {
     const opts = complaintOptions && complaintOptions.length > 0 ? complaintOptions : DEFAULT_COMPLAINT_OPTIONS;
+    const isBulk = !!ngReasonPicker.bulkAction; // 一括やり直し(この工程から下/全工程)からの呼び出しか
     const closePicker = () => setNgReasonPicker(null);
     const applyReason = (reason) => {
-      handleTaskMenuAction('ng', ngReasonPicker.key, reason);
+      if (isBulk) {
+        handleTaskMenuAction(ngReasonPicker.bulkAction, ngReasonPicker.key, reason, { stepIdx: ngReasonPicker.stepIdx, unitIdx: ngReasonPicker.unitIdx });
+      } else {
+        handleTaskMenuAction('ng', ngReasonPicker.key, reason);
+      }
       setNgReasonPicker(null);
     };
     return (
       <div className="fixed inset-0 z-[310] bg-black/60 flex items-center justify-center p-4" onClick={closePicker}>
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden" onClick={e => e.stopPropagation()}>
           <div className="bg-red-600 text-white p-3 text-center">
-            <div className="font-black text-base flex items-center justify-center gap-2"><XCircle className="w-5 h-5"/> NG 理由を選択</div>
-            <div className="text-[11px] opacity-90 mt-0.5">#{ngReasonPicker.unitIdx + 1} を NG にします</div>
+            <div className="font-black text-base flex items-center justify-center gap-2"><XCircle className="w-5 h-5"/> {isBulk ? 'やり直しの理由を選択' : 'NG 理由を選択'}</div>
+            <div className="text-[11px] opacity-90 mt-0.5">{isBulk ? `#${ngReasonPicker.unitIdx + 1} を ${ngReasonPicker.bulkAction === 'redo-from-here' ? 'この工程から下' : '全工程'} やり直し（再測定）にします` : `${LOT_ONCE_RE.test(ngReasonPicker.key || '') ? `${ngReasonPicker.unitIdx + 1}回目` : `#${ngReasonPicker.unitIdx + 1}`} を NG にします`}</div>
           </div>
-          <div className="p-3 space-y-1.5">
-            {opts.map(opt => (
-              <button key={opt} onClick={() => applyReason(opt)}
-                className="w-full py-2.5 px-3 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg text-red-700 font-bold text-sm text-left transition-colors">
-                {opt}
+          <div className="p-3 space-y-2">
+            {/* 理由候補は2〜3列のグリッド + 高さ上限で縦長を解消 (多くても3〜4行ぶんで残りはスクロール) */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-[40vh] overflow-y-auto pr-0.5">
+              {opts.map(opt => (
+                <button key={opt} onClick={() => applyReason(opt)}
+                  className="py-2 px-2 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg text-red-700 font-bold text-xs text-center transition-colors leading-tight min-h-[44px] flex items-center justify-center">
+                  {opt}
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button onClick={() => {
+                const custom = prompt('理由を入力してください', '');
+                if (custom && custom.trim()) applyReason(custom.trim());
+              }} className="py-2 px-3 bg-slate-50 hover:bg-slate-100 border border-dashed border-slate-300 rounded-lg text-slate-600 font-bold text-xs text-center transition-colors">
+                ✎ その他 (自由入力)
               </button>
-            ))}
-            <button onClick={() => {
-              const custom = prompt('NG 理由を入力してください', '');
-              if (custom && custom.trim()) applyReason(custom.trim());
-            }} className="w-full py-2 px-3 bg-slate-50 hover:bg-slate-100 border border-dashed border-slate-300 rounded-lg text-slate-600 font-bold text-xs text-left transition-colors">
-              ✎ その他 (自由入力)
-            </button>
-            <button onClick={() => applyReason(null)}
-              className="w-full py-2 px-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-slate-500 font-bold text-xs text-left transition-colors">
-              理由なしで NG にする
-            </button>
+              <button onClick={() => applyReason(null)}
+                className="py-2 px-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-slate-500 font-bold text-xs text-center transition-colors">
+                {isBulk ? '理由なしでやり直し' : '理由なしでNG'}
+              </button>
+            </div>
           </div>
           <div className="p-2 border-t text-center">
             <button onClick={closePicker} className="text-slate-400 hover:text-slate-600 font-bold text-sm">キャンセル</button>
@@ -7182,6 +8000,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                 if (stepUnitTimes[`${step.id}-${u}`] != null) completedUnits++;
               }
               incompleteCount = totalUnits - completedUnits;
+          } else if (step?.lotOnce) {
+              // ロット1回工程: 分母=実施回数 (台数で数えると永久に完了不可になる)
+              const keys = lotOnceKeysOf(tasks, step);
+              const n = Math.max(1, keys.length);
+              let completeCount = 0, totalDur = 0;
+              keys.forEach(k => { const t = tasks[k]; if (t?.status === 'completed' || t?.status === 'skipped') { completeCount++; totalDur += (t.duration || 0); } });
+              incompleteCount = n - completeCount;
+              duration = completeCount > 0 ? totalDur / completeCount : 0;
           } else {
               let completeCount = 0;
               let totalDur = 0;
@@ -7293,12 +8119,6 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       <div data-fs="execution" className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
         <div className="bg-white rounded-xl shadow-2xl p-8 max-w-md w-full text-center">
            <h2 className="text-xl font-bold mb-6">作業モードを選択してください</h2>
-           {/* オススメ作業順: モード選択前にも参照可能に (実績ベース+AI) */}
-           <div className="flex items-center justify-center gap-2 mb-3">
-             <button onClick={() => setShowWorkOrderOptimizer(true)} className="flex items-center gap-2 px-4 py-2 rounded-full font-bold text-sm transition-all shadow-sm bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:shadow-md" title="自動測定中に並行できる手動工程の組合せを提案">
-               <Zap className="w-4 h-4"/> オススメ作業順を見る
-             </button>
-           </div>
            {/* Voice Assistant Toggle */}
            <div className="flex items-center justify-center mb-5">
              <button onClick={toggleVoice} className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-bold text-sm transition-all shadow-sm ${voiceEnabled ? 'bg-blue-600 text-white ring-2 ring-blue-300 shadow-blue-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
@@ -7342,6 +8162,36 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
   // --- Custom Mode Variables Definition (Fixed) ---
   const isCustom = executionType === 'custom';
+  // 工程ごとの目標時間(較正済み: customTargetTimes→型式グループ→step.targetTime)。
+  // timerTick で毎秒再描画されるため、ここはプレーン計算でライブ更新される。
+  const effTargetsBySIdx = (localSteps || []).map(st => getEffectiveTargetTime(st, lot.model, customTargetTimes, modelGroups));
+  // バッチ台数マップ (工程ごと: startTime→processing台数)。一括中は 目標×N と比較する。
+  const procCountsBySIdx = batchProcCounts(tasks, localSteps || [], lot.quantity || 1);
+  // 自分(inspectorName)が作業中の全タスク (枠ゲージ用に警告前も含む)。pct = 経過/目標×100。
+  const myRunning = (() => {
+    const out = []; const nowMs = Date.now(); const qty = lot.quantity || 1;
+    if (!oaCfg.enabled) return out; // 設定でOFF
+    (localSteps || []).forEach((st, sIdx) => {
+      const baseTgt = effTargetsBySIdx[sIdx]; if (!(baseTgt > 0)) return;
+      const isLO = !!st.lotOnce;
+      const loopN = isLO ? lotOnceCountOf(tasks, st) : qty; // ロット1回工程は回数分
+      for (let u = 0; u < loopN; u++) {
+        const idKey = isLO ? `${st.id}-lot-${u}` : (st.id ? `${st.id}-${u}` : null); const numKey = `${sIdx}-${u}`;
+        const t = (idKey && tasks[idKey]) ? tasks[idKey] : (isLO ? null : tasks[numKey]);
+        if (!t || t.status !== 'processing' || !t.startTime) continue;
+        if (t.workerName && inspectorName && t.workerName !== inspectorName) continue; // 自分の作業のみ通知
+        const bN = isLO ? 1 : Math.max(1, procCountsBySIdx[sIdx]?.[t.startTime] || 1);
+        const tgt = baseTgt * bN;
+        const sec = (t.duration || 0) + Math.floor((nowMs - t.startTime) / 1000);
+        const pct = sec / tgt * 100;
+        out.push({ sIdx, u, title: st.title + (isLO ? `（${u + 1}回目）` : bN > 1 ? `（${bN}台一括）` : ''), sec, tgt, pct, warn: pct >= oaCfg.warnPct, over: pct >= (oaCfg.overPct || 100), bN, isLot: isLO });
+      }
+    });
+    return out.sort((a, b) => b.pct - a.pct);
+  })();
+  const myOverruns = myRunning.filter(r => r.warn);
+  const worstOverrun = myOverruns[0] || null;
+  const gaugeWorst = myRunning[0] || null; // 一番切迫している作業 → 画面外枠ゲージに反映
   let displayStepIdx = 0;
   let displayUnitIdx = 0;
   if (activeCustomTaskKey) {
@@ -7359,6 +8209,43 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         {autoEndToast && (
           <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[400] bg-purple-600 text-white px-4 py-2 rounded-lg shadow-2xl text-sm font-bold flex items-center gap-2 animate-bounce">
             🤖 自動測定{autoEndToast.title ? `「${autoEndToast.title}」` : ''}が時間経過で完了しました
+          </div>
+        )}
+        {/* 画面外枠ゲージ (円形ゲージの画面全体版): 経過時間が枠として上辺中央から時計回りに「塗られていく」。
+            一周 = 超過しきい値(overPct)。超過したら枠全体が超過色になり、明るい帯が回り続ける(回転速度/帯の長さは設定)。
+            設定(oaCfg): gaugeEnabled / gaugeColor(進行中の色) / gaugeWidth(太さ) / gaugeTrack(下地) / gaugeRotate / gaugeCometLen */}
+        {gaugeWorst && oaCfg.gaugeEnabled !== false && (() => {
+          const filled = Math.min(100, gaugeWorst.pct / (oaCfg.overPct || 100) * 100);
+          const color = gaugeWorst.warn ? oaCfg.warnColor : (oaCfg.gaugeColor || '#10B981');
+          const gw = Math.max(8, Math.min(60, oaCfg.gaugeWidth || 24));
+          const rotDur = { slow: '2.6s', normal: '1.6s', fast: '0.8s' }[oaCfg.gaugeRotate || 'normal'] || null; // 'none'→null=回転なし
+          const cometLen = Math.max(6, Math.min(45, oaCfg.gaugeCometLen || 18));
+          return (
+            <svg className="fixed inset-0 z-[105] pointer-events-none w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+              {gaugeWorst.over ? (
+                rotDur ? (
+                  <>
+                    {/* 超過: 枠全体が超過色 + 明るい帯が時計回りに回転し続ける */}
+                    <path d="M50 0 H100 V100 H0 V0 H50" pathLength="100" fill="none" stroke={oaCfg.overColor} strokeWidth={gw} vectorEffect="non-scaling-stroke" opacity="0.45" />
+                    <path className="oa-rotate" style={{ animationDuration: rotDur }} d="M50 0 H100 V100 H0 V0 H50" pathLength="100" fill="none" stroke={oaCfg.overColor} strokeWidth={gw} vectorEffect="non-scaling-stroke" strokeDasharray={`${cometLen} ${100 - cometLen}`} strokeLinecap="round" />
+                  </>
+                ) : (
+                  /* 回転なし設定: 全周を超過色で点灯 (点滅はoverBlink設定) */
+                  <path className={oaBlinkCls(oaCfg.overBlink)} d="M50 0 H100 V100 H0 V0 H50" pathLength="100" fill="none" stroke={oaCfg.overColor} strokeWidth={gw} vectorEffect="non-scaling-stroke" />
+                )
+              ) : (
+                <>
+                  {/* 進行中: うっすら下地(設定で非表示可) + 経過分が時計回りに塗られていく */}
+                  {oaCfg.gaugeTrack !== false && <path d="M50 0 H100 V100 H0 V0 H50" pathLength="100" fill="none" stroke={color} strokeWidth={gw} vectorEffect="non-scaling-stroke" opacity="0.12" />}
+                  <path className={gaugeWorst.warn ? oaBlinkCls(oaCfg.warnBlink) : ''} d="M50 0 H100 V100 H0 V0 H50" pathLength="100" fill="none" stroke={color} strokeWidth={gw} vectorEffect="non-scaling-stroke" strokeDasharray="100 100" strokeDashoffset={100 - filled} style={{ transition: 'stroke 0.5s, stroke-dashoffset 0.95s linear' }} />
+                </>
+              )}
+            </svg>
+          );
+        })()}
+        {worstOverrun && oaCfg.screenEffect && (
+          <div className={`fixed top-0 left-1/2 -translate-x-1/2 z-[106] pointer-events-none px-5 py-2 rounded-b-2xl shadow-2xl text-white font-black text-sm flex items-center gap-2 ${oaBlinkCls(worstOverrun.over ? oaCfg.overBlink : oaCfg.warnBlink)}`} style={{ backgroundColor: worstOverrun.over ? oaCfg.overColor : oaCfg.warnColor }}>
+            ⏰ {worstOverrun.over ? '目標時間オーバー！' : 'まもなく目標時間'}：{worstOverrun.title}{worstOverrun.isLot ? '' : ` #${worstOverrun.u + 1}`} — {formatTime(worstOverrun.sec)} / 目標{formatTime(worstOverrun.tgt)}{myOverruns.length > 1 ? ` （他${myOverruns.length - 1}件）` : ''}
           </div>
         )}
         {showDefectModal && (
@@ -7412,7 +8299,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         {showComplaintModal && (
             <div className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
                 <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
-                    <h3 className="text-lg font-bold mb-4 flex items-center gap-2 text-purple-600"><Megaphone className="w-5 h-5"/> 気づき・改善提案</h3>
+                    <h3 className="text-lg font-bold mb-4 flex items-center gap-2 text-purple-600"><Megaphone className="w-5 h-5"/> 軽微不良の報告</h3>
                     <div className="space-y-3">
                       <div>
                         <label className="block text-xs font-bold text-slate-500 mb-1">カテゴリ</label>
@@ -7427,11 +8314,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                       </div>
                       <div>
                         <label className="block text-xs font-bold text-slate-500 mb-1">詳細内容</label>
-                        <textarea className="w-full border rounded-lg p-2" rows={3} placeholder="気づいたことや改善提案を入力..." value={complaintLabel} onChange={e=>setComplaintLabel(e.target.value)}/>
+                        <textarea className="w-full border rounded-lg p-2" rows={3} placeholder="不良の内容を入力（工程改善の提案は「気づき・改善」へ）..." value={complaintLabel} onChange={e=>setComplaintLabel(e.target.value)}/>
                       </div>
                     </div>
                     <div className="mt-4 p-2 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-500">
-                      ※「時間取りして報告」を選ぶと別作業として時間計測を開始します。<br/>普通の気づきメモなら「報告のみ」でOK。
+                      ※「時間取りして報告」を選ぶと別作業として時間計測を開始します。<br/>普通の軽微不良メモなら「報告のみ」でOK。
                     </div>
                     <div className="flex justify-end gap-2 mt-3 flex-wrap">
                         <button onClick={()=>{setShowComplaintModal(false);setComplaintLabel('');setComplaintCategory('');}} className="px-4 py-2 text-slate-500">キャンセル</button>
@@ -7451,9 +8338,52 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                           setShowComplaintModal(false);
                           setComplaintLabel('');
                           setComplaintCategory('');
-                        }} className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold flex items-center gap-1" title="この気づきの対応時間を計測開始します">
+                        }} className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold flex items-center gap-1" title="この軽微不良の対応時間を計測開始します">
                           <Clock className="w-4 h-4"/> 時間取りして報告
                         </button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {/* 気づき・改善: 工程をこう変えたら、の提案+理由。軽微不良(品質)とは別枠。分析画面に出てテンプレ改善の手がかりになる。 */}
+        {showImproveModal && (
+            <div className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+                <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
+                    <h3 className="text-lg font-bold mb-1 flex items-center gap-2 text-indigo-600"><Lightbulb className="w-5 h-5" /> 気づき・改善（工程の提案）</h3>
+                    <div className="text-[11px] text-slate-500 mb-3">「この工程はこう変えた方がいい」を理由つきで残す。後で<b>作業データ分析・改善</b>画面に出て、テンプレ改善の手がかりになります。（品質の不良は「軽微不良」へ）</div>
+                    <div className="space-y-3">
+                        <div>
+                            <label className="block text-xs font-bold text-slate-500 mb-1">種類</label>
+                            <div className="flex flex-wrap gap-2">
+                                {IMPROVE_KINDS.map(k => (
+                                    <button key={k.id} onClick={() => setImproveKind(improveKind === k.id ? '' : k.id)}
+                                        className={`px-3 py-1.5 rounded-full text-sm font-bold border transition-colors ${improveKind === k.id ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-indigo-50'}`}>{k.label}</button>
+                                ))}
+                            </div>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-bold text-slate-500 mb-1">対象工程（任意・空なら今見てる工程）</label>
+                            <select value={improveStep} onChange={e => setImproveStep(e.target.value)} className="w-full border rounded-lg p-2 text-sm">
+                                <option value="">（今の工程）</option>
+                                {localSteps.map((s, i) => <option key={i} value={s.title}>{s.title}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-bold text-slate-500 mb-1">理由・詳細</label>
+                            <textarea className="w-full border rounded-lg p-2" rows={3} placeholder="なぜそう変えた方がいいか（例: この測定は2台ずつ治具にセットできるので分けた方が速い）..." value={improveReason} onChange={e => setImproveReason(e.target.value)} />
+                        </div>
+                    </div>
+                    <div className="flex justify-end gap-2 mt-4 flex-wrap">
+                        <button onClick={() => { setShowImproveModal(false); setImproveKind(''); setImproveReason(''); setImproveStep(''); }} className="px-4 py-2 text-slate-500">キャンセル</button>
+                        <button onClick={() => {
+                            const kindLabel = (IMPROVE_KINDS.find(k => k.id === improveKind) || {}).label || '改善';
+                            if (!improveReason.trim()) { alert('理由・詳細を入力してください'); return; }
+                            const stepForReport = improveStep || (localSteps[executionType === 'custom' ? displayStepIdx : currentStepIdx]?.title || '');
+                            const label = `${kindLabel}${stepForReport ? '（' + stepForReport + '）' : ''}：${improveReason}`;
+                            startInterruption('improvement', label, '', [], true, { improvementKind: improveKind || 'other', targetStepTitle: stepForReport });
+                            setShowImproveModal(false); setImproveKind(''); setImproveReason(''); setImproveStep('');
+                        }} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold">記録する</button>
                     </div>
                 </div>
             </div>
@@ -7593,8 +8523,20 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                 <div className="bg-amber-50 border border-amber-200 rounded p-2 text-[11px] text-amber-800 mb-3">
                   ⚠ 完了済み・該当なしの台は選択不可。<br/>選択中: <span className="font-bold text-orange-700 font-mono">{formatRanges(selectedUnits)} ({selectedCount}台)</span>
                 </div>
-                <div className="flex justify-end gap-2">
+                <div className="flex flex-wrap justify-end gap-2">
                   <button onClick={() => setBatchRangeModal(null)} className="px-4 py-2 text-slate-500">キャンセル</button>
+                  <button
+                    onClick={() => {
+                      const { stepIdx } = batchRangeModal;
+                      const keys = Array.from(selectedUnits).filter(u => u >= 0 && u < lot.quantity).map(u => getTaskKey(stepIdx, u));
+                      if (!keys.length) return;
+                      setBatchRangeModal(null);
+                      setTimeInput({ keys, label: `${keys.length}台`, min: '', sec: '' });
+                    }}
+                    disabled={selectedCount < 1}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white rounded-lg font-bold flex items-center gap-1">
+                    <Timer className="w-4 h-4"/> 時間手入力 ({selectedCount}台)
+                  </button>
                   <button
                     onClick={() => {
                       const { stepIdx } = batchRangeModal;
@@ -7614,7 +8556,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
         <div className="bg-white w-full max-w-6xl h-full max-h-full rounded-2xl shadow-2xl flex flex-col overflow-hidden relative">
           <div className="bg-slate-800 text-white px-3 py-1.5 flex justify-between items-center shrink-0 gap-2">
-             <div className="shrink-0"><h2 className="text-sm font-bold flex items-center gap-1.5"><button onClick={switchToSequential} className="bg-emerald-600 hover:bg-blue-600 px-2 py-0.5 rounded text-[11px] transition-colors" title="通常モードに切替">カスタム ⇄</button><span className="truncate max-w-[10rem]">{lot.model}</span> <span className="font-mono opacity-70 text-xs">#{lot.serialNo}</span> <span className="text-xs opacity-70">({lot.quantity}台)</span></h2></div>
+             <div className="shrink-0"><h2 className="text-sm font-bold flex items-center gap-1.5"><button onClick={switchToSequential} className="bg-emerald-600 hover:bg-blue-600 px-2 py-0.5 rounded text-[11px] transition-colors" title="通常モードに切替">カスタム ⇄</button><span className="truncate max-w-[9rem]">{lot.model}</span> <span className="font-mono opacity-70 text-xs">#{lot.serialNo}</span> {lotTemplate?.name && <span className="text-[11px] bg-white/15 px-1.5 py-0.5 rounded font-bold truncate max-w-[10rem]" title={`テンプレート: ${lotTemplate.name}`}>📋 {lotTemplate.name}</span>} <span className="text-xs opacity-70 shrink-0">({lot.quantity}台)</span></h2></div>
              <div className="flex flex-wrap gap-1.5 items-center justify-end">
                  <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
                    {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
@@ -7630,8 +8572,15 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                    <button onClick={onOpenWorkStandards} className="px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="作業標準ライブラリを開く"><BookOpen className="w-4 h-4"/> 作業標準</button>
                  )}
                  <button onClick={()=>setShowInProgressReport(true)} className="px-3 py-2 bg-teal-600 hover:bg-teal-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="途中経過の成績表を表示 (未入力は空白)"><Printer className="w-4 h-4"/> 成績表</button>
-                 <button onClick={()=>setShowComplaintModal(true)} className="px-3 py-2 bg-purple-600 hover:bg-purple-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap"><Megaphone className="w-4 h-4"/> 気づき報告</button>
-                 <button onClick={()=>setShowDefectModal(true)} className="px-3 py-2 bg-rose-600 hover:bg-rose-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap"><AlertTriangle className="w-4 h-4"/> 不具合報告</button>
+                 {/* 報告ボタン統合: 1ボタンから 軽微不良 / 気づき・改善 / 不具合 を選ぶ (ボタン数削減) */}
+                 <details className="relative" onClick={e => e.stopPropagation()}>
+                   <summary className="px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap list-none cursor-pointer bg-purple-600 hover:bg-purple-700"><Megaphone className="w-4 h-4"/> 報告 ▾</summary>
+                   <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-2xl border border-slate-200 w-52 z-50 overflow-hidden p-2 space-y-1">
+                     <button onClick={(e)=>{ e.currentTarget.closest('details')?.removeAttribute('open'); setShowComplaintModal(true); }} className="w-full text-left px-3 py-2 rounded-lg hover:bg-purple-50 text-purple-800 border border-purple-200 flex items-center gap-2 font-bold text-sm"><Megaphone className="w-4 h-4 shrink-0"/> 軽微不良</button>
+                     <button onClick={(e)=>{ e.currentTarget.closest('details')?.removeAttribute('open'); setShowImproveModal(true); }} className="w-full text-left px-3 py-2 rounded-lg hover:bg-indigo-50 text-indigo-800 border border-indigo-200 flex items-center gap-2 font-bold text-sm"><Lightbulb className="w-4 h-4 shrink-0"/> 気づき・改善</button>
+                     <button onClick={(e)=>{ e.currentTarget.closest('details')?.removeAttribute('open'); setShowDefectModal(true); }} className="w-full text-left px-3 py-2 rounded-lg hover:bg-rose-50 text-rose-800 border border-rose-200 flex items-center gap-2 font-bold text-sm"><AlertTriangle className="w-4 h-4 shrink-0"/> 不具合</button>
+                   </div>
+                 </details>
                  {/* 停止理由ボタン (ドロップダウン): 押すと 5理由 + 解除 が出る。理由を選ぶと自動で一時停止＋ロットカードにバッジ表示 */}
                  <details className="relative" onClick={e => e.stopPropagation()}>
                    <summary className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap list-none cursor-pointer ${pauseReason ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'}`} title="停止理由を選ぶ (ロットカードに表示)">
@@ -7721,10 +8670,6 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  <button onClick={toggleBreak} className={`px-3 py-2 ${isOnBreak ? 'bg-emerald-500 hover:bg-emerald-600 animate-pulse' : 'bg-amber-600 hover:bg-amber-700'} rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap`} title={executionType === 'sequential' ? (isOnBreak ? '作業時間の計測を再開' : '作業時間の計測を一時停止') : (isOnBreak ? '全タスクを再開' : '進行中タスクをまとめて一時停止')}>
                    {isOnBreak ? <><Play className="w-4 h-4"/> 再開</> : <><Pause className="w-4 h-4"/> {executionType === 'sequential' ? '中断' : 'まとめて中断'}</>}
                  </button>
-                 {/* 作業順最適化: 同テンプレ実績から推奨順を生成 */}
-                 <button onClick={() => setShowWorkOrderOptimizer(true)} className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="自動測定中に並行できる手動工程を提案">
-                   <Zap className="w-4 h-4"/> オススメ順
-                 </button>
                  {/* 表示形式切替: カード ⇄ コンパクト */}
                  <button
                    onClick={() => setCustomViewModePersist(customViewMode === 'card' ? 'compact' : 'card')}
@@ -7733,18 +8678,39 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  >
                    {customViewMode === 'card' ? <><LayoutList className="w-4 h-4"/> 一覧</> : <><LayoutGrid className="w-4 h-4"/> カード</>}
                  </button>
-                 {/* 厳密順序モード: 型式ごとに、作業中いつでも ON/OFF 切替可能。管理者のテンプレ設定は初期既定。 */}
-                 <button
-                   onClick={toggleStrictOrderMode}
-                   className={`px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap ${strictOrderMode ? 'bg-rose-600 hover:bg-rose-700 ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-700'}`}
-                   title={`${lot.model || 'この型式'} × このテンプレ の順番モードを切替（この端末で一時上書き・組み合わせごとに記憶）\n🔒厳密=「1台目から順番」を強制 / 🔓ガイド=警告のみで飛ばしも可${adminStrictForCombo != null ? `\n（管理者の既定: ${adminStrictForCombo ? '厳密' : 'ガイド'}）` : ''}`}
-                 >
-                   {strictOrderMode ? '🔒' : '🔓'} {strictOrderMode ? '順番厳密' : '順番ガイド'}
-                   <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">型式別</span>
-                 </button>
+                 {/* 密表示トグルは時間取り表(工程列)の近くへ移動した (ヘッダー整理のため) */}
+                 {/* 厳密モードは「一元管理」で承認された時だけ ON。作業画面ではONに出来ないが、状況対応の“一時OFF”は可。 */}
+                 {strictApprovedOn && (
+                   strictOverrideOff ? (
+                     <button
+                       onClick={toggleStrictOrderMode}
+                       className="px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap bg-amber-500 hover:bg-amber-600 text-white ring-2 ring-amber-300/50"
+                       title="厳密順を一時的に外しています（このロットを開いている間だけ）。タップで厳密に戻す。"
+                     >
+                       🔓 厳密 一時OFF中 <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">戻す</span>
+                     </button>
+                   ) : (
+                     <span className="flex items-center gap-1">
+                       <span
+                         className="px-3 py-2 rounded-l font-bold text-xs flex items-center gap-1 whitespace-nowrap bg-rose-600 text-white ring-2 ring-rose-300/50"
+                         title={`${lot.model || 'この型式'} × このテンプレ は厳密モード（一元管理で承認済み）。順番どおりに作業してください。\nON は管理者の一元管理でのみ。状況により外す場合は右の「一時OFF」を押してください。`}
+                       >
+                         🔒 順番厳密 <span className="text-[9px] bg-white/25 px-1 rounded ml-0.5">承認済</span>
+                       </span>
+                       <button
+                         onClick={toggleStrictOrderMode}
+                         className="px-2 py-2 rounded-r font-bold text-[10px] whitespace-nowrap bg-rose-700 hover:bg-rose-800 text-rose-100 border-l border-rose-400"
+                         title="状況により厳密順を一時的に外す（このロットを開いている間だけ。再度開くと承認状態に戻る）"
+                       >
+                         一時OFF
+                       </button>
+                     </span>
+                   )
+                 )}
                  {/* 「全作業完了」は誤タップ防止のため、サイズ・色・余白で他ボタンと差別化 */}
                  <div className="ml-1.5 pl-1.5 border-l border-white/20 flex items-center gap-1.5">
-                   <button onClick={handleCompleteTrigger} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 ring-2 ring-emerald-300/50 rounded-lg font-black text-xs shadow-lg flex items-center gap-1 whitespace-nowrap"><CheckCircle2 className="w-4 h-4"/> 全作業完了</button>
+                   <button onClick={() => setShowTimeTable('view')} className="px-2.5 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="工程×台数の測定時間を確認・修正"><Timer className="w-4 h-4"/> 測定時間表</button>
+                   <button onClick={() => handleCompleteTrigger()} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 ring-2 ring-emerald-300/50 rounded-lg font-black text-xs shadow-lg flex items-center gap-1 whitespace-nowrap"><CheckCircle2 className="w-4 h-4"/> 全作業完了</button>
                    <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-1.5 hover:bg-white/10 rounded-full flex items-center justify-center"><X className="w-5 h-5"/></button>
                  </div>
              </div>
@@ -7835,8 +8801,17 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
           <div className="flex-1 flex overflow-hidden">
             <div className="flex-1 overflow-auto p-6 bg-slate-50 pb-4">
-               {/* ライブ並行作業ガイド: 自動測定中に「今やれる他の台の作業」をリアルタイム表示 */}
-               <LiveParallelGuide guide={liveParallelGuide} fmtTime={formatTime} />
+               {/* ライブ並行作業ガイド: 自動測定中に「今やれる他の台の作業」をリアルタイム表示。
+                   厳密モード(実効)中は順番が強制されるので自動非表示。端末の好みで非表示も可。 */}
+               {!strictOrderMode && (
+                 parallelGuideHidden
+                   ? (liveParallelGuide && liveParallelGuide.runningAuto && (
+                       <button onClick={toggleParallelGuide} className="mb-2 px-3 py-1.5 rounded-lg bg-purple-100 hover:bg-purple-200 text-purple-700 text-xs font-bold flex items-center gap-1.5 border border-purple-200">
+                         <Zap className="w-3.5 h-3.5"/> 並行ガイドを表示
+                       </button>
+                     ))
+                   : <LiveParallelGuide guide={liveParallelGuide} fmtTime={formatTime} onHide={toggleParallelGuide} />
+               )}
                {/* 厳密モード推奨バナー: データが十分貯まったテンプレで提案 (誰でも型式ごとに有効化可・作業中いつでも切替) */}
                {showStrictSuggestion && (
                  <div className="mb-3 bg-gradient-to-r from-rose-50 to-amber-50 border-2 border-rose-300 rounded-xl p-3 flex items-start gap-3">
@@ -7875,10 +8850,19 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  stepTitle={null}
                  info={modelQualityInfo}
                  open={showQualityInfoPanel}
-                 onToggle={() => setShowQualityInfoPanel(v => !v)}
+                 onToggle={toggleQualityInfoPanel}
                />
                {/* === コンパクト一覧表示 (工程×台数の高密度テーブル) === */}
                {customViewMode === 'compact' && (
+                 <>
+                 {/* 密表示トグル: 表の工程列の真上に配置 (ヘッダーから移動して整理) */}
+                 <div className="flex justify-end mb-1">
+                   <button onClick={toggleGridDense}
+                     className={`px-2.5 py-1 rounded font-bold text-[11px] flex items-center gap-1 whitespace-nowrap border ${gridDense ? 'bg-amber-500 text-white border-amber-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}
+                     title={gridDense ? '通常表示に戻す' : '密表示: 工程欄とセルを縮めて全台を画面に詰める'}>
+                     {gridDense ? <><Eye className="w-3.5 h-3.5"/> 通常表示に戻す</> : <><LayoutGrid className="w-3.5 h-3.5"/> 密表示(全台を詰める)</>}
+                   </button>
+                 </div>
                  <CustomCompactGrid
                    localSteps={localSteps}
                    lot={lot}
@@ -7890,6 +8874,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                    activeCustomTaskKey={activeCustomTaskKey}
                    onCellClick={(sIdx, uIdx) => {
                      const step = localSteps[sIdx];
+                     // ロット1回工程: 順序ゲート対象外。uIdx=回数k として toggleTask へ直行 (完了済みはメニュー)
+                     if (step?.lotOnce) {
+                       const loKey = `${step.id}-lot-${uIdx}`;
+                       const loT = tasks[loKey];
+                       if (loT && ['completed', 'ng', 'reworking', 'rework-done'].includes(loT.status)) { setCompletedTaskMenu({ key: loKey, stepIdx: sIdx, unitIdx: uIdx }); return; }
+                       toggleTask(sIdx, uIdx);
+                       return;
+                     }
                      const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
                      const key = step?.id ? `${step.id}-${uIdx}` : `${sIdx}-${uIdx}`;
                      const task = tasks[key] || tasks[`${sIdx}-${uIdx}`] || { status: 'waiting' };
@@ -7899,17 +8891,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                      const isOOO = globalNextTask && (task.status === 'waiting') && !isNext && (
                        (globalNextTask.sIdx === sIdx && uIdx > globalNextTask.unitIdx) || (sIdx > globalNextTask.sIdx)
                      );
-                     if (isOOO) {
-                       if (strictOrderMode) { alert(`🚫 厳密モードON: 先に「${localSteps[globalNextTask.sIdx]?.title}」#${globalNextTask.unitIdx + 1}台目 を完了させてください。`); return; }
-                       setOutOfOrderConfirm({ sIdx, uIdx, nextSIdx: globalNextTask.sIdx, nextU: globalNextTask.unitIdx, nextTitle: localSteps[globalNextTask.sIdx]?.title || '', thisTitle: step.title });
-                       return;
+                     // データ最適順(承認コンボ)が有効ならそちらで強制。なければ従来の昇順ルール。
+                     if (optimalNextMove && strictOrderMode) {
+                       const og = optimalGate(sIdx, uIdx);
+                       if (og) { setOrderHint(og.hint); return; }
+                     } else if (isOOO && strictOrderMode) {
+                       setOrderHint(`🔒 厳密モード: 先に「${localSteps[globalNextTask.sIdx]?.title}」#${globalNextTask.unitIdx + 1}台目 を完了してください`); return;
                      }
                      setActiveCustomTaskKey(`${sIdx}-${uIdx}`);
                      toggleTask(sIdx, uIdx);
                    }}
                    onBatchClick={(sIdx) => handleBatchClick(sIdx)}
                    onSkipRow={(sIdx) => handleSkipRow(sIdx)}
+                   dense={gridDense}
+                   effTargets={effTargetsBySIdx}
+                   oa={oaCfg}
+                   onEditReworks={(sIdx, uIdx) => openReworkEditor(getTaskKey(sIdx, uIdx), `#${uIdx + 1}`)}
                  />
+                 </>
                )}
                <div className="grid gap-6" style={{ display: customViewMode === 'compact' ? 'none' : 'grid' }}>
                  {localSteps.map((step, sIdx) => {
@@ -7928,6 +8927,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                              <span className="bg-slate-100 text-slate-500 font-bold px-2 py-1 rounded text-xs">Step {sIdx+1}</span>
                              <span className="font-bold text-lg text-slate-800">{step.title}</span>
                              {isAuto && <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded text-xs font-bold flex items-center gap-1"><Bot className="w-3 h-3"/> 自動</span>}
+                             {effTargetsBySIdx[sIdx] > 0 && <span className="bg-slate-100 text-slate-500 px-2 py-0.5 rounded text-xs font-bold font-mono" title="目標時間 (1台あたり・較正済み)">🎯 目標 {formatTime(effTargetsBySIdx[sIdx])}/台</span>}
                            </div>
                            <div className="flex gap-2">
                                {isAuto && (
@@ -7935,6 +8935,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                        <Eye className="w-3 h-3"/> {isMonitoring ? '監視中...' : '監視'}
                                    </button>
                                )}
+                               {!step.lotOnce && (
                                <button
                                  onClick={() => handleBatchClick(sIdx)}
                                  className={`px-3 py-1 text-xs font-bold rounded border flex items-center gap-1 transition-colors ${isBatch ? 'bg-orange-500 text-white border-orange-600 animate-pulse' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
@@ -7942,9 +8943,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                >
                                  {isBatch ? <><StopCircle className="w-3 h-3"/> まとめて完了</> : <><PlayCircle className="w-3 h-3"/> まとめて開始</>}
                                </button>
+                               )}
                                {(() => {
-                                 // この工程の全タスクが skipped かどうか
-                                 const allKeys = Array.from({ length: lot.quantity }).map((_, u) => step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
+                                 // この工程の全タスクが skipped かどうか (ロット1回工程は回数キー lot-k を対象)
+                                 const allKeys = step?.lotOnce
+                                   ? (lotOnceKeysOf(tasks, step).length ? lotOnceKeysOf(tasks, step) : [`${step.id}-lot-0`])
+                                   : Array.from({ length: lot.quantity }).map((_, u) => step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
                                  // step.id ベース + 旧数値キー 両方を見て、いずれかが skipped 状態を持っていれば skipped 扱い
                                  const allSkipped = allKeys.every((k, u) => {
                                    const numKey = `${sIdx}-${u}`;
@@ -7996,7 +9000,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                    </button>
                                  );
                                })()}
-                               <button onClick={() => setActiveCustomTaskKey(`${sIdx}-0`)} className="text-xs text-blue-600 underline">詳細を表示</button>
+                               {!step.lotOnce && <button onClick={() => setActiveCustomTaskKey(`${sIdx}-0`)} className="text-xs text-blue-600 underline">詳細を表示</button>}
                            </div>
                         </div>
                         {stepSpecificNotes.length > 0 && (
@@ -8005,6 +9009,54 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                             <div className="text-xs text-amber-800">{stepSpecificNotes.map(n => <div key={n.id}>• {n.content} {n.image && '📷'} <span className="text-amber-500">— {n.author}</span></div>)}</div>
                           </div>
                         )}
+                        {step.lotOnce ? (
+                          /* === ロット1回(段取り)工程: 台数分ではなく「回数」ボタン。全回完了後は「＋もう1回」で次の持ち込み分を追加して即計測開始 === */
+                          <div className="flex flex-wrap items-start gap-2">
+                            {(() => {
+                              const loKeys = lotOnceKeysOf(tasks, step);
+                              const tgt = effTargetsBySIdx[sIdx] || 0;
+                              const renderOcc = (k, kIdx) => {
+                                const t = tasks[k] || { status: 'waiting', duration: 0 };
+                                const live = t.status === 'processing' && t.startTime ? (t.duration || 0) + Math.floor((Date.now() - t.startTime) / 1000) : (t.duration || 0);
+                                const over = oaCfg.enabled && tgt > 0 && t.status === 'processing' && live >= tgt * ((oaCfg.overPct || 100) / 100);
+                                const warn = oaCfg.enabled && tgt > 0 && t.status === 'processing' && !over && live >= tgt * (oaCfg.warnPct / 100);
+                                const isNGo = t.status === 'ng' || t.status === 'reworking';
+                                return (
+                                  <button key={k} onClick={() => toggleTask(sIdx, kIdx)}
+                                    className={`w-28 h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNGo ? 'bg-red-600 text-white' : over ? `text-white ${oaBlinkCls(oaCfg.overBlink)}` : getTaskStatusColor(t.status)}`}
+                                    style={over ? { backgroundColor: oaCfg.overColor, borderColor: oaCfg.overColor, boxShadow: `0 0 0 4px ${oaCfg.overColor}55` } : warn ? { boxShadow: `0 0 0 4px ${oaCfg.warnColor}` } : undefined}
+                                    title={t.status === 'processing' ? 'タップで完了' : t.status === 'waiting' ? 'タップで計測開始' : 'タップでメニュー'}>
+                                    <span className="text-sm font-bold">{kIdx + 1}回目</span>
+                                    {isNGo ? <span className="text-xs font-black bg-white/20 px-1.5 rounded">NG</span> : <span className="text-sm font-mono font-bold mt-1">{t.status === 'skipped' ? '該当なし' : formatTime(live)}</span>}
+                                    {tgt > 0 && !isNGo && <span className={`text-[9px] leading-none mt-0.5 font-mono ${over ? 'text-white font-bold' : 'opacity-50'}`}>{over ? '⏰超過 ' : ''}目標{formatTime(tgt)}</span>}
+                                    {t.status === 'processing' && tgt > 0 && (
+                                      <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-black/20 rounded-b-lg overflow-hidden">
+                                        <div className="h-full transition-all duration-500" style={{ width: `${Math.min(100, live / tgt * 100)}%`, backgroundColor: over ? '#fff' : warn ? oaCfg.warnColor : '#34d399' }} />
+                                      </div>
+                                    )}
+                                    {t.status === 'processing' && <span className="absolute top-1 right-1 w-2 h-2 bg-white rounded-full animate-ping"/>}
+                                  </button>
+                                );
+                              };
+                              const allDone = loKeys.length > 0 && loKeys.every(kk => ['completed', 'skipped'].includes(tasks[kk]?.status));
+                              return (
+                                <>
+                                  {loKeys.length === 0 ? renderOcc(`${step.id}-lot-0`, 0) : loKeys.map((k, kIdx) => renderOcc(k, kIdx))}
+                                  {allDone && (
+                                    <button onClick={() => toggleTask(sIdx, loKeys.length)}
+                                      className="w-28 h-20 rounded-lg border-2 border-dashed border-teal-400 bg-teal-50 hover:bg-teal-100 text-teal-700 text-xs font-bold flex flex-col items-center justify-center gap-0.5"
+                                      title="次の持ち込み分の段取りを追加して、すぐ計測を開始します">
+                                      <span className="text-xl leading-none">＋</span>
+                                      <span>もう1回</span>
+                                      <span className="text-[9px] font-normal text-teal-500">押すと計測開始</span>
+                                    </button>
+                                  )}
+                                  <div className="basis-full text-[10px] text-teal-600 mt-0.5">📦 ロット1回の段取り工程（台数に関係なく回数で計測。5台ずつ持ち込み等は「＋もう1回」）</div>
+                                </>
+                              );
+                            })()}
+                          </div>
+                        ) : (
                         <div className="grid grid-cols-5 md:grid-cols-8 lg:grid-cols-10 gap-2">
                            {Array.from({ length: lot.quantity }).map((_, uIdx) => {
                              // step.id ベースを優先しつつ numeric にフォールバック (互換性)
@@ -8039,18 +9091,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                      ? '他の手動作業を実行中です。並行作業は自動測定中のみ可能です。\n先に作業を完了するか、自動工程の「監視」を開始してください。'
                                      : '';
                                    // 順序外タップの処理: 厳密モードならブロック、通常モードは警告ダイアログ
+                                   // 目標時間との比較 (作業中のみライブ判定)。一括(バッチ)中は目標×N台と比較(完了時に按分されるため)。
+                                   const cellBN = (task.status === 'processing' && task.startTime) ? Math.max(1, procCountsBySIdx[sIdx]?.[task.startTime] || 1) : 1;
+                                   const cellTgt = (effTargetsBySIdx[sIdx] || 0) * cellBN;
+                                   const liveSec = task.status === 'processing' && task.startTime ? (task.duration || 0) + Math.floor((Date.now() - task.startTime) / 1000) : (task.duration || 0);
+                                   const cellOver = oaCfg.enabled && cellTgt > 0 && task.status === 'processing' && liveSec >= cellTgt * ((oaCfg.overPct || 100) / 100);
+                                   const cellWarn = oaCfg.enabled && cellTgt > 0 && task.status === 'processing' && !cellOver && liveSec >= cellTgt * (oaCfg.warnPct / 100);
                                    const handleClick = () => {
                                      if (blockParallel) { alert('🚫 ' + blockReason); return; }
                                      if (isNG) return;
                                      // 推奨順から外れている (=「次」より先のタスクを押そうとしている)
-                                     if (isOutOfOrder && globalNextTask) {
+                                     // データ最適順(承認コンボ)が有効ならそちらで強制。なければ従来の昇順ルール。
+                                     // 厳密ONの時だけ順序を強制(非ブロッキング通知)。厳密OFF(ガイド)は順序外でも確認なしで自由に開始。
+                                     if (optimalNextMove && strictOrderMode) {
+                                       const og = optimalGate(sIdx, uIdx);
+                                       if (og) { setOrderHint(og.hint); return; }
+                                     } else if (isOutOfOrder && globalNextTask && strictOrderMode) {
                                        const nextStepTitle = localSteps[globalNextTask.sIdx]?.title || '';
-                                       if (strictOrderMode) {
-                                         alert(`🚫 厳密モードON: 先に「${nextStepTitle}」#${globalNextTask.unitIdx + 1}台目 を完了させてください。\n\n(厳密モードはヘッダーの「順番厳密」ボタンで解除できます)`);
-                                         return;
-                                       }
-                                       // 通常モード: 確認ダイアログ
-                                       setOutOfOrderConfirm({ sIdx, uIdx, nextSIdx: globalNextTask.sIdx, nextU: globalNextTask.unitIdx, nextTitle: nextStepTitle, thisTitle: step.title });
+                                       setOrderHint(`🔒 厳密モード: 先に「${nextStepTitle}」#${globalNextTask.unitIdx + 1}台目 を完了してください`);
                                        return;
                                      }
                                      setActiveCustomTaskKey(`${sIdx}-${uIdx}`);
@@ -8068,7 +9126,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                      disabled={blockParallel || isNG}
                                      onClick={handleClick}
                                      title={blockParallel ? blockReason : parallelAllowedHint ? '✓ 自動測定中: 並行作業 OK' : isRecommendedNext ? '👉 推奨次タスク (1台目から順番)' : isOutOfOrder ? '⚠ 順序外: 先に手前の台をやるのが推奨' : ''}
-                                     className={`w-full h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNG ? 'bg-red-600 text-white' : getTaskStatusColor(task.status)} ${blockParallel ? 'opacity-30 cursor-not-allowed grayscale' : ''} ${parallelAllowedHint ? 'ring-2 ring-emerald-300' : ''} ${isRecommendedNext ? 'ring-4 ring-emerald-400 shadow-emerald-200 shadow-lg' : ''} ${isOutOfOrder ? 'opacity-60' : ''}`}
+                                     className={`w-full h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNG ? 'bg-red-600 text-white' : cellOver ? `text-white ${oaBlinkCls(oaCfg.overBlink)}` : getTaskStatusColor(task.status)} ${cellWarn ? oaBlinkCls(oaCfg.warnBlink) : ''} ${blockParallel ? 'opacity-30 cursor-not-allowed grayscale' : ''} ${parallelAllowedHint && !cellOver && !cellWarn ? 'ring-2 ring-emerald-300' : ''} ${isRecommendedNext && !cellOver && !cellWarn ? 'ring-4 ring-emerald-400 shadow-emerald-200 shadow-lg' : ''} ${isOutOfOrder ? 'opacity-60' : ''}`}
+                                     style={cellOver ? { backgroundColor: oaCfg.overColor, borderColor: oaCfg.overColor, boxShadow: `0 0 0 4px ${oaCfg.overColor}55` } : cellWarn ? { boxShadow: `0 0 0 4px ${oaCfg.warnColor}` } : undefined}
                                    >
                                      <span className="text-sm font-bold">#{uIdx+1}</span>
                                      {isNG ? (
@@ -8077,30 +9136,38 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                          <span className="text-xs font-mono mt-0.5">{formatTime(task.duration)}</span>
                                        </>
                                      ) : (
-                                       <span className="text-sm font-mono font-bold mt-1">{formatTime(task.status === 'processing' && task.startTime ? task.duration + Math.floor((Date.now() - task.startTime) / 1000) : task.duration)}</span>
+                                       <span className="text-sm font-mono font-bold mt-1">{formatTime(liveSec)}</span>
+                                     )}
+                                     {!isNG && cellTgt > 0 && <span className={`text-[9px] leading-none mt-0.5 font-mono ${cellOver ? 'text-white font-bold' : cellWarn ? 'font-bold' : 'opacity-50'}`} style={cellWarn && !cellOver ? { color: oaCfg.warnColor } : undefined}>{cellOver ? '⏰超過 ' : ''}目標{formatTime(cellTgt)}{cellBN > 1 ? `(${cellBN}台)` : ''}</span>}
+                                     {/* 進捗ゲージ: 経過/目標 をひと目で (緑→警告色→超過で満タン) */}
+                                     {task.status === 'processing' && cellTgt > 0 && (
+                                       <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-black/20 rounded-b-lg overflow-hidden">
+                                         <div className="h-full transition-all duration-500" style={{ width: `${Math.min(100, liveSec / cellTgt * 100)}%`, backgroundColor: cellOver ? '#ffffff' : cellWarn ? oaCfg.warnColor : '#34d399' }} />
+                                       </div>
                                      )}
                                      {task.status === 'processing' && <span className="absolute top-1 right-1 w-2 h-2 bg-white rounded-full animate-ping"/>}
                                    </button>
-                                   {/* NG 理由をボタン外に独立表示 (枠内 truncate されないように) */}
-                                   {isNG && task.ngReason && (
-                                     <div className="mt-1 text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-300 rounded px-1.5 py-1 leading-tight whitespace-normal break-words" title={task.ngReason}>
-                                       <span className="text-rose-500 mr-0.5">理由:</span>{task.ngReason}
+                                   {/* NG 理由をボタン外に独立表示 (枠内 truncate されないように)。修正後合格(completed)でも消さずに残す。 */}
+                                   {task.ngReason && (
+                                     <div className={`mt-1 text-[10px] font-bold rounded px-1.5 py-1 leading-tight whitespace-normal break-words border ${isNG ? 'text-rose-700 bg-rose-50 border-rose-300' : 'text-slate-500 bg-slate-50 border-slate-300'}`} title={task.ngReason}>
+                                       <span className={`mr-0.5 ${isNG ? 'text-rose-500' : 'text-slate-400'}`}>{isNG ? '理由:' : 'NG理由(修正済):'}</span>{task.ngReason}
                                      </div>
                                    )}
                                  </div>
                                    );
                                  })()}
-                                 {/* 修正作業ボタン群（NG時 or 修正履歴あり） */}
+                                 {/* 修正作業ボタン群（NG時 or 修正履歴あり）。完了済み修正はタップで「修正・理由の編集」を開く */}
                                  {(isNG || reworks.length > 0) && reworks.map((rw, rIdx) => (
                                    <button key={rIdx} onClick={() => {
-                                     if (rw.endTime) return; // 完了済み修正は押せない
+                                     if (rw.endTime) { openReworkEditor(key, `#${uIdx + 1}`); return; } // 完了済み修正 → 編集・削除モーダル
                                      if (task.status === 'reworking' && rIdx === reworks.length - 1) {
                                        // 修正中 → 修正完了
                                        toggleTask(sIdx, uIdx);
                                      }
-                                   }} className={`h-14 rounded-lg flex flex-col items-center justify-center border text-xs font-bold transition-all ${rw.endTime ? 'bg-orange-100 text-orange-700 border-orange-300' : 'bg-orange-500 text-white border-orange-600 animate-pulse'}`}>
-                                     <span>修正{rIdx + 1}</span>
+                                   }} title={rw.endTime ? `タップで編集・削除${rw.reason ? ` / 理由: ${rw.reason}` : ''}` : '修正中 (タップで完了)'} className={`h-14 rounded-lg flex flex-col items-center justify-center border text-xs font-bold transition-all ${rw.endTime ? 'bg-orange-100 text-orange-700 border-orange-300 hover:bg-orange-200' : 'bg-orange-500 text-white border-orange-600 animate-pulse'}`}>
+                                     <span>修正{rIdx + 1} {rw.endTime ? '✎' : ''}</span>
                                      <span className="font-mono text-[11px]">{formatTime(rw.endTime ? rw.duration : (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0))}</span>
+                                     {rw.reason && <span className="text-[8px] leading-none truncate max-w-full px-1 opacity-80">{rw.reason}</span>}
                                    </button>
                                  ))}
                                  {/* 新しい修正作業開始ボタン（NG直後） */}
@@ -8113,6 +9180,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                              );
                            })}
                         </div>
+                        )}
                      </div>
                    );
                  })}
@@ -8406,6 +9474,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             </div>
           )}
           {completedTaskMenuModal}
+          {timeTableModal}
+          {timeInputModal}
+          {reworkEditorModal}
           {ngReasonPickerModal}
         </div>
 
@@ -8686,7 +9757,6 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
               {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
             </button>
             <button onClick={()=>setShowInProgressReport(true)} className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 rounded font-bold text-sm flex items-center gap-1" title="途中経過の成績表を表示 (未入力は空白)"><Printer className="w-4 h-4"/> 成績表</button>
-            <button onClick={() => setShowWorkOrderOptimizer(true)} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 rounded font-bold text-sm flex items-center gap-1" title="自動測定中に並行できる手動工程を提案"><Zap className="w-4 h-4"/> オススメ順</button>
             <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-2 hover:bg-white/10 rounded-full"><X className="w-6 h-6"/></button>
           </div>
         </div>
@@ -8698,7 +9768,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                stepTitle={currentStep?.title}
                info={modelQualityInfo}
                open={showQualityInfoPanel}
-               onToggle={() => setShowQualityInfoPanel(v => !v)}
+               onToggle={toggleQualityInfoPanel}
              />
              {Array.isArray(currentStep.checklistItems) && currentStep.checklistItems.length > 0 && currentStep.type !== 'measurement' ? (() => {
                // チェックリスト単独工程 (順序実行モード、測定なし)
@@ -8868,7 +9938,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
              </div>
              <div className="mt-8 border-t pt-6 space-y-2">
                <button onClick={()=>setShowDefectModal(true)} className="w-full py-3 border-2 border-rose-100 text-rose-500 hover:bg-rose-50 rounded-xl font-bold flex items-center justify-center gap-2"><AlertTriangle className="w-5 h-5"/> 不具合報告</button>
-               <button onClick={()=>setShowComplaintModal(true)} className="w-full py-2 border-2 border-purple-100 text-purple-500 hover:bg-purple-50 rounded-xl font-bold flex items-center justify-center gap-2 text-sm"><Megaphone className="w-4 h-4"/> 気づき報告</button>
+               <button onClick={()=>setShowComplaintModal(true)} className="w-full py-2 border-2 border-purple-100 text-purple-500 hover:bg-purple-50 rounded-xl font-bold flex items-center justify-center gap-2 text-sm"><Megaphone className="w-4 h-4"/> 軽微不良報告</button>
+               <button onClick={()=>setShowImproveModal(true)} className="w-full py-2 border-2 border-indigo-100 text-indigo-500 hover:bg-indigo-50 rounded-xl font-bold flex items-center justify-center gap-2 text-sm"><Lightbulb className="w-4 h-4"/> 気づき・改善（工程の提案）</button>
                <button onClick={toggleBreak} className={`w-full py-3 ${isOnBreak ? 'bg-emerald-500 text-white animate-pulse' : 'border-2 border-amber-100 text-amber-500 hover:bg-amber-50'} rounded-xl font-bold flex items-center justify-center gap-2`} title={isOnBreak ? '作業時間の計測を再開' : '作業時間の計測を一時停止'}>
                  {isOnBreak ? <><Play className="w-5 h-5"/> 再開</> : <><Pause className="w-5 h-5"/> 中断</>}
                </button>
@@ -9001,6 +10072,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           onSwitchToCustom={() => { setExecutionType('custom'); onSave({ executionType: 'custom' }); }}
           onClose={() => setShowWorkOrderOptimizer(false)}
         />
+      )}
+
+      {/* 厳密モードの順序外通知 (非ブロッキング・自動消滅・クリックを妨げない) */}
+      {orderHint && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[400] bg-rose-600 text-white px-4 py-2.5 rounded-xl shadow-2xl text-sm font-bold flex items-center gap-2 pointer-events-none animate-bounce max-w-[92vw]">
+          {orderHint}
+        </div>
       )}
 
       {/* === 順序外タップの警告ダイアログ === */}
@@ -10676,6 +11754,238 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
     );
 };
 
+// 型式グループ管理: 同じ製品・工程の型式を束ねてデータ共有(作業順・目標時間)。管理者専用。
+const ModelGroupManager = ({ lots = [], settings = {}, saveSettings }) => {
+  const groups = settings.modelGroups || [];
+  const allModels = useMemo(() => [...new Set((lots || []).map(l => (l.model || '').trim()).filter(Boolean))].sort(), [lots]);
+  const completedCountByModel = useMemo(() => { const c = {}; (lots || []).forEach(l => { if (l.status === 'completed' && l.model) c[l.model] = (c[l.model] || 0) + 1; }); return c; }, [lots]);
+  const groupOf = (m) => groups.find(g => (g.models || []).includes(m));
+  const save = (ng) => saveSettings({ modelGroups: ng });
+  const addGroup = () => save([...groups, { id: generateId(), name: 'グループ' + (groups.length + 1), models: [] }]);
+  const rename = (id, name) => save(groups.map(g => g.id === id ? { ...g, name } : g));
+  const del = (id) => save(groups.filter(g => g.id !== id));
+  const toggle = (gid, model) => {
+    // 1型式1グループ: 他グループから外してから対象グループへ入れる
+    save(groups.map(g => {
+      if (g.id === gid) { const has = (g.models || []).includes(model); return { ...g, models: has ? g.models.filter(m => m !== model) : [...(g.models || []), model] }; }
+      return { ...g, models: (g.models || []).filter(m => m !== model) };
+    }));
+  };
+  const ungrouped = allModels.filter(m => !groupOf(m));
+  // 目標時間の一回きりコピー(立ち上げ用)
+  const ctt = settings.customTargetTimes || {};
+  const calCount = (m) => Object.keys(ctt[`model_${m}`] || {}).length;
+  const [copyFrom, setCopyFrom] = useState('');
+  const [copyTo, setCopyTo] = useState('');
+  const doCopy = () => {
+    if (!copyFrom || !copyTo || copyFrom === copyTo) return;
+    const src = ctt[`model_${copyFrom}`];
+    if (!src || !Object.keys(src).length) { alert('コピー元に目標時間の較正値がありません。'); return; }
+    if (calCount(copyTo) > 0 && !confirm(`${copyTo} には既に較正値があります。上書きしますか？`)) return;
+    saveSettings({ customTargetTimes: { ...ctt, [`model_${copyTo}`]: { ...src } } });
+    alert(`${copyFrom} の目標時間を ${copyTo} にコピーしました（${Object.keys(src).length}工程）。`);
+  };
+  return (
+    <div className="bg-white rounded-xl border p-4 h-full overflow-auto">
+      <div className="flex items-start justify-between mb-3 gap-3">
+        <div>
+          <div className="text-lg font-black text-slate-800 flex items-center gap-2"><Layers className="w-5 h-5 text-indigo-600" /> 型式グループ（データ共有）</div>
+          <div className="text-xs text-slate-500 mt-0.5 leading-relaxed">同じ製品で型式（サイズ・L/R 等）が違うものを束ねると、<b>作業順</b>と<b>目標時間</b>のデータを<b>合算</b>して解析します。<br />名前が変わっても同じグループに入れれば引き継げます。<b>1型式は1グループ</b>まで。数字 = 完了ロット数。</div>
+        </div>
+        <button onClick={addGroup} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-sm flex items-center gap-1 shrink-0"><Plus className="w-4 h-4" /> グループ追加</button>
+      </div>
+      {groups.length === 0 && <div className="text-center text-slate-400 py-6 text-sm border border-dashed rounded-lg mb-3">まだグループがありません。「グループ追加」で作り、下の型式を選んでください。</div>}
+      <div className="space-y-3">
+        {groups.map(g => {
+          const totalLots = (g.models || []).reduce((a, m) => a + (completedCountByModel[m] || 0), 0);
+          return (
+            <div key={g.id} className="border rounded-lg p-3 bg-slate-50">
+              <div className="flex items-center gap-2 mb-2">
+                <input value={g.name} onChange={e => rename(g.id, e.target.value)} className="font-bold text-sm border rounded px-2 py-1 bg-white flex-1 max-w-xs" />
+                <span className="text-xs text-slate-500">{(g.models || []).length}型式・完了{totalLots}ロット合算</span>
+                <button onClick={() => del(g.id)} className="ml-auto text-rose-500 hover:bg-rose-50 rounded p-1" title="グループ削除"><Trash2 className="w-4 h-4" /></button>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {allModels.map(m => {
+                  const inThis = (g.models || []).includes(m);
+                  const other = groupOf(m); const inOther = other && other.id !== g.id;
+                  return (
+                    <button key={m} onClick={() => toggle(g.id, m)} disabled={inOther} title={inOther ? `「${other.name}」に所属中` : ''}
+                      className={`px-2 py-1 rounded text-[11px] font-bold border ${inThis ? 'bg-indigo-600 text-white border-indigo-600' : inOther ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed line-through' : 'bg-white text-slate-600 border-slate-300 hover:bg-indigo-50'}`}>
+                      {m}{completedCountByModel[m] ? <span className="opacity-60 ml-0.5">({completedCountByModel[m]})</span> : ''}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {groups.length > 0 && ungrouped.length > 0 && (
+        <div className="mt-3 text-[11px] text-slate-400">未所属の型式 {ungrouped.length} 件はそれぞれ単独で解析されます。</div>
+      )}
+      {/* 目標時間の一回きりコピー(立ち上げ用) */}
+      <div className="mt-4 pt-3 border-t">
+        <div className="text-sm font-bold text-slate-700 mb-1 flex items-center gap-1"><Copy className="w-4 h-4 text-indigo-600" /> 目標時間を別型式にコピー（一回きり）</div>
+        <div className="text-[11px] text-slate-500 mb-2">立ち上げ時など、ある型式の較正済み目標時間を別型式へ複製。以後は別々に育ちます。<br />（グループ化していれば自動で引き継ぐので、こちらは“グループにしないが一回だけ流用したい”時用）</div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <select value={copyFrom} onChange={e => setCopyFrom(e.target.value)} className="border rounded px-2 py-1 text-sm">
+            <option value="">コピー元…</option>
+            {allModels.map(m => <option key={m} value={m}>{m}（{calCount(m)}工程）</option>)}
+          </select>
+          <span className="text-slate-400">→</span>
+          <select value={copyTo} onChange={e => setCopyTo(e.target.value)} className="border rounded px-2 py-1 text-sm">
+            <option value="">コピー先…</option>
+            {allModels.map(m => <option key={m} value={m}>{m}（{calCount(m)}工程）</option>)}
+          </select>
+          <button onClick={doCopy} disabled={!copyFrom || !copyTo || copyFrom === copyTo} className="px-3 py-1 bg-indigo-600 disabled:bg-slate-300 text-white rounded font-bold text-sm">コピー</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 実データ分析モーダル(読み取り専用): 1コンボの全ロットの実作業順を見比べ、改善シグナルを出す。
+const WorkOrderReviewModal = ({ combo, lots = [], settings = {}, onClose, currentStrict = null, onMakeStrict, onSetGuide, onEditTemplate }) => {
+  const data = useMemo(() => {
+    if (!combo) return null;
+    const groupModels = sameGroupModels(combo.model, settings);
+    const completed = (lots || []).filter(l => l.status === 'completed' && groupModels.includes(l.model) && l.templateId === combo.templateId);
+    const sample = completed.find(l => l.steps && l.steps.length) || completed[0];
+    if (!sample) return { empty: true };
+    return { ...analyzeLotsForReview(sample.steps, completed), grouped: groupModels.length > 1, groupModels, qty: sample.quantity || 1 };
+  }, [combo, lots, settings]);
+  const [openLots, setOpenLots] = useState({});
+  // 現場の「気づき・改善」(type:'improvement') をこのコンボの全ロットから集める(完了/進行中問わず)。
+  const improvements = useMemo(() => {
+    if (!combo) return [];
+    const groupModels = sameGroupModels(combo.model, settings);
+    const comboLots = (lots || []).filter(l => groupModels.includes(l.model) && l.templateId === combo.templateId);
+    const out = [];
+    comboLots.forEach(l => (l.interruptions || []).forEach(it => { if (it.type === 'improvement') out.push({ ...it, lotOrderNo: l.orderNo, lotModel: l.model }); }));
+    return out.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  }, [combo, lots, settings]);
+  const IMPROVE_LABELS = { split: '細分化', add: '追加', change: '変更', remove: '削除', order: '順番変更', other: 'その他' };
+  if (!combo) return null;
+  const fmtDate = (ts) => ts ? new Date(ts).toLocaleDateString() : '-';
+  const ok = data && !data.empty && data.lotsWithTime > 0;
+  const unneeded = ok ? Object.entries(data.skipRate).filter(([, v]) => v.pct >= 50).sort((a, b) => b[1].pct - a[1].pct) : [];
+  const batchSig = ok ? Object.entries(data.blockAgg).filter(([, v]) => v.pct >= 50).sort((a, b) => b[1].pct - a[1].pct) : [];
+  const orderVaries = ok && data.orderSignatures.length > 1;
+  return (
+    <div className="fixed inset-0 z-[140] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b bg-gradient-to-r from-indigo-50 to-slate-50 flex items-center justify-between">
+          <div>
+            <div className="text-xs text-indigo-700 font-bold">実データ分析（読み取り専用）</div>
+            <div className="text-lg font-black text-slate-800">{combo.model} <span className="text-sm font-normal text-slate-500">× {combo.templateName}</span></div>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-lg"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="flex-1 overflow-auto p-4 space-y-4">
+          {!ok ? (
+            <div className="text-center text-slate-400 py-12">時刻データのある完了ロットがありません。</div>
+          ) : (<>
+            <div className="text-xs text-slate-600 bg-slate-50 rounded-lg p-2 border">
+              完了 {data.totalLots}ロット / 時刻データあり <b>{data.lotsWithTime}</b>ロット / {data.qty}台
+              {data.grouped && <span className="ml-2 text-indigo-600">（型式グループ {data.groupModels.length}型式を合算）</span>}
+            </div>
+            <div>
+              <div className="font-bold text-sm text-slate-700 mb-1">① 作業順の揃い具合</div>
+              <div className="text-[11px] text-slate-500 mb-1">テンプレ順: {data.tmplTitles.join(' › ')}</div>
+              {orderVaries
+                ? <div className="text-xs text-rose-700 font-bold mb-1">⚠ ロットで作業順がバラついています（{data.orderSignatures.length}パターン）</div>
+                : <div className="text-xs text-emerald-700 font-bold mb-1">✓ 全ロットが同じ作業順</div>}
+              <div className="space-y-1">
+                {data.orderSignatures.map((p, i) => (
+                  <div key={i} className="text-[11px] flex items-start gap-2">
+                    <span className="bg-slate-200 px-1.5 rounded font-bold shrink-0">{p.n}ロット</span>
+                    <span className="text-slate-700">{p.sig}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="font-bold text-sm text-slate-700 mb-1">② 各ロットの実作業順（<span className="text-indigo-700">▦=全台まとめ</span> / <span className="text-purple-700">紫=自動測定</span>）</div>
+              <div className="space-y-1.5">
+                {data.perLot.map((p, i) => (
+                  <div key={i} className="border rounded-lg p-2 bg-white">
+                    <div className="flex items-center gap-2 text-[11px] mb-1 flex-wrap">
+                      <span className="font-bold text-slate-700">指図{p.orderNo}</span>
+                      <span className="text-slate-400">{p.model} / {p.qty}台 / {fmtDate(p.completedAt)}</span>
+                      {p.matchesTemplate ? <span className="text-emerald-600 font-bold">✓テンプレ通り</span> : <span className="text-rose-600 font-bold">⚠順序ちがい</span>}
+                      {p.ganttUnits && p.ganttUnits.length > 0 && (
+                        <button onClick={() => setOpenLots(o => ({ ...o, [p.orderNo]: !o[p.orderNo] }))} className="ml-auto text-[11px] text-indigo-600 hover:underline font-bold">{openLots[p.orderNo] ? '台ごとの流れを閉じる' : '台ごとの作業の流れ▼'}</button>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {p.actualOrder.map((t, j) => (
+                        <span key={j} className={`px-1.5 py-0.5 rounded text-[11px] border ${data.autoTitles.includes(t) ? 'bg-purple-50 border-purple-300 text-purple-700' : p.blocks[t] ? 'bg-indigo-100 border-indigo-300 text-indigo-800 font-bold' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
+                          {p.blocks[t] ? '▦' : ''}{t}
+                        </span>
+                      ))}
+                    </div>
+                    {openLots[p.orderNo] && p.ganttUnits && (
+                      <div className="mt-2 bg-slate-50 rounded border p-2 max-h-72 overflow-auto">
+                        <div className="text-[10px] text-slate-500 mb-1 flex items-center gap-2"><span className="inline-flex items-center gap-1"><span className="w-2.5 h-2.5 bg-blue-500 rounded-sm inline-block" />手動</span><span className="inline-flex items-center gap-1"><span className="w-2.5 h-2.5 bg-violet-500 rounded-sm inline-block" />自動測定</span> ／ 同じ横軸＝並行作業が見える</div>
+                        <MultiUnitGantt lot={{ orderNo: p.orderNo, units: p.ganttUnits }} />
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="font-bold text-sm text-slate-700 mb-1">③ 改善シグナル（データ根拠）</div>
+              <div className="space-y-1 text-xs">
+                {orderVaries && <div className="bg-amber-50 border border-amber-200 rounded p-2">🔀 <b>順番がばらつく</b>：②で入れ替わってる工程を比べ、速い順に揃える/テンプレ変更を検討。</div>}
+                {batchSig.length > 0 && <div className="bg-indigo-50 border border-indigo-200 rounded p-2">▦ <b>まとめ作業</b>：{batchSig.map(([t, v]) => `${t}(${v.b}/${v.n}ロット${v.confident ? '・確定' : '・参考'})`).join('・')} → テンプレで“まとめ”/上に集約を検討。</div>}
+                {unneeded.length > 0 && <div className="bg-rose-50 border border-rose-200 rounded p-2">🗑 <b>不要工程の候補</b>：{unneeded.map(([t, v]) => `${t}(該当なし ${v.sk}/${v.tot}台=${v.pct}%)`).join('・')} → テンプレから外す検討。</div>}
+                {!orderVaries && batchSig.length === 0 && unneeded.length === 0 && <div className="text-slate-400">目立つ改善シグナルなし（安定）。</div>}
+              </div>
+            </div>
+          </>)}
+          {/* ④ 現場の気づき・改善(工程追加・変更の手がかり) ― 時刻データの有無に関係なく表示 */}
+          <div>
+            <div className="font-bold text-sm text-slate-700 mb-1 flex items-center gap-1"><Lightbulb className="w-4 h-4 text-indigo-600" /> 現場の気づき・改善（工程の追加・変更の手がかり）</div>
+            {improvements.length === 0
+              ? <div className="text-[11px] text-slate-400">まだありません。作業画面の「気づき・改善」から、工程の細分化・追加・変更などを理由つきで残せます（＝工程“追加”の手がかりはここから）。</div>
+              : <div className="space-y-1">
+                {improvements.map((it, i) => {
+                  const reason = (it.label || '').split('：').slice(1).join('：').trim() || it.label || '';
+                  return (
+                    <div key={i} className="text-[11px] border border-indigo-100 bg-indigo-50/40 rounded p-1.5 flex items-start gap-2">
+                      <span className="bg-indigo-600 text-white px-1.5 py-0.5 rounded font-bold shrink-0">{IMPROVE_LABELS[it.improvementKind] || '改善'}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-slate-700">{it.targetStepTitle && <b className="text-indigo-700">[{it.targetStepTitle}] </b>}{reason}</div>
+                        <div className="text-[10px] text-slate-400">{it.workerName || '?'}・指図{it.lotOrderNo}・{it.timestamp ? new Date(it.timestamp).toLocaleDateString() : ''}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>}
+          </div>
+        </div>
+        <div className="px-4 py-2.5 border-t bg-slate-50">
+          <div className="text-[11px] text-slate-500 mb-1.5">見て納得したら、ここから動かす（厳密化・様子見は履歴に残ります）：</div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button onClick={() => { onMakeStrict && onMakeStrict(); onClose && onClose(); }} disabled={currentStrict === true}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold border ${currentStrict === true ? 'bg-rose-100 text-rose-400 border-rose-200 cursor-default' : 'bg-rose-600 text-white border-rose-700 hover:bg-rose-700'}`}>
+              {currentStrict === true ? '✓ この順番を厳密化中' : '🔒 この順番を厳密化'}
+            </button>
+            <button onClick={() => onEditTemplate && onEditTemplate()} className="px-3 py-1.5 rounded-lg text-xs font-bold border bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700">✏️ テンプレを改善（並べ替え・追加・削除）</button>
+            <button onClick={() => { onSetGuide && onSetGuide(); onClose && onClose(); }} disabled={currentStrict === false}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold border ${currentStrict === false ? 'bg-slate-200 text-slate-400 border-slate-200 cursor-default' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>👀 ガイドで様子見</button>
+          </div>
+          <div className="mt-2 text-[10px] text-slate-500 bg-amber-50 border border-amber-200 rounded p-1.5">
+            💡 <b>工程の「追加」は時間データからは出ません</b>（既にあてる工程しか記録されないので）。追加の手がかりは現場の<b>「軽微不良・改善提案・不具合・クレーム」</b>です（ヘッダーの「不良/クレーム」やノート）。＝<b>並べ替え・削除・まとめ＝この時間データから／追加＝現場の声から</b>、と出どころが違います。
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, targetTimeHistory, settings, saveData = null, currentUserName = '' }) => {
   // === 進行中ロットへの較正値再適用 ===
   // 新規ロットは作成時に較正値が焼き付くが、既に作成済の進行中ロットには反映されていない。
@@ -10782,16 +12092,18 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                     workerTimesByStep[stepKey] = {};
                 }
 
-                for (let i = 0; i < (lot.quantity || 1); i++) {
-                    // 製品アプリは task を step.id ベースのキーで保存する。旧 numeric index キーにもフォールバック。
-                    const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${idx}-${i}`];
+                // ロット1回工程: 回数キー(lot-k)を収集 (1回=1標本、台数ループ不適用)
+                const taskList = step.lotOnce
+                    ? lotOnceKeysOf(lot.tasks || {}, step).map(k => lot.tasks?.[k])
+                    : Array.from({ length: lot.quantity || 1 }, (_, i) => lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${idx}-${i}`]);
+                taskList.forEach(task => {
                     if (task && task.status === 'completed' && task.duration > 0) {
                         stepTimes[stepKey].times.push(task.duration);
                         const worker = task.workerName || workers.find(w => w.id === task.workerId)?.name || '不明';
                         if (!workerTimesByStep[stepKey][worker]) workerTimesByStep[stepKey][worker] = [];
                         workerTimesByStep[stepKey][worker].push(task.duration);
                     }
-                }
+                });
             });
         });
 
@@ -10879,10 +12191,13 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                 const cal = customTargetTimes[`model_${model}`]?.[sKey];
                 const effTarget = (typeof cal === 'number' && cal > 0) ? cal : (step.targetTime || 0);
                 if (!byModelStep[mapKey]) byModelStep[mapKey] = { model, title: step.title, category: step.category || '', stepKey: sKey, target: effTarget, calibrated: typeof cal === 'number' && cal > 0, times: [] };
-                for (let i = 0; i < (l.quantity || 1); i++) {
-                    const t = l.tasks?.[`${step.id}-${i}`] || l.tasks?.[`${idx}-${i}`];
+                // ロット1回工程は回数キー(lot-k)が標本 (目標は1回あたりなのでそのまま比較可)
+                const tList = step.lotOnce
+                    ? lotOnceKeysOf(l.tasks || {}, step).map(k => l.tasks?.[k])
+                    : Array.from({ length: l.quantity || 1 }, (_, i) => l.tasks?.[`${step.id}-${i}`] || l.tasks?.[`${idx}-${i}`]);
+                tList.forEach(t => {
                     if (t && (t.status === 'completed' || t.status === 'ng') && t.duration > 0) byModelStep[mapKey].times.push(t.duration);
-                }
+                });
             });
         });
         const alerts = [];
@@ -11289,7 +12604,1023 @@ const AIDeepAnalysisSection = ({ payload }) => {
   );
 };
 
-const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [] }) => {
+// =============================================================================
+//  万能データ書き出しセンター — 種別/期間/絞り込み/列/形式を自由に選んで Excel・CSV・PDF
+//  ・データ源は raw(lots/indirectWork/settings) から自前で期間集計 → 他タブのフィルタと独立
+//  ・「提出セット」(条件のプリセット) を settings.exportPresets に保存して1クリック再出力
+// =============================================================================
+const EXPORT_SOURCES = {
+  inspection: { label: '検査実績（完了ロット）', cols: [
+    { k: 'date', label: '完了日' }, { k: 'orderNo', label: '指図No' }, { k: 'model', label: '型式' },
+    { k: 'qty', label: '台数' }, { k: 'standard', label: '規格番号' }, { k: 'ng', label: '不良数' },
+    { k: 'leadDays', label: 'リードタイム(日)' }, { k: 'workers', label: '作業者' },
+  ]},
+  defect: { label: '不具合', cols: [
+    { k: 'date', label: '日時' }, { k: 'orderNo', label: '指図No' }, { k: 'model', label: '型式' },
+    { k: 'item', label: '項目' }, { k: 'content', label: '内容' }, { k: 'cause', label: '原因工程' }, { k: 'worker', label: '報告者' },
+  ]},
+  complaint: { label: '軽微不良・気づき', cols: [
+    { k: 'date', label: '日時' }, { k: 'kind', label: '種別' }, { k: 'orderNo', label: '指図No' }, { k: 'model', label: '型式' },
+    { k: 'item', label: '項目' }, { k: 'content', label: '内容' }, { k: 'worker', label: '報告者' },
+  ]},
+  worktime: { label: '作業時間（工程×台数）', cols: [
+    { k: 'date', label: '完了日' }, { k: 'orderNo', label: '指図No' }, { k: 'model', label: '型式' },
+    { k: 'step', label: '工程' }, { k: 'units', label: '台数' }, { k: 'totalMin', label: '合計(分)' }, { k: 'avgSec', label: '平均/台(秒)' },
+  ]},
+  indirect: { label: '間接作業', cols: [
+    { k: 'date', label: '日付' }, { k: 'worker', label: '作業者' }, { k: 'category', label: 'カテゴリ' }, { k: 'min', label: '時間(分)' },
+  ]},
+  targettime: { label: '目標時間 更新履歴', cols: [
+    { k: 'date', label: '日時' }, { k: 'model', label: '型式' }, { k: 'step', label: '工程' },
+    { k: 'oldSec', label: '旧(秒)' }, { k: 'newSec', label: '新(秒)' }, { k: 'reason', label: '根拠/理由' }, { k: 'user', label: '変更者' },
+  ]},
+};
+
+const DataExportCenter = ({ lots = [], workers = [], indirectWork = [], settings = {}, currentUserName = '', saveSettings = null }) => {
+  const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
+  const wname = (idOrName) => (workers.find(w => w.id === idOrName)?.name) || idOrName || '';
+  const pad = (n) => String(n).padStart(2, '0');
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const fmtDateTime = (ms) => ms ? new Date(ms).toLocaleString('ja-JP', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+  const fmtDate = (ms) => ms ? new Date(ms).toLocaleDateString('ja-JP') : '';
+  const today = new Date();
+  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+
+  const [src, setSrc] = useState('inspection');
+  const [from, setFrom] = useState(ymd(monthStart));
+  const [to, setTo] = useState(ymd(today));
+  const [modelF, setModelF] = useState('');
+  const [workerF, setWorkerF] = useState('');
+  const [orderF, setOrderF] = useState('');
+  const [cols, setCols] = useState(() => Object.fromEntries(Object.keys(EXPORT_SOURCES).map(k => [k, EXPORT_SOURCES[k].cols.map(c => c.k)])));
+  const [busy, setBusy] = useState(false);
+  const presets = settings.exportPresets || [];
+
+  const models = useMemo(() => [...new Set((lots || []).map(l => l.model).filter(Boolean))].sort(), [lots]);
+
+  const setPeriod = (mode) => {
+    const t = new Date();
+    if (mode === 'thisMonth') { setFrom(ymd(new Date(t.getFullYear(), t.getMonth(), 1))); setTo(ymd(t)); }
+    else if (mode === 'lastMonth') { setFrom(ymd(new Date(t.getFullYear(), t.getMonth() - 1, 1))); setTo(ymd(new Date(t.getFullYear(), t.getMonth(), 0))); }
+    else if (mode === 'thisYear') { setFrom(ymd(new Date(t.getFullYear(), 0, 1))); setTo(ymd(t)); }
+    else if (mode === 'all') { setFrom(''); setTo(''); }
+  };
+
+  // src ごとに「全行(列キー値 + 内部フィルタ用 _ts/_model/_worker/_order)」を生成
+  const buildAll = (s) => {
+    const rows = [];
+    if (s === 'inspection') {
+      (lots || []).filter(l => l.status === 'completed' || l.location === 'completed').forEach(l => {
+        const cMs = toMs(l.completedAt) || toMs(l.updatedAt);
+        const eMs = toMs(l.entryAt) || toMs(l.createdAt);
+        const ngCount = (l.interruptions || []).filter(i => i.type === 'defect').length;
+        const wset = new Set(); Object.values(l.tasks || {}).forEach(t => { if (t && t.workerName) wset.add(wname(t.workerName)); });
+        const ws = [...wset].join('・');
+        rows.push({ date: fmtDate(cMs), orderNo: l.orderNo || '', model: l.model || '', qty: l.quantity || 1, standard: l.appliedStandard?.standardNo || '', ng: ngCount, leadDays: (cMs && eMs) ? Math.max(0, Math.round((cMs - eMs) / 86400000)) : '', workers: ws, _ts: cMs, _model: l.model || '', _worker: ws, _order: l.orderNo || '' });
+      });
+    } else if (s === 'defect' || s === 'complaint') {
+      const wantTypes = s === 'defect' ? ['defect'] : ['complaint', 'improvement'];
+      (lots || []).forEach(l => {
+        (l.interruptions || []).filter(i => wantTypes.includes(i.type)).forEach(d => {
+          const w = wname(d.workerName);
+          const kind = d.type === 'improvement' ? '気づき・改善' : (d.type === 'defect' ? '不具合' : '軽微不良');
+          rows.push({ date: fmtDateTime(d.timestamp), kind, orderNo: l.orderNo || '', model: l.model || '', item: d.stepInfo?.title || '全体', content: d.label || d.note || '', cause: d.causeProcess || '', worker: w, _ts: d.timestamp, _model: l.model || '', _worker: w, _order: l.orderNo || '' });
+        });
+      });
+    } else if (s === 'worktime') {
+      (lots || []).filter(l => l.status === 'completed' || l.location === 'completed').forEach(l => {
+        const cMs = toMs(l.completedAt) || toMs(l.updatedAt);
+        const qty = l.quantity || 1;
+        (l.steps || []).forEach((step, sIdx) => {
+          let units = 0, totalSec = 0;
+          for (let u = 0; u < qty; u++) {
+            const t = (l.tasks || {})[`${step.id}-${u}`] || (l.tasks || {})[`${sIdx}-${u}`];
+            if (t && (t.status === 'completed' || t.status === 'ng') && (t.duration || 0) > 0) { units++; totalSec += t.duration; }
+          }
+          if (units > 0) rows.push({ date: fmtDate(cMs), orderNo: l.orderNo || '', model: l.model || '', step: step.title || '', units, totalMin: Math.round(totalSec / 60), avgSec: Math.round(totalSec / units), _ts: cMs, _model: l.model || '', _worker: '', _order: l.orderNo || '' });
+        });
+      });
+    } else if (s === 'indirect') {
+      (indirectWork || []).forEach(iw => {
+        const ms = toMs(iw.startTime) || toMs(iw.createdAt);
+        const w = wname(iw.workerName);
+        rows.push({ date: fmtDate(ms), worker: w, category: iw.category || '', min: Math.round((iw.duration || 0) / 60), _ts: ms, _model: '', _worker: w, _order: '' });
+      });
+    } else if (s === 'targettime') {
+      (settings.targetTimeHistory || []).forEach(e => {
+        const ms = toMs(e.timestamp ?? e.at ?? e.changedAt);
+        rows.push({ date: fmtDateTime(ms), model: e.model || '', step: e.step || e.title || e.stepTitle || '', oldSec: e.from ?? e.old ?? e.before ?? '', newSec: e.to ?? e.new ?? e.after ?? '', reason: e.reason || e.note || e.evidence || '', user: e.user || e.changedBy || '', _ts: ms, _model: e.model || '', _worker: '', _order: '' });
+      });
+    }
+    return rows;
+  };
+
+  const filtered = useMemo(() => {
+    const fromMs = from ? new Date(from + 'T00:00:00').getTime() : -Infinity;
+    const toMsv = to ? new Date(to + 'T23:59:59').getTime() : Infinity;
+    return buildAll(src).filter(r => {
+      if (r._ts != null && (r._ts < fromMs || r._ts > toMsv)) return false;
+      if (modelF && r._model !== modelF) return false;
+      if (workerF && !(r._worker || '').includes(workerF)) return false;
+      if (orderF && !(r._order || '').includes(orderF)) return false;
+      return true;
+    }).sort((a, b) => (b._ts || 0) - (a._ts || 0));
+  }, [src, from, to, modelF, workerF, orderF, lots, indirectWork, settings]);
+
+  const activeCols = EXPORT_SOURCES[src].cols.filter(c => (cols[src] || []).includes(c.k));
+  const toggleCol = (k) => setCols(c => ({ ...c, [src]: (c[src] || []).includes(k) ? c[src].filter(x => x !== k) : [...(c[src] || []), k] }));
+  const periodLabel = `${from || '最古'} 〜 ${to || '最新'}`;
+  const srcLabel = EXPORT_SOURCES[src].label;
+  const fname = (ext) => `${srcLabel}_${(from || 'all')}_${(to || 'all')}.${ext}`;
+
+  const exportCSV = () => {
+    const q = (v) => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    const lines = [activeCols.map(c => q(c.label)).join(',')];
+    filtered.forEach(r => lines.push(activeCols.map(c => q(r[c.k])).join(',')));
+    const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = fname('csv'); a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const exportExcel = async () => {
+    setBusy(true);
+    try {
+      const ExcelJS = await loadExcelJS();
+      const wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet(srcLabel.slice(0, 28));
+      const bd = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+      let R = 1;
+      ws.mergeCells(R, 1, R, Math.max(2, activeCols.length)); const t = ws.getRow(R).getCell(1); t.value = `${srcLabel}　(${periodLabel})`; t.font = { bold: true, size: 13 }; R += 1;
+      const meta = ws.getRow(R).getCell(1); meta.value = `発行: ${settings.reportOrgName || ''} ${settings.reportDeptName || ''}　作成: ${currentUserName || ''}　出力日: ${new Date().toLocaleDateString('ja-JP')}　件数: ${filtered.length}`; meta.font = { size: 9, color: { argb: 'FF64748B' } }; R += 2;
+      const hr = ws.getRow(R); activeCols.forEach((c, i) => { const cell = hr.getCell(i + 1); cell.value = c.label; cell.font = { bold: true }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDBEAFE' } }; cell.border = bd; }); R++;
+      filtered.forEach(r => { const row = ws.getRow(R); activeCols.forEach((c, i) => { const cell = row.getCell(i + 1); cell.value = r[c.k] ?? ''; cell.border = bd; }); R++; });
+      activeCols.forEach((c, i) => { ws.getColumn(i + 1).width = ['content', 'reason', 'workers', 'step'].includes(c.k) ? 28 : 14; });
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = fname('xlsx'); a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { alert('Excel出力に失敗: ' + e.message); } finally { setBusy(false); }
+  };
+  const exportPDF = () => {
+    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+    const th = activeCols.map(c => `<th>${esc(c.label)}</th>`).join('');
+    const trs = filtered.map(r => `<tr>${activeCols.map(c => `<td>${esc(r[c.k])}</td>`).join('')}</tr>`).join('');
+    const css = `@page{size:A4 landscape;margin:12mm;}body{font-family:'Yu Gothic','Hiragino Kaku Gothic ProN',sans-serif;color:#1e293b;font-size:11px;margin:0;}h1{font-size:16px;margin:0 0 4px;}.meta{color:#64748b;font-size:10px;margin-bottom:8px;}table{width:100%;border-collapse:collapse;}th,td{border:1px solid #94a3b8;padding:4px 6px;text-align:left;font-size:10px;}th{background:#dbeafe;}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact;}}`;
+    const body = `<h1>${esc(srcLabel)}</h1><div class="meta">期間: ${esc(periodLabel)}　／　発行: ${esc(settings.reportOrgName || '')} ${esc(settings.reportDeptName || '')}　／　作成: ${esc(currentUserName || '')}　／　出力日: ${esc(new Date().toLocaleDateString('ja-JP'))}　／　件数: ${filtered.length}</div><table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
+    const pw = window.open('', '_blank'); if (!pw) { alert('ポップアップがブロックされました。'); return; }
+    pw.document.open(); pw.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${esc(srcLabel)}</title><style>${css}</style></head><body>${body}<scr` + `ipt>window.onload=function(){setTimeout(function(){window.print();},400);}</scr` + `ipt></body></html>`); pw.document.close();
+  };
+
+  const savePreset = () => {
+    if (!saveSettings) return;
+    const name = (prompt('提出セットの名前を入力\n例: 月末品質報告、客先提出 不良一覧') || '').trim(); if (!name) return;
+    const p = { id: `exp_${Date.now()}`, name, src, from, to, modelF, workerF, orderF, cols: cols[src] };
+    saveSettings({ exportPresets: [...presets.filter(x => x.name !== name), p] });
+  };
+  const loadPreset = (p) => { setSrc(p.src); setFrom(p.from ?? ''); setTo(p.to ?? ''); setModelF(p.modelF || ''); setWorkerF(p.workerF || ''); setOrderF(p.orderF || ''); if (Array.isArray(p.cols)) setCols(c => ({ ...c, [p.src]: p.cols })); };
+  const delPreset = (id) => { if (saveSettings) saveSettings({ exportPresets: presets.filter(x => x.id !== id) }); };
+
+  const inputCls = 'border border-slate-300 rounded px-2 py-1.5 text-sm';
+  return (
+    <div className="h-full overflow-auto p-1 space-y-3">
+      <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
+        <div className="flex items-center gap-2"><DownloadCloud className="w-5 h-5 text-blue-600" /><h3 className="font-bold text-slate-800">データ書き出しセンター</h3><span className="text-[11px] text-slate-400">種別・期間・絞り込み・列を選んで Excel / CSV / PDF</span></div>
+        {/* 種別 */}
+        <div className="flex flex-wrap gap-1.5">
+          {Object.entries(EXPORT_SOURCES).map(([k, v]) => (
+            <button key={k} onClick={() => setSrc(k)} className={`px-3 py-1.5 rounded-lg text-sm font-bold border ${src === k ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-slate-600 border-slate-300 hover:bg-blue-50'}`}>{v.label}</button>
+          ))}
+        </div>
+        {/* 期間 + 絞り込み */}
+        <div className="flex flex-wrap items-end gap-3">
+          <div><label className="block text-[11px] text-slate-500 mb-1">期間(開始)</label><input type="date" value={from} onChange={e => setFrom(e.target.value)} className={inputCls} /></div>
+          <div><label className="block text-[11px] text-slate-500 mb-1">期間(終了)</label><input type="date" value={to} onChange={e => setTo(e.target.value)} className={inputCls} /></div>
+          <div className="flex gap-1">
+            {[['今月', 'thisMonth'], ['先月', 'lastMonth'], ['今年', 'thisYear'], ['全期間', 'all']].map(([lb, m]) => <button key={m} onClick={() => setPeriod(m)} className="px-2 py-1 text-[11px] rounded border border-slate-300 text-slate-600 hover:bg-slate-100">{lb}</button>)}
+          </div>
+          <div><label className="block text-[11px] text-slate-500 mb-1">型式</label><select value={modelF} onChange={e => setModelF(e.target.value)} className={inputCls}><option value="">全型式</option>{models.map(m => <option key={m} value={m}>{m}</option>)}</select></div>
+          <div><label className="block text-[11px] text-slate-500 mb-1">作業者(含む)</label><input value={workerF} onChange={e => setWorkerF(e.target.value)} placeholder="氏名の一部" className={`${inputCls} w-28`} /></div>
+          <div><label className="block text-[11px] text-slate-500 mb-1">指図(含む)</label><input value={orderF} onChange={e => setOrderF(e.target.value)} placeholder="指図No" className={`${inputCls} w-28`} /></div>
+        </div>
+        {/* 列選択 */}
+        <div>
+          <div className="text-[11px] text-slate-500 mb-1">出力する列（チェックで選択）</div>
+          <div className="flex flex-wrap gap-2">
+            {EXPORT_SOURCES[src].cols.map(c => (
+              <label key={c.k} className={`flex items-center gap-1 text-xs px-2 py-1 rounded border cursor-pointer ${(cols[src] || []).includes(c.k) ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white border-slate-300 text-slate-500'}`}>
+                <input type="checkbox" checked={(cols[src] || []).includes(c.k)} onChange={() => toggleCol(c.k)} className="w-3.5 h-3.5 accent-blue-600" />{c.label}
+              </label>
+            ))}
+          </div>
+        </div>
+        {/* 出力ボタン */}
+        <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
+          <span className="text-sm font-bold text-slate-700">該当 {filtered.length} 件</span>
+          <div className="flex-1" />
+          <button onClick={exportExcel} disabled={busy || activeCols.length === 0 || filtered.length === 0} className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm ${busy || activeCols.length === 0 || filtered.length === 0 ? 'bg-slate-200 text-slate-400' : 'bg-emerald-600 hover:bg-emerald-700 text-white'}`}><FileSpreadsheet className="w-4 h-4" /> Excel</button>
+          <button onClick={exportCSV} disabled={activeCols.length === 0 || filtered.length === 0} className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm ${activeCols.length === 0 || filtered.length === 0 ? 'bg-slate-200 text-slate-400' : 'bg-slate-600 hover:bg-slate-700 text-white'}`}><FileText className="w-4 h-4" /> CSV</button>
+          <button onClick={exportPDF} disabled={activeCols.length === 0 || filtered.length === 0} className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm ${activeCols.length === 0 || filtered.length === 0 ? 'bg-slate-200 text-slate-400' : 'bg-rose-600 hover:bg-rose-700 text-white'}`}><Printer className="w-4 h-4" /> PDF</button>
+        </div>
+        {/* 提出セット */}
+        <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
+          <span className="text-[11px] text-slate-500">提出セット:</span>
+          {presets.length === 0 && <span className="text-[11px] text-slate-400">未保存</span>}
+          {presets.map(p => (
+            <span key={p.id} className="inline-flex items-center gap-1 bg-indigo-50 border border-indigo-200 rounded-full pl-2 pr-1 py-0.5 text-xs">
+              <button onClick={() => loadPreset(p)} className="font-bold text-indigo-700 hover:underline" title="この条件を読み込む">{p.name}</button>
+              <button onClick={() => delPreset(p.id)} className="text-indigo-300 hover:text-rose-600" title="削除"><X className="w-3 h-3" /></button>
+            </span>
+          ))}
+          <button onClick={savePreset} className="px-2 py-1 text-[11px] rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-50 font-bold">＋ 今の条件を保存</button>
+        </div>
+      </div>
+      {/* プレビュー(先頭50件) */}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-3 py-2 bg-slate-50 border-b text-xs font-bold text-slate-600">プレビュー（先頭50件 / 全{filtered.length}件）</div>
+        <div className="overflow-auto max-h-[40vh]">
+          <table className="w-full text-xs border-collapse">
+            <thead className="sticky top-0 bg-slate-100"><tr>{activeCols.map(c => <th key={c.k} className="px-2 py-1.5 text-left font-bold border-b border-slate-300 whitespace-nowrap">{c.label}</th>)}</tr></thead>
+            <tbody>
+              {filtered.slice(0, 50).map((r, i) => <tr key={i} className="border-b border-slate-100 hover:bg-blue-50/30">{activeCols.map(c => <td key={c.k} className="px-2 py-1 whitespace-nowrap max-w-[260px] truncate" title={String(r[c.k] ?? '')}>{String(r[c.k] ?? '')}</td>)}</tr>)}
+              {filtered.length === 0 && <tr><td colSpan={Math.max(1, activeCols.length)} className="px-2 py-8 text-center text-slate-400">該当データがありません（期間・絞り込みを確認）</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
+//  管理者ダッシュボード — 当月KPI(完了台数/不良率/納期遵守率/平均リードタイム/軽微不良)
+//  ＋前月比＋12ヶ月トレンド＋型式別トップ。すべて読み取り集計(書き込み無し)。
+// =============================================================================
+const ManagerDashboard = ({ lots = [], settings = {} }) => {
+  const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
+  const now = new Date();
+  const compMs = (l) => toMs(l.completedAt) || toMs(l.updatedAt);
+  const isCompleted = (l) => l.status === 'completed' || l.location === 'completed';
+  const monthRange = (off) => [new Date(now.getFullYear(), now.getMonth() + off, 1).getTime(), new Date(now.getFullYear(), now.getMonth() + off + 1, 1).getTime()];
+
+  const calcMonth = (off) => {
+    const [s, e] = monthRange(off);
+    const comp = (lots || []).filter(l => { if (!isCompleted(l)) return false; const m = compMs(l); return m != null && m >= s && m < e; });
+    const units = comp.reduce((a, l) => a + (l.quantity || 1), 0);
+    let defectLots = 0, defectTotal = 0, onTime = 0, withDue = 0, leadSum = 0, leadN = 0;
+    const byModel = {}, defByModel = {};
+    comp.forEach(l => {
+      const defs = (l.interruptions || []).filter(i => i.type === 'defect');
+      if (defs.length) defectLots++;
+      defectTotal += defs.length;
+      const m = l.model || '不明';
+      byModel[m] = (byModel[m] || 0) + (l.quantity || 1);
+      if (defs.length) defByModel[m] = (defByModel[m] || 0) + defs.length;
+      const cm = compMs(l);
+      if (l.dueDate) { withDue++; const dd = new Date(l.dueDate + 'T23:59:59').getTime(); if (cm != null && !isNaN(dd) && cm <= dd) onTime++; }
+      const em = toMs(l.entryAt) || toMs(l.createdAt);
+      if (em && cm && cm >= em) { leadSum += (cm - em) / 86400000; leadN++; }
+    });
+    let minor = 0;
+    (lots || []).forEach(l => (l.interruptions || []).forEach(i => { const it = toMs(i.timestamp); if ((i.type === 'complaint' || i.type === 'improvement') && it != null && it >= s && it < e) minor++; }));
+    return { lots: comp.length, units, defectLots, defectTotal, defectRate: comp.length ? (defectLots / comp.length * 100) : 0, onTime, withDue, dueRate: withDue ? (onTime / withDue * 100) : null, lead: leadN ? (leadSum / leadN) : null, minor, byModel, defByModel };
+  };
+  const cur = calcMonth(0), prev = calcMonth(-1);
+  const trend = []; for (let i = 11; i >= 0; i--) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); const mm = calcMonth(-i); trend.push({ label: `${d.getMonth() + 1}月`, units: mm.units, defectRate: mm.defectRate }); }
+  const maxUnits = Math.max(1, ...trend.map(t => t.units));
+  const topModels = Object.entries(cur.byModel).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const topDef = Object.entries(cur.defByModel).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  // 前月比表示 (good = 良い方向。dir: 'up' なら増加が良い, 'down' なら減少が良い)
+  const Delta = ({ now: n, prev: p, dir, suffix = '' }) => {
+    if (n == null || p == null) return <span className="text-[11px] text-slate-400">前月比 —</span>;
+    const diff = n - p; if (Math.abs(diff) < 0.05) return <span className="text-[11px] text-slate-400">前月比 ±0</span>;
+    const good = dir === 'up' ? diff > 0 : diff < 0;
+    return <span className={`text-[11px] font-bold ${good ? 'text-emerald-600' : 'text-rose-600'}`}>{diff > 0 ? '▲' : '▼'} {Math.abs(diff).toFixed(1)}{suffix} 前月比</span>;
+  };
+  const Card = ({ label, value, unit, sub, delta, color = 'text-slate-800' }) => (
+    <div className="bg-white rounded-xl border border-slate-200 p-3 shadow-sm flex flex-col">
+      <div className="text-[11px] font-bold text-slate-500">{label}</div>
+      <div className="flex items-baseline gap-1 mt-0.5"><span className={`text-2xl font-black ${color}`}>{value}</span><span className="text-xs text-slate-400">{unit}</span></div>
+      {sub && <div className="text-[10px] text-slate-400 mt-0.5">{sub}</div>}
+      <div className="mt-1">{delta}</div>
+    </div>
+  );
+
+  return (
+    <div className="h-full overflow-auto p-1 space-y-3">
+      <div className="text-sm font-bold text-slate-600">{now.getFullYear()}年{now.getMonth() + 1}月 サマリー <span className="text-[11px] text-slate-400 font-normal">（管理者向けKPI・前月比）</span></div>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">
+        <Card label="完了台数" value={cur.units} unit="台" sub={`完了 ${cur.lots} ロット`} color="text-blue-700" delta={<Delta now={cur.units} prev={prev.units} dir="up" suffix="台" />} />
+        <Card label="不良率(ロット)" value={cur.defectRate.toFixed(1)} unit="%" sub={`不良 ${cur.defectLots}/${cur.lots} ロット`} color="text-rose-600" delta={<Delta now={cur.defectRate} prev={prev.defectRate} dir="down" suffix="%" />} />
+        <Card label="納期遵守率" value={cur.dueRate == null ? '—' : cur.dueRate.toFixed(1)} unit="%" sub={cur.withDue ? `${cur.onTime}/${cur.withDue} 件 期日内` : '納期設定なし'} color="text-emerald-700" delta={<Delta now={cur.dueRate} prev={prev.dueRate} dir="up" suffix="%" />} />
+        <Card label="平均リードタイム" value={cur.lead == null ? '—' : cur.lead.toFixed(1)} unit="日" sub="入荷→完了" color="text-indigo-700" delta={<Delta now={cur.lead} prev={prev.lead} dir="down" suffix="日" />} />
+        <Card label="軽微不良・気づき" value={cur.minor} unit="件" sub="当月の報告" color="text-purple-700" delta={<Delta now={cur.minor} prev={prev.minor} dir="down" suffix="件" />} />
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-3">
+        <div className="text-[11px] font-bold text-slate-500 mb-2">完了台数 12ヶ月トレンド（棒）＋不良率(%)</div>
+        <div className="flex items-end gap-1 h-28">
+          {trend.map((t, i) => (
+            <div key={i} className="flex-1 flex flex-col items-center justify-end gap-0.5" title={`${t.label}: ${t.units}台 / 不良率${t.defectRate.toFixed(1)}%`}>
+              <span className="text-[9px] text-rose-500 font-bold">{t.defectRate > 0 ? t.defectRate.toFixed(0) + '%' : ''}</span>
+              <div className="w-full bg-blue-500 rounded-t" style={{ height: `${Math.max(2, (t.units / maxUnits) * 90)}px` }} />
+              <span className="text-[9px] text-slate-500">{t.label}</span>
+              <span className="text-[9px] text-slate-400">{t.units}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="bg-white rounded-xl border border-slate-200 p-3">
+          <div className="text-[11px] font-bold text-slate-500 mb-2">当月 型式別 完了台数 (上位5)</div>
+          {topModels.length === 0 ? <div className="text-xs text-slate-400 py-3 text-center">データなし</div> : topModels.map(([m, c]) => (
+            <div key={m} className="flex items-center gap-2 mb-1"><span className="text-xs font-mono w-32 truncate" title={m}>{m}</span><div className="flex-1 bg-slate-100 rounded h-3"><div className="bg-blue-500 h-3 rounded" style={{ width: `${(c / topModels[0][1]) * 100}%` }} /></div><span className="text-xs font-bold w-12 text-right">{c}台</span></div>
+          ))}
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 p-3">
+          <div className="text-[11px] font-bold text-slate-500 mb-2">当月 型式別 不良件数 (上位5)</div>
+          {topDef.length === 0 ? <div className="text-xs text-emerald-600 py-3 text-center">当月の不良なし 👍</div> : topDef.map(([m, c]) => (
+            <div key={m} className="flex items-center gap-2 mb-1"><span className="text-xs font-mono w-32 truncate" title={m}>{m}</span><div className="flex-1 bg-slate-100 rounded h-3"><div className="bg-rose-500 h-3 rounded" style={{ width: `${(c / topDef[0][1]) * 100}%` }} /></div><span className="text-xs font-bold w-12 text-right">{c}件</span></div>
+          ))}
+        </div>
+      </div>
+      <div className="text-[10px] text-slate-400">※ 完了=ステータス完了のロット。不良率=不良が出た完了ロット数÷完了ロット数。納期遵守=完了日が納期以内。リードタイム=入荷→完了の日数平均。</div>
+    </div>
+  );
+};
+
+// =============================================================================
+//  達成率分析 — 標準時間(目標)に対する実績の達成率(能率)
+//  達成率 = 目標時間合計 ÷ 実績時間合計 ×100 (100%超 = 目標より速い)
+//  ①型式別×期間指定 ②型式関係なく週毎/月毎の全体推移。読み取り集計のみ。
+// =============================================================================
+const AchievementRateView = ({ lots = [], customTargetTimes = {}, settings = {}, templates = [] }) => {
+  const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
+  const [mode, setMode] = useState('model');      // 'model' | 'trend'
+  const [groupBy, setGroupBy] = useState('model'); // 'model' | 'modelTpl' (型式 / 型式×テンプレ)
+  const [expanded, setExpanded] = useState(null);  // クリックで工程別詳細を開いている行のkey
+  const [from, setFrom] = useState('');           // YYYY-MM-DD ('' = 制限なし)
+  const [to, setTo] = useState('');
+  const [bucket, setBucket] = useState('month');  // 'month' | 'week'
+  const groups = modelGroupsOf(settings);
+
+  // 全完了タスクを {完了時刻, 型式, テンプレ, 工程名, 目標秒, 実績秒} に展開 (抜取スキップ/目標未設定/0秒は除外)
+  const rows = useMemo(() => {
+    const out = [];
+    (lots || []).forEach(l => {
+      const steps = l.steps || []; const qty = l.quantity || 1; const tasks = l.tasks || {};
+      const lotMs = toMs(l.completedAt) || toMs(l.updatedAt);
+      const tpl = (templates || []).find(tp => tp.id === l.templateId)?.name || '(テンプレなし)';
+      steps.forEach((st, si) => {
+        const tgt = getEffectiveTargetTime(st, l.model, customTargetTimes, groups);
+        if (!(tgt > 0)) return;
+        // ロット1回工程: 回数キー(lot-k)の実績を1回=1行で収集 (目標は1回あたり)
+        if (st.lotOnce) {
+          lotOnceKeysOf(tasks, st).forEach(k => {
+            const t = tasks[k];
+            if (!t || (t.status !== 'completed' && t.status !== 'ng')) return;
+            const d = t.duration || 0; if (d <= 0) return;
+            const ms = toMs(t.endTime) || lotMs; if (!ms) return;
+            out.push({ ms, model: l.model || '不明', tpl, step: st.title || '(工程名なし)', tgt, act: d, within: d <= tgt });
+          });
+          return;
+        }
+        for (let u = 0; u < qty; u++) {
+          const t = tasks[st.id ? `${st.id}-${u}` : `${si}-${u}`] || tasks[`${si}-${u}`];
+          if (!t || (t.status !== 'completed' && t.status !== 'ng')) continue;
+          if (t.samplingSkipped) continue;
+          const d = t.duration || 0; if (d <= 0) continue;
+          const ms = toMs(t.endTime) || lotMs; if (!ms) continue;
+          out.push({ ms, model: l.model || '不明', tpl, step: st.title || '(工程名なし)', tgt, act: d, within: d <= tgt });
+        }
+      });
+    });
+    return out;
+  }, [lots, customTargetTimes, settings, templates]);
+
+  const pctColor = (p) => p >= 100 ? 'text-emerald-600' : p >= 80 ? 'text-amber-600' : 'text-rose-600';
+  const barColor = (p) => p >= 100 ? 'bg-emerald-500' : p >= 80 ? 'bg-amber-500' : 'bg-rose-500';
+  const fmtH = (sec) => (sec / 3600).toFixed(1);
+  const rateOf = (arr) => { const tg = arr.reduce((a, r) => a + r.tgt, 0), ac = arr.reduce((a, r) => a + r.act, 0); return { tg, ac, rate: ac > 0 ? tg / ac * 100 : null, within: arr.filter(r => r.within).length, n: arr.length }; };
+
+  // ===== ①型式別 (期間指定) =====
+  const setPreset = (p) => {
+    const t = new Date(); const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    if (p === 'thisMonth') { setFrom(ymd(new Date(t.getFullYear(), t.getMonth(), 1))); setTo(ymd(new Date(t.getFullYear(), t.getMonth() + 1, 0))); }
+    else if (p === 'lastMonth') { setFrom(ymd(new Date(t.getFullYear(), t.getMonth() - 1, 1))); setTo(ymd(new Date(t.getFullYear(), t.getMonth(), 0))); }
+    else if (p === '3m') { setFrom(ymd(new Date(t.getFullYear(), t.getMonth() - 3, t.getDate()))); setTo(ymd(t)); }
+    else { setFrom(''); setTo(''); }
+  };
+  const filtered = useMemo(() => {
+    const s = from ? new Date(from + 'T00:00:00').getTime() : -Infinity;
+    const e = to ? new Date(to + 'T23:59:59').getTime() : Infinity;
+    return rows.filter(r => r.ms >= s && r.ms <= e);
+  }, [rows, from, to]);
+  // グルーピング: 型式 or 型式×テンプレ。arr を保持して工程別詳細(クリック展開)にも使う
+  const byGroup = useMemo(() => {
+    const m = {};
+    filtered.forEach(r => {
+      const key = groupBy === 'modelTpl' ? `${r.model}｜${r.tpl}` : r.model;
+      (m[key] = m[key] || []).push(r);
+    });
+    return Object.entries(m).map(([key, arr]) => ({ key, model: arr[0].model, tpl: arr[0].tpl, arr, ...rateOf(arr) })).sort((a, b) => b.n - a.n);
+  }, [filtered, groupBy]);
+  // クリックした行の工程別達成率 (詳細)
+  const stepDetailOf = (arr) => {
+    const m = {}; arr.forEach(r => (m[r.step] = m[r.step] || []).push(r));
+    return Object.entries(m).map(([step, a]) => ({ step, ...rateOf(a) })).sort((a, b) => b.n - a.n);
+  };
+  const total = useMemo(() => rateOf(filtered), [filtered]);
+
+  // ===== ②全体推移 (週毎/月毎・型式関係なし) =====
+  const trend = useMemo(() => {
+    const buckets = [];
+    const now = new Date();
+    if (bucket === 'month') {
+      for (let i = 11; i >= 0; i--) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); buckets.push({ key: `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}`, label: `${d.getMonth() + 1}月`, s: d.getTime(), e: new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime(), arr: [] }); }
+    } else {
+      const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate()); mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7)); // 今週の月曜
+      for (let i = 15; i >= 0; i--) { const s = new Date(mon); s.setDate(s.getDate() - i * 7); const e = new Date(s); e.setDate(e.getDate() + 7); buckets.push({ key: `${s.getFullYear()}/${String(s.getMonth() + 1).padStart(2, '0')}/${String(s.getDate()).padStart(2, '0')}週`, label: `${s.getMonth() + 1}/${s.getDate()}`, s: s.getTime(), e: e.getTime(), arr: [] }); }
+    }
+    rows.forEach(r => { const b = buckets.find(b => r.ms >= b.s && r.ms < b.e); if (b) b.arr.push(r); });
+    return buckets.map(b => ({ ...b, ...rateOf(b.arr) }));
+  }, [rows, bucket]);
+  const trendAll = useMemo(() => rateOf(trend.flatMap(b => b.arr)), [trend]);
+
+  const Cards = ({ d, label }) => (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div className="bg-white rounded-xl border border-slate-200 p-3 text-center"><div className="text-[10px] text-slate-500 font-bold">達成率(能率)</div><div className={`text-2xl font-black font-mono ${d.rate == null ? 'text-slate-300' : pctColor(d.rate)}`}>{d.rate == null ? '—' : d.rate.toFixed(1)}<span className="text-xs">%</span></div><div className="text-[9px] text-slate-400">目標{fmtH(d.tg)}h ÷ 実績{fmtH(d.ac)}h</div></div>
+      <div className="bg-white rounded-xl border border-slate-200 p-3 text-center"><div className="text-[10px] text-slate-500 font-bold">目標内タスク率</div><div className="text-2xl font-black font-mono text-indigo-700">{d.n ? (d.within / d.n * 100).toFixed(0) : '—'}<span className="text-xs">%</span></div><div className="text-[9px] text-slate-400">{d.within}/{d.n} タスク</div></div>
+      <div className="bg-white rounded-xl border border-slate-200 p-3 text-center"><div className="text-[10px] text-slate-500 font-bold">対象タスク</div><div className="text-2xl font-black font-mono text-slate-700">{d.n}</div><div className="text-[9px] text-slate-400">目標設定あり・完了のみ</div></div>
+      <div className="bg-white rounded-xl border border-slate-200 p-3 text-center"><div className="text-[10px] text-slate-500 font-bold">{label}</div><div className="text-sm font-bold text-slate-600 mt-2">{mode === 'model' ? ((from || to) ? `${from || '…'} 〜 ${to || '…'}` : '全期間') : (bucket === 'month' ? '直近12ヶ月' : '直近16週')}</div></div>
+    </div>
+  );
+
+  return (
+    <div className="h-full overflow-auto p-1 space-y-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex bg-slate-200 rounded-lg p-1">
+          <button onClick={() => setMode('model')} className={`px-4 py-1.5 rounded-md text-sm font-bold ${mode === 'model' ? 'bg-white shadow text-emerald-700' : 'text-slate-500 hover:text-slate-700'}`}>型式別（期間指定）</button>
+          <button onClick={() => setMode('trend')} className={`px-4 py-1.5 rounded-md text-sm font-bold ${mode === 'trend' ? 'bg-white shadow text-emerald-700' : 'text-slate-500 hover:text-slate-700'}`}>全体推移（週・月）</button>
+        </div>
+        {mode === 'model' ? (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {[['今月', 'thisMonth'], ['先月', 'lastMonth'], ['過去3ヶ月', '3m'], ['全期間', 'all']].map(([lb, p]) => <button key={p} onClick={() => setPreset(p)} className="px-2.5 py-1 text-xs rounded-lg font-bold border bg-white text-slate-600 border-slate-300 hover:bg-emerald-50">{lb}</button>)}
+            <input type="date" value={from} onChange={e => setFrom(e.target.value)} className="border border-slate-300 rounded px-2 py-1 text-xs" />
+            <span className="text-xs text-slate-400">〜</span>
+            <input type="date" value={to} onChange={e => setTo(e.target.value)} className="border border-slate-300 rounded px-2 py-1 text-xs" />
+          </div>
+        ) : (
+          <div className="flex bg-slate-200 rounded-lg p-1">
+            <button onClick={() => setBucket('month')} className={`px-3 py-1 rounded-md text-xs font-bold ${bucket === 'month' ? 'bg-white shadow text-emerald-700' : 'text-slate-500'}`}>月毎</button>
+            <button onClick={() => setBucket('week')} className={`px-3 py-1 rounded-md text-xs font-bold ${bucket === 'week' ? 'bg-white shadow text-emerald-700' : 'text-slate-500'}`}>週毎</button>
+          </div>
+        )}
+      </div>
+
+      <div className="text-[11px] text-slate-500 bg-emerald-50 border border-emerald-200 rounded-lg p-2">
+        <b>達成率(能率) = 目標時間の合計 ÷ 実績時間の合計 ×100</b>。100%超 = 目標より速く作業できている。目標時間は較正済みの型式別値（無ければ工程の既定値）。抜取で省略した工程・目標未設定・時間0は集計から除外。
+      </div>
+
+      {mode === 'model' ? (
+        <>
+          <Cards d={total} label="集計期間" />
+          <div className="bg-white rounded-xl border border-slate-200 p-4">
+            <div className="flex items-center gap-3 mb-2 flex-wrap">
+              <div className="text-sm font-bold text-emerald-700">{groupBy === 'modelTpl' ? '型式×テンプレ別' : '型式別'} 達成率（タスク数順）</div>
+              <div className="flex bg-slate-200 rounded-lg p-0.5">
+                <button onClick={() => { setGroupBy('model'); setExpanded(null); }} className={`px-3 py-1 rounded-md text-xs font-bold ${groupBy === 'model' ? 'bg-white shadow text-emerald-700' : 'text-slate-500'}`}>型式</button>
+                <button onClick={() => { setGroupBy('modelTpl'); setExpanded(null); }} className={`px-3 py-1 rounded-md text-xs font-bold ${groupBy === 'modelTpl' ? 'bg-white shadow text-emerald-700' : 'text-slate-500'}`}>型式×テンプレ</button>
+              </div>
+              <span className="text-[10px] text-slate-400">行をタップ → 工程ごとの達成率を展開</span>
+            </div>
+            {byGroup.length === 0 ? <div className="text-xs text-slate-400 py-6 text-center">この期間に対象データがありません</div> : (
+              <table className="w-full text-xs border-collapse">
+                <thead><tr className="bg-slate-100 border-b-2 border-slate-200">
+                  <th className="p-2 text-left font-bold">{groupBy === 'modelTpl' ? '型式 / テンプレ' : '型式'}</th><th className="p-2 text-right font-bold">タスク</th><th className="p-2 text-right font-bold">目標(h)</th><th className="p-2 text-right font-bold">実績(h)</th><th className="p-2 text-left font-bold w-[30%]">達成率</th><th className="p-2 text-right font-bold">目標内率</th>
+                </tr></thead>
+                <tbody>
+                  {byGroup.map(x => (
+                    <React.Fragment key={x.key}>
+                      <tr onClick={() => setExpanded(expanded === x.key ? null : x.key)} className={`border-b border-slate-50 cursor-pointer hover:bg-emerald-50/40 ${expanded === x.key ? 'bg-emerald-50/60' : ''}`}>
+                        <td className="p-2 font-mono font-bold">
+                          <span className="text-slate-400 mr-1">{expanded === x.key ? '▼' : '▶'}</span>{x.model}
+                          {groupBy === 'modelTpl' && <div className="text-[10px] font-sans font-normal text-indigo-600 pl-4 truncate max-w-[14rem]" title={x.tpl}>{x.tpl}</div>}
+                        </td>
+                        <td className="p-2 text-right text-slate-500">{x.n}</td>
+                        <td className="p-2 text-right font-mono">{fmtH(x.tg)}</td>
+                        <td className="p-2 text-right font-mono">{fmtH(x.ac)}</td>
+                        <td className="p-2"><div className="flex items-center gap-2"><div className="flex-1 bg-slate-100 rounded h-3 overflow-hidden"><div className={`h-3 ${barColor(x.rate)}`} style={{ width: `${Math.min(100, x.rate / 1.5)}%` }} /></div><span className={`font-black font-mono w-16 text-right ${pctColor(x.rate)}`}>{x.rate.toFixed(1)}%</span></div></td>
+                        <td className="p-2 text-right font-mono text-indigo-700">{(x.within / x.n * 100).toFixed(0)}%</td>
+                      </tr>
+                      {expanded === x.key && (
+                        <tr className="border-b border-emerald-100">
+                          <td colSpan={6} className="p-0 bg-emerald-50/30">
+                            <div className="px-4 py-2">
+                              <div className="text-[11px] font-bold text-emerald-700 mb-1">工程ごとの達成率 — {x.model}{groupBy === 'modelTpl' ? ` / ${x.tpl}` : ''}</div>
+                              <table className="w-full text-[11px] border-collapse">
+                                <thead><tr className="text-slate-400 border-b border-emerald-100">
+                                  <th className="px-2 py-1 text-left font-bold">工程</th><th className="px-2 py-1 text-right font-bold">タスク</th><th className="px-2 py-1 text-right font-bold">目標(h)</th><th className="px-2 py-1 text-right font-bold">実績(h)</th><th className="px-2 py-1 text-left font-bold w-[30%]">達成率</th><th className="px-2 py-1 text-right font-bold">目標内率</th>
+                                </tr></thead>
+                                <tbody>
+                                  {stepDetailOf(x.arr).map(s => (
+                                    <tr key={s.step} className="border-b border-emerald-50">
+                                      <td className="px-2 py-1 font-bold truncate max-w-[12rem]" title={s.step}>{s.step}</td>
+                                      <td className="px-2 py-1 text-right text-slate-500">{s.n}</td>
+                                      <td className="px-2 py-1 text-right font-mono">{fmtH(s.tg)}</td>
+                                      <td className="px-2 py-1 text-right font-mono">{fmtH(s.ac)}</td>
+                                      <td className="px-2 py-1"><div className="flex items-center gap-2"><div className="flex-1 bg-white rounded h-2.5 overflow-hidden border border-emerald-100"><div className={`h-2.5 ${barColor(s.rate)}`} style={{ width: `${Math.min(100, s.rate / 1.5)}%` }} /></div><span className={`font-black font-mono w-14 text-right ${pctColor(s.rate)}`}>{s.rate.toFixed(0)}%</span></div></td>
+                                      <td className="px-2 py-1 text-right font-mono text-indigo-700">{(s.within / s.n * 100).toFixed(0)}%</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div className="text-[10px] text-slate-400 mt-2">※ バーは150%でフルスケール。緑=100%以上(目標達成)・黄=80%以上・赤=80%未満。行タップで工程別の内訳。</div>
+          </div>
+        </>
+      ) : (
+        <>
+          <Cards d={trendAll} label="表示範囲" />
+          <div className="bg-white rounded-xl border border-slate-200 p-4">
+            <div className="text-sm font-bold text-emerald-700 mb-3">全体推移 — 型式関係なくまとめた達成率（{bucket === 'month' ? '月毎・直近12ヶ月' : '週毎・直近16週'}）</div>
+            <div className="flex items-end gap-1.5 h-44 border-b border-slate-200 pb-1">
+              {trend.map(b => (
+                <div key={b.key} className="flex-1 flex flex-col items-center justify-end h-full" title={`${b.key}: ${b.rate == null ? 'データなし' : b.rate.toFixed(1) + '%'} (${b.n}タスク)`}>
+                  {b.rate != null && <div className={`text-[9px] font-bold font-mono ${pctColor(b.rate)}`}>{b.rate.toFixed(0)}</div>}
+                  <div className={`w-full max-w-[34px] rounded-t ${b.rate == null ? 'bg-slate-100' : barColor(b.rate)}`} style={{ height: `${b.rate == null ? 2 : Math.max(3, Math.min(100, b.rate / 1.5))}%` }} />
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-1.5 mt-1">
+              {trend.map(b => <div key={b.key} className="flex-1 text-center"><div className="text-[9px] text-slate-500 font-bold">{b.label}</div><div className="text-[8px] text-slate-300">{b.n || ''}</div></div>)}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-2">※ 棒の下の数字=対象タスク数。100%ライン超え（緑）が「標準時間どおりかそれより速い」状態。タスクの完了時刻（無ければロット完了日時）で集計。</div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// =============================================================================
+//  管理者向けライブアラート — どの画面にいても右下に固定表示 (管理者ログイン時のみマウント)
+//  ①時間オーバー: 進行中タスク(全作業者)が目標時間を超過  ②NG発生: 未修正のNGタスク
+//  5秒毎に再集計。読み取りのみ。「30分非表示」で一時ミュート可。
+// =============================================================================
+const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [] }) => {
+  const [tick, setTick] = useState(0);
+  const [open, setOpen] = useState(false);
+  const [mutedUntil, setMutedUntil] = useState(0);
+  useEffect(() => { const iv = setInterval(() => setTick(t => t + 1), 5000); return () => clearInterval(iv); }, []);
+  const { overs, ngs } = useMemo(() => {
+    const overs = []; const ngs = []; const now = Date.now();
+    (lots || []).forEach(l => {
+      if (l.status === 'completed') return;
+      const steps = l.steps || []; const qty = l.quantity || 1; const tasks = l.tasks || {};
+      steps.forEach((st, si) => {
+        const tgt = getEffectiveTargetTime(st, l.model, customTargetTimes, modelGroups);
+        // ロット1回工程: 回数キー(lot-k)を走査 (バッチ按分なし)
+        if (st.lotOnce) {
+          lotOnceKeysOf(tasks, st).forEach((k, kIdx) => {
+            const t = tasks[k]; if (!t) return;
+            if (t.status === 'ng' || t.status === 'reworking') ngs.push({ id: `${l.id}-${k}`, ord: l.orderNo || l.id, model: l.model, title: `${st.title}（${kIdx + 1}回目）`, u: kIdx, reason: t.ngReason || '', worker: t.workerName || '', reworking: t.status === 'reworking', isLot: true });
+            if (t.status === 'processing' && t.startTime && tgt > 0) {
+              const sec = (t.duration || 0) + Math.floor((now - t.startTime) / 1000);
+              if (sec >= tgt) overs.push({ id: `${l.id}-${k}`, ord: l.orderNo || l.id, model: l.model, title: `${st.title}（${kIdx + 1}回目）`, u: kIdx, sec, tgt, worker: t.workerName || '', isLot: true });
+            }
+          });
+          return;
+        }
+        // 一括(バッチ)= 同一startTimeのprocessing群。完了時に按分されるため目標×Nと比較する
+        const procMap = {};
+        for (let u = 0; u < qty; u++) {
+          const t = tasks[st.id ? `${st.id}-${u}` : `${si}-${u}`] || tasks[`${si}-${u}`];
+          if (t && t.status === 'processing' && t.startTime) procMap[t.startTime] = (procMap[t.startTime] || 0) + 1;
+        }
+        for (let u = 0; u < qty; u++) {
+          const t = tasks[st.id ? `${st.id}-${u}` : `${si}-${u}`] || tasks[`${si}-${u}`];
+          if (!t) continue;
+          if (t.status === 'ng' || t.status === 'reworking') ngs.push({ id: `${l.id}-${si}-${u}`, ord: l.orderNo || l.id, model: l.model, title: st.title, u, reason: t.ngReason || '', worker: t.workerName || '', reworking: t.status === 'reworking' });
+          if (t.status === 'processing' && t.startTime && tgt > 0) {
+            const bN = Math.max(1, procMap[t.startTime] || 1);
+            const tgtN = tgt * bN;
+            const sec = (t.duration || 0) + Math.floor((now - t.startTime) / 1000);
+            if (sec >= tgtN) overs.push({ id: `${l.id}-${si}-${u}`, ord: l.orderNo || l.id, model: l.model, title: st.title + (bN > 1 ? `（${bN}台一括）` : ''), u, sec, tgt: tgtN, worker: t.workerName || '' });
+          }
+        }
+      });
+    });
+    overs.sort((a, b) => (b.sec / b.tgt) - (a.sec / a.tgt));
+    return { overs, ngs };
+  }, [lots, tick, customTargetTimes, modelGroups]);
+  const total = overs.length + ngs.length;
+  const fmtMS = (s) => { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  if (!total || Date.now() < mutedUntil) return null;
+  return (
+    <div className="fixed bottom-4 right-4 z-[120] w-[340px] max-w-[92vw] pointer-events-auto">
+      <div className="bg-white rounded-2xl shadow-2xl border-2 border-rose-300 overflow-hidden">
+        <button onClick={() => setOpen(o => !o)} className="w-full px-4 py-2.5 bg-rose-600 text-white flex items-center justify-between gap-2 animate-pulse">
+          <span className="font-black text-sm flex items-center gap-2">⚠ 作業アラート
+            {overs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">⏰ 時間オーバー {overs.length}</span>}
+            {ngs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">🛑 NG {ngs.length}</span>}
+          </span>
+          <span className="text-xs font-bold">{open ? '閉じる ▼' : '詳細 ▲'}</span>
+        </button>
+        {open && (
+          <div className="max-h-72 overflow-auto divide-y divide-slate-100">
+            {overs.map(o => (
+              <div key={'o' + o.id} className="px-3 py-2 text-xs bg-rose-50/50">
+                <div className="flex items-center gap-1.5"><span className="font-black text-rose-600">⏰ 時間オーバー</span><span className="font-mono text-slate-500">{o.ord}</span><span className="text-slate-400 truncate">{o.model}</span></div>
+                <div className="mt-0.5 font-bold text-slate-700 truncate">{o.title} #{o.u + 1}{o.worker ? <span className="font-normal text-slate-500"> ／ {o.worker}</span> : null}</div>
+                <div className="font-mono text-rose-600 font-bold">{fmtMS(o.sec)} <span className="text-slate-400 font-normal">/ 目標 {fmtMS(o.tgt)} ({Math.round(o.sec / o.tgt * 100)}%)</span></div>
+              </div>
+            ))}
+            {ngs.map(n => (
+              <div key={'n' + n.id} className="px-3 py-2 text-xs">
+                <div className="flex items-center gap-1.5"><span className="font-black text-rose-600">🛑 {n.reworking ? 'NG修正中' : 'NG発生'}</span><span className="font-mono text-slate-500">{n.ord}</span><span className="text-slate-400 truncate">{n.model}</span></div>
+                <div className="mt-0.5 font-bold text-slate-700 truncate">{n.title} #{n.u + 1}{n.worker ? <span className="font-normal text-slate-500"> ／ {n.worker}</span> : null}</div>
+                {n.reason && <div className="text-slate-500 truncate" title={n.reason}>理由: {n.reason}</div>}
+              </div>
+            ))}
+            <div className="px-3 py-2 bg-slate-50 flex items-center justify-between">
+              <span className="text-[10px] text-slate-400">5秒毎に自動更新</span>
+              <button onClick={() => { setMutedUntil(Date.now() + 30 * 60 * 1000); setOpen(false); }} className="text-[11px] font-bold text-slate-500 hover:text-slate-700 underline">30分非表示</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
+//  経営分析(KPI詳細) — リードタイム詳細 / 納期遵守(型式別・遅延一覧) / コスト換算
+//  読み取り集計のみ。コスト時給(settings.laborCostPerHour)だけ管理者が保存可。
+// =============================================================================
+const KpiDetailView = ({ lots = [], settings = {}, saveSettings = null, currentUserName = '' }) => {
+  const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
+  const compMs = (l) => toMs(l.completedAt) || toMs(l.updatedAt);
+  const isCompleted = (l) => l.status === 'completed' || l.location === 'completed';
+  const [period, setPeriod] = useState('thisMonth');
+  const [rate, setRate] = useState(settings.laborCostPerHour || 0);
+  useEffect(() => { setRate(settings.laborCostPerHour || 0); }, [settings.laborCostPerHour]);
+  const isAdmin = currentUserName === '管理者';
+
+  const range = () => { const t = new Date(); if (period === 'thisMonth') return [new Date(t.getFullYear(), t.getMonth(), 1).getTime(), new Date(t.getFullYear(), t.getMonth() + 1, 1).getTime()]; if (period === 'lastMonth') return [new Date(t.getFullYear(), t.getMonth() - 1, 1).getTime(), new Date(t.getFullYear(), t.getMonth(), 1).getTime()]; if (period === 'thisYear') return [new Date(t.getFullYear(), 0, 1).getTime(), new Date(t.getFullYear() + 1, 0, 1).getTime()]; return [-Infinity, Infinity]; };
+
+  const D = useMemo(() => {
+    const [s, e] = range();
+    const comp = (lots || []).filter(l => { if (!isCompleted(l)) return false; const m = compMs(l); return m != null && m >= s && m < e; });
+    const leads = []; comp.forEach(l => { const cm = compMs(l), em = toMs(l.entryAt) || toMs(l.createdAt); if (cm && em && cm >= em) leads.push({ d: (cm - em) / 86400000, lot: l }); });
+    const vals = leads.map(x => x.d).sort((a, b) => a - b);
+    const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    const median = vals.length ? (vals.length % 2 ? vals[(vals.length - 1) / 2] : (vals[vals.length / 2 - 1] + vals[vals.length / 2]) / 2) : null;
+    const longest = [...leads].sort((a, b) => b.d - a.d)[0] || null;
+    const lbm = {}; leads.forEach(x => { const m = x.lot.model || '不明'; (lbm[m] = lbm[m] || []).push(x.d); });
+    const leadByModel = Object.entries(lbm).map(([m, arr]) => ({ m, avg: arr.reduce((a, b) => a + b, 0) / arr.length, n: arr.length })).sort((a, b) => b.avg - a.avg).slice(0, 6);
+    const stalled = (lots || []).filter(l => !isCompleted(l)).map(l => { const em = toMs(l.entryAt) || toMs(l.createdAt); return { lot: l, age: em ? (Date.now() - em) / 86400000 : null }; }).filter(x => x.age != null).sort((a, b) => b.age - a.age).slice(0, 8);
+    const withDue = comp.filter(l => l.dueDate); let onTime = 0; const late = []; const dbm = {};
+    withDue.forEach(l => { const cm = compMs(l), dd = new Date(l.dueDate + 'T23:59:59').getTime(); const o = dbm[l.model || '不明'] = dbm[l.model || '不明'] || { on: 0, tot: 0 }; o.tot++; if (cm != null && !isNaN(dd)) { if (cm <= dd) { onTime++; o.on++; } else late.push({ lot: l, daysLate: Math.ceil((cm - dd) / 86400000) }); } });
+    const dueByModel = Object.entries(dbm).map(([m, o]) => ({ m, rate: o.on / o.tot * 100, on: o.on, tot: o.tot })).sort((a, b) => a.rate - b.rate).slice(0, 6);
+    late.sort((a, b) => b.daysLate - a.daysLate);
+    let totalSec = 0; comp.forEach(l => Object.values(l.tasks || {}).forEach(t => { if (t && (t.status === 'completed' || t.status === 'ng') && (t.duration || 0) > 0) totalSec += t.duration; }));
+    const hours = totalSec / 3600; const units = comp.reduce((a, l) => a + (l.quantity || 1), 0);
+    return { comp, avg, median, longest, leadByModel, stalled, withDue: withDue.length, onTime, dueRate: withDue.length ? onTime / withDue.length * 100 : null, dueByModel, late, hours, units };
+  }, [lots, period]);
+
+  const cost = rate > 0 ? D.hours * rate : null;
+  const yen = (n) => '¥' + Math.round(n).toLocaleString('ja-JP');
+  const ordKey = (l) => l.orderNo || l.id;
+
+  return (
+    <div className="h-full overflow-auto p-1 space-y-3">
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-slate-500">期間:</span>
+        {[['今月', 'thisMonth'], ['先月', 'lastMonth'], ['今年', 'thisYear'], ['全期間', 'all']].map(([lb, m]) => <button key={m} onClick={() => setPeriod(m)} className={`px-3 py-1 text-xs rounded-lg font-bold border ${period === m ? 'bg-indigo-600 text-white border-indigo-700' : 'bg-white text-slate-600 border-slate-300 hover:bg-indigo-50'}`}>{lb}</button>)}
+        <span className="text-[11px] text-slate-400 ml-2">完了 {D.comp.length}ロット / {D.units}台</span>
+      </div>
+
+      {/* リードタイム */}
+      <div className="bg-white rounded-xl border border-slate-200 p-4">
+        <div className="text-sm font-bold text-indigo-700 mb-2">リードタイム分析（入荷→完了）</div>
+        <div className="grid grid-cols-3 gap-2 mb-3">
+          <div className="bg-indigo-50 rounded-lg p-2 text-center"><div className="text-[10px] text-slate-500">平均</div><div className="text-xl font-black text-indigo-700">{D.avg == null ? '—' : D.avg.toFixed(1)}<span className="text-xs">日</span></div></div>
+          <div className="bg-indigo-50 rounded-lg p-2 text-center"><div className="text-[10px] text-slate-500">中央値</div><div className="text-xl font-black text-indigo-700">{D.median == null ? '—' : D.median.toFixed(1)}<span className="text-xs">日</span></div></div>
+          <div className="bg-rose-50 rounded-lg p-2 text-center"><div className="text-[10px] text-slate-500">最長</div><div className="text-xl font-black text-rose-600">{D.longest ? D.longest.d.toFixed(1) : '—'}<span className="text-xs">日</span></div>{D.longest && <div className="text-[9px] text-slate-400 truncate">{ordKey(D.longest.lot)} {D.longest.lot.model}</div>}</div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1">型式別 平均リードタイム (長い順)</div>
+            {D.leadByModel.length === 0 ? <div className="text-xs text-slate-400">データなし</div> : D.leadByModel.map(x => (
+              <div key={x.m} className="flex items-center gap-2 mb-0.5 text-xs"><span className="font-mono w-32 truncate" title={x.m}>{x.m}</span><div className="flex-1 bg-slate-100 rounded h-2.5"><div className="bg-indigo-500 h-2.5 rounded" style={{ width: `${Math.min(100, (x.avg / (D.leadByModel[0].avg || 1)) * 100)}%` }} /></div><span className="font-bold w-16 text-right">{x.avg.toFixed(1)}日</span><span className="text-slate-400 w-10 text-right">{x.n}件</span></div>
+            ))}
+          </div>
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1">滞留中（未完了・入荷から長い順）</div>
+            {D.stalled.length === 0 ? <div className="text-xs text-emerald-600">滞留なし 👍</div> : D.stalled.map(x => (
+              <div key={x.lot.id} className="flex items-center gap-2 mb-0.5 text-xs"><span className="font-mono w-28 truncate" title={ordKey(x.lot)}>{ordKey(x.lot)}</span><span className="text-slate-500 flex-1 truncate">{x.lot.model}</span><span className={`font-bold w-14 text-right ${x.age > 14 ? 'text-rose-600' : 'text-slate-700'}`}>{x.age.toFixed(0)}日</span></div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* 納期遵守 */}
+      <div className="bg-white rounded-xl border border-slate-200 p-4">
+        <div className="text-sm font-bold text-emerald-700 mb-2">納期遵守</div>
+        <div className="flex items-baseline gap-2 mb-3"><span className="text-3xl font-black text-emerald-700">{D.dueRate == null ? '—' : D.dueRate.toFixed(1)}<span className="text-sm">%</span></span><span className="text-xs text-slate-400">{D.withDue ? `${D.onTime}/${D.withDue} 件 期日内` : '納期設定のある完了ロットなし'}</span></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1">型式別 遵守率 (低い順)</div>
+            {D.dueByModel.length === 0 ? <div className="text-xs text-slate-400">データなし</div> : D.dueByModel.map(x => (
+              <div key={x.m} className="flex items-center gap-2 mb-0.5 text-xs"><span className="font-mono w-32 truncate" title={x.m}>{x.m}</span><div className="flex-1 bg-slate-100 rounded h-2.5"><div className={`h-2.5 rounded ${x.rate >= 90 ? 'bg-emerald-500' : x.rate >= 70 ? 'bg-amber-500' : 'bg-rose-500'}`} style={{ width: `${x.rate}%` }} /></div><span className="font-bold w-16 text-right">{x.rate.toFixed(0)}%</span><span className="text-slate-400 w-12 text-right">{x.on}/{x.tot}</span></div>
+            ))}
+          </div>
+          <div>
+            <div className="text-[11px] font-bold text-slate-500 mb-1">遅延ロット (遅れ日数順)</div>
+            {D.late.length === 0 ? <div className="text-xs text-emerald-600">遅延なし 👍</div> : D.late.slice(0, 8).map(x => (
+              <div key={x.lot.id} className="flex items-center gap-2 mb-0.5 text-xs"><span className="font-mono w-28 truncate" title={ordKey(x.lot)}>{ordKey(x.lot)}</span><span className="text-slate-500 flex-1 truncate">{x.lot.model}</span><span className="font-bold w-16 text-right text-rose-600">+{x.daysLate}日</span></div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* コスト換算 */}
+      <div className="bg-white rounded-xl border border-slate-200 p-4">
+        <div className="text-sm font-bold text-teal-700 mb-2">コスト換算（検査工数 → 概算人件費）</div>
+        <div className="flex flex-wrap items-end gap-3 mb-3">
+          <div><label className="block text-[11px] text-slate-500 mb-1">時給(円/h)</label><input type="number" min="0" step="100" value={rate || ''} onChange={e => setRate(Math.max(0, Number(e.target.value) || 0))} disabled={!isAdmin} className="border border-slate-300 rounded px-2 py-1.5 text-sm w-28 disabled:bg-slate-100" placeholder="例 3000" /></div>
+          {isAdmin && <button onClick={() => saveSettings && saveSettings({ laborCostPerHour: Math.max(0, Number(rate) || 0) })} className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold rounded">時給を保存</button>}
+          {!isAdmin && <span className="text-[11px] text-slate-400">時給の設定は管理者のみ</span>}
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div className="bg-teal-50 rounded-lg p-2 text-center"><div className="text-[10px] text-slate-500">検査工数(直接)</div><div className="text-xl font-black text-teal-700">{D.hours.toFixed(1)}<span className="text-xs">h</span></div></div>
+          <div className="bg-teal-50 rounded-lg p-2 text-center"><div className="text-[10px] text-slate-500">概算人件費</div><div className="text-xl font-black text-teal-700">{cost == null ? '時給未設定' : yen(cost)}</div></div>
+          <div className="bg-teal-50 rounded-lg p-2 text-center"><div className="text-[10px] text-slate-500">1台あたり</div><div className="text-xl font-black text-teal-700">{cost == null || D.units === 0 ? '—' : yen(cost / D.units)}</div></div>
+        </div>
+        <div className="text-[10px] text-slate-400 mt-2">※ 工数=当該期間に完了したロットの検査タスク実時間の合計。間接作業・残業割増は含みません（残業/土曜のコストは全体進捗で別途）。</div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
+//  提出前チェック＆全バックアップ — データの欠損/矛盾を自動点検 + 全データをJSON書き出し
+//  すべて読み取り(書き込み無し)。復元(取り込み)はデータ上書きの危険があるため別途・厳重確認で実装。
+// =============================================================================
+// 測定時間表(工程×台数): 異常セルを色分けし、セルtapで「目標で埋める/実時間手入力/そのまま」で人が判断して直す再利用部品。
+//   異常=ヒントであって判定ではない。全体を見て人が決める。onSaveTasks(newTasks) で保存。
+const LotTimeTable = ({ lot, onSaveTasks }) => {
+  const [ti, setTi] = useState(null);
+  const steps = lot.steps || []; const qty = lot.quantity || 1; const tasks = lot.tasks || {};
+  const fmt = (s) => { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  const keyOf = (si, u) => { const st = steps[si]; return st?.lotOnce ? `${st.id}-lot-${u}` : (st?.id ? `${st.id}-${u}` : `${si}-${u}`); };
+  const getT = (si, u) => tasks[keyOf(si, u)] || (steps[si]?.lotOnce ? null : tasks[`${si}-${u}`]);
+  // ロット1回工程の実施回数 (列数)
+  const colsOf = (si) => { const st = steps[si]; if (!st?.lotOnce) return qty; return Math.max(1, Object.keys(tasks).filter(k => k.startsWith(`${st.id}-lot-`)).length); };
+  const anomOf = (t) => { if (!t || t.status !== 'completed') return null; const d = t.duration || 0; if (!d) return 'high'; if (d < 5) return 'mid'; if (d > 14400) return 'high'; if (t.firstStartTime && t.endTime && t.endTime < t.firstStartTime) return 'high'; return null; };
+  const apply = (key, sec) => { const cur = tasks[key] || {}; onSaveTasks({ ...tasks, [key]: { ...cur, status: 'completed', duration: Math.round(sec), startTime: null, endTime: cur.endTime || Date.now(), firstStartTime: cur.firstStartTime || Date.now(), manualTime: true } }); setTi(null); };
+  let anom = 0; steps.forEach((s, si) => { for (let u = 0; u < colsOf(si); u++) if (anomOf(getT(si, u))) anom++; });
+  const tiTotal = ti ? (parseInt(ti.min) || 0) * 60 + (parseInt(ti.sec) || 0) : 0;
+  return (
+    <div className="border border-slate-200 rounded-lg overflow-hidden mb-3">
+      <div className="px-3 py-2 bg-slate-800 text-white text-xs font-bold flex items-center justify-between gap-2"><span className="truncate">{lot.orderNo} ・ {lot.model} ({qty}台)</span>{anom > 0 ? <span className="bg-rose-600 px-1.5 py-0.5 rounded shrink-0">要確認 {anom}</span> : <span className="bg-emerald-600 px-1.5 py-0.5 rounded shrink-0">OK</span>}</div>
+      <div className="overflow-auto max-h-[50vh]">
+        <table className="w-full text-[11px] border-collapse">
+          <thead className="sticky top-0 bg-slate-100"><tr><th className="px-2 py-1 text-left font-bold border-b sticky left-0 bg-slate-100">工程</th><th className="px-1 py-1 text-center border-b">目標</th>{Array.from({ length: qty }, (_, u) => <th key={u} className="px-1 py-1 text-center border-b">#{u + 1}</th>)}</tr></thead>
+          <tbody>
+            {steps.map((s, si) => (
+              <tr key={si} className="border-b border-slate-50">
+                <td className="px-2 py-1 font-bold sticky left-0 bg-white truncate max-w-[9rem]" title={s.title}>{s.title}</td>
+                <td className="px-1 py-1 text-center text-slate-400 font-mono">{s.targetTime || '-'}</td>
+                {Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = s.lotOnce ? `${u + 1}回目` : `#${u + 1}`; return (<td key={u} colSpan={s.lotOnce && colsOf(si) <= 1 ? qty : 1} className="px-0.5 py-0.5 text-center"><button onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`w-full min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`${s.lotOnce ? `📦${cellLabel} ` : ''}${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{s.lotOnce ? `${cellLabel} ` : ''}{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : '·'))}</button></td>); })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {ti && (
+        <div className="fixed inset-0 z-[330] bg-black/50 flex items-center justify-center p-4" onClick={() => setTi(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="bg-indigo-600 text-white p-3 text-center font-bold text-sm">{ti.label} の時間を直す</div>
+            <div className="p-4 space-y-3">
+              <div className="flex items-center justify-center gap-1.5"><input type="number" min="0" value={ti.min} onChange={e => setTi(p => ({ ...p, min: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" /><span className="font-bold text-sm">分</span><input type="number" min="0" max="59" value={ti.sec} onChange={e => setTi(p => ({ ...p, sec: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" /><span className="font-bold text-sm">秒</span></div>
+              <div className="text-center text-xs text-slate-400">= {tiTotal} 秒</div>
+              {ti.targetSec > 0 && <button onClick={() => setTi(p => ({ ...p, min: String(Math.floor(ti.targetSec / 60)), sec: String(ti.targetSec % 60) }))} className="w-full py-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg text-blue-700 font-bold text-xs">目標 {ti.targetSec}秒 を入れる</button>}
+              <div className="flex gap-2"><button onClick={() => setTi(null)} className="flex-1 py-2.5 border rounded-xl font-bold text-slate-600 hover:bg-slate-50">そのまま</button><button disabled={tiTotal <= 0} onClick={() => apply(ti.key, tiTotal)} className={`flex-1 py-2.5 rounded-xl font-bold text-white ${tiTotal > 0 ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-300 cursor-not-allowed'}`}>確定</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], currentUserName = '', onRestore = null }) => {
+  const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
+  const isCompleted = (l) => l.status === 'completed' || l.location === 'completed';
+  const ord = (l) => l.orderNo || l.id;
+
+  const issues = useMemo(() => {
+    const out = [];
+    (lots || []).forEach(l => {
+      const qty = l.quantity || 1; const steps = l.steps || []; let undone = false;
+      steps.forEach((st, si) => {
+        // ロット1回工程: 回数キー(lot-k)を走査。台キーで見ると「完了だが未処理」を誤検知するため必須分岐
+        const isLO = !!st.lotOnce;
+        const loKeys = isLO ? Object.keys(l.tasks || {}).filter(k => k.startsWith(`${st.id}-lot-`)) : null;
+        const loopN = isLO ? Math.max(1, loKeys.length) : qty;
+        for (let u = 0; u < loopN; u++) {
+          const t = isLO ? (l.tasks || {})[`${st.id}-lot-${u}`] : ((l.tasks || {})[`${st.id}-${u}`] || (l.tasks || {})[`${si}-${u}`]);
+          const lbl = isLO ? `${u + 1}回目` : `#${u + 1}`;
+          if (!t) { if (isCompleted(l)) undone = true; continue; }
+          const done = t.status === 'completed' || t.status === 'ng';
+          if (done && (t.duration || 0) === 0) out.push({ sev: 'err', kind: '作業時間が0', lot: l, detail: `${st.title} ${lbl}` });
+          else if (done && t.duration > 0 && t.duration < 5) out.push({ sev: 'warn', kind: '極端に短い時間', lot: l, detail: `${st.title} ${lbl} (${t.duration}秒)` });
+          else if (done && t.duration > 14400) out.push({ sev: 'warn', kind: '極端に長い時間', lot: l, detail: `${st.title} ${lbl} (${(t.duration / 3600).toFixed(1)}h)` });
+          if (t.firstStartTime && t.endTime && toMs(t.endTime) < toMs(t.firstStartTime)) out.push({ sev: 'err', kind: '時刻の逆転', lot: l, detail: `${st.title} ${lbl}` });
+          if (isCompleted(l) && (t.status === 'waiting' || t.status === 'processing' || t.status === 'paused')) undone = true;
+        }
+      });
+      if (isCompleted(l) && undone) out.push({ sev: 'err', kind: '完了だが未処理の工程あり', lot: l, detail: '' });
+      if (!isCompleted(l) && !l.dueDate) out.push({ sev: 'warn', kind: '納期未設定(進行中)', lot: l, detail: '' });
+    });
+    return out;
+  }, [lots]);
+
+  const byKind = useMemo(() => { const m = {}; issues.forEach(i => { const k = m[i.kind] = m[i.kind] || { kind: i.kind, sev: i.sev, n: 0 }; k.n++; }); return Object.values(m).sort((a, b) => b.n - a.n); }, [issues]);
+  const errCount = issues.filter(i => i.sev === 'err').length;
+  const warnCount = issues.filter(i => i.sev === 'warn').length;
+
+  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length };
+  const doBackup = () => {
+    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, lots };
+    const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url;
+    a.download = `バックアップ_製品検査_${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // --- 復元(取り込み) UI ---
+  const fileRef = useRef(null);
+  const [rstPhase, setRstPhase] = useState('idle'); // idle | preview | running | done | error
+  const [rst, setRst] = useState(null);
+  const [rstConfirm, setRstConfirm] = useState('');
+  const [rstChk, setRstChk] = useState(false);
+  const [rstProg, setRstProg] = useState({ done: 0, total: 0 });
+  const [rstMsg, setRstMsg] = useState('');
+  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業' };
+  const curIdSet = (arr) => new Set((arr || []).map(x => x && x.id).filter(Boolean));
+  const diffOf = (cur, bk) => {
+    const cs = curIdSet(cur); let create = 0, over = 0;
+    (bk || []).forEach(x => { if (!x || !x.id) return; if (cs.has(x.id)) over++; else create++; });
+    const bkIds = new Set((bk || []).map(x => x && x.id).filter(Boolean)); let keep = 0; cs.forEach(id => { if (!bkIds.has(id)) keep++; });
+    return { create, over, keep, n: (bk || []).length };
+  };
+  const onPickRestore = async (e) => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    try {
+      const parsed = JSON.parse(await f.text());
+      const app = parsed && parsed.meta && parsed.meta.app;
+      if (app && app !== 'product-inspection') { setRst({ err: `このファイルは「${app}」用のバックアップです。製品検査アプリには取り込めません（データ破損防止のためブロックしました）。`, fileName: f.name }); setRstMsg(''); setRstPhase('error'); return; }
+      if (!parsed || (!Array.isArray(parsed.lots) && !parsed.settings)) { setRst({ err: 'バックアップ形式ではないようです（lots / settings が見つかりません）。', fileName: f.name }); setRstMsg(''); setRstPhase('error'); return; }
+      const diff = { lots: diffOf(lots, parsed.lots), templates: diffOf(templates, parsed.templates), workers: diffOf(workers, parsed.workers), indirectWork: diffOf(indirectWork, parsed.indirectWork) };
+      setRst({ parsed, diff, fileName: f.name, meta: parsed.meta || {} }); setRstConfirm(''); setRstChk(false); setRstMsg(''); setRstPhase('preview');
+    } catch (err) { setRst({ err: 'ファイルの読み込み/解析に失敗しました: ' + (err.message || err), fileName: f.name }); setRstMsg(''); setRstPhase('error'); }
+    finally { if (fileRef.current) fileRef.current.value = ''; }
+  };
+  const doRestore = async () => {
+    if (!rst || !rst.parsed || !onRestore) return;
+    if (rstConfirm.trim() !== '復元' || !rstChk) return;
+    setRstPhase('running'); setRstProg({ done: 0, total: 0 });
+    try {
+      doBackup(); // 復元前に現状を自動バックアップ（ダウンロード）
+      const r = await onRestore(rst.parsed, (done, total) => setRstProg({ done, total }));
+      setRstMsg(`復元が完了しました（${(r && r.total) || ''}件を書き込み）。画面のデータは自動で最新化されます。`); setRstPhase('done');
+    } catch (err) { setRstMsg('復元中にエラーが発生しました: ' + (err.message || err) + '（復元前の自動バックアップは保存済みです）'); setRstPhase('error'); }
+  };
+  const rstReset = () => { setRstPhase('idle'); setRst(null); setRstMsg(''); setRstConfirm(''); setRstChk(false); };
+
+  return (
+    <div className="h-full overflow-auto p-1 space-y-3">
+      {/* 全バックアップ */}
+      <div className="bg-white rounded-xl border border-emerald-200 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <DownloadCloud className="w-5 h-5 text-emerald-600 shrink-0" />
+            <div>
+              <h3 className="font-bold text-slate-800 text-sm">全データ バックアップ（JSON書き出し）</h3>
+              <div className="text-[11px] text-slate-500">検査ロット {counts.lots}件・テンプレ {counts.templates}・作業者 {counts.workers}・間接作業 {counts['間接作業']} ＋設定を1ファイルに保存。提出前/月末の保管に。</div>
+            </div>
+          </div>
+          <button onClick={doBackup} className="px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm bg-emerald-600 hover:bg-emerald-700 text-white"><DownloadCloud className="w-4 h-4" /> JSONで保存</button>
+        </div>
+        <div className="text-[10px] text-slate-400 mt-2">※ 読み取りのみ（現在のデータには一切変更しません）。不良/軽微/気づきの報告はロット内に含まれます。復元(取り込み)は下の「データ復元」から、プレビュー＋確認の上で行えます。</div>
+      </div>
+
+      {/* 復元(取り込み) */}
+      <div className="bg-white rounded-xl border border-amber-200 p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <Upload className="w-5 h-5 text-amber-600 shrink-0" />
+          <h3 className="font-bold text-slate-800 text-sm">データ復元（バックアップから取り込み）</h3>
+        </div>
+        <div className="text-[11px] text-slate-500 mb-3">書き出したJSONを読み込み、<b>ID単位で上書き／追加</b>します。現在あってファイルに無いデータは<b>消しません</b>。実行直前に<b>現状を自動バックアップ</b>（ダウンロード）してから書き込みます。</div>
+
+        {rstPhase === 'idle' && (
+          <div>
+            <input ref={fileRef} type="file" accept=".json,application/json" onChange={onPickRestore} className="hidden" />
+            <button onClick={() => fileRef.current && fileRef.current.click()} className="px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm bg-amber-600 hover:bg-amber-700 text-white"><Upload className="w-4 h-4" /> バックアップJSONを選択…</button>
+          </div>
+        )}
+
+        {rstPhase === 'error' && (
+          <div className="space-y-2">
+            <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2 whitespace-pre-wrap">{(rst && rst.err) || rstMsg}</div>
+            <button onClick={rstReset} className="px-3 py-1.5 rounded text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700">選び直す</button>
+          </div>
+        )}
+
+        {rstPhase === 'preview' && rst && rst.parsed && (
+          <div className="space-y-3">
+            <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded p-2">ファイル: <b>{rst.fileName}</b>{rst.meta && rst.meta.exportedAt ? <> ／ 作成: {new Date(rst.meta.exportedAt).toLocaleString('ja-JP')}</> : null}{rst.meta && rst.meta.by ? <> ／ 担当: {rst.meta.by}</> : null}</div>
+            <div className="overflow-auto border border-slate-100 rounded">
+              <table className="w-full text-xs border-collapse">
+                <thead className="bg-slate-100"><tr><th className="px-2 py-1.5 text-left font-bold border-b">種類</th><th className="px-2 py-1.5 text-right font-bold border-b">ファイル件数</th><th className="px-2 py-1.5 text-right font-bold border-b text-emerald-700">新規追加</th><th className="px-2 py-1.5 text-right font-bold border-b text-blue-700">上書き</th><th className="px-2 py-1.5 text-right font-bold border-b text-slate-400">据え置き</th></tr></thead>
+                <tbody>
+                  {Object.keys(RST_LABELS).map(k => { const d = (rst.diff && rst.diff[k]) || { n: 0, create: 0, over: 0, keep: 0 }; return (
+                    <tr key={k} className="border-b border-slate-50"><td className="px-2 py-1 font-bold">{RST_LABELS[k]}</td><td className="px-2 py-1 text-right">{d.n}</td><td className="px-2 py-1 text-right text-emerald-700 font-bold">+{d.create}</td><td className="px-2 py-1 text-right text-blue-700 font-bold">{d.over}</td><td className="px-2 py-1 text-right text-slate-400">{d.keep}</td></tr>
+                  ); })}
+                  <tr><td className="px-2 py-1 font-bold">設定</td><td className="px-2 py-1 text-slate-500" colSpan={4}>設定を上書き（既存設定は保持）</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">⚠ 「上書き」対象は内容が<b>このファイルの状態に置き換わります</b>。「据え置き」はファイルに無いため変更されません（削除もしません）。実行直前に現状を自動バックアップします。</div>
+            <label className="flex items-center gap-2 text-xs text-slate-700 select-none"><input type="checkbox" checked={rstChk} onChange={e => setRstChk(e.target.checked)} className="w-4 h-4" />現在のデータを上書きすることを理解しました</label>
+            <div className="flex items-center gap-2"><span className="text-xs text-slate-600">確認のため <b className="text-rose-600">復元</b> と入力:</span><input value={rstConfirm} onChange={e => setRstConfirm(e.target.value)} className="border border-slate-300 rounded px-2 py-1 text-xs w-28" placeholder="復元" /></div>
+            <div className="flex items-center gap-2">
+              <button onClick={doRestore} disabled={rstConfirm.trim() !== '復元' || !rstChk} className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm ${rstConfirm.trim() === '復元' && rstChk ? 'bg-rose-600 hover:bg-rose-700 text-white' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}><Upload className="w-4 h-4" /> 復元を実行</button>
+              <button onClick={rstReset} className="px-3 py-1.5 rounded text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700">キャンセル</button>
+            </div>
+          </div>
+        )}
+
+        {rstPhase === 'running' && (
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600 font-bold">復元中… {rstProg.done}/{rstProg.total}</div>
+            <div className="w-full h-2 bg-slate-100 rounded overflow-hidden"><div className="h-full bg-amber-500 transition-all" style={{ width: `${rstProg.total ? Math.round(rstProg.done / rstProg.total * 100) : 0}%` }} /></div>
+            <div className="text-[10px] text-slate-400">画面を閉じたり更新したりしないでください。</div>
+          </div>
+        )}
+
+        {rstPhase === 'done' && (
+          <div className="space-y-2">
+            <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded p-2 whitespace-pre-wrap">✅ {rstMsg}</div>
+            <button onClick={rstReset} className="px-3 py-1.5 rounded text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700">閉じる</button>
+          </div>
+        )}
+      </div>
+
+      {/* 提出前チェック */}
+      <div className="bg-white rounded-xl border border-slate-200 p-4">
+        <div className="flex items-center gap-2 mb-2">
+          <ClipboardCheck className="w-5 h-5 text-blue-600" />
+          <h3 className="font-bold text-slate-800 text-sm">提出前データ点検</h3>
+          {errCount === 0 && warnCount === 0
+            ? <span className="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded">問題なし 👍</span>
+            : <span className="text-xs font-bold"><span className="text-rose-600">重大 {errCount}</span> <span className="text-amber-600">／ 注意 {warnCount}</span></span>}
+        </div>
+        {byKind.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-3">
+            {byKind.map(k => <span key={k.kind} className={`text-[11px] px-2 py-1 rounded-full font-bold ${k.sev === 'err' ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>{k.kind}: {k.n}件</span>)}
+          </div>
+        )}
+        <div className="overflow-auto max-h-[40vh] border border-slate-100 rounded">
+          <table className="w-full text-xs border-collapse">
+            <thead className="sticky top-0 bg-slate-100"><tr><th className="px-2 py-1.5 text-left font-bold border-b">区分</th><th className="px-2 py-1.5 text-left font-bold border-b">指図No</th><th className="px-2 py-1.5 text-left font-bold border-b">型式</th><th className="px-2 py-1.5 text-left font-bold border-b">内容</th></tr></thead>
+            <tbody>
+              {issues.slice(0, 200).map((i, idx) => (
+                <tr key={idx} className="border-b border-slate-50">
+                  <td className="px-2 py-1 whitespace-nowrap"><span className={`font-bold ${i.sev === 'err' ? 'text-rose-600' : 'text-amber-600'}`}>{i.sev === 'err' ? '重大' : '注意'}</span> {i.kind}</td>
+                  <td className="px-2 py-1 font-mono whitespace-nowrap">{ord(i.lot)}</td>
+                  <td className="px-2 py-1 whitespace-nowrap">{i.lot.model}</td>
+                  <td className="px-2 py-1 text-slate-500">{i.detail}</td>
+                </tr>
+              ))}
+              {issues.length === 0 && <tr><td colSpan={4} className="px-2 py-8 text-center text-emerald-600">点検OK：欠損・矛盾は見つかりませんでした 👍</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <div className="text-[10px] text-slate-400 mt-2">※ 点検は読み取りのみ。「重大」は提出前に修正推奨（作業時間0・時刻逆転・完了漏れ）。詳細修正はヘッダーの「要確認」(異常値検出)からも行えます。{issues.length > 200 ? '（先頭200件表示）' : ''}</div>
+      </div>
+    </div>
+  );
+};
+
+const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [], onRestore = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('defects'); // 工程改善分析は「作業最適化」タブへ移動したため既定を不具合分析に
   const [selectedModel, setSelectedModel] = useState('all');
@@ -11363,6 +13694,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
             const unitTotals = {};
             Object.entries(lot.tasks).forEach(([key, task]) => {
                 if (task.status === 'completed') {
+                    if (key.includes('-lot-')) return; // ロット1回工程は台単位の分布に混ぜない (幻のunit'lot'防止)
                     const [_, uIdx] = key.split('-');
                     unitTotals[uIdx] = (unitTotals[uIdx] || 0) + task.duration;
                 }
@@ -11375,8 +13707,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
             unitTimes = Array(totalQty).fill(avgTime);
         }
 
-        // Add to stats
-        const target = calculateLotEstimatedTime(lot) / totalQty; // Target per unit
+        // Add to stats (実績側で lot-once を除外しているため、目標も lotOnce 分を除いて1台あたりに揃える)
+        const lotOnceTargetSec = (lot.steps || []).reduce((s, st) => s + (st?.lotOnce ? getEffectiveTargetTime(st, lot.model, null) : 0), 0);
+        const target = (calculateLotEstimatedTime(lot) - lotOnceTargetSec) / totalQty; // Target per unit
         
         if (target > 0) {
             modelStats[lot.model].target = target;
@@ -11470,13 +13803,14 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       if (lotDefects.length > 0) {
         defectLotCount++;
         lotDefects.forEach(d => {
-          defects.push({ ...d, lot });
+          // workerName が ID(過去データ)でも名前に解決して表示・集計する
+          const wname = (workers.find(x => x.id === d.workerName)?.name) || d.workerName || '不明';
+          defects.push({ ...d, lot, workerName: wname });
           const m = lot.model || '不明';
           modelCounts[m] = (modelCounts[m] || 0) + 1;
           const st = d.stepInfo ? d.stepInfo.title : '全体';
           stepCounts[st] = (stepCounts[st] || 0) + 1;
-          const w = d.workerName || '不明';
-          workerCounts[w] = (workerCounts[w] || 0) + 1;
+          workerCounts[wname] = (workerCounts[wname] || 0) + 1;
           const cp = d.causeProcess || '未指定';
           processCounts[cp] = (processCounts[cp] || 0) + 1;
           if (d.timestamp) {
@@ -11503,7 +13837,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     const diff = defects.length - prevCount;
     const diffRate = prevCount > 0 ? ((diff / prevCount) * 100) : (defects.length > 0 ? 100 : 0);
     return { totalCompletedLots, defectLotCount, totalDefects: defects.length, defectRate, defects: defects.sort((a, b) => b.timestamp - a.timestamp), models: sortObj(modelCounts), steps: sortObj(stepCounts), workers: sortObj(workerCounts), processes: sortObj(processCounts), trendMonths, prevCount, diff, diffRate };
-  }, [lots, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
+  }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
   const complaintStats = useMemo(() => {
     const complaints = [];
@@ -11521,13 +13855,13 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       const lotComplaints = (lot.interruptions || []).filter(i => i.type === 'complaint');
       lotComplaints.forEach(c => {
         if (isInDefectPeriod(c.timestamp)) {
-          complaints.push({ ...c, lot });
+          const wname = (workers.find(x => x.id === c.workerName)?.name) || c.workerName || '不明';
+          complaints.push({ ...c, lot, workerName: wname });
           const mainLabel = (c.label || '').split(' : ')[0] || 'その他';
           labelCounts[mainLabel] = (labelCounts[mainLabel] || 0) + 1;
           const st = c.stepInfo ? c.stepInfo.title : '全体';
           stepCounts[st] = (stepCounts[st] || 0) + 1;
-          const w = c.workerName || '不明';
-          workerCounts[w] = (workerCounts[w] || 0) + 1;
+          workerCounts[wname] = (workerCounts[wname] || 0) + 1;
           const m = lot.model || '不明';
           modelCounts[m] = (modelCounts[m] || 0) + 1;
           if (c.timestamp) {
@@ -11578,7 +13912,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       diff,
       diffRate,
     };
-  }, [lots, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
+  }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
   const defectFilterLabel = defectFilterMode === 'month' ? defectFilterMonth : `${defectFilterStart} ~ ${defectFilterEnd}`;
   const defectFilterSuffix = defectFilterMode === 'month' ? defectFilterMonth : `${defectFilterStart}_${defectFilterEnd}`;
@@ -11677,7 +14011,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
        {editModal.isOpen && (
          <div className="fixed inset-0 z-[70] bg-black/50 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setEditModal({ isOpen: false, type: null, data: null, lotId: null })}>
            <div className="bg-white rounded-xl p-6 w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-             <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-blue-600"><Pencil className="w-5 h-5" /> {editModal.type === 'defect' ? '不具合報告の編集' : '気づきの編集'}</h3>
+             <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-blue-600"><Pencil className="w-5 h-5" /> {editModal.type === 'defect' ? '不具合報告の編集' : '軽微不良の編集'}</h3>
              {editModal.type === 'defect' && defectProcessOptions.length > 0 && (
                <div className="mb-4"><div className="text-sm font-bold text-slate-700 mb-2">原因工程</div><div className="flex flex-wrap gap-2">
                  {defectProcessOptions.map(opt => (<button key={opt} onClick={() => setEditCauseProcess(editCauseProcess === opt ? '' : opt)} className={`px-3 py-1.5 rounded-full text-sm font-bold border transition-colors ${editCauseProcess === opt ? 'bg-rose-600 text-white border-rose-600' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-rose-50'}`}>{opt}</button>))}
@@ -11708,21 +14042,33 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
             {/* タイトルは activeMode に応じて切り替え (旧「生産性分析」固定は削除) */}
             <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
               {activeMode === 'process' && (<><TrendingUp className="w-6 h-6 text-blue-600"/> 工程改善分析</>)}
+              {activeMode === 'dashboard' && (<><Activity className="w-6 h-6 text-blue-600"/> 管理者ダッシュボード</>)}
+              {activeMode === 'kpi' && (<><TrendingUp className="w-6 h-6 text-indigo-600"/> 経営分析（KPI詳細）</>)}
+              {activeMode === 'achievement' && (<><Target className="w-6 h-6 text-emerald-600"/> 達成率分析</>)}
+              {activeMode === 'audit' && (<><ClipboardCheck className="w-6 h-6 text-emerald-600"/> 提出前チェック・バックアップ</>)}
               {activeMode === 'defects' && (<><AlertTriangle className="w-6 h-6 text-rose-600"/> 不具合分析</>)}
-              {activeMode === 'complaints' && (<><Megaphone className="w-6 h-6 text-purple-600"/> 気づき・改善提案</>)}
+              {activeMode === 'complaints' && (<><Megaphone className="w-6 h-6 text-purple-600"/> 軽微不良・改善提案</>)}
               {activeMode === 'direct-indirect' && (<><Activity className="w-6 h-6 text-teal-600"/> 直間分析</>)}
               {activeMode === 'worker-eval' && (<><Users className="w-6 h-6 text-amber-600"/> 作業者評価</>)}
               {activeMode === 'improvement' && (<><Zap className="w-6 h-6 text-indigo-600"/> 改善ヒント</>)}
+              {activeMode === 'monthly' && (<><FileText className="w-6 h-6 text-slate-700"/> 月次レポート</>)}
             </h2>
             <div className="flex items-center gap-3">
               <div className="flex bg-slate-200 p-1 rounded-lg">
                  {/* 工程改善分析(目標時間最適化)は「作業最適化」タブに移動 */}
+                 <button onClick={()=>setActiveMode('dashboard')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='dashboard' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> ダッシュボード</button>
+                 <button onClick={()=>setActiveMode('kpi')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='kpi' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><TrendingUp className="w-4 h-4"/> 経営分析</button>
+                 <button onClick={()=>setActiveMode('achievement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='achievement' ? 'bg-white shadow text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}><Target className="w-4 h-4"/> 達成率</button>
+                 <button onClick={()=>setActiveMode('audit')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='audit' ? 'bg-white shadow text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}><ClipboardCheck className="w-4 h-4"/> 点検・バックアップ</button>
                  <button onClick={()=>setActiveMode('defects')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='defects' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><AlertTriangle className="w-4 h-4"/> 不具合分析</button>
-                 <button onClick={()=>setActiveMode('complaints')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='complaints' ? 'bg-white shadow text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}><Megaphone className="w-4 h-4"/> 気づき・改善提案</button>
+                 <button onClick={()=>setActiveMode('complaints')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='complaints' ? 'bg-white shadow text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}><Megaphone className="w-4 h-4"/> 軽微不良・改善提案</button>
                  <button onClick={()=>setActiveMode('direct-indirect')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='direct-indirect' ? 'bg-white shadow text-teal-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> 直間分析</button>
                  {currentUserName === '管理者' && <button onClick={()=>setActiveMode('worker-eval')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='worker-eval' ? 'bg-white shadow text-amber-600' : 'text-slate-500 hover:text-slate-700'}`}><Users className="w-4 h-4"/> 作業者評価</button>}
                  <button onClick={()=>setActiveMode('improvement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='improvement' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Zap className="w-4 h-4"/> 改善ヒント</button>
+                 <button onClick={()=>setActiveMode('monthly')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='monthly' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}><FileText className="w-4 h-4"/> 月次レポート</button>
+                 <button onClick={()=>setActiveMode('export')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='export' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><DownloadCloud className="w-4 h-4"/> データ書き出し</button>
               </div>
+              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
                 {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
                 <button onClick={async ()=>{
@@ -11754,7 +14100,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                     sm.addRow([]); sm.addRow(['作業者別','件数']); defectStats.workers.forEach(x => sm.addRow([x.name, x.count]));
                     sm.addRow([]); sm.addRow(['原因工程別','件数']); defectStats.processes.forEach(x => sm.addRow([x.name, x.count]));
                   } else if (activeMode === 'complaints') {
-                    const ws = wb.addWorksheet('気づき明細');
+                    const ws = wb.addWorksheet('軽微不良明細');
                     ws.addRow(['日時','型式','指図番号','工程','カテゴリ/内容','作業者','備考']);
                     complaintStats.complaints.forEach(c => {
                       const dt = c.timestamp ? new Date(c.timestamp).toLocaleString('ja-JP') : '-';
@@ -11765,7 +14111,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                     });
                     styleHeader(ws.getRow(1));
                     ws.columns.forEach(c => c.width = 18);
-                    const sm = wb.addWorksheet('気づきサマリー');
+                    const sm = wb.addWorksheet('軽微不良サマリー');
                     sm.addRow(['カテゴリ','件数']); complaintStats.labels.forEach(x => sm.addRow([x.name, x.count]));
                     sm.addRow([]); sm.addRow(['工程別','件数']); complaintStats.steps.forEach(x => sm.addRow([x.name, x.count]));
                     sm.addRow([]); sm.addRow(['作業者別','件数']); complaintStats.workers.forEach(x => sm.addRow([x.name, x.count]));
@@ -11825,7 +14171,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                     const summary = (arr, title) => arr.length ? `<h2>${title}</h2><table><thead><tr><th>${title}</th><th style="text-align:right">件数</th></tr></thead><tbody>${arr.map(x => `<tr><td>${esc(x.name)}</td><td style="text-align:right">${x.count}</td></tr>`).join('')}</tbody></table>` : '';
                     body = `<h2>サマリー</h2><div class="kpi-grid"><div class="kpi"><div class="kpi-val" style="color:#3b82f6">${defectStats.totalCompletedLots}</div><div class="kpi-label">完了ロット数</div></div><div class="kpi"><div class="kpi-val" style="color:#dc2626">${defectStats.defectLotCount}</div><div class="kpi-label">不具合ロット</div></div><div class="kpi"><div class="kpi-val" style="color:#dc2626">${defectStats.defectRate}%</div><div class="kpi-label">不具合率</div></div><div class="kpi"><div class="kpi-val" style="color:#dc2626">${defectStats.totalDefects}</div><div class="kpi-label">総件数</div></div></div>${summary(defectStats.models,'型式別')}${summary(defectStats.steps,'工程別')}${summary(defectStats.workers,'作業者別')}${summary(defectStats.processes,'原因工程別')}<h2>明細</h2><table><thead><tr><th>日時</th><th>型式</th><th>指図</th><th>工程</th><th>内容</th><th>原因工程</th><th>作業者</th></tr></thead><tbody>${dRows || '<tr><td colspan="7" style="text-align:center;color:#94a3b8">データなし</td></tr>'}</tbody></table>`;
                   } else if (activeMode === 'complaints') {
-                    title = '気づき・改善提案';
+                    title = '軽微不良・改善提案';
                     const cRows = complaintStats.complaints.map(c => {
                       const parts = (c.label || '').split(' : ');
                       return `<tr><td>${c.timestamp ? new Date(c.timestamp).toLocaleString('ja-JP') : '-'}</td><td>${esc(c.lot?.model)}</td><td>${esc(c.lot?.orderNo)}</td><td>${esc(c.stepInfo?.title || '全体')}</td><td>${esc(parts[0])}</td><td>${esc(parts.slice(1).join(' : '))}</td><td>${esc(c.workerName)}</td></tr>`;
@@ -11851,6 +14197,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                   setTimeout(() => pw.print(), 500);
                 }} className="px-3 py-1.5 text-xs font-bold bg-rose-600 text-white hover:bg-rose-700 flex items-center gap-1"><Printer className="w-3 h-3"/> PDF</button>
               </div>
+              )}
             </div>
           </div>
           {/* 共通フィルタ UI: 月単位 / 期間指定 (全タブ共有)。
@@ -12230,7 +14577,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                            <td className="p-3 text-center">
                              <div className="flex items-center justify-center gap-1">
                                <button onClick={() => triggerEditInterruption(d, d.lot.id, 'complaint')} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded" title="編集"><Pencil className="w-4 h-4" /></button>
-                               <button onClick={() => triggerDeleteInterruption(d.id, d.lot.id, '気づき')} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded" title="削除"><Trash2 className="w-4 h-4" /></button>
+                               <button onClick={() => triggerDeleteInterruption(d.id, d.lot.id, '軽微不良')} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded" title="削除"><Trash2 className="w-4 h-4" /></button>
                              </div>
                            </td>
                          </tr>
@@ -12360,11 +14707,13 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                (lot.steps || []).forEach((step, sIdx) => {
                  const sk = `${lot.model}-${step.title}`;
                  if (!stepGlobalTimes[sk]) stepGlobalTimes[sk] = { times: [], targetTime: step.targetTime || 0 };
-                 for (let u = 0; u < (lot.quantity || 1); u++) {
-                   const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`];
+                 const tListG = step.lotOnce
+                   ? lotOnceKeysOf(tasks, step).map(k => tasks[k])
+                   : Array.from({ length: lot.quantity || 1 }, (_, u) => tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`]);
+                 tListG.forEach(t => {
                    const dur = t?.duration;
                    if (dur && dur > 0) stepGlobalTimes[sk].times.push(dur);
-                 }
+                 });
                });
              });
              const stepGlobalMin = {};
@@ -12386,18 +14735,20 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                const qty = lot.quantity || 1;
                steps.forEach((step, sIdx) => {
                  const auto = isAutoStep(step);
-                 for (let u = 0; u < qty; u++) {
-                   const t = tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`];
-                   if (!t || !t.startTime || !t.duration) continue;
+                 const tListI = step.lotOnce
+                   ? lotOnceKeysOf(tasks, step).map(k => tasks[k])
+                   : Array.from({ length: qty }, (_, u) => tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`]);
+                 tListI.forEach(t => {
+                   if (!t || !t.startTime || !t.duration) return;
                    // 作業者ID: task.workerName 優先 → lot.workerId
                    const taskWid = t.workerName ? (workers.find(w => w.name === t.workerName)?.id) : null;
                    const wid = taskWid || lot.workerId;
-                   if (!wid) continue;
+                   if (!wid) return;
                    const interval = { s: t.startTime, e: t.startTime + t.duration * 1000, lot: lot.orderNo, step: step.title };
                    const bucket = ensureBucket(wid);
                    if (auto) bucket.auto.push(interval);
                    else bucket.manual.push(interval);
-                 }
+                 });
                });
                // monitoring interruption も auto レンジに含める
                (lot.interruptions || []).filter(i => i.type === 'monitoring' && i.startTime).forEach(i => {
@@ -12426,9 +14777,11 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  steps.forEach((step, sIdx) => {
                    const stepKey = `${lot.model}-${step.title}`;
                    if (!stepTimes[stepKey]) stepTimes[stepKey] = [];
-                   for (let uIdx = 0; uIdx < qty; uIdx++) {
-                     const task = getTask(step, sIdx, uIdx);
-                     if (!task) continue;
+                   const tListE = step.lotOnce
+                     ? lotOnceKeysOf(tasks, step).map(k => tasks[k])
+                     : Array.from({ length: qty }, (_, uIdx) => getTask(step, sIdx, uIdx));
+                   tListE.forEach(task => {
+                     if (!task) return;
                      totalTasks++;
                      if (task.status === 'completed' || task.status === 'ng') completedTasks++;
                      const dur = task.duration || 0;
@@ -12442,7 +14795,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                        ngCount += 1;
                        reworkTime += (task.reworks || []).reduce((a, r) => a + (r.duration || 0), 0);
                      }
-                   }
+                   });
                  });
                });
 
@@ -12674,14 +15027,17 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                    };
                  }
                  const s = stepStats[stepKey];
-                 for (let u = 0; u < (lot.quantity || 1); u++) {
-                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
-                   if (!t) continue;
+                 // ロット1回工程は回数キー(lot-k)、通常工程は台数キー
+                 const tListR = step.lotOnce
+                   ? lotOnceKeysOf(lot.tasks || {}, step).map(k => lot.tasks?.[k])
+                   : Array.from({ length: lot.quantity || 1 }, (_, u) => lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`]);
+                 tListR.forEach(t => {
+                   if (!t) return;
                    s.totalAppearances++;
                    if (t.status === 'skipped') s.skippedCount++;
                    else if (t.status === 'ng') s.ngCount++;
                    else if (t.status === 'completed') { s.completedCount++; if (t.duration > 0) s.completedDurations.push(t.duration); }
-                 }
+                 });
                });
              });
              // ランキング: 削除スコア = 該当なし率(*100) - 不良率(*50). NG多い工程は削除しない方がいい。
@@ -12709,12 +15065,14 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                (lot.steps || []).forEach((step, sIdx) => {
                  const title = step.title || `step-${sIdx}`;
                  if (!stepWorkerTimes[title]) stepWorkerTimes[title] = { isAuto: isAutoStep(step), byWorker: {} };
-                 for (let u = 0; u < (lot.quantity || 1); u++) {
-                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
-                   if (!t || t.status !== 'completed' || !t.duration) continue;
+                 const tListW = step.lotOnce
+                   ? lotOnceKeysOf(lot.tasks || {}, step).map(k => lot.tasks?.[k])
+                   : Array.from({ length: lot.quantity || 1 }, (_, u) => lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`]);
+                 tListW.forEach(t => {
+                   if (!t || t.status !== 'completed' || !t.duration) return;
                    if (!stepWorkerTimes[title].byWorker[lot.workerId]) stepWorkerTimes[title].byWorker[lot.workerId] = [];
                    stepWorkerTimes[title].byWorker[lot.workerId].push(t.duration);
-                 }
+                 });
                });
              });
              // スキル差ランキング: max/min 比率が大きい工程 = 教育機会大
@@ -12743,7 +15101,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  if (!t.firstStartTime || !t.endTime) return;
                  const parts = k.split('-');
                  const unitIdxStr = parts.pop();
-                 const stepIdOrIdx = parts.join('-');
+                 let stepIdOrIdx = parts.join('-');
+                 // ロット1回キー `${id}-lot-${k}` は pop 後 `${id}-lot` になるため正規化
+                 if (stepIdOrIdx.endsWith('-lot')) stepIdOrIdx = stepIdOrIdx.slice(0, -4);
                  const step = stepById.get(stepIdOrIdx) || (lot.steps || [])[parseInt(stepIdOrIdx)];
                  if (!step) return;
                  taskEvents.push({ stepTitle: step.title, isAuto: isAutoStep(step), start: t.firstStartTime, end: t.endTime });
@@ -12774,13 +15134,15 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                (lot.steps || []).forEach((step, sIdx) => {
                  if (isAutoStep(step)) return; // 手動のみ (自動は機械時間なのでスキル無関係)
                  const title = step.title;
-                 for (let u = 0; u < (lot.quantity || 1); u++) {
-                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
-                   if (!t || t.status !== 'completed' || !t.duration) continue;
+                 const tListS = step.lotOnce
+                   ? lotOnceKeysOf(lot.tasks || {}, step).map(k => lot.tasks?.[k])
+                   : Array.from({ length: lot.quantity || 1 }, (_, u) => lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`]);
+                 tListS.forEach(t => {
+                   if (!t || t.status !== 'completed' || !t.duration) return;
                    if (!stepWorkerSamples[title]) stepWorkerSamples[title] = {};
                    if (!stepWorkerSamples[title][lot.workerId]) stepWorkerSamples[title][lot.workerId] = [];
                    stepWorkerSamples[title][lot.workerId].push(t.duration);
-                 }
+                 });
                });
              });
              const medianOf = (arr) => { if (!arr.length) return 0; const s = [...arr].sort((a,b)=>a-b); return s[Math.floor(s.length/2)]; };
@@ -12811,13 +15173,15 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
              completedLots.forEach(lot => {
                (lot.steps || []).forEach((step, sIdx) => {
                  const title = step.title;
-                 for (let u = 0; u < (lot.quantity || 1); u++) {
-                   const t = lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`];
-                   if (!t || t.status !== 'completed' || !t.duration) continue;
+                 const tListB = step.lotOnce
+                   ? lotOnceKeysOf(lot.tasks || {}, step).map(k => lot.tasks?.[k])
+                   : Array.from({ length: lot.quantity || 1 }, (_, u) => lot.tasks?.[`${step.id}-${u}`] || lot.tasks?.[`${sIdx}-${u}`]);
+                 tListB.forEach(t => {
+                   if (!t || t.status !== 'completed' || !t.duration) return;
                    if (!bottleneckMap[title]) bottleneckMap[title] = { title, isAuto: isAutoStep(step), durations: [], count: 0 };
                    bottleneckMap[title].durations.push(t.duration);
                    bottleneckMap[title].count++;
-                 }
+                 });
                });
              });
              const bottlenecks = Object.values(bottleneckMap).map(b => {
@@ -13088,6 +15452,13 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                </div>
              );
            })()}
+
+           {activeMode === 'monthly' && <MonthlyReportView lots={lots} workers={workers} settings={settings} customTargetTimes={settings.customTargetTimes || {}} targetTimeHistory={settings.targetTimeHistory || []} currentUserName={currentUserName} templates={templates} indirectWork={indirectWork} onSaveSettings={saveSettings} />}
+           {activeMode === 'export' && <DataExportCenter lots={lots} workers={workers} indirectWork={indirectWork} settings={settings} currentUserName={currentUserName} saveSettings={saveSettings} />}
+           {activeMode === 'dashboard' && <ManagerDashboard lots={lots} settings={settings} />}
+           {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
+           {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
+           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} currentUserName={currentUserName} onRestore={onRestore} />}
         </div>
      </div>
    );
@@ -13162,10 +15533,10 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
          if (lot.interruptions && lot.interruptions.length > 0) {
              lot.interruptions.filter(i => i.type !== 'break').forEach(i => {
                  const labelText = i.type === 'monitoring' ? `監視: ${i.label}`
-                   : i.type === 'complaint' ? `気づき: ${i.label}`
+                   : i.type === 'complaint' ? `軽微不良: ${i.label}`
                    : `不具合対応: ${i.label}`;
                  const categoryText = i.type === 'monitoring' ? '監視作業'
-                   : i.type === 'complaint' ? '気づき報告'
+                   : i.type === 'complaint' ? '軽微不良報告'
                    : '不具合対応';
                  rows.push([
                      lot.id,
@@ -13241,9 +15612,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                     lot.id, '全体', lot.model, lot.orderNo, lot.quantity, lot.status, zoneName,
                     workers.find(w => w.id === lot.workerId)?.name || '未割当',
                     lot.entryAt ? formatDateSafe(lot.entryAt) : '-', workStartTimeStr, formatDateSafe(lot.updatedAt),
-                    i.type === 'monitoring' ? `監視: ${i.label}` : i.type === 'complaint' ? `気づき: ${i.label}` : `不具合対応: ${i.label}`,
+                    i.type === 'monitoring' ? `監視: ${i.label}` : i.type === 'complaint' ? `軽微不良: ${i.label}` : `不具合対応: ${i.label}`,
                     '0', i.duration, '-',
-                    i.type === 'monitoring' ? '監視作業' : i.type === 'complaint' ? '気づき報告' : '不具合対応'
+                    i.type === 'monitoring' ? '監視作業' : i.type === 'complaint' ? '軽微不良報告' : '不具合対応'
                 ]);
             });
         }
@@ -14429,10 +16800,10 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
            </div>
          </div>
 
-         {/* 気づき・改善提案の報告オプション */}
+         {/* 軽微不良・改善提案の報告オプション */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-           <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Megaphone className="w-5 h-5 text-purple-500" /> 気づき・改善提案の選択肢マスタ</h3>
-           <p className="text-xs text-slate-500 mb-3">作業中に気づきや改善提案を報告する際のカテゴリを設定します。(1行1項目)</p>
+           <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Megaphone className="w-5 h-5 text-purple-500" /> 軽微不良・改善提案の選択肢マスタ</h3>
+           <p className="text-xs text-slate-500 mb-3">作業中に軽微不良や改善提案を報告する際のカテゴリを設定します。(1行1項目)</p>
            <textarea
              value={complaintOptionsText}
              onChange={e => setComplaintOptionsText(e.target.value)}
@@ -14496,6 +16867,125 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
              <span className="text-sm text-slate-500">秒</span>
            </div>
            <p className="text-xs text-slate-400 mt-2">ボタン押し間違い時に、この秒数以内であれば取り消しが可能です</p>
+         </div>
+
+         {/* 目標時間オーバー警告設定 (カスタム作業画面の点滅・音) */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><Target className="w-5 h-5 text-rose-600" /> 目標時間オーバー警告（カスタム作業画面）</h3>
+           <p className="text-xs text-slate-400 mb-4">作業中のタスクが目標時間に近づいた/超えた時の、ボタン点滅・画面全体の警告・通知音を調整します。警告は「その作業をしている本人」にだけ出ます。</p>
+           {(() => {
+             const oa = { enabled: true, warnPct: 80, overPct: 100, screenEffect: true, sound: 'warn', warnColor: '#F59E0B', overColor: '#E11D48', warnBlink: 'none', overBlink: 'slow', ...(settings.overrunAlert || {}) };
+             const setOA = (patch) => saveSettings({ overrunAlert: { ...oa, ...patch } });
+             const SWATCHES = [['黄', '#F59E0B'], ['オレンジ', '#EA580C'], ['赤', '#E11D48'], ['紫', '#9333EA'], ['青', '#2563EB']];
+             const BLINKS = [['none', '点滅しない'], ['slow', 'ゆっくり点滅'], ['fast', 'はやく点滅']];
+             return (
+               <div className="space-y-4">
+                 <label className="flex items-center gap-3 cursor-pointer">
+                   <input type="checkbox" checked={oa.enabled} onChange={e => setOA({ enabled: e.target.checked })} className="w-5 h-5 accent-rose-600" />
+                   <span className="text-sm font-bold text-slate-700">警告を有効にする</span>
+                   <span className="text-xs text-slate-400">OFFにしても目標時間の表示（🎯）は残ります</span>
+                 </label>
+                 <div className={`space-y-4 ${oa.enabled ? '' : 'opacity-40 pointer-events-none'}`}>
+                   <div className="flex items-center gap-3 flex-wrap">
+                     <span className="text-sm font-bold text-slate-700 w-44">警告を始めるタイミング</span>
+                     <div className="flex items-center gap-1">
+                       <span className="text-xs text-slate-500">目標の</span>
+                       <input type="number" min={10} max={295} step={5} value={oa.warnPct} onChange={e => setOA({ warnPct: Math.max(10, Math.min(295, parseInt(e.target.value) || 80)) })} className="w-20 border rounded p-2 text-sm text-center font-mono" />
+                       <span className="text-xs text-slate-500">% に達したら</span>
+                     </div>
+                     <span className="text-xs text-slate-400">警告色（リング）で知らせ始める</span>
+                   </div>
+                   <div className="flex items-center gap-3 flex-wrap">
+                     <span className="text-sm font-bold text-slate-700 w-44">超過とみなすタイミング</span>
+                     <div className="flex items-center gap-1">
+                       <span className="text-xs text-slate-500">目標の</span>
+                       <input type="number" min={50} max={300} step={5} value={oa.overPct} onChange={e => setOA({ overPct: Math.max(50, Math.min(300, parseInt(e.target.value) || 100)) })} className="w-20 border rounded p-2 text-sm text-center font-mono" />
+                       <span className="text-xs text-slate-500">% に達したら</span>
+                     </div>
+                     <span className="text-xs text-slate-400">100=目標ちょうど。110なら1割超えてから超過扱い{oa.warnPct >= oa.overPct ? ' ⚠ 警告%は超過%より小さく' : ''}</span>
+                   </div>
+                   {/* 警告と超過の色・点滅をそれぞれ設定 */}
+                   {[['warn', '警告', 'warnColor', 'warnBlink'], ['over', '超過', 'overColor', 'overBlink']].map(([kind, label, colorKey, blinkKey]) => (
+                     <div key={kind} className="flex items-center gap-3 flex-wrap">
+                       <span className="text-sm font-bold text-slate-700 w-44">{label}の色・点滅</span>
+                       <div className="flex items-center gap-1">
+                         {SWATCHES.map(([nm, hex]) => (
+                           <button key={hex} onClick={() => setOA({ [colorKey]: hex })} title={nm}
+                             className={`w-7 h-7 rounded-full border-2 ${oa[colorKey] === hex ? 'border-slate-700 ring-2 ring-slate-300' : 'border-white shadow'}`}
+                             style={{ backgroundColor: hex }} />
+                         ))}
+                         <input type="color" value={oa[colorKey]} onChange={e => setOA({ [colorKey]: e.target.value })} className="w-9 h-7 border rounded cursor-pointer" title="自由な色を選ぶ" />
+                       </div>
+                       <select value={oa[blinkKey]} onChange={e => setOA({ [blinkKey]: e.target.value })} className="border rounded p-2 text-sm">
+                         {BLINKS.map(([v, lb]) => <option key={v} value={v}>{lb}</option>)}
+                       </select>
+                       <span className={`px-3 py-1.5 rounded text-xs font-bold text-white ${oaBlinkCls(oa[blinkKey])}`} style={{ backgroundColor: oa[colorKey] }}>プレビュー</span>
+                     </div>
+                   ))}
+                   {/* 画面外枠ゲージ (円形ゲージの画面全体版) の詳細設定 */}
+                   <div className="border border-emerald-200 rounded-lg p-3 space-y-3 bg-emerald-50/30">
+                     <label className="flex items-center gap-3 cursor-pointer">
+                       <input type="checkbox" checked={oa.gaugeEnabled !== false} onChange={e => setOA({ gaugeEnabled: e.target.checked })} className="w-5 h-5 accent-emerald-600" />
+                       <span className="text-sm font-bold text-slate-700">画面外枠ゲージを表示</span>
+                       <span className="text-xs text-slate-400">画面のフチに経過時間が時計回りに塗られていく。超過で超過色の帯が回り続ける</span>
+                     </label>
+                     <div className={`space-y-2.5 pl-8 ${oa.gaugeEnabled !== false ? '' : 'opacity-40 pointer-events-none'}`}>
+                       <div className="flex items-center gap-3 flex-wrap">
+                         <span className="text-xs font-bold text-slate-600 w-32">太さ</span>
+                         <input type="range" min="8" max="60" step="4" value={oa.gaugeWidth ?? 24} onChange={e => setOA({ gaugeWidth: Number(e.target.value) })} className="w-32 accent-emerald-600" />
+                         <span className="text-xs font-mono w-28">{oa.gaugeWidth ?? 24}（画面内 約{Math.round((oa.gaugeWidth ?? 24) / 2)}px）</span>
+                       </div>
+                       <div className="flex items-center gap-3 flex-wrap">
+                         <span className="text-xs font-bold text-slate-600 w-32">進行中の色</span>
+                         <div className="flex items-center gap-1">
+                           {[['緑', '#10B981'], ['青', '#2563EB'], ['シアン', '#06B6D4'], ['紫', '#9333EA']].map(([nm, hex]) => (
+                             <button key={hex} onClick={() => setOA({ gaugeColor: hex })} title={nm}
+                               className={`w-6 h-6 rounded-full border-2 ${(oa.gaugeColor || '#10B981') === hex ? 'border-slate-700 ring-2 ring-slate-300' : 'border-white shadow'}`}
+                               style={{ backgroundColor: hex }} />
+                           ))}
+                           <input type="color" value={oa.gaugeColor || '#10B981'} onChange={e => setOA({ gaugeColor: e.target.value })} className="w-8 h-6 border rounded cursor-pointer" title="自由な色" />
+                         </div>
+                         <span className="text-[10px] text-slate-400">警告・超過になったら上で設定した警告色／超過色に変わります</span>
+                       </div>
+                       <label className="flex items-center gap-2 cursor-pointer">
+                         <span className="text-xs font-bold text-slate-600 w-32">うっすら下地</span>
+                         <input type="checkbox" checked={oa.gaugeTrack !== false} onChange={e => setOA({ gaugeTrack: e.target.checked })} className="w-4 h-4 accent-emerald-600" />
+                         <span className="text-[10px] text-slate-400">枠の全周を薄く表示して「どこまで塗られるか」を見せる</span>
+                       </label>
+                       <div className="flex items-center gap-3 flex-wrap">
+                         <span className="text-xs font-bold text-slate-600 w-32">超過時のまわる帯</span>
+                         <select value={oa.gaugeRotate || 'normal'} onChange={e => setOA({ gaugeRotate: e.target.value })} className="border rounded p-1.5 text-xs">
+                           <option value="slow">ゆっくり回る</option>
+                           <option value="normal">標準</option>
+                           <option value="fast">はやく回る</option>
+                           <option value="none">回転なし（全周点灯）</option>
+                         </select>
+                         <span className="text-xs font-bold text-slate-600">帯の長さ</span>
+                         <input type="range" min="6" max="45" step="2" value={oa.gaugeCometLen ?? 18} onChange={e => setOA({ gaugeCometLen: Number(e.target.value) })} className="w-24 accent-emerald-600" disabled={(oa.gaugeRotate || 'normal') === 'none'} />
+                         <span className="text-xs font-mono w-12">{oa.gaugeCometLen ?? 18}%</span>
+                       </div>
+                     </div>
+                   </div>
+                   <label className="flex items-center gap-3 cursor-pointer">
+                     <input type="checkbox" checked={oa.screenEffect} onChange={e => setOA({ screenEffect: e.target.checked })} className="w-5 h-5 accent-rose-600" />
+                     <span className="text-sm font-bold text-slate-700">上部バナーを表示</span>
+                     <span className="text-xs text-slate-400">「まもなく目標時間／目標時間オーバー！」の文字バナー（警告以降に表示）</span>
+                   </label>
+                   <div className="flex items-center gap-3 flex-wrap">
+                     <span className="text-sm font-bold text-slate-700 w-44">通知音</span>
+                     <select value={oa.sound} onChange={e => setOA({ sound: e.target.value })} className="border rounded p-2 text-sm">
+                       <option value="off">鳴らさない</option>
+                       <option value="warn">警告時に軽くピッ</option>
+                       <option value="both">警告時＋超過時（ピッ・ピッ）</option>
+                     </select>
+                     <button onClick={() => playOverrunBeep('warn')} className="px-3 py-1.5 text-xs font-bold rounded border bg-slate-50 hover:bg-slate-100 text-slate-600">警告音を試聴</button>
+                     <button onClick={() => playOverrunBeep('over')} className="px-3 py-1.5 text-xs font-bold rounded border bg-rose-50 hover:bg-rose-100 text-rose-600">超過音を試聴</button>
+                   </div>
+                   <p className="text-[11px] text-slate-400">※ 音はタスクごとに段階を跨いだ瞬間に1回だけ鳴ります（鳴り続けません）。タブレットは音量設定を確認してください。</p>
+                 </div>
+               </div>
+             );
+           })()}
          </div>
 
          {/* 文字サイズ設定 */}
@@ -14632,14 +17122,13 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
              <span className="text-slate-400">※ 既存の画像には影響しません。今後の登録から反映されます。</span>
            </p>
            <div className="space-y-2">
+             {/* ※ 製品アプリで実際に使う種別のみ。荷姿写真・機番AI認識は最終検査アプリ専用のため削除済 (誤移植だった) */}
              {[
                { key: 'workStandard', label: '作業標準の画像' },
                { key: 'defectPhoto',  label: '不良写真' },
-               { key: 'packingPhoto', label: '荷姿写真' },
-               { key: 'serialAI',     label: '機番AI認識の画像' },
                { key: 'diagram',      label: '測定図' },
              ].map(({ key, label }) => {
-               const def = { workStandard:{maxDim:800,quality:0.55}, defectPhoto:{maxDim:1000,quality:0.6}, packingPhoto:{maxDim:800,quality:0.55}, serialAI:{maxDim:1280,quality:0.72}, diagram:{maxDim:1000,quality:0.6} }[key];
+               const def = { workStandard:{maxDim:800,quality:0.55}, defectPhoto:{maxDim:1000,quality:0.6}, diagram:{maxDim:1000,quality:0.6} }[key];
                const cur = { ...def, ...(settings.imageQuality?.[key] || {}) };
                const set = (patch) => saveSettings({ imageQuality: { ...(settings.imageQuality || {}), [key]: { ...cur, ...patch } } });
                const tier = (cur.maxDim >= 1280 || cur.quality >= 0.75) ? { t: '鮮明・大', c: 'text-rose-600' } : (cur.maxDim <= 800 && cur.quality <= 0.55) ? { t: '軽量・小', c: 'text-emerald-600' } : { t: '標準', c: 'text-slate-500' };
@@ -17814,7 +20303,28 @@ const DailyWorkerGantt = ({ lots, workers, workSchedule }) => {
   );
 };
 
-const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
+// 通常勤務(実効直工キャパ)を超える負荷を、残業(のべ時間/人)と土曜出勤(日数)でこなす計画を算出する。
+//   reqH        = その期間に必要な直工時間(h)  (= 予定/実績 totalSec / 3600)
+//   headcount   = 在籍(有効)人数
+//   factor      = 間接込み係数 (実効キャパは名目を factor で割り引く)
+//   maxOtPerDay = 1人1日の最大残業時間(h)
+// 戻り値: over=超過しているか, excessH=超過した直工時間, otClockH=残業のべ実時間(間接込み係数を戻した実拘束時間),
+//        otPerPersonH=1人あたり残業時間, otMaxedClockH=残業を上限まで使ったときののべ実時間, satDays=必要土曜出勤日数
+const overflowPlan = (reqH, headcount, factor, hoursPerWeek, hoursPerDay, daysPerWeek, maxOtPerDay) => {
+  const f = Math.max(1, factor || 1);
+  const regularCapH = headcount * hoursPerWeek / f;
+  if (reqH <= regularCapH + 1e-6) return { over:false, excessH:0, otClockH:0, otPerPersonH:0, otMaxedClockH:0, satDays:0 };
+  const excessH = reqH - regularCapH;
+  const otDirectMaxWeek = headcount * (maxOtPerDay||0) * daysPerWeek / f;
+  const otDirectUsed = Math.min(excessH, otDirectMaxWeek);
+  const otClockH = otDirectUsed * f;
+  const remainingH = excessH - otDirectMaxWeek;
+  let satDays = 0;
+  if (remainingH > 1e-6) { const satCapPerDay = headcount * hoursPerDay / f; satDays = satCapPerDay>0 ? Math.ceil(remainingH / satCapPerDay) : 0; }
+  return { over:true, excessH, otClockH, otPerPersonH: headcount? otClockH/headcount : 0, otMaxedClockH: otDirectMaxWeek*f, satDays };
+};
+
+const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSettings, indirectWork = [] }) => {
   const [tickN, setTickN] = useState(0);
   // 週次仕事量で展開中の週 (null = なし)
   const [expandedWeekIdx, setExpandedWeekIdx] = useState(null);
@@ -17848,6 +20358,15 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
   const DAYS_PER_MONTH = settings?.workloadDaysPerMonth || settings?.workSchedule?.daysPerMonth || 20;
   const HOURS_PER_WEEK = HOURS_PER_DAY * DAYS_PER_WEEK;     // 40h
   const HOURS_PER_MONTH = HOURS_PER_DAY * DAYS_PER_MONTH;   // 160h
+
+  // 間接作業を加味した実効直工キャパ
+  //   factor = 間接込み係数 (1.0 = 間接ゼロ, 1.3 = 直工1hあたり間接0.3h など)
+  //   必要人数(間接込み) = 直工必要人数 × factor、実効直工キャパ = 名目キャパ ÷ factor
+  const factor = Number(settings?.indirectFactor) || 1;
+  // 余力判定しきい値 (稼働率% で判定)。未設定なら現行挙動 (50/85/100) を維持。
+  const capLevels = settings?.capLevels || { yoyu: 50, tekisei: 85, manKado: 100 };
+  // 1人1日の最大残業時間 (超過分を残業/土曜出勤に振り分ける計算で使用)。未設定なら 2.0h。
+  const maxOtPerDay = (settings?.maxOvertimeHoursPerDay != null && Number(settings.maxOvertimeHoursPerDay) >= 0) ? Number(settings.maxOvertimeHoursPerDay) : 2.0;
 
   const activeLots = useMemo(() => {
     return lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
@@ -17986,6 +20505,31 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
   const totalWorkers = (overrideWorkers && Number(overrideWorkers) > 0) ? Number(overrideWorkers) : registeredWorkers;
   const isWorkerOverride = (overrideWorkers && Number(overrideWorkers) > 0 && Number(overrideWorkers) !== registeredWorkers);
 
+  // 実測間接込み係数 (参考値): 直近90日の完了ロット
+  //   directSec  = 完了ロットの完了タスク duration 合計
+  //   indirectSec = 同期間の indirectWork[].duration 合計
+  //   実測係数 = (directSec + indirectSec) / directSec
+  const measuredFactor = useMemo(() => {
+    const since = Date.now() - 90 * 86400000;
+    let directSec = 0;
+    lots.forEach(lot => {
+      const done = lot.status === 'completed' || lot.location === 'completed';
+      if (!done) return;
+      if (lot.completedAt && lot.completedAt < since) return; // 90日より古い完了は除外 (completedAt 無しは含める)
+      Object.values(lot.tasks || {}).forEach(t => {
+        if (t && t.status === 'completed' && t.duration > 0) directSec += t.duration;
+      });
+    });
+    let indirectSec = 0;
+    (indirectWork || []).forEach(w => {
+      const ts = w.endTime || w.startTime || w.timestamp;
+      if (ts != null && ts < since) return;
+      if (w.duration > 0) indirectSec += w.duration;
+    });
+    const hasData = directSec > 0 && indirectSec > 0;
+    return { hasData, directSec, indirectSec, factor: hasData ? (directSec + indirectSec) / directSec : 1 };
+  }, [lots, indirectWork]);
+
   // ヘルパー
   const fmtHours = (sec) => {
     const h = sec / 3600;
@@ -17993,13 +20537,18 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
     if (h < 10) return `${h.toFixed(1)}h`;
     return `${Math.round(h)}h`;
   };
-  const requiredWorkersWeek = (sec) => (sec / 3600) / HOURS_PER_WEEK;
-  const requiredWorkersMonth = (sec) => (sec / 3600) / HOURS_PER_MONTH;
+  // 必要人数(間接込み) = 直工必要人数 × factor
+  const requiredWorkersWeek = (sec) => ((sec / 3600) / HOURS_PER_WEEK) * factor;
+  const requiredWorkersMonth = (sec) => ((sec / 3600) / HOURS_PER_MONTH) * factor;
+  // チーム実効直工キャパ (h/週・h/月): 名目キャパを間接ぶん割り引く
+  const teamCapacityWeekH = totalWorkers * HOURS_PER_WEEK / factor;
+  const teamCapacityMonthH = totalWorkers * HOURS_PER_MONTH / factor;
+  // 余力判定: 稼働率% (= 必要人数(間接込み) / 在籍人数 × 100) を capLevels で判定
   const capLevel = (req, capacity) => {
-    // 必要人数 vs 在籍人数
-    if (req <= capacity * 0.5) return { color: 'emerald', label: '余裕あり' };
-    if (req <= capacity * 0.85) return { color: 'blue', label: '適正' };
-    if (req <= capacity) return { color: 'amber', label: '満稼働' };
+    const util = capacity > 0 ? (req / capacity) * 100 : 0;
+    if (util < capLevels.yoyu) return { color: 'emerald', label: '余裕あり' };
+    if (util < capLevels.tekisei) return { color: 'blue', label: '適正' };
+    if (util <= capLevels.manKado) return { color: 'amber', label: '満稼働' };
     return { color: 'rose', label: '人員不足' };
   };
   const colorMap = {
@@ -18010,12 +20559,94 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
     rose: { bg: 'bg-rose-50', border: 'border-rose-300', text: 'text-rose-700', badge: 'bg-rose-500' },
   };
 
-  // 週次・月次最大値 (バー幅算出用)
-  const weekMaxSec = Math.max(...weeklyWorkload.weeks.map(w => w.totalSec), totalWorkers * HOURS_PER_WEEK * 3600);
-  const monthMaxSec = Math.max(...monthlyWorkload.map(m => m.totalSec), totalWorkers * HOURS_PER_MONTH * 3600);
+  // 週次・月次最大値 (バー幅算出用) — 実効直工キャパ基準
+  const weekMaxSec = Math.max(...weeklyWorkload.weeks.map(w => w.totalSec), teamCapacityWeekH * 3600);
+  const monthMaxSec = Math.max(...monthlyWorkload.map(m => m.totalSec), teamCapacityMonthH * 3600);
 
   return (
     <div className="p-4 max-w-screen-2xl mx-auto h-full overflow-y-auto space-y-4">
+      {/* セクション 0: 稼働率の前提 (間接作業) — 実効直工キャパの設定 */}
+      <div className="bg-white border border-indigo-200 rounded-xl shadow-sm">
+        <div className="p-3 border-b border-indigo-100 bg-indigo-50/50 flex items-center justify-between gap-2 flex-wrap">
+          <h3 className="font-bold text-base flex items-center gap-2 text-indigo-800"><Settings className="w-4 h-4"/> 稼働率の前提（間接作業）</h3>
+          <span className="text-[11px] text-slate-500">必要人数・余力判定は「間接作業を加味した実効直工キャパ」で計算します</span>
+        </div>
+        <div className="p-3 flex flex-wrap items-end gap-4">
+          {/* 間接込み係数 */}
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] font-bold text-slate-600">間接込み係数</label>
+            <div className="flex items-center gap-1">
+              <input
+                type="number" step="0.05" min="1"
+                value={factor}
+                onChange={e => { const v = Math.max(1, Number(e.target.value) || 1); saveSettings && saveSettings({ indirectFactor: v }); }}
+                className="w-24 border border-slate-300 rounded p-1.5 text-center font-bold text-indigo-700"
+                title="直工1hあたり何h相当の総工数が必要か (1.0=間接ゼロ, 1.3=間接30%)"
+              />
+              <span className="text-[10px] text-slate-400">×</span>
+            </div>
+          </div>
+          {/* 1人1日の最大残業時間 */}
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] font-bold text-slate-600">1人1日の最大残業</label>
+            <div className="flex items-center gap-1">
+              <input
+                type="number" step="0.5" min="0"
+                value={maxOtPerDay}
+                onChange={e => { const v = Math.max(0, Number(e.target.value) || 0); saveSettings && saveSettings({ maxOvertimeHoursPerDay: v }); }}
+                className="w-24 border border-slate-300 rounded p-1.5 text-center font-bold text-indigo-700"
+                title="通常勤務でキャパを超えた場合に、まず残業で何h/人まで処理するか。超えた分は土曜出勤で算出します"
+              />
+              <span className="text-[10px] text-slate-400">h/人</span>
+              <span className="text-[10px] text-slate-400">×</span>
+            </div>
+          </div>
+          {/* しきい値 3つ */}
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] font-bold text-slate-600">余力判定しきい値 (稼働率%)</label>
+            <div className="flex items-center gap-1.5 text-xs">
+              <span className="text-emerald-700">余裕&lt;</span>
+              <input type="number" min="1" max="100" value={capLevels.yoyu}
+                onChange={e => saveSettings && saveSettings({ capLevels: { ...capLevels, yoyu: Math.max(1, Number(e.target.value) || 0) } })}
+                className="w-14 border border-slate-300 rounded p-1 text-center"/>
+              <span className="text-blue-700">適正&lt;</span>
+              <input type="number" min="1" max="120" value={capLevels.tekisei}
+                onChange={e => saveSettings && saveSettings({ capLevels: { ...capLevels, tekisei: Math.max(1, Number(e.target.value) || 0) } })}
+                className="w-14 border border-slate-300 rounded p-1 text-center"/>
+              <span className="text-amber-700">満稼働≤</span>
+              <input type="number" min="1" max="150" value={capLevels.manKado}
+                onChange={e => saveSettings && saveSettings({ capLevels: { ...capLevels, manKado: Math.max(1, Number(e.target.value) || 0) } })}
+                className="w-14 border border-slate-300 rounded p-1 text-center"/>
+            </div>
+          </div>
+          {/* 実効直工キャパ表示 */}
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] font-bold text-slate-600">実効直工キャパ</label>
+            <div className="text-sm font-bold text-slate-800">{teamCapacityWeekH.toFixed(1)}<span className="text-[10px] font-normal text-slate-500">h/週</span> ・ {teamCapacityMonthH.toFixed(1)}<span className="text-[10px] font-normal text-slate-500">h/月</span></div>
+          </div>
+          {/* 実測係数 + 反映 */}
+          <div className="flex flex-col gap-1 ml-auto">
+            <label className="text-[11px] font-bold text-slate-600">実測間接込み係数 <span className="font-normal text-slate-400">(直近90日)</span></label>
+            <div className="flex items-center gap-2">
+              {measuredFactor.hasData ? (
+                <span className="text-sm font-bold text-slate-800" title={`直工 ${fmtHours(measuredFactor.directSec)} / 間接 ${fmtHours(measuredFactor.indirectSec)}`}>
+                  {measuredFactor.factor.toFixed(2)}<span className="text-[10px] font-normal text-slate-500"> ×</span>
+                </span>
+              ) : (
+                <span className="text-xs font-bold text-slate-400">データ不足</span>
+              )}
+              <button
+                type="button"
+                disabled={!measuredFactor.hasData || !saveSettings}
+                onClick={() => saveSettings && saveSettings({ indirectFactor: Math.round(measuredFactor.factor * 100) / 100 })}
+                className="text-[11px] font-bold px-2.5 py-1 rounded bg-indigo-600 text-white disabled:bg-slate-300 disabled:cursor-not-allowed hover:bg-indigo-700"
+                title="実測した間接込み係数を上の入力に反映します"
+              >実測値を係数に反映</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* セクション 1: 作業者の現状 */}
       <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
         <div className="p-3 border-b flex items-center justify-between">
@@ -18118,7 +20749,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
             </div>
           </div>
           <div className="text-[11px] text-slate-500">
-            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_WEEK}日</span> = {HOURS_PER_WEEK.toFixed(1)}h/週 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → チーム上限 <span className="font-bold">{(totalWorkers * HOURS_PER_WEEK).toFixed(1)}h/週</span>
+            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_WEEK}日</span> = {HOURS_PER_WEEK.toFixed(1)}h/週 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → 実効直工キャパ <span className="font-bold">{teamCapacityWeekH.toFixed(1)}h/週</span>{factor !== 1 && <span className="text-indigo-600 ml-0.5">(間接込み係数{factor.toFixed(2)})</span>}
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -18142,9 +20773,9 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
                 const lv = capLevel(req, totalWorkers);
                 const c = colorMap[lv.color];
                 const barPct = Math.min(100, (wk.totalSec / weekMaxSec) * 100);
-                const capLinePct = Math.min(100, (totalWorkers * HOURS_PER_WEEK * 3600 / weekMaxSec) * 100);
+                const capLinePct = Math.min(100, (teamCapacityWeekH * 3600 / weekMaxSec) * 100);
                 const isExpanded = expandedWeekIdx === idx;
-                const teamDayCapH = totalWorkers * HOURS_PER_DAY; // 1日のチーム上限 (h)
+                const teamDayCapH = totalWorkers * HOURS_PER_DAY / factor; // 1日の実効直工キャパ (h)
 
                 // 日別の負荷を計算 (この週の月〜金 = 平日のみ表示)
                 // 土日は会社休なので非表示。週末納期のロットは月曜にまとめる。
@@ -18256,14 +20887,24 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
                         ) : (
                           <div className={`h-full ${c.badge} opacity-80`} style={{ width: `${barPct}%` }}/>
                         )}
-                        {/* チーム上限ライン */}
-                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-500" style={{ left: `${capLinePct}%` }} title={`チーム上限 ${totalWorkers * HOURS_PER_WEEK}h`}/>
+                        {/* 実効直工キャパライン */}
+                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-500" style={{ left: `${capLinePct}%` }} title={`実効直工キャパ ${teamCapacityWeekH.toFixed(1)}h/週`}/>
                       </div>
                     </td>
                     <td className="p-2 text-center">
-                      {wk.totalSec > 0 ? (
-                        <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-full ${c.badge} text-white whitespace-nowrap`}>{lv.label}</span>
-                      ) : <span className="text-slate-300 text-xs">空き</span>}
+                      {wk.totalSec > 0 ? (() => {
+                        const plan = overflowPlan(wk.totalSec / 3600, totalWorkers, factor, HOURS_PER_WEEK, HOURS_PER_DAY, DAYS_PER_WEEK, maxOtPerDay);
+                        return (
+                          <div className="flex flex-col items-center gap-1">
+                            <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-full ${c.badge} text-white whitespace-nowrap`}>{lv.label}</span>
+                            {plan.over && (
+                              <span className="inline-block text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 border border-rose-300 whitespace-nowrap leading-tight" title={`通常勤務(${teamCapacityWeekH.toFixed(1)}h/週)を ${plan.excessH.toFixed(1)}h 超過。残業のべ${plan.otClockH.toFixed(1)}h${plan.satDays > 0 ? ` + 土曜${plan.satDays}日` : ''}で処理可能。`}>
+                                要残業 のべ{plan.otClockH.toFixed(1)}h（約{plan.otPerPersonH.toFixed(1)}h/人）{plan.satDays > 0 ? ` ＋ 土曜出勤 ${plan.satDays}日` : ''}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })() : <span className="text-slate-300 text-xs">空き</span>}
                     </td>
                   </tr>
                   {isExpanded && (
@@ -18275,12 +20916,12 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
                               <CalendarDays className="w-5 h-5"/> {wk.label} ({wk.start.getMonth()+1}/{wk.start.getDate()}〜{wk.end.getMonth()+1}/{wk.end.getDate()}) — 日別負荷 (平日のみ)
                             </div>
                             <div className="text-xs text-slate-500">
-                              1日のチーム上限: <span className="font-bold text-sm">{teamDayCapH.toFixed(1)}h/日</span> (在籍{totalWorkers}人×{HOURS_PER_DAY.toFixed(1)}h)
+                              1日の実効直工キャパ: <span className="font-bold text-sm">{teamDayCapH.toFixed(1)}h/日</span> (在籍{totalWorkers}人×{HOURS_PER_DAY.toFixed(1)}h{factor !== 1 ? `÷${factor.toFixed(2)}` : ''})
                             </div>
                           </div>
                           <div className="grid grid-cols-5 gap-2 p-3">
                             {days.map((d, di) => {
-                              const dayReq = d.sec / 3600 / HOURS_PER_DAY;
+                              const dayReq = (d.sec / 3600 / HOURS_PER_DAY) * factor;
                               const dayLv = d.sec === 0 ? { color: 'slate', label: '空き' } : capLevel(dayReq, totalWorkers);
                               const dayC = colorMap[dayLv.color];
                               const dayBarPct = Math.min(100, (d.sec / weekDayMaxSec) * 100);
@@ -18336,7 +20977,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
                                     ) : (
                                       <div className={`h-full ${dayC.badge}`} style={{ width: `${dayBarPct}%` }}/>
                                     )}
-                                    <div className="absolute top-0 bottom-0 border-l border-dashed border-slate-500" style={{ left: `${dayCapPct}%` }} title={`チーム上限 ${teamDayCapH.toFixed(1)}h`}/>
+                                    <div className="absolute top-0 bottom-0 border-l border-dashed border-slate-500" style={{ left: `${dayCapPct}%` }} title={`実効直工キャパ ${teamDayCapH.toFixed(1)}h`}/>
                                   </div>
                                   {/* ロット詳細 */}
                                   {d.dayLots.length > 0 && (
@@ -18416,7 +21057,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
         <div className="p-3 border-b flex flex-wrap items-center justify-between gap-2">
           <h3 className="font-bold text-lg flex items-center gap-2"><Calendar className="w-5 h-5 text-teal-600"/> 月次仕事量 <span className="text-xs font-normal text-slate-500">(納期ベース)</span></h3>
           <div className="text-[11px] text-slate-500">
-            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_MONTH}日</span> = {HOURS_PER_MONTH.toFixed(1)}h/月 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → チーム上限 <span className="font-bold">{(totalWorkers * HOURS_PER_MONTH).toFixed(1)}h/月</span>
+            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_MONTH}日</span> = {HOURS_PER_MONTH.toFixed(1)}h/月 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → 実効直工キャパ <span className="font-bold">{teamCapacityMonthH.toFixed(1)}h/月</span>{factor !== 1 && <span className="text-indigo-600 ml-0.5">(間接込み係数{factor.toFixed(2)})</span>}
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -18437,7 +21078,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
                 const lv = capLevel(req, totalWorkers);
                 const c = colorMap[lv.color];
                 const barPct = Math.min(100, (mo.totalSec / monthMaxSec) * 100);
-                const capLinePct = Math.min(100, (totalWorkers * HOURS_PER_MONTH * 3600 / monthMaxSec) * 100);
+                const capLinePct = Math.min(100, (teamCapacityMonthH * 3600 / monthMaxSec) * 100);
                 return (
                   <tr key={idx} className="border-b last:border-b-0 hover:bg-slate-50">
                     <td className="p-2 font-bold text-slate-700 font-mono">{mo.label}</td>
@@ -18451,7 +21092,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
                     <td className="p-2">
                       <div className="relative h-5 bg-slate-100 rounded overflow-hidden">
                         <div className={`h-full ${c.badge} opacity-80`} style={{ width: `${barPct}%` }}/>
-                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-500" style={{ left: `${capLinePct}%` }} title={`チーム上限 ${totalWorkers * HOURS_PER_MONTH}h`}/>
+                        <div className="absolute top-0 bottom-0 border-l-2 border-dashed border-slate-500" style={{ left: `${capLinePct}%` }} title={`実効直工キャパ ${teamCapacityMonthH.toFixed(1)}h/月`}/>
                       </div>
                     </td>
                     <td className="p-2 text-center">
@@ -18469,12 +21110,817 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [] }) => {
 
       {/* 凡例 */}
       <div className="bg-slate-50 border border-slate-200 rounded-lg p-2 text-[11px] text-slate-600 flex flex-wrap items-center gap-3">
-        <span className="font-bold">負荷状態の見方:</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-emerald-500"/>余裕あり (50%以下)</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-blue-500"/>適正 (85%まで)</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-amber-500"/>満稼働 (100%まで)</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-rose-500"/>人員不足 (100%超)</span>
-        <span className="ml-auto text-slate-500">破線は在籍人数のチーム上限ライン</span>
+        <span className="font-bold">負荷状態の見方 (稼働率):</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-emerald-500"/>余裕あり (&lt;{capLevels.yoyu}%)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-blue-500"/>適正 (&lt;{capLevels.tekisei}%)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-amber-500"/>満稼働 (≤{capLevels.manKado}%)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-rose-500"/>人員不足 (&gt;{capLevels.manKado}%)</span>
+        <span className="ml-auto text-slate-500">破線は実効直工キャパ{factor !== 1 ? ` (間接込み係数${factor.toFixed(2)})` : ''}</span>
+      </div>
+    </div>
+  );
+};
+
+// =====================================================================================
+// 月次レポート (会社提出用) — 月初「作業計画報告書」(PLAN) + 月末「業務実績報告書」(ACTUAL)
+// ・実データのみ使用。算出不能な指標は「—」または省略 (数値の捏造はしない)。
+// ・PDF (ブラウザ印刷) + Excel (多シート) の両方を出力。
+// ・PLAN は lot.dueDate ベースで当月の予定を集計、ACTUAL は lot.completedAt ベースで当月の実績を集計。
+// =====================================================================================
+const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTargetTimes = {}, targetTimeHistory = [], currentUserName = '', templates = [], indirectWork = [], onSaveSettings }) => {
+  // ---- 月選択 (既定: 当月) ----
+  const ymNow = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
+  const [selectedMonth, setSelectedMonth] = useState(ymNow());
+  // ---- 提出先 / 部署名 (settings に永続化) + 所感 (永続化しない) ----
+  const [orgName, setOrgName] = useState(settings?.reportOrgName || '');
+  const [deptName, setDeptName] = useState(settings?.reportDeptName || '');
+  const [comment, setComment] = useState('');
+  // settings 側が後から読み込まれた場合に初期反映 (ユーザ未編集時のみ)
+  const orgTouched = useRef(false);
+  const deptTouched = useRef(false);
+  useEffect(() => { if (!orgTouched.current && settings?.reportOrgName != null) setOrgName(settings.reportOrgName); }, [settings?.reportOrgName]);
+  useEffect(() => { if (!deptTouched.current && settings?.reportDeptName != null) setDeptName(settings.reportDeptName); }, [settings?.reportDeptName]);
+
+  const persistOrg = (v) => { orgTouched.current = true; setOrgName(v); };
+  const persistDept = (v) => { deptTouched.current = true; setDeptName(v); };
+  const commitOrgDept = () => { if (onSaveSettings) onSaveSettings({ reportOrgName: orgName, reportDeptName: deptName }); };
+
+  // ---- 月の範囲 (ローカルタイム) ----
+  const monthRange = useMemo(() => {
+    const [yy, mm] = selectedMonth.split('-').map(Number);
+    const year = yy || new Date().getFullYear();
+    const monNum = mm || (new Date().getMonth() + 1);
+    const start = new Date(year, monNum - 1, 1, 0, 0, 0, 0);
+    const end = new Date(year, monNum, 0, 23, 59, 59, 999); // 月末日
+    return { year, monNum, start, end, startMs: start.getTime(), endMs: end.getTime() };
+  }, [selectedMonth]);
+  const inMonth = (ts) => { if (ts == null) return false; const t = (typeof ts === 'number') ? ts : new Date(ts).getTime(); return !isNaN(t) && t >= monthRange.startMs && t <= monthRange.endMs; };
+
+  // ---- 勤務時間マスタから稼働能力を算出 (ProgressOverviewView と同一ロジック) ----
+  const workHours = useMemo(() => computeWorkHours(settings?.workSchedule), [settings?.workSchedule]);
+  const includeOT = settings?.workSchedule?.includeOvertimeInCapacity ?? false;
+  const HOURS_PER_DAY = settings?.workloadHoursPerDay ?? (includeOT ? workHours.totalHours : workHours.regularHours);
+  const DAYS_PER_WEEK = settings?.workloadDaysPerWeek || settings?.workSchedule?.daysPerWeek || 5;
+  const HOURS_PER_WEEK = HOURS_PER_DAY * DAYS_PER_WEEK;
+  // 在籍(有効)人数: マスタ上書きがあれば優先、なければ登録作業者数
+  const registeredWorkers = workers.length || 0;
+  const overrideWorkers = settings?.workloadEffectiveWorkers;
+  const effectiveWorkers = (overrideWorkers && Number(overrideWorkers) > 0) ? Number(overrideWorkers) : registeredWorkers;
+  const capacityWorkers = effectiveWorkers || 1; // 0除算回避用
+  // 間接作業を加味した実効直工キャパ (ProgressOverviewView と同一の前提)
+  const factor = Number(settings?.indirectFactor) || 1;
+  const capLevels = settings?.capLevels || { yoyu: 50, tekisei: 85, manKado: 100 };
+  // 1人1日の最大残業時間 (超過分を残業/土曜出勤に振り分ける計算で使用)。ProgressOverviewView と同一の前提。
+  const maxOtPerDay = (settings?.maxOvertimeHoursPerDay != null && Number(settings.maxOvertimeHoursPerDay) >= 0) ? Number(settings.maxOvertimeHoursPerDay) : 2.0;
+  const teamCapacityWeekH = capacityWorkers * HOURS_PER_WEEK / factor; // 実効直工キャパ h/週
+
+  // ---- ロットの中間/完品 分類 (ProgressOverviewView と同一ロジック) ----
+  const categorizeLot = (lot) => {
+    const tpl = templates.find(t => t.id === lot.templateId);
+    const tplName = tpl?.name || (lot.templateId === 'demo' ? '詳細デモ手順' : '');
+    return tplName.includes('中間') ? 'intermediate' : 'final';
+  };
+  const CATEGORY_LABELS = { intermediate: '中間検査', final: '完品検査' };
+
+  // ---- 当月の Monday ベース週バケット (再実装) ----
+  const monthWeeks = useMemo(() => {
+    // 月初を含む週の月曜から、月末を含む週の月曜まで
+    const firstMon = new Date(monthRange.start);
+    const dow0 = firstMon.getDay(); const diff0 = dow0 === 0 ? -6 : 1 - dow0;
+    firstMon.setDate(firstMon.getDate() + diff0); firstMon.setHours(0, 0, 0, 0);
+    const weeks = [];
+    let cur = new Date(firstMon);
+    let guard = 0;
+    while (cur.getTime() <= monthRange.endMs && guard < 8) {
+      const ws = new Date(cur);
+      const we = new Date(cur); we.setDate(we.getDate() + 6); we.setHours(23, 59, 59, 999);
+      const labelFrom = `${ws.getMonth() + 1}/${ws.getDate()}`;
+      const labelTo = `${we.getMonth() + 1}/${we.getDate()}`;
+      weeks.push({ start: ws, end: we, startMs: ws.getTime(), endMs: we.getTime(), label: `${labelFrom}〜${labelTo}` });
+      cur.setDate(cur.getDate() + 7);
+      guard++;
+    }
+    return weeks;
+  }, [monthRange]);
+
+  // 日付(Date)がどの週バケットに入るか
+  const weekIndexOf = (dateMs) => monthWeeks.findIndex(w => dateMs >= w.startMs && dateMs <= w.endMs);
+
+  // =====================================================================================
+  // PLAN: 当月予定 (lot.dueDate が当月のロット)。完了済みは「予定」から除外する。
+  // =====================================================================================
+  const planData = useMemo(() => {
+    const activeLots = lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
+    const monthLots = activeLots.filter(l => l.dueDate && inMonth(new Date(l.dueDate).getTime()));
+    let totalSec = 0, totalQty = 0;
+    let noDueInfo = 0; // 当月外だが納期未設定で進行中(参考表示用): ここでは当月集計に含めない
+    // 週次バケット
+    const weeks = monthWeeks.map(w => ({
+      ...w, lots: 0, qty: 0, sec: 0,
+      byCategory: { intermediate: { lots: 0, qty: 0, sec: 0 }, final: { lots: 0, qty: 0, sec: 0 } },
+    }));
+    let overdueCount = 0, overdueSec = 0; // 当月内だが本日より前の納期(納期超過)
+    const todayMs = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+    // 型式別予定
+    const modelMap = {}; // model -> { qty, sec, lots }
+    monthLots.forEach(lot => {
+      const sec = calculateLotEstimatedTime(lot, customTargetTimes);
+      const qty = lot.quantity || 1;
+      totalSec += sec; totalQty += qty;
+      const dueMs = new Date(lot.dueDate).setHours(0, 0, 0, 0);
+      if (dueMs < todayMs) { overdueCount++; overdueSec += sec; }
+      const wi = weekIndexOf(new Date(lot.dueDate).setHours(12, 0, 0, 0));
+      if (wi >= 0) {
+        const wk = weeks[wi];
+        wk.lots++; wk.qty += qty; wk.sec += sec;
+        const cat = categorizeLot(lot);
+        wk.byCategory[cat].lots++; wk.byCategory[cat].qty += qty; wk.byCategory[cat].sec += sec;
+      }
+      const m = lot.model || '(型式未設定)';
+      if (!modelMap[m]) modelMap[m] = { model: m, qty: 0, sec: 0, lots: 0 };
+      modelMap[m].qty += qty; modelMap[m].sec += sec; modelMap[m].lots++;
+    });
+    // 納期未設定で進行中のロット (当月の計画に乗らない注意喚起)
+    const noDueLots = activeLots.filter(l => !l.dueDate);
+    noDueInfo = noDueLots.length;
+    const noDueSec = noDueLots.reduce((a, l) => a + calculateLotEstimatedTime(l, customTargetTimes), 0);
+
+    const byModel = Object.values(modelMap).sort((a, b) => b.sec - a.sec);
+    const totalHours = totalSec / 3600;
+    // 必要人数(間接込み) = 直工必要人数 × factor。ProgressOverviewView と同一ロジック。
+    // 週平均必要人数 = 当月総工数h / (実働週数 × 週稼働h) × factor  ※週次必要人数の平均
+    const weekReqs = weeks.map(w => ((w.sec / 3600) / HOURS_PER_WEEK) * factor);
+    const avgReqWorkers = weeks.length ? ((totalHours / weeks.length) / HOURS_PER_WEEK) * factor : 0;
+    // 通常勤務(実効直工キャパ)超過分を残業/土曜出勤でこなす週次プラン (ProgressOverviewView と同一ロジック)
+    const HOURS_PER_DAY_LOCAL = HOURS_PER_WEEK / (DAYS_PER_WEEK || 5);
+    const weekPlans = weeks.map(w => overflowPlan(w.sec / 3600, capacityWorkers, factor, HOURS_PER_WEEK, HOURS_PER_DAY_LOCAL, DAYS_PER_WEEK, maxOtPerDay));
+    // 当月合計: 超過した週の残業のべ時間と土曜出勤日数を合算
+    const overflow = weekPlans.reduce((acc, pl) => {
+      if (pl.over) { acc.any = true; acc.otClockH += pl.otClockH; acc.satDays += pl.satDays; }
+      return acc;
+    }, { any: false, otClockH: 0, satDays: 0 });
+    // 余力判定 (稼働率% = 週平均必要人数 / 在籍人数 × 100 を capLevels で判定)
+    const capLevel = (req, cap) => {
+      const util = cap > 0 ? (req / cap) * 100 : 0;
+      if (util < capLevels.yoyu) return '余裕あり';
+      if (util < capLevels.tekisei) return '適正';
+      if (util <= capLevels.manKado) return '満稼働';
+      return '人員不足';
+    };
+    return {
+      lotCount: monthLots.length, totalQty, totalSec, totalHours,
+      weeks, weekReqs, weekPlans, overflow, avgReqWorkers, byModel,
+      overdueCount, overdueSec, noDueInfo, noDueSec,
+      capacityLabel: capLevel(avgReqWorkers, capacityWorkers),
+    };
+  }, [lots, customTargetTimes, monthWeeks, monthRange, templates, HOURS_PER_WEEK, DAYS_PER_WEEK, capacityWorkers, factor, capLevels, maxOtPerDay]);
+
+  // =====================================================================================
+  // ACTUAL: 当月実績 (lot.completedAt が当月の完了ロット)
+  // =====================================================================================
+  const lotWorkSec = (lot) => {
+    const fromTasks = Object.values(lot.tasks || {}).reduce((s, t) => s + (t && t.status === 'completed' ? (t.duration || 0) : 0), 0);
+    if (fromTasks > 0) return fromTasks;
+    return Math.floor((lot.totalWorkTime || 0) / 1000);
+  };
+  const actualData = useMemo(() => {
+    const completed = lots.filter(l => (l.status === 'completed' || l.location === 'completed') && inMonth(l.completedAt));
+    let totalSec = 0, totalQty = 0;
+    const weeks = monthWeeks.map(w => ({ ...w, lots: 0, qty: 0, sec: 0 }));
+    const modelMap = {}; // model -> { qty, sec, lots }
+    const workerMap = {}; // name -> { qty, sec, lots, ng, rework }
+    completed.forEach(lot => {
+      const sec = lotWorkSec(lot);
+      const qty = lot.quantity || 1;
+      totalSec += sec; totalQty += qty;
+      const wi = weekIndexOf(lot.completedAt);
+      if (wi >= 0) { weeks[wi].lots++; weeks[wi].qty += qty; weeks[wi].sec += sec; }
+      const m = lot.model || '(型式未設定)';
+      if (!modelMap[m]) modelMap[m] = { model: m, qty: 0, sec: 0, lots: 0, targetSec: 0, hasTarget: false };
+      modelMap[m].qty += qty; modelMap[m].sec += sec; modelMap[m].lots++;
+      // 目標工数 (型式別較正値があるロットのみ): 1台あたり目標 × 数量
+      let perUnitTarget = 0, lotOnceTarget = 0; // ロット1回工程は台数を掛けない
+      (lot.steps || []).forEach(step => {
+        const tt = getEffectiveTargetTime(step, lot.model, customTargetTimes, modelGroupsOf(settings));
+        if (step?.lotOnce) lotOnceTarget += tt; else perUnitTarget += tt;
+      });
+      if (perUnitTarget > 0 || lotOnceTarget > 0) { modelMap[m].targetSec += perUnitTarget * qty + lotOnceTarget; modelMap[m].hasTarget = true; }
+      // 作業者別: ロット担当者 (lot.workerName / workerId) に台数を計上。
+      // 工数は各タスクの workerName 単位で割り振る (タスクに作業者名がある場合)。
+      const lotWorkerName = (workers.find(x => x.id === lot.workerId)?.name) || lot.workerName || (workers.find(x => x.id === lot.workerName)?.name) || '不明';
+      if (!workerMap[lotWorkerName]) workerMap[lotWorkerName] = { name: lotWorkerName, qty: 0, sec: 0, lots: 0, ng: 0, rework: 0 };
+      workerMap[lotWorkerName].qty += qty; workerMap[lotWorkerName].lots++;
+      // タスク単位で工数・NG・手直しを作業者へ集計
+      Object.values(lot.tasks || {}).forEach(t => {
+        if (!t) return;
+        const tw = (workers.find(x => x.id === t.workerName)?.name) || t.workerName || lotWorkerName;
+        if (!workerMap[tw]) workerMap[tw] = { name: tw, qty: 0, sec: 0, lots: 0, ng: 0, rework: 0 };
+        if (t.status === 'completed') workerMap[tw].sec += (t.duration || 0);
+        if (t.status === 'ng') workerMap[tw].ng += 1;
+        if (Array.isArray(t.reworks)) workerMap[tw].rework += t.reworks.length;
+      });
+    });
+    const byModel = Object.values(modelMap).sort((a, b) => b.sec - a.sec);
+    const byWorker = Object.values(workerMap).sort((a, b) => b.sec - a.sec);
+    const activeWorkerCount = byWorker.filter(w => w.sec > 0 || w.qty > 0).length;
+    const totalHours = totalSec / 3600;
+    const perWorkerHours = activeWorkerCount ? totalHours / activeWorkerCount : 0;
+    const hasNgRework = byWorker.some(w => w.ng > 0 || w.rework > 0);
+    return {
+      lotCount: completed.length, totalQty, totalSec, totalHours,
+      weeks, byModel, byWorker, activeWorkerCount, perWorkerHours, hasNgRework,
+    };
+  }, [lots, workers, customTargetTimes, settings, monthWeeks, monthRange, templates]);
+
+  // ---- 直間比率 (当月) : 直工 = 当月完了ロットの完了タスク duration、間接 = 当月の indirectWork ----
+  const directIndirect = useMemo(() => {
+    const completed = lots.filter(l => (l.status === 'completed' || l.location === 'completed') && inMonth(l.completedAt));
+    let directSec = 0;
+    completed.forEach(lot => { Object.values(lot.tasks || {}).forEach(t => { if (t && t.status === 'completed' && t.duration > 0) directSec += t.duration; }); });
+    let indirectSec = 0;
+    const catMap = {};
+    (indirectWork || []).forEach(w => {
+      const ts = w.endTime || w.startTime || w.timestamp;
+      if (!inMonth(ts)) return;
+      const dur = w.duration || 0;
+      if (dur <= 0) return;
+      indirectSec += dur;
+      const c = w.category || 'その他';
+      catMap[c] = (catMap[c] || 0) + dur;
+    });
+    const total = directSec + indirectSec;
+    const hasData = total > 0;
+    return {
+      hasData, directSec, indirectSec, total,
+      directPct: total > 0 ? (directSec / total) * 100 : 0,
+      indirectPct: total > 0 ? (indirectSec / total) * 100 : 0,
+      categories: Object.entries(catMap).sort((a, b) => b[1] - a[1]).map(([name, sec]) => ({ name, sec })),
+    };
+  }, [lots, indirectWork, monthRange]);
+
+  // =====================================================================================
+  // QUALITY: 当月の不具合(defect) / 軽微不良(complaint) / 気づき改善(improvement)
+  // =====================================================================================
+  const qualityData = useMemo(() => {
+    const IMPROVE_LABELS = { split: '細分化', add: '追加', change: '変更', remove: '削除', order: '順番変更', other: 'その他' };
+    const resolveWorker = (nameOrId) => (workers.find(x => x.id === nameOrId)?.name) || nameOrId || '不明';
+    const defects = [], complaints = [], improvements = [];
+    const dModel = {}, dStep = {}, dProc = {};
+    const cLabel = {}, cStep = {};
+    const iKind = {}, iStep = {};
+    lots.forEach(lot => {
+      (lot.interruptions || []).forEach(it => {
+        if (!inMonth(it.timestamp)) return;
+        if (it.type === 'defect') {
+          const wname = resolveWorker(it.workerName);
+          defects.push({ ...it, lot, workerName: wname });
+          const m = lot.model || '不明'; dModel[m] = (dModel[m] || 0) + 1;
+          const st = it.stepInfo ? it.stepInfo.title : '全体'; dStep[st] = (dStep[st] || 0) + 1;
+          const cp = it.causeProcess || '未指定'; dProc[cp] = (dProc[cp] || 0) + 1;
+        } else if (it.type === 'complaint') {
+          const wname = resolveWorker(it.workerName);
+          const main = (it.label || '').split(' : ')[0] || 'その他';
+          const sub = (it.label || '').split(' : ').slice(1).join(' : ');
+          complaints.push({ ...it, lot, workerName: wname, mainLabel: main, subLabel: sub });
+          cLabel[main] = (cLabel[main] || 0) + 1;
+          const st = it.stepInfo ? it.stepInfo.title : '全体'; cStep[st] = (cStep[st] || 0) + 1;
+        } else if (it.type === 'improvement') {
+          const wname = resolveWorker(it.workerName);
+          const kindLabel = IMPROVE_LABELS[it.improvementKind] || 'その他';
+          const reason = (it.label || '').split('：').slice(1).join('：').trim() || it.label || '';
+          improvements.push({ ...it, lot, workerName: wname, kindLabel, reason });
+          iKind[kindLabel] = (iKind[kindLabel] || 0) + 1;
+          const st = it.targetStepTitle || (it.stepInfo ? it.stepInfo.title : '全体'); iStep[st] = (iStep[st] || 0) + 1;
+        }
+      });
+    });
+    const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
+    return {
+      defects: defects.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
+      complaints: complaints.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
+      improvements: improvements.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
+      defectModels: sortObj(dModel), defectSteps: sortObj(dStep), defectProcesses: sortObj(dProc),
+      complaintLabels: sortObj(cLabel), complaintSteps: sortObj(cStep),
+      improveKinds: sortObj(iKind), improveSteps: sortObj(iStep),
+    };
+  }, [lots, workers, monthRange]);
+
+  // ---- TARGET TIME 更新履歴 (当月) — TargetTimeHistoryPanel と同じく行にフラット化 ----
+  const targetUpdates = useMemo(() => {
+    const rows = [];
+    (targetTimeHistory || []).filter(h => inMonth(h.timestamp)).sort((a, b) => b.timestamp - a.timestamp).forEach(h => {
+      (h.updates || []).forEach(u => rows.push({ ...u, timestamp: h.timestamp, by: h.by, targetType: h.targetType, targetValue: h.targetValue }));
+    });
+    return rows;
+  }, [targetTimeHistory, monthRange]);
+
+  // ---- フォーマッタ ----
+  const hrs = (sec) => (sec == null || isNaN(sec)) ? '—' : (sec / 3600).toFixed(1);
+  const hrsH = (sec) => (sec == null || isNaN(sec)) ? '—' : `${(sec / 3600).toFixed(1)}h`;
+  const num1 = (n) => (n == null || isNaN(n)) ? '—' : Number(n).toFixed(1);
+  const todayStr = localYMD(new Date());
+  const monthTitle = `${monthRange.year}年${monthRange.monNum}月`;
+  const planTitle = `${monthTitle} 月次 作業計画報告書`;
+  const actualTitle = `${monthTitle} 月次 業務実績報告書`;
+  const fmtDateTime = (ts) => { const d = new Date(ts); return isNaN(d) ? '—' : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  const fmtDate = (ts) => { const d = new Date(ts); return isNaN(d) ? '—' : `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`; };
+
+  // =====================================================================================
+  // PDF 出力 (ブラウザ印刷)
+  // =====================================================================================
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const pdfStyle = `<style>
+    @page { size: A4; margin: 14mm; }
+    body { font-family: 'Segoe UI','Hiragino Sans','Yu Gothic','Meiryo',sans-serif; color:#1e293b; font-size:11px; line-height:1.5; }
+    .doc-title { text-align:center; font-size:19px; font-weight:800; letter-spacing:1px; margin:0 0 4px; }
+    .doc-sub { text-align:center; font-size:11px; color:#475569; margin-bottom:14px; }
+    .meta-table { width:100%; border-collapse:collapse; margin-bottom:16px; font-size:11px; }
+    .meta-table td { border:1px solid #cbd5e1; padding:5px 8px; }
+    .meta-table td.lbl { background:#f1f5f9; font-weight:700; width:90px; white-space:nowrap; }
+    h2 { font-size:13px; margin:18px 0 7px; padding:4px 8px; background:#1e293b; color:#fff; border-radius:3px; }
+    h3 { font-size:12px; margin:12px 0 5px; color:#334155; border-left:4px solid #64748b; padding-left:7px; }
+    table.data { width:100%; border-collapse:collapse; margin-bottom:12px; font-size:10.5px; }
+    table.data th { background:#e2e8f0; color:#1e293b; border:1px solid #94a3b8; padding:4px 6px; text-align:center; font-weight:700; }
+    table.data td { border:1px solid #cbd5e1; padding:4px 6px; vertical-align:top; }
+    table.data td.r { text-align:right; }
+    table.data td.c { text-align:center; }
+    table.data tr:nth-child(even) td { background:#f8fafc; }
+    .kpi-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:14px; }
+    .kpi { border:1px solid #cbd5e1; border-radius:6px; padding:8px 10px; }
+    .kpi .v { font-size:20px; font-weight:800; }
+    .kpi .l { font-size:9.5px; color:#64748b; }
+    .note { font-size:9.5px; color:#475569; background:#f8fafc; border:1px solid #e2e8f0; border-radius:4px; padding:8px 10px; }
+    .note li { margin-bottom:2px; }
+    .comment-box { border:1px solid #cbd5e1; border-radius:4px; padding:8px 10px; min-height:48px; white-space:pre-wrap; font-size:11px; margin-bottom:12px; }
+    .muted { color:#94a3b8; text-align:center; padding:8px; }
+    .footer { margin-top:22px; border-top:1px solid #cbd5e1; padding-top:6px; font-size:9.5px; color:#64748b; display:flex; justify-content:space-between; }
+    @media print { body { -webkit-print-color-adjust:exact; print-color-adjust:exact; } h2 { break-after:avoid; } table.data { break-inside:auto; } tr { break-inside:avoid; } }
+  </style>`;
+
+  const headerBlock = () => `
+    <div class="doc-sub">${esc(orgName || '')}${orgName && deptName ? ' / ' : ''}${esc(deptName || '')}</div>
+    <table class="meta-table">
+      <tr><td class="lbl">対象月</td><td>${esc(monthTitle)}</td><td class="lbl">作成日</td><td>${esc(todayStr)}</td></tr>
+      <tr><td class="lbl">提出先</td><td>${esc(orgName || '—')}</td><td class="lbl">作成者</td><td>${esc(currentUserName || '—')}</td></tr>
+      <tr><td class="lbl">グループ/部署</td><td colspan="3">${esc(deptName || '—')}</td></tr>
+    </table>`;
+
+  const footerBlock = (kind) => `<div class="footer"><span>作成日: ${esc(todayStr)}　作成者: ${esc(currentUserName || '—')}</span><span>製品検査Webアプリ — ${esc(kind)}</span></div>`;
+
+  const openPrint = (title, inner) => {
+    const pw = window.open('', '_blank');
+    if (!pw) { alert('ポップアップがブロックされています。ブラウザのポップアップを許可してください。'); return; }
+    pw.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${esc(title)}</title>${pdfStyle}</head><body>${inner}${footerBlock(title)}</body></html>`);
+    pw.document.close();
+    setTimeout(() => pw.print(), 500);
+  };
+
+  const buildPlanPdf = () => {
+    const p = planData;
+    let body = `<div class="doc-title">${esc(planTitle)}</div>${headerBlock()}`;
+    // §1 サマリー
+    body += `<h2>§1 当月予定 サマリー</h2><div class="kpi-grid">
+      <div class="kpi"><div class="v">${p.lotCount}</div><div class="l">当月予定ロット数</div></div>
+      <div class="kpi"><div class="v">${p.totalQty}</div><div class="l">予定台数</div></div>
+      <div class="kpi"><div class="v">${num1(p.totalHours)}<span style="font-size:12px">h</span></div><div class="l">予定総工数</div></div>
+      <div class="kpi"><div class="v">${num1(p.avgReqWorkers)}<span style="font-size:12px">名</span></div><div class="l">週平均必要人数</div></div>
+      <div class="kpi"><div class="v">${effectiveWorkers}<span style="font-size:12px">名</span></div><div class="l">在籍(有効)人数</div></div>
+      <div class="kpi"><div class="v" style="font-size:16px">${esc(p.capacityLabel)}</div><div class="l">余力判定</div></div>
+    </div>`;
+    body += `<div class="note">実効直工キャパ: <b>${teamCapacityWeekH.toFixed(1)}h/週</b>${factor !== 1 ? ` (間接込み係数 ${factor.toFixed(2)} を適用)` : ''} ／ 必要人数は間接作業を加味した値です。</div>`;
+    if (p.overdueCount > 0) body += `<div class="note" style="margin-top:6px">※ 当月納期のうち <b>納期超過</b> (本日より前の納期) ロット: ${p.overdueCount}件 (${num1(p.overdueSec / 3600)}h)</div>`;
+    if (p.noDueInfo > 0) body += `<div class="note" style="margin-top:6px">※ <b>納期未設定</b>で進行中のロット: ${p.noDueInfo}件 (${num1(p.noDueSec / 3600)}h) — 当月計画には含まれていません。納期設定を推奨します。</div>`;
+    // §2 週次計画
+    body += `<h2>§2 週次計画</h2><table class="data"><thead><tr><th>週 (期間)</th><th>ロット数</th><th>台数</th><th>予定工数(h)</th><th>必要人数</th><th>中間 (台/h)</th><th>完品 (台/h)</th><th>要残業/土曜</th></tr></thead><tbody>`;
+    if (p.weeks.every(w => w.lots === 0)) body += `<tr><td colspan="8" class="muted">該当なし</td></tr>`;
+    else p.weeks.forEach((w, i) => {
+      const pl = p.weekPlans[i];
+      const otCell = (pl && pl.over) ? `残業のべ${num1(pl.otClockH)}h${pl.satDays > 0 ? ` ＋ 土曜${pl.satDays}日` : ''}` : '—';
+      body += `<tr><td>${esc(w.label)}</td><td class="r">${w.lots}</td><td class="r">${w.qty}</td><td class="r">${num1(w.sec / 3600)}</td><td class="r">${num1(p.weekReqs[i])}</td><td class="r">${w.byCategory.intermediate.qty} / ${num1(w.byCategory.intermediate.sec / 3600)}</td><td class="r">${w.byCategory.final.qty} / ${num1(w.byCategory.final.sec / 3600)}</td><td class="r">${esc(otCell)}</td></tr>`;
+    });
+    body += `</tbody></table>`;
+    // §2 当月の超過対応サマリー
+    if (p.overflow.any) body += `<div class="note" style="border-color:#fecaca;background:#fef2f2;color:#9f1239">当月をこなすには（通常勤務に加えて）: <b>残業 のべ ${num1(p.overflow.otClockH)} h ＋ 土曜出勤 ${p.overflow.satDays} 日</b> → これで全件処理可能 (1人1日の最大残業 ${num1(maxOtPerDay)}h で算出)。</div>`;
+    else body += `<div class="note" style="border-color:#bbf7d0;background:#f0fdf4;color:#166534">通常勤務内で処理可能（残業・土曜は不要）。</div>`;
+    // §3 型式別予定
+    body += `<h2>§3 型式別 予定内訳</h2><table class="data"><thead><tr><th>型式</th><th>ロット数</th><th>台数</th><th>予定工数(h)</th></tr></thead><tbody>`;
+    if (p.byModel.length === 0) body += `<tr><td colspan="4" class="muted">該当なし</td></tr>`;
+    else p.byModel.forEach(m => { body += `<tr><td>${esc(m.model)}</td><td class="r">${m.lots}</td><td class="r">${m.qty}</td><td class="r">${num1(m.sec / 3600)}</td></tr>`; });
+    body += `</tbody></table>`;
+    // §4 注記
+    body += `<h2>§4 算出根拠注記</h2><div class="note"><ul style="margin:0;padding-left:16px">
+      <li>予定工数 = 各ロットの工程目標時間(型式別較正値があれば優先) × 数量 の合計。</li>
+      <li>週次は各ロットの<b>納期(dueDate)</b>を基準に月曜始まりの週へ割り当て。</li>
+      <li>必要人数 = 週予定工数(h) ÷ 週稼働時間(${num1(HOURS_PER_WEEK)}h/週 = ${num1(HOURS_PER_DAY)}h/日 × ${DAYS_PER_WEEK}日) × 間接込み係数(${factor.toFixed(2)})。間接作業(段取り・運搬・検査準備等)を加味した実効値です。</li>
+      <li>実効直工キャパ = 在籍${effectiveWorkers}名 × ${num1(HOURS_PER_WEEK)}h/週 ÷ 係数${factor.toFixed(2)} = <b>${teamCapacityWeekH.toFixed(1)}h/週</b>。</li>
+      <li>余力判定 = 稼働率(週平均必要人数 ÷ 在籍(有効)人数 ${effectiveWorkers}名 × 100) で判定 (${capLevels.yoyu}%未満:余裕あり / ${capLevels.tekisei}%未満:適正 / ${capLevels.manKado}%以下:満稼働 / 超過:人員不足)。</li>
+      <li>要残業/土曜 = 週予定工数が実効直工キャパを超える場合、まず残業(上限 1人1日 ${num1(maxOtPerDay)}h × ${DAYS_PER_WEEK}日)で処理し、なお不足する分を土曜出勤(1日=実効直工キャパ ÷ ${DAYS_PER_WEEK})で算出。残業のべ時間は実拘束時間(間接込み)。</li>
+      <li>完了済みロットは予定から除外。納期未設定ロットは当月集計対象外。</li>
+    </ul></div>`;
+    openPrint(planTitle, body);
+  };
+
+  const buildActualPdf = () => {
+    const a = actualData;
+    const q = qualityData;
+    let body = `<div class="doc-title">${esc(actualTitle)}</div>${headerBlock()}`;
+    // §1 実績サマリー
+    body += `<h2>§1 実績サマリー</h2><div class="kpi-grid">
+      <div class="kpi"><div class="v">${a.lotCount}</div><div class="l">完了ロット数</div></div>
+      <div class="kpi"><div class="v">${a.totalQty}</div><div class="l">完了台数</div></div>
+      <div class="kpi"><div class="v">${num1(a.totalHours)}<span style="font-size:12px">h</span></div><div class="l">実作業総工数</div></div>
+      <div class="kpi"><div class="v">${a.activeWorkerCount}<span style="font-size:12px">名</span></div><div class="l">稼働作業者数</div></div>
+      <div class="kpi"><div class="v">${a.activeWorkerCount ? num1(a.perWorkerHours) : '—'}<span style="font-size:12px">h</span></div><div class="l">1人当たり工数</div></div>`;
+    if (directIndirect.hasData) body += `<div class="kpi"><div class="v">${num1(directIndirect.directPct)}<span style="font-size:12px">%</span></div><div class="l">直工比率 (直${num1(directIndirect.directSec / 3600)}h / 間${num1(directIndirect.indirectSec / 3600)}h)</div></div>`;
+    body += `</div>`;
+    // §2 週次実績
+    body += `<h2>§2 週次実績</h2><table class="data"><thead><tr><th>週 (期間)</th><th>完了ロット数</th><th>完了台数</th><th>実工数(h)</th></tr></thead><tbody>`;
+    if (a.weeks.every(w => w.lots === 0)) body += `<tr><td colspan="4" class="muted">該当なし</td></tr>`;
+    else a.weeks.forEach(w => { body += `<tr><td>${esc(w.label)}</td><td class="r">${w.lots}</td><td class="r">${w.qty}</td><td class="r">${num1(w.sec / 3600)}</td></tr>`; });
+    body += `</tbody></table>`;
+    // §3 型式別実績
+    body += `<h2>§3 型式別 実績</h2><table class="data"><thead><tr><th>型式</th><th>完了台数</th><th>実工数(h)</th><th>目標比 (%)</th></tr></thead><tbody>`;
+    if (a.byModel.length === 0) body += `<tr><td colspan="4" class="muted">該当なし</td></tr>`;
+    else a.byModel.forEach(m => {
+      const ratio = (m.hasTarget && m.targetSec > 0) ? `${num1((m.sec / m.targetSec) * 100)}%` : '—';
+      body += `<tr><td>${esc(m.model)}</td><td class="r">${m.qty}</td><td class="r">${num1(m.sec / 3600)}</td><td class="r">${ratio}</td></tr>`;
+    });
+    body += `</tbody></table>`;
+    // §4 作業者別実績
+    body += `<h2>§4 作業者別 実績</h2><table class="data"><thead><tr><th>作業者</th><th>完了台数</th><th>実工数(h)</th>${a.hasNgRework ? '<th>NG件数</th><th>手直し回数</th>' : ''}</tr></thead><tbody>`;
+    if (a.byWorker.length === 0) body += `<tr><td colspan="${a.hasNgRework ? 5 : 3}" class="muted">該当なし</td></tr>`;
+    else a.byWorker.forEach(w => {
+      body += `<tr><td>${esc(w.name)}</td><td class="r">${w.qty}</td><td class="r">${num1(w.sec / 3600)}</td>${a.hasNgRework ? `<td class="r">${w.ng}</td><td class="r">${w.rework}</td>` : ''}</tr>`;
+    });
+    body += `</tbody></table>`;
+    // §5 品質サマリー
+    body += `<h2>§5 品質サマリー</h2><div class="kpi-grid">
+      <div class="kpi"><div class="v" style="color:#dc2626">${q.defects.length}</div><div class="l">不具合 (件)</div></div>
+      <div class="kpi"><div class="v" style="color:#7c3aed">${q.complaints.length}</div><div class="l">軽微不良 (件)</div></div>
+      <div class="kpi"><div class="v" style="color:#4f46e5">${q.improvements.length}</div><div class="l">気づき・改善 (件)</div></div>
+    </div>`;
+    const topList = (arr, label) => arr.length ? `<h3>${esc(label)} 上位</h3><table class="data"><thead><tr><th>${esc(label)}</th><th>件数</th></tr></thead><tbody>${arr.slice(0, 5).map(x => `<tr><td>${esc(x.name)}</td><td class="r">${x.count}</td></tr>`).join('')}</tbody></table>` : '';
+    // 不具合
+    body += `<h3>不具合 明細</h3>`;
+    body += topList(q.defectModels, '型式別') + topList(q.defectSteps, '工程別') + topList(q.defectProcesses, '原因工程別');
+    body += `<table class="data"><thead><tr><th>日付</th><th>型式</th><th>工程</th><th>内容</th><th>原因工程</th><th>報告者</th></tr></thead><tbody>`;
+    if (q.defects.length === 0) body += `<tr><td colspan="6" class="muted">該当なし</td></tr>`;
+    else q.defects.forEach(d => { body += `<tr><td>${esc(fmtDate(d.timestamp))}</td><td>${esc(d.lot?.model)}</td><td>${esc(d.stepInfo?.title || '全体')}</td><td>${esc(d.label)}</td><td>${esc(d.causeProcess || '未指定')}</td><td>${esc(d.workerName)}</td></tr>`; });
+    body += `</tbody></table>`;
+    // 軽微不良
+    body += `<h3>軽微不良 明細</h3>`;
+    body += topList(q.complaintLabels, 'カテゴリ別') + topList(q.complaintSteps, '工程別');
+    body += `<table class="data"><thead><tr><th>日付</th><th>型式</th><th>工程</th><th>カテゴリ</th><th>内容</th><th>報告者</th></tr></thead><tbody>`;
+    if (q.complaints.length === 0) body += `<tr><td colspan="6" class="muted">該当なし</td></tr>`;
+    else q.complaints.forEach(c => { body += `<tr><td>${esc(fmtDate(c.timestamp))}</td><td>${esc(c.lot?.model)}</td><td>${esc(c.stepInfo?.title || '全体')}</td><td>${esc(c.mainLabel)}</td><td>${esc(c.subLabel)}</td><td>${esc(c.workerName)}</td></tr>`; });
+    body += `</tbody></table>`;
+    // 気づき・改善
+    body += `<h3>気づき・改善 明細</h3>`;
+    body += `<table class="data"><thead><tr><th>日付</th><th>種類</th><th>対象工程</th><th>理由</th><th>型式</th><th>報告者</th></tr></thead><tbody>`;
+    if (q.improvements.length === 0) body += `<tr><td colspan="6" class="muted">該当なし</td></tr>`;
+    else q.improvements.forEach(im => { body += `<tr><td>${esc(fmtDate(im.timestamp))}</td><td>${esc(im.kindLabel)}</td><td>${esc(im.targetStepTitle || '—')}</td><td>${esc(im.reason)}</td><td>${esc(im.model || im.lot?.model || '—')}</td><td>${esc(im.workerName)}</td></tr>`; });
+    body += `</tbody></table>`;
+    // §6 目標時間の更新
+    body += `<h2>§6 目標時間の更新</h2>`;
+    body += `<table class="data"><thead><tr><th>日時</th><th>型式(対象)</th><th>工程</th><th>旧→新(秒)</th><th>戦略</th><th>エビデンス</th><th>更新者</th></tr></thead><tbody>`;
+    if (targetUpdates.length === 0) body += `<tr><td colspan="7" class="muted">当月の目標時間更新はありません</td></tr>`;
+    else targetUpdates.forEach(u => {
+      const ev = u.evidence ? `期間:${esc(u.evidence.periodLabel || '—')} / ${u.evidence.validCount ?? '—'}件 / 平均${u.evidence.mean ?? '—'}s${u.evidence.stdDev != null ? ` / ±${u.evidence.stdDev}s` : ''}` : '—';
+      const target = `${u.targetType === 'app' ? '[外観図]' : '[型式]'} ${esc(u.targetValue)}`;
+      body += `<tr><td>${esc(fmtDateTime(u.timestamp))}</td><td>${target}</td><td>${esc(u.category ? `[${u.category}] ` : '')}${esc(u.title)}</td><td class="c">${u.oldTime}s → ${u.newTime}s</td><td>${esc(u.strategyName || '—')}</td><td style="font-size:9.5px">${ev}</td><td>${esc(u.by || '—')}</td></tr>`;
+    });
+    body += `</tbody></table>`;
+    if (targetUpdates.length > 0) body += `<div class="note">当月は ${targetUpdates.length} 件の目標時間を更新しました。各行の「旧→新(秒)」が変更内容、「エビデンス」が変更根拠 (対象期間の実績サンプル数・平均・標準偏差) です。</div>`;
+    // §7 所感 + 注記
+    body += `<h2>§7 所感</h2><div class="comment-box">${comment ? esc(comment) : '<span style="color:#94a3b8">（記載なし）</span>'}</div>`;
+    body += `<h3>算出根拠注記</h3><div class="note"><ul style="margin:0;padding-left:16px">
+      <li>実作業工数 = 完了ロットの完了タスク所要時間(duration)の合計。タスク記録が無い場合はロット総作業時間で代替。</li>
+      <li>集計対象 = <b>完了日(completedAt)</b>が当月内の完了ロット。週次は完了日を月曜始まりの週へ割り当て。</li>
+      <li>目標比(%) = 実工数 ÷ 目標工数 × 100。目標工数が未設定の型式は「—」。</li>
+      <li>1人当たり工数 = 実作業総工数 ÷ 稼働作業者数。NG件数・手直し回数はタスク記録に基づく。</li>
+      <li>品質・気づき改善は当月内に報告された記録 (タイムスタンプ基準) を集計。</li>
+    </ul></div>`;
+    openPrint(actualTitle, body);
+  };
+
+  // =====================================================================================
+  // Excel 出力 (多シート)
+  // =====================================================================================
+  const xlStyle = (ExcelJS) => {
+    const thin = { style: 'thin', color: { argb: 'FF94A3B8' } };
+    const allBorder = { top: thin, bottom: thin, left: thin, right: thin };
+    const headerFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+    const headerFont = { bold: true, color: { argb: 'FF1E293B' } };
+    return { allBorder, headerFill, headerFont };
+  };
+  const addHeaderRow = (ws, R, cols, st) => {
+    cols.forEach((h, i) => { const c = ws.getRow(R).getCell(i + 1); c.value = h; c.font = st.headerFont; c.fill = st.headerFill; c.border = st.allBorder; c.alignment = { horizontal: 'center' }; });
+    return R + 1;
+  };
+  const addDataRow = (ws, R, vals, st, rightCols = []) => {
+    vals.forEach((v, i) => { const c = ws.getRow(R).getCell(i + 1); c.value = v; c.border = st.allBorder; if (rightCols.includes(i)) c.alignment = { horizontal: 'right' }; });
+    return R + 1;
+  };
+  const titleRow = (ws, R, text, span) => { ws.mergeCells(R, 1, R, span); const c = ws.getRow(R).getCell(1); c.value = text; c.font = { size: 13, bold: true }; return R + 1; };
+
+  const buildPlanExcel = async () => {
+    const ExcelJS = await loadExcelJS();
+    const st = xlStyle(ExcelJS);
+    const wb = new ExcelJS.Workbook();
+    const p = planData;
+    // サマリー
+    const s1 = wb.addWorksheet('計画サマリー');
+    let R = 1;
+    R = titleRow(s1, R, planTitle, 4); R++;
+    R = addDataRow(s1, R, ['提出先', orgName || '—', 'グループ/部署', deptName || '—'], st);
+    R = addDataRow(s1, R, ['対象月', monthTitle, '作成日', todayStr], st);
+    R = addDataRow(s1, R, ['作成者', currentUserName || '—', '', ''], st);
+    R++;
+    R = addHeaderRow(s1, R, ['指標', '値'], st);
+    [['当月予定ロット数', p.lotCount], ['予定台数', p.totalQty], ['予定総工数(h)', Number(p.totalHours.toFixed(1))], ['間接込み係数', factor], ['実効直工キャパ(h/週)', Number(teamCapacityWeekH.toFixed(1))], ['週平均必要人数', Number(p.avgReqWorkers.toFixed(1))], ['在籍(有効)人数', effectiveWorkers], ['余力判定', p.capacityLabel], ['納期超過ロット', p.overdueCount], ['納期未設定(進行中)', p.noDueInfo]].forEach(row => { R = addDataRow(s1, R, row, st, [1]); });
+    s1.getColumn(1).width = 22; s1.getColumn(2).width = 18; s1.getColumn(3).width = 16; s1.getColumn(4).width = 18;
+    // 週次計画
+    const s2 = wb.addWorksheet('週次計画');
+    R = 1; R = titleRow(s2, R, `週次計画 (${monthTitle})`, 11); R++;
+    R = addHeaderRow(s2, R, ['週(期間)', 'ロット数', '台数', '予定工数(h)', '必要人数', '中間台数', '中間工数(h)', '完品台数', '完品工数(h)', '要残業のべ(h)', '土曜出勤(日)'], st);
+    if (p.weeks.every(w => w.lots === 0)) R = addDataRow(s2, R, ['該当なし', '', '', '', '', '', '', '', '', '', ''], st);
+    else p.weeks.forEach((w, i) => { const pl = p.weekPlans[i]; R = addDataRow(s2, R, [w.label, w.lots, w.qty, Number((w.sec / 3600).toFixed(1)), Number(p.weekReqs[i].toFixed(1)), w.byCategory.intermediate.qty, Number((w.byCategory.intermediate.sec / 3600).toFixed(1)), w.byCategory.final.qty, Number((w.byCategory.final.sec / 3600).toFixed(1)), (pl && pl.over) ? Number(pl.otClockH.toFixed(1)) : 0, (pl && pl.over) ? pl.satDays : 0], st, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]); });
+    R++;
+    // 当月の超過対応サマリー
+    if (p.overflow.any) R = addDataRow(s2, R, ['当月をこなすには（通常勤務に加えて）', `残業 のべ ${Number(p.overflow.otClockH.toFixed(1))} h ＋ 土曜出勤 ${p.overflow.satDays} 日 → 全件処理可能`], st);
+    else R = addDataRow(s2, R, ['当月の超過対応', '通常勤務内で処理可能（残業・土曜は不要）'], st);
+    s2.getColumn(1).width = 18; for (let i = 2; i <= 9; i++) s2.getColumn(i).width = 12; s2.getColumn(10).width = 14; s2.getColumn(11).width = 12;
+    // 型式別予定
+    const s3 = wb.addWorksheet('型式別予定');
+    R = 1; R = titleRow(s3, R, `型式別 予定内訳 (${monthTitle})`, 4); R++;
+    R = addHeaderRow(s3, R, ['型式', 'ロット数', '台数', '予定工数(h)'], st);
+    if (p.byModel.length === 0) R = addDataRow(s3, R, ['該当なし', '', '', ''], st);
+    else p.byModel.forEach(m => { R = addDataRow(s3, R, [m.model, m.lots, m.qty, Number((m.sec / 3600).toFixed(1))], st, [1, 2, 3]); });
+    s3.getColumn(1).width = 26; s3.getColumn(2).width = 12; s3.getColumn(3).width = 12; s3.getColumn(4).width = 14;
+    await downloadWb(wb, `月次作業計画_${selectedMonth}.xlsx`);
+  };
+
+  const buildActualExcel = async () => {
+    const ExcelJS = await loadExcelJS();
+    const st = xlStyle(ExcelJS);
+    const wb = new ExcelJS.Workbook();
+    const a = actualData; const q = qualityData;
+    // サマリー
+    const s1 = wb.addWorksheet('実績サマリー');
+    let R = 1;
+    R = titleRow(s1, R, actualTitle, 4); R++;
+    R = addDataRow(s1, R, ['提出先', orgName || '—', 'グループ/部署', deptName || '—'], st);
+    R = addDataRow(s1, R, ['対象月', monthTitle, '作成日', todayStr], st);
+    R = addDataRow(s1, R, ['作成者', currentUserName || '—', '', ''], st);
+    R++;
+    R = addHeaderRow(s1, R, ['指標', '値'], st);
+    const summaryRows = [['完了ロット数', a.lotCount], ['完了台数', a.totalQty], ['実作業総工数(h)', Number(a.totalHours.toFixed(1))], ['稼働作業者数', a.activeWorkerCount], ['1人当たり工数(h)', a.activeWorkerCount ? Number(a.perWorkerHours.toFixed(1)) : '—']];
+    if (directIndirect.hasData) { summaryRows.push(['直工比率(%)', Number(directIndirect.directPct.toFixed(1))]); summaryRows.push(['直工工数(h)', Number((directIndirect.directSec / 3600).toFixed(1))]); summaryRows.push(['間接工数(h)', Number((directIndirect.indirectSec / 3600).toFixed(1))]); }
+    summaryRows.forEach(row => { R = addDataRow(s1, R, row, st, [1]); });
+    s1.getColumn(1).width = 22; s1.getColumn(2).width = 18; s1.getColumn(3).width = 16; s1.getColumn(4).width = 18;
+    // 週次実績
+    const s2 = wb.addWorksheet('週次実績');
+    R = 1; R = titleRow(s2, R, `週次実績 (${monthTitle})`, 4); R++;
+    R = addHeaderRow(s2, R, ['週(期間)', '完了ロット数', '完了台数', '実工数(h)'], st);
+    if (a.weeks.every(w => w.lots === 0)) R = addDataRow(s2, R, ['該当なし', '', '', ''], st);
+    else a.weeks.forEach(w => { R = addDataRow(s2, R, [w.label, w.lots, w.qty, Number((w.sec / 3600).toFixed(1))], st, [1, 2, 3]); });
+    s2.getColumn(1).width = 18; s2.getColumn(2).width = 14; s2.getColumn(3).width = 12; s2.getColumn(4).width = 12;
+    // 型式別実績
+    const s3 = wb.addWorksheet('型式別実績');
+    R = 1; R = titleRow(s3, R, `型式別 実績 (${monthTitle})`, 4); R++;
+    R = addHeaderRow(s3, R, ['型式', '完了台数', '実工数(h)', '目標比(%)'], st);
+    if (a.byModel.length === 0) R = addDataRow(s3, R, ['該当なし', '', '', ''], st);
+    else a.byModel.forEach(m => { const ratio = (m.hasTarget && m.targetSec > 0) ? Number(((m.sec / m.targetSec) * 100).toFixed(1)) : '—'; R = addDataRow(s3, R, [m.model, m.qty, Number((m.sec / 3600).toFixed(1)), ratio], st, [1, 2, 3]); });
+    s3.getColumn(1).width = 26; s3.getColumn(2).width = 12; s3.getColumn(3).width = 12; s3.getColumn(4).width = 12;
+    // 作業者別
+    const s4 = wb.addWorksheet('作業者別実績');
+    R = 1; R = titleRow(s4, R, `作業者別 実績 (${monthTitle})`, 5); R++;
+    R = addHeaderRow(s4, R, ['作業者', '完了台数', '実工数(h)', 'NG件数', '手直し回数'], st);
+    if (a.byWorker.length === 0) R = addDataRow(s4, R, ['該当なし', '', '', '', ''], st);
+    else a.byWorker.forEach(w => { R = addDataRow(s4, R, [w.name, w.qty, Number((w.sec / 3600).toFixed(1)), w.ng, w.rework], st, [1, 2, 3, 4]); });
+    s4.getColumn(1).width = 16; for (let i = 2; i <= 5; i++) s4.getColumn(i).width = 12;
+    // 不具合
+    const s5 = wb.addWorksheet('不具合');
+    R = 1; R = titleRow(s5, R, `不具合 (${monthTitle}) — ${q.defects.length}件`, 6); R++;
+    R = addHeaderRow(s5, R, ['日付', '型式', '工程', '内容', '原因工程', '報告者'], st);
+    if (q.defects.length === 0) R = addDataRow(s5, R, ['該当なし', '', '', '', '', ''], st);
+    else q.defects.forEach(d => { R = addDataRow(s5, R, [fmtDate(d.timestamp), d.lot?.model || '', d.stepInfo?.title || '全体', d.label || '', d.causeProcess || '未指定', d.workerName || ''], st); });
+    [14, 16, 16, 30, 12, 12].forEach((w, i) => { s5.getColumn(i + 1).width = w; });
+    // 軽微不良
+    const s6 = wb.addWorksheet('軽微不良');
+    R = 1; R = titleRow(s6, R, `軽微不良 (${monthTitle}) — ${q.complaints.length}件`, 6); R++;
+    R = addHeaderRow(s6, R, ['日付', '型式', '工程', 'カテゴリ', '内容', '報告者'], st);
+    if (q.complaints.length === 0) R = addDataRow(s6, R, ['該当なし', '', '', '', '', ''], st);
+    else q.complaints.forEach(c => { R = addDataRow(s6, R, [fmtDate(c.timestamp), c.lot?.model || '', c.stepInfo?.title || '全体', c.mainLabel, c.subLabel, c.workerName || ''], st); });
+    [14, 16, 16, 16, 30, 12].forEach((w, i) => { s6.getColumn(i + 1).width = w; });
+    // 気づき改善
+    const s7 = wb.addWorksheet('気づき改善');
+    R = 1; R = titleRow(s7, R, `気づき・改善 (${monthTitle}) — ${q.improvements.length}件`, 6); R++;
+    R = addHeaderRow(s7, R, ['日付', '種類', '対象工程', '理由', '型式', '報告者'], st);
+    if (q.improvements.length === 0) R = addDataRow(s7, R, ['該当なし', '', '', '', '', ''], st);
+    else q.improvements.forEach(im => { R = addDataRow(s7, R, [fmtDate(im.timestamp), im.kindLabel, im.targetStepTitle || '—', im.reason, im.model || im.lot?.model || '—', im.workerName || ''], st); });
+    [14, 12, 18, 32, 16, 12].forEach((w, i) => { s7.getColumn(i + 1).width = w; });
+    // 目標時間更新
+    const s8 = wb.addWorksheet('目標時間更新');
+    R = 1; R = titleRow(s8, R, `目標時間の更新 (${monthTitle}) — ${targetUpdates.length}件`, 9); R++;
+    R = addHeaderRow(s8, R, ['日時', '対象種別', '対象', '工程', '旧(秒)', '新(秒)', '戦略', 'エビデンス', '更新者'], st);
+    if (targetUpdates.length === 0) R = addDataRow(s8, R, ['当月の更新なし', '', '', '', '', '', '', '', ''], st);
+    else targetUpdates.forEach(u => {
+      const ev = u.evidence ? `期間:${u.evidence.periodLabel || '—'} / ${u.evidence.validCount ?? '—'}件 / 平均${u.evidence.mean ?? '—'}s${u.evidence.stdDev != null ? ` / ±${u.evidence.stdDev}s` : ''}` : '—';
+      R = addDataRow(s8, R, [fmtDateTime(u.timestamp), u.targetType === 'app' ? '外観図' : '型式', u.targetValue || '', `${u.category ? `[${u.category}] ` : ''}${u.title || ''}`, u.oldTime, u.newTime, u.strategyName || '—', ev, u.by || '—'], st, [4, 5]);
+    });
+    [18, 10, 16, 22, 9, 9, 12, 40, 12].forEach((w, i) => { s8.getColumn(i + 1).width = w; });
+    // 所感
+    if (comment) { const cell = s1.getRow(R + 2).getCell(1); s1.mergeCells(R + 2, 1, R + 2, 4); cell.value = `所感: ${comment}`; cell.alignment = { wrapText: true, vertical: 'top' }; cell.font = { italic: true }; }
+    await downloadWb(wb, `月次業務実績_${selectedMonth}.xlsx`);
+  };
+
+  const downloadWb = async (wb, filename) => {
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+
+  // =====================================================================================
+  // 画面 (UI)
+  // =====================================================================================
+  const Btn = ({ onClick, color, icon: Icon, children }) => (
+    <button onClick={onClick} className={`px-3 py-2 rounded-lg text-sm font-bold text-white flex items-center gap-1.5 shadow-sm ${color}`}>
+      <Icon className="w-4 h-4" /> {children}
+    </button>
+  );
+  const a = actualData; const p = planData; const q = qualityData;
+
+  return (
+    <div data-fs="tables" className="h-full overflow-y-auto bg-slate-50 p-4">
+      <div className="max-w-screen-xl mx-auto space-y-4">
+        {/* ヘッダ */}
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+          <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2 mb-1"><FileText className="w-6 h-6 text-blue-600" /> 月次レポート <span className="text-xs font-normal text-slate-400">(会社提出用)</span></h2>
+          <p className="text-xs text-slate-500 mb-3">対象月を選び、<b>月初の作業計画報告書</b>と<b>月末の業務実績報告書</b>を PDF / Excel で出力します。すべて実データに基づきます。</p>
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">対象月</label>
+              <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="border border-slate-300 rounded px-3 py-1.5 font-bold text-slate-700" />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">提出先</label>
+              <input type="text" value={orgName} onChange={e => persistOrg(e.target.value)} onBlur={commitOrgDept} placeholder="例: ○○製作所" className="border border-slate-300 rounded px-3 py-1.5 text-sm w-48" />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">グループ / 部署名</label>
+              <input type="text" value={deptName} onChange={e => persistDept(e.target.value)} onBlur={commitOrgDept} placeholder="例: 品質保証部 検査課" className="border border-slate-300 rounded px-3 py-1.5 text-sm w-56" />
+            </div>
+            <div className="text-[11px] text-slate-500">作成者: <b className="text-slate-700">{currentUserName || '—'}</b> / 作成日: <b className="text-slate-700">{todayStr}</b></div>
+          </div>
+        </div>
+
+        {/* エクスポートボタン */}
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-wrap items-center gap-3">
+          <span className="text-sm font-bold text-slate-600">出力:</span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-1 rounded">月初・作業計画</span>
+            <Btn onClick={buildPlanPdf} color="bg-rose-600 hover:bg-rose-700" icon={Printer}>PDF</Btn>
+            <Btn onClick={buildPlanExcel} color="bg-emerald-600 hover:bg-emerald-700" icon={FileSpreadsheet}>Excel</Btn>
+          </div>
+          <div className="w-px h-8 bg-slate-200" />
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold text-teal-700 bg-teal-50 px-2 py-1 rounded">月末・業務実績</span>
+            <Btn onClick={buildActualPdf} color="bg-rose-600 hover:bg-rose-700" icon={Printer}>PDF</Btn>
+            <Btn onClick={buildActualExcel} color="bg-emerald-600 hover:bg-emerald-700" icon={FileSpreadsheet}>Excel</Btn>
+          </div>
+        </div>
+
+        {/* 所感 */}
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+          <label className="block text-sm font-bold text-slate-600 mb-2">所感 (実績報告書 §7 に記載 — 任意)</label>
+          <textarea value={comment} onChange={e => setComment(e.target.value)} rows={3} placeholder="当月の総括・特記事項・次月への課題などを記入してください。" className="w-full border border-slate-300 rounded p-2.5 text-sm" />
+        </div>
+
+        {/* プレビュー: 2カラム */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {/* PLAN プレビュー */}
+          <div className="bg-white rounded-xl border border-blue-200 shadow-sm overflow-hidden">
+            <div className="bg-blue-600 text-white px-4 py-2.5 font-bold text-sm flex items-center gap-2"><FileText className="w-4 h-4" /> 月初レポート プレビュー</div>
+            <div className="p-4 space-y-3">
+              <div className="text-center font-bold text-slate-800 text-base">{planTitle}</div>
+              <div className="grid grid-cols-3 gap-2">
+                {[['予定ロット', p.lotCount, '件'], ['予定台数', p.totalQty, '台'], ['予定総工数', num1(p.totalHours), 'h'], ['週平均必要人数', num1(p.avgReqWorkers), '名'], ['在籍人数', effectiveWorkers, '名'], ['余力判定', p.capacityLabel, '']].map(([l, v, u], i) => (
+                  <div key={i} className="border border-slate-200 rounded-lg p-2 text-center bg-slate-50">
+                    <div className="text-[10px] text-slate-500">{l}</div>
+                    <div className="text-lg font-black text-slate-800">{v}<span className="text-[10px] font-normal ml-0.5">{u}</span></div>
+                  </div>
+                ))}
+              </div>
+              <div className="text-[11px] text-slate-500 bg-indigo-50/60 border border-indigo-100 rounded px-2 py-1.5">
+                実効直工キャパ <span className="font-bold text-slate-700">{teamCapacityWeekH.toFixed(1)}h/週</span>
+                {factor !== 1 && <span className="text-indigo-600"> (間接込み係数 {factor.toFixed(2)})</span>}
+                <span className="text-slate-400"> ・必要人数は間接作業を加味した値</span>
+              </div>
+              <div>
+                <div className="text-xs font-bold text-slate-600 mb-1">週次計画</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px] border-collapse">
+                    <thead><tr className="bg-slate-100 text-slate-600"><th className="border border-slate-200 px-1.5 py-1">週</th><th className="border border-slate-200 px-1.5 py-1">ロット</th><th className="border border-slate-200 px-1.5 py-1">台数</th><th className="border border-slate-200 px-1.5 py-1">工数h</th><th className="border border-slate-200 px-1.5 py-1">必要人数</th><th className="border border-slate-200 px-1.5 py-1">残業/土曜</th></tr></thead>
+                    <tbody>
+                      {p.weeks.every(w => w.lots === 0) ? <tr><td colSpan={6} className="text-center text-slate-400 py-3">該当なし</td></tr> :
+                        p.weeks.map((w, i) => {
+                          const pl = p.weekPlans[i];
+                          return (
+                          <tr key={i} className="even:bg-slate-50"><td className="border border-slate-200 px-1.5 py-1 whitespace-nowrap">{w.label}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{w.lots}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{w.qty}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{num1(w.sec / 3600)}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{num1(p.weekReqs[i])}</td><td className={`border border-slate-200 px-1.5 py-1 text-right whitespace-nowrap ${pl && pl.over ? 'text-rose-700 font-bold' : 'text-slate-300'}`}>{pl && pl.over ? `残業${num1(pl.otClockH)}h${pl.satDays > 0 ? ` ＋土${pl.satDays}日` : ''}` : '—'}</td></tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+                {p.overflow.any ? (
+                  <div className="mt-1.5 text-[11px] bg-rose-50 border border-rose-200 rounded px-2 py-1.5 text-rose-800">
+                    当月をこなすには（通常勤務に加えて）: <span className="font-bold">残業 のべ {num1(p.overflow.otClockH)} h ＋ 土曜出勤 {p.overflow.satDays} 日</span> → これで全件処理可能
+                  </div>
+                ) : (
+                  <div className="mt-1.5 text-[11px] bg-emerald-50 border border-emerald-200 rounded px-2 py-1.5 text-emerald-800">
+                    通常勤務内で処理可能（残業・土曜は不要）
+                  </div>
+                )}
+              </div>
+              <div>
+                <div className="text-xs font-bold text-slate-600 mb-1">型式別 予定 (上位)</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px] border-collapse">
+                    <thead><tr className="bg-slate-100 text-slate-600"><th className="border border-slate-200 px-1.5 py-1 text-left">型式</th><th className="border border-slate-200 px-1.5 py-1">台数</th><th className="border border-slate-200 px-1.5 py-1">工数h</th></tr></thead>
+                    <tbody>
+                      {p.byModel.length === 0 ? <tr><td colSpan={3} className="text-center text-slate-400 py-3">該当なし</td></tr> :
+                        p.byModel.slice(0, 6).map((m, i) => (
+                          <tr key={i} className="even:bg-slate-50"><td className="border border-slate-200 px-1.5 py-1 truncate max-w-[140px]" title={m.model}>{m.model}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{m.qty}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{num1(m.sec / 3600)}</td></tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              {(p.overdueCount > 0 || p.noDueInfo > 0) && (
+                <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+                  {p.overdueCount > 0 && <div>納期超過: {p.overdueCount}件 ({num1(p.overdueSec / 3600)}h)</div>}
+                  {p.noDueInfo > 0 && <div>納期未設定(進行中): {p.noDueInfo}件 — 計画対象外</div>}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* ACTUAL プレビュー */}
+          <div className="bg-white rounded-xl border border-teal-200 shadow-sm overflow-hidden">
+            <div className="bg-teal-600 text-white px-4 py-2.5 font-bold text-sm flex items-center gap-2"><FileText className="w-4 h-4" /> 月末レポート プレビュー</div>
+            <div className="p-4 space-y-3">
+              <div className="text-center font-bold text-slate-800 text-base">{actualTitle}</div>
+              <div className="grid grid-cols-3 gap-2">
+                {[['完了ロット', a.lotCount, '件'], ['完了台数', a.totalQty, '台'], ['実総工数', num1(a.totalHours), 'h'], ['稼働作業者', a.activeWorkerCount, '名'], ['1人当工数', a.activeWorkerCount ? num1(a.perWorkerHours) : '—', 'h'], ['直工比率', directIndirect.hasData ? num1(directIndirect.directPct) : '—', directIndirect.hasData ? '%' : '']].map(([l, v, u], i) => (
+                  <div key={i} className="border border-slate-200 rounded-lg p-2 text-center bg-slate-50">
+                    <div className="text-[10px] text-slate-500">{l}</div>
+                    <div className="text-lg font-black text-slate-800">{v}<span className="text-[10px] font-normal ml-0.5">{u}</span></div>
+                  </div>
+                ))}
+              </div>
+              <div>
+                <div className="text-xs font-bold text-slate-600 mb-1">週次実績</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px] border-collapse">
+                    <thead><tr className="bg-slate-100 text-slate-600"><th className="border border-slate-200 px-1.5 py-1">週</th><th className="border border-slate-200 px-1.5 py-1">完了ロット</th><th className="border border-slate-200 px-1.5 py-1">台数</th><th className="border border-slate-200 px-1.5 py-1">実工数h</th></tr></thead>
+                    <tbody>
+                      {a.weeks.every(w => w.lots === 0) ? <tr><td colSpan={4} className="text-center text-slate-400 py-3">該当なし</td></tr> :
+                        a.weeks.map((w, i) => (
+                          <tr key={i} className="even:bg-slate-50"><td className="border border-slate-200 px-1.5 py-1 whitespace-nowrap">{w.label}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{w.lots}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{w.qty}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{num1(w.sec / 3600)}</td></tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <div className="text-xs font-bold text-slate-600 mb-1">作業者別 実績 (上位)</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px] border-collapse">
+                    <thead><tr className="bg-slate-100 text-slate-600"><th className="border border-slate-200 px-1.5 py-1 text-left">作業者</th><th className="border border-slate-200 px-1.5 py-1">台数</th><th className="border border-slate-200 px-1.5 py-1">工数h</th>{a.hasNgRework && <th className="border border-slate-200 px-1.5 py-1">NG</th>}{a.hasNgRework && <th className="border border-slate-200 px-1.5 py-1">手直し</th>}</tr></thead>
+                    <tbody>
+                      {a.byWorker.length === 0 ? <tr><td colSpan={a.hasNgRework ? 5 : 3} className="text-center text-slate-400 py-3">該当なし</td></tr> :
+                        a.byWorker.slice(0, 6).map((w, i) => (
+                          <tr key={i} className="even:bg-slate-50"><td className="border border-slate-200 px-1.5 py-1">{w.name}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{w.qty}</td><td className="border border-slate-200 px-1.5 py-1 text-right">{num1(w.sec / 3600)}</td>{a.hasNgRework && <td className="border border-slate-200 px-1.5 py-1 text-right">{w.ng}</td>}{a.hasNgRework && <td className="border border-slate-200 px-1.5 py-1 text-right">{w.rework}</td>}</tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div className="border border-rose-200 bg-rose-50 rounded-lg p-2 text-center"><div className="text-[10px] text-rose-600">不具合</div><div className="text-lg font-black text-rose-700">{q.defects.length}<span className="text-[10px] font-normal">件</span></div></div>
+                <div className="border border-purple-200 bg-purple-50 rounded-lg p-2 text-center"><div className="text-[10px] text-purple-600">軽微不良</div><div className="text-lg font-black text-purple-700">{q.complaints.length}<span className="text-[10px] font-normal">件</span></div></div>
+                <div className="border border-indigo-200 bg-indigo-50 rounded-lg p-2 text-center"><div className="text-[10px] text-indigo-600">気づき改善</div><div className="text-lg font-black text-indigo-700">{q.improvements.length}<span className="text-[10px] font-normal">件</span></div></div>
+              </div>
+              <div className="text-[11px] text-slate-600">
+                <span className="font-bold">当月の目標時間更新:</span> {targetUpdates.length > 0 ? `${targetUpdates.length}件` : 'なし'}
+                {targetUpdates.length > 0 && <span className="text-slate-400"> (詳細はPDF/Excel §6)</span>}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="text-[11px] text-slate-400 text-center pb-4">※ プレビューは主要な表のみを表示しています。完全版 (注記・全明細・品質詳細・目標時間更新一覧) は PDF / Excel に含まれます。</div>
       </div>
     </div>
   );
@@ -18486,6 +21932,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
   const [reportLot, setReportLot] = useState(null);
   const [editingTimeLot, setEditingTimeLot] = useState(null);
   const [editingMeasLot, setEditingMeasLot] = useState(null);
+  const [viewGridLot, setViewGridLot] = useState(null); // 完了ロットを作業画面の工程×台表で閲覧（読み取り専用）
   const [confirmModal, setConfirmModal] = useState({ isOpen: false, title: '', message: '', action: null });
 
   const getTodayStr = () => { const d = new Date(); const pad = (n) => n.toString().padStart(2, '0'); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
@@ -18608,6 +22055,20 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
           </div>
         </div>
       )}
+      {viewGridLot && (
+        <div className="fixed inset-0 z-[120] bg-black/60 flex items-center justify-center p-4" onClick={() => setViewGridLot(null)}>
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-6xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-3 bg-slate-800 text-white flex items-center justify-between shrink-0">
+              <div className="font-black flex items-center gap-2"><LayoutGrid className="w-5 h-5"/> 作業表（閲覧）— {viewGridLot.model} <span className="text-slate-300 font-normal">/ 指図 {viewGridLot.orderNo} / {viewGridLot.quantity}台</span></div>
+              <button onClick={() => setViewGridLot(null)} className="hover:bg-white/20 rounded-full p-1.5"><X className="w-5 h-5"/></button>
+            </div>
+            <div className="flex-1 overflow-auto p-4 bg-slate-50">
+              <div className="text-[11px] text-slate-500 mb-2">※ 閲覧専用です（ここからは変更できません）。✓完了 ▶作業中 修正=やり直し NG –該当なし。</div>
+              <CustomCompactGrid localSteps={viewGridLot.steps || []} lot={viewGridLot} tasks={viewGridLot.tasks || {}} batchStartTimes={{}} globalNextTask={null} getTaskStatusColor={() => ''} formatTime={formatTime} activeCustomTaskKey={null} onCellClick={() => {}} onBatchClick={() => {}} onSkipRow={() => {}} />
+            </div>
+          </div>
+        </div>
+      )}
       {reportLot && <ReportPreview lot={reportLot} workers={workers} onClose={() => setReportLot(null)} />}
       {editingTimeLot && <EditTimeModal lot={editingTimeLot} onClose={() => setEditingTimeLot(null)} onSave={(data) => { saveData('lots', editingTimeLot.id, data); setEditingTimeLot(null); }} />}
       {editingMeasLot && <EditMeasurementModal lot={editingMeasLot} onClose={() => setEditingMeasLot(null)} onSave={(data) => { saveData('lots', editingMeasLot.id, data); setEditingMeasLot(null); }} />}
@@ -18657,6 +22118,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                 <div className="flex justify-between items-start gap-2">
                   <div className="font-bold text-lg text-slate-800 break-all">{lot.model}</div>
                   <div className="flex gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                    <button onClick={() => setViewGridLot(lot)} className="p-1.5 border rounded hover:bg-indigo-50 text-indigo-600 transition-colors" title="作業表で見る（工程×台）"><LayoutGrid className="w-4 h-4" /></button>
                     <button onClick={() => setReportLot(lot)} className="p-1.5 border rounded hover:bg-green-50 text-green-600 transition-colors" title="成績表プレビュー"><Printer className="w-4 h-4" /></button>
                     <button onClick={() => setEditingTimeLot(lot)} className="p-1.5 border rounded hover:bg-amber-50 text-amber-600 transition-colors" title="作業時間編集"><Clock className="w-4 h-4" /></button>
                     <button onClick={() => setEditingMeasLot(lot)} className="p-1.5 border rounded hover:bg-emerald-50 text-emerald-600 transition-colors" title="測定結果編集"><Ruler className="w-4 h-4" /></button>
@@ -18671,19 +22133,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                 </div>
                 <div className="text-xs text-slate-400 mt-auto pt-3 border-t flex items-center justify-between gap-2">
                   <span>{lot.updatedAt ? new Date(toMs(lot.updatedAt)).toLocaleString() : '-'}</span>
-                  {(() => {
-                    // 完了から30分以内ならロットを未完了に戻すボタンを表示
-                    const completedTs = toMs(lot.updatedAt);
-                    const within30 = completedTs && (Date.now() - completedTs) < 30 * 60 * 1000;
-                    if (!within30) return null;
-                    return (
-                      <button onClick={(e) => {
-                        e.stopPropagation();
-                        if (!confirm(`このロット（${lot.model} / ${lot.orderNo}）を未完了に戻しますか？\n再度作業ができるようになります。`)) return;
-                        saveData('lots', lot.id, { status: 'paused', location: lot.mapZoneId ? 'planned' : 'arrival', completedAt: null });
-                      }} className="text-xs bg-amber-100 text-amber-700 hover:bg-amber-200 px-2 py-0.5 rounded font-bold flex items-center gap-1 shrink-0" title="完了から30分以内なら未完了に戻せます"><RotateCcw className="w-3 h-3"/> 戻す</button>
-                    );
-                  })()}
+                  <button onClick={(e) => {
+                    e.stopPropagation();
+                    if (!confirm(`このロット（${lot.model} / ${lot.orderNo}）を検査リストへ復帰しますか？\n完了を取り消し、再度作業ができるようになります（実績は残ります）。`)) return;
+                    saveData('lots', lot.id, { status: 'paused', location: lot.mapZoneId ? 'planned' : 'arrival', completedAt: null });
+                  }} className="text-xs bg-amber-100 text-amber-700 hover:bg-amber-200 px-2 py-0.5 rounded font-bold flex items-center gap-1 shrink-0" title="完了を取り消して検査リストへ戻す"><RotateCcw className="w-3 h-3"/> 検査リストへ復帰</button>
                 </div>
               </div>
             ))}
@@ -18715,6 +22169,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                     <td className="p-3 font-mono text-sm">{formatTime(totalActual)}</td>
                     <td className="p-3 text-right">
                       <div className="flex justify-end gap-1.5">
+                        <button onClick={() => setViewGridLot(lot)} className="p-1.5 border rounded hover:bg-indigo-50 text-indigo-600 bg-white transition-colors" title="作業表で見る（工程×台）"><LayoutGrid className="w-4 h-4" /></button>
+                        <button onClick={() => { if (!confirm(`このロット（${lot.model} / ${lot.orderNo}）を検査リストへ復帰しますか？\n完了を取り消し、再度作業ができるようになります（実績は残ります）。`)) return; saveData('lots', lot.id, { status: 'paused', location: lot.mapZoneId ? 'planned' : 'arrival', completedAt: null }); }} className="p-1.5 border rounded hover:bg-amber-50 text-amber-600 bg-white transition-colors" title="検査リストへ復帰（完了を取り消す）"><RotateCcw className="w-4 h-4" /></button>
                         <button onClick={() => setReportLot(lot)} className="p-1.5 border rounded hover:bg-green-50 text-green-600 bg-white transition-colors" title="成績表プレビュー"><Printer className="w-4 h-4" /></button>
                         <button onClick={() => setEditingTimeLot(lot)} className="p-1.5 border rounded hover:bg-amber-50 text-amber-600 bg-white transition-colors" title="作業時間編集"><Clock className="w-4 h-4" /></button>
                         <button onClick={() => setEditingMeasLot(lot)} className="p-1.5 border rounded hover:bg-emerald-50 text-emerald-600 bg-white transition-colors" title="測定結果編集"><Ruler className="w-4 h-4" /></button>
@@ -18905,6 +22361,26 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    // State: UI
    const [viewMode, setViewMode] = useState('dashboard');
    const [activeTab, setActiveTab] = useState('main');
+   // タブ集約: 親タブの下にサブタブをぶら下げる。activeTab は子の値('history'等)も取りうる。
+   const TAB_GROUPS = {
+     inspection: [
+       { id: 'inspection', label: '検査リスト', icon: ListChecks },
+       { id: 'history', label: '完了履歴', icon: CheckSquare },
+     ],
+     analysis: [
+       { id: 'analysis', label: '分析', icon: BarChart3 },
+       { id: 'optimize', label: '作業最適化', icon: Zap },
+     ],
+     templates: [
+       { id: 'templates', label: 'マスタ設定', icon: Settings },
+       { id: 'template-mgr', label: '工程テンプレート', icon: ClipboardList },
+       { id: 'measurement-settings', label: '測定設定', icon: Ruler },
+     ],
+   };
+   const TAB_PARENT = { inspection: 'inspection', history: 'inspection', analysis: 'analysis', optimize: 'analysis', templates: 'templates', 'template-mgr': 'templates', 'measurement-settings': 'templates' };
+   // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
+   const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
+   const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
    const [showLotModal, setShowLotModal] = useState(false);
    const [lotFormQty, setLotFormQty] = useState(1);
    const [showAnomalyPanel, setShowAnomalyPanel] = useState(false);
@@ -19184,6 +22660,33 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        setErrorMsg(e.message || '設定の保存に失敗しました');
        lastFailedPayloadRef.current = { kind: 'settings', data: newSettings };
      }
+   };
+
+   // --- 復元(取り込み): バックアップJSONを ID 単位で upsert（merge）。全消し/削除はしない。---
+   const restoreAllFromBackup = async (parsed, onProgress) => {
+     if (!user || !db) throw new Error('ログインしていないため復元できません。');
+     if (!parsed || typeof parsed !== 'object') throw new Error('バックアップの内容が不正です。');
+     const cols = [
+       ['lots', parsed.lots],
+       ['templates', parsed.templates],
+       ['workers', parsed.workers],
+       ['indirectWork', parsed.indirectWork],
+     ];
+     const total = cols.reduce((n, [, a]) => n + (Array.isArray(a) ? a.length : 0), 0) + 1; // +1: settings/config
+     let done = 0;
+     for (const [col, arr] of cols) {
+       if (!Array.isArray(arr)) continue;
+       for (const raw of arr) {
+         if (raw && raw.id) {
+           const { id, ...rest } = raw;
+           await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', col, id), { ...cleanUndefined(rest), updatedAt: serverTimestamp() }, { merge: true });
+         }
+         done++; if (onProgress) onProgress(done, total);
+       }
+     }
+     await setDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), cleanUndefined(parsed.settings || {}), { merge: true });
+     done++; if (onProgress) onProgress(done, total);
+     return { total };
    };
 
    // 設定内のネストしたサブキーを削除するヘルパー。
@@ -20398,13 +23901,22 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const tasks = lot.tasks || {};
        const steps = lot.steps || [];
        Object.entries(tasks).forEach(([k, t]) => {
-         const parts = k.split('-');
-         const unitIdxStr = parts.pop();
-         const stepIdOrIdx = parts.join('-');
-         const step = steps.find(s => s.id === stepIdOrIdx) || steps[parseInt(stepIdOrIdx)];
+         if (!t) return; // null タスク混入時のクラッシュ防止
+         // ロット1回キー `${id}-lot-${k}` を先に分離 (parseIntで別工程に誤帰属するのを防ぐ)
+         const lotM = k.match(LOT_ONCE_RE);
+         let stepIdOrIdx, unitNo;
+         if (lotM) {
+           stepIdOrIdx = lotM[1];
+           unitNo = `${parseInt(lotM[2]) + 1}回目`;
+         } else {
+           const parts = k.split('-');
+           const unitIdxStr = parts.pop();
+           stepIdOrIdx = parts.join('-');
+           unitNo = `#${parseInt(unitIdxStr) + 1}`;
+         }
+         const step = steps.find(s => s.id === stepIdOrIdx) || (lotM ? null : steps[parseInt(stepIdOrIdx)]);
          const stepTitle = step?.title || '(不明)';
          const targetTime = step?.targetTime || 0;
-         const unitNo = `#${parseInt(unitIdxStr) + 1}`;
 
          if (t.status === 'completed') {
            if (!t.duration || t.duration === 0) {
@@ -20421,7 +23933,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        });
        // ロット status='completed' なのに未完了タスクが残ってる
        if (lot.status === 'completed') {
-         const stuck = Object.entries(tasks).filter(([, t]) => t.status === 'paused' || t.status === 'waiting' || t.status === 'processing');
+         const stuck = Object.entries(tasks).filter(([, t]) => t && (t.status === 'paused' || t.status === 'waiting' || t.status === 'processing'));
          if (stuck.length > 0) {
            results.push({ kind: 'lot-status-mismatch', severity: 'mid', lotId: lot.id, orderNo: lot.orderNo, model: lot.model, message: `ロットは完了済みだが ${stuck.length} タスクが未完了状態`, suggestion: '一括で「該当なし」に変換 (理由: ロット完了済)', stuckKeys: stuck.map(([k]) => k) });
          }
@@ -20508,6 +24020,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    }, [lots, templates, settings.strictModeRules, strictMaturityUnits]);
    const [showStrictManager, setShowStrictManager] = useState(false);
    const [optimizeView, setOptimizeView] = useState('target'); // 作業最適化タブ: 'target'(目標時間) | 'strict'(厳密)
+   const [analysisCombo, setAnalysisCombo] = useState(null); // 実データ分析モーダルの対象コンボ {model, templateId, templateName}
    const [strictModeHistory, setStrictModeHistory] = useState([]);
    const strictPanelActive = showStrictManager || (activeTab === 'optimize' && optimizeView === 'strict');
    // 変更履歴は厳密モード画面を見ているときだけ購読（全端末共有・監査ログ）
@@ -20532,6 +24045,65 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        at: Date.now(), by: currentUserName || '?',
        model: row.model, templateId: row.templateId, templateName: row.templateName,
        old, new: enabled, evidence,
+     });
+   };
+
+   // === データ最適順: コンボごとの算出結果(エビデンス) ===
+   // 同テンプレ完了ロットから analyzeWorkOrder + computeEnforcedSchedule を回し、
+   // 時短%・バッチ工程・先頭手順を要約。管理表の「データ最適順」列で表示する。
+   const optimalByCombo = useMemo(() => {
+     const out = {};
+     try {
+       const rows = computeStrictEvidence(lots, templates, strictMaturityUnits);
+       const hasTime = (l) => Object.values(l.tasks || {}).some(t => t && t.firstStartTime);
+       rows.forEach(r => {
+         // ★コンボは「型式×テンプレ」。素は自型式のみ。ただし型式グループがあれば同グループ型式を合算(データ共有)。
+         const groupModels = sameGroupModels(r.model, settings);
+         const grouped = groupModels.length > 1;
+         const completed = (lots || []).filter(l => l.status === 'completed' && groupModels.includes(l.model) && l.templateId === r.templateId);
+         if (completed.length === 0) return;
+         // 工程タイトル取得用サンプルは「時刻データのあるロット」を優先
+         const sample = completed.find(l => l.steps && l.steps.length && hasTime(l)) || completed.find(l => l.steps && l.steps.length) || completed[0];
+         if (!sample) return;
+         const qty = sample.quantity || 1;
+         const a = analyzeWorkOrder(sample.steps, completed, { quantity: qty });
+         const s = computeEnforcedSchedule(sample.steps, qty, a, {});
+         const stepTitleByKey = {};
+         sample.steps.forEach((st, i) => { stepTitleByKey[st.id || `idx-${i}`] = st.title; });
+         // まとめ工程は rate と「何ロット中何ロット」を正直に出す。
+         //   確定 = 3ロット以上が70%以上で「全台ぶん連続(B)」→ 自動強制の対象。未満は参考(強制しない)。
+         const batchSteps = Object.entries(a.batchObservations)
+           .filter(([, v]) => v.totalLots > 0 && v.batchRate >= 0.5)
+           .map(([k, v]) => ({ title: stepTitleByKey[k] || k, ratePct: Math.round(v.batchRate * 100), batched: v.batchedLots, total: v.totalLots, confident: v.totalLots >= 3 && v.batchRate >= 0.7 }))
+           .sort((a, b) => (b.confident - a.confident) || (b.ratePct - a.ratePct));
+         const confidentBatchCount = batchSteps.filter(b => b.confident).length;
+         out[r.key] = {
+           grouped, groupModelCount: groupModels.length,
+           sampleLotCount: a.sampleLotCount, lotsWithTime: a.lotsWithTime, lotsNoTime: a.lotsNoTime, hasEnoughData: a.hasEnoughData,
+           serialSec: a.serialTotalSec, optimalSec: s.makespanSec,
+           savedPct: a.serialTotalSec > 0 ? Math.max(0, Math.round((1 - s.makespanSec / a.serialTotalSec) * 100)) : 0,
+           autoCount: a.autoCount, moveCount: s.moves.length,
+           batchSteps, confidentBatchCount,
+           firstMoves: s.moves.slice(0, 10).map(m => m.type === 'batch'
+             ? `一括「${m.title}」×${m.units.length}台`
+             : `${m.type === 'auto-start' ? '自動' : '手'}「${m.title}」#${m.unitIdx + 1}`),
+         };
+       });
+     } catch (e) { console.warn('optimalByCombo算出失敗', e); }
+     return out;
+   }, [lots, templates, strictMaturityUnits]);
+
+   // データ最適順の承認/解除。既存の strictModeRules[key] に optimalOrder をマージ(厳密enabledは保持)。
+   const handleOptimalDecide = (row, enabled) => {
+     const key = row.key;
+     const prevRule = (settings.strictModeRules || {})[key] || {};
+     const snap = enabled ? (optimalByCombo[key] || null) : null;
+     const newRule = { ...prevRule, optimalOrder: { enabled, approvedBy: currentUserName || '?', approvedAt: Date.now(), snapshot: snap } };
+     saveSettings({ strictModeRules: { ...(settings.strictModeRules || {}), [key]: newRule } });
+     saveData('strict_mode_history', generateId(), {
+       at: Date.now(), by: currentUserName || '?', kind: 'optimalOrder',
+       model: row.model, templateId: row.templateId, templateName: row.templateName,
+       old: prevRule?.optimalOrder?.enabled ?? null, new: enabled, evidence: snap,
      });
    };
 
@@ -20769,7 +24341,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        <header data-fs="header" className="h-14 bg-slate-800 text-white flex items-center justify-between px-6 shadow-md z-50 shrink-0">
          <div className="flex items-center gap-3">
            <div className="bg-blue-600 p-1.5 rounded"><Layout className="w-5 h-5 text-white" /></div>
-           <h1 className="font-bold text-lg tracking-tight">製品検査アプリ <span className="text-xs font-normal text-slate-400 ml-1">Pro</span></h1>
+           <h1 className="font-bold text-base tracking-tight whitespace-nowrap">製品検査</h1>
            <div className="h-6 w-px bg-slate-600 mx-1"/>
            {currentUserName ? (
              <div className="flex items-center gap-1.5 bg-slate-700 rounded-full pl-2 pr-1 py-0.5">
@@ -20793,71 +24365,92 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                 { id: 'progress', label: '全体進捗', icon: Activity },
                 { id: 'inspection', label: '検査リスト', icon: ListChecks },
                 { id: 'analysis', label: '分析', icon: BarChart3 },
-                { id: 'optimize', label: '作業最適化', icon: Zap },
-                { id: 'history', label: '完了履歴', icon: CheckSquare },
-                { id: 'template-mgr', label: '工程テンプレート', icon: ClipboardList },
-                { id: 'measurement-settings', label: '測定設定', icon: Ruler },
                 { id: 'templates', label: 'マスタ設定', icon: Settings },
               ].map(tab => (
-                <button 
+                <button
                   key={tab.id}
                   onClick={() => { setActiveTab(tab.id); setViewMode('dashboard'); }}
-                  className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-bold transition-all ${activeTab === tab.id ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-bold transition-all ${(TAB_PARENT[activeTab] || activeTab) === tab.id ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}
                 >
                   <tab.icon className="w-4 h-4" /> {tab.label}
                 </button>
               ))}
            </div>
            <div className="flex items-center gap-1">
-             <button onClick={() => setShowHelp(true)} className="bg-white text-blue-700 border border-blue-200 hover:bg-blue-50 px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="使い方ガイド (操作マニュアル)">
-               <HelpCircle className="w-3.5 h-3.5" /> 使い方
-             </button>
-             <button onClick={() => setShowWorkStandardsLib(true)} className="bg-orange-600 hover:bg-orange-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="作業標準ライブラリ (登録された PDF を閲覧)">
-               <BookOpen className="w-3.5 h-3.5" /> 作業標準
-             </button>
-             <button onClick={() => activeIndirect ? setShowIndirectModal(true) : setShowIndirectModal(true)} className={`relative px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ${activeIndirect ? 'bg-amber-500 hover:bg-amber-600 text-white animate-pulse' : 'bg-amber-600 hover:bg-amber-700 text-white'}`} title="間接作業">
-               <Coffee className="w-3.5 h-3.5" /> {activeIndirect ? `${activeIndirect.category}...` : '間接作業'}
-             </button>
-             <button onClick={() => setShowDailySummary(true)} className="bg-teal-600 hover:bg-teal-700 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="日次集計">
-               <Clock className="w-3.5 h-3.5" /> 日次集計
-             </button>
-             <button onClick={() => setShowNoteModal(true)} className="relative bg-slate-600 hover:bg-slate-500 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="個人ノート">
-               <FileText className="w-3.5 h-3.5" /> ノート
+             <button onClick={(e) => openHdrMenu('docs', e)} className="relative bg-slate-600 hover:bg-slate-500 text-white px-2 py-1.5 rounded-md shadow-sm flex items-center gap-0.5" title="資料 (作業標準 / ノート)">
+               <BookOpen className="w-4 h-4" /><ChevronDown className="w-3 h-3" />
                {notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length > 0 && <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length}</span>}
              </button>
-             <button onClick={() => setShowAnnouncementModal(true)} className="relative bg-purple-600 hover:bg-purple-500 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm" title="お知らせ">
-               <Megaphone className="w-3.5 h-3.5" /> お知らせ
-               {(() => { const unread = announcements.filter(a => (a.mode || 'confirm') === 'confirm' && !(a.confirmedBy || []).includes(currentUserName)).length; return unread > 0 ? <span className="absolute -top-1 -right-1 bg-red-500 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{unread}</span> : null; })()}
+             <button onClick={(e) => openHdrMenu('time', e)} className={`px-2 py-1.5 rounded-md shadow-sm flex items-center gap-1 text-xs font-bold whitespace-nowrap ${activeIndirect ? 'bg-amber-500 hover:bg-amber-600 text-white animate-pulse' : 'bg-amber-600 hover:bg-amber-700 text-white'}`} title="時間 (間接作業 / 日次集計)">
+               <Coffee className="w-4 h-4" />{activeIndirect ? <span>{activeIndirect.category}...</span> : null}<ChevronDown className="w-3 h-3" />
              </button>
              {/* 不具合通知トグル: 押した端末に不具合発生時の通知が届く */}
              <button
                onClick={defectNotifyEnabled ? disableDefectNotifications : enableDefectNotifications}
-               className={`relative px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ${defectNotifyEnabled ? 'bg-rose-600 hover:bg-rose-700 text-white ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-500 text-white'}`}
+               className={`p-2 rounded-md shadow-sm ${defectNotifyEnabled ? 'bg-rose-600 hover:bg-rose-700 text-white ring-2 ring-rose-300/50' : 'bg-slate-600 hover:bg-slate-500 text-white'}`}
                title={defectNotifyEnabled ? '不具合通知ON: タップでOFF' : '不具合通知OFF: タップしてONにする (この端末に通知が届きます)'}
              >
-               {defectNotifyEnabled ? <BellRing className="w-3.5 h-3.5"/> : <Bell className="w-3.5 h-3.5"/>}
-               {defectNotifyEnabled ? '通知ON' : '通知'}
+               {defectNotifyEnabled ? <BellRing className="w-4 h-4"/> : <Bell className="w-4 h-4"/>}
              </button>
              {/* 異常値検出 (ヒューマンエラー): バッジで件数表示、押すと一覧+修正モーダル */}
              {anomalyCount > 0 && (
                <button
                  onClick={() => setShowAnomalyPanel(true)}
-                 className="relative bg-amber-500 hover:bg-amber-600 text-white px-2 py-1.5 rounded-md text-xs font-bold flex items-center gap-1 shadow-sm ring-2 ring-amber-300/50 animate-pulse"
+                 className="relative bg-amber-500 hover:bg-amber-600 text-white p-2 rounded-md shadow-sm ring-2 ring-amber-300/50 animate-pulse"
                  title={`異常値 ${anomalyCount} 件を検出 — クリックで一覧表示&修正`}
                >
-                 <AlertTriangle className="w-3.5 h-3.5"/> 要確認
+                 <AlertTriangle className="w-4 h-4"/>
                  <span className="absolute -top-1 -right-1 bg-rose-600 text-[9px] text-white rounded-full w-5 h-4 flex items-center justify-center font-black">{anomalyCount > 99 ? '99+' : anomalyCount}</span>
                </button>
              )}
+             <button onClick={(e) => openHdrMenu('more', e)} className="relative bg-slate-600 hover:bg-slate-500 text-white px-2 py-1.5 rounded-md shadow-sm flex items-center gap-0.5" title="その他 (使い方 / お知らせ)">
+               <Wrench className="w-4 h-4" /><ChevronDown className="w-3 h-3" />
+               {(() => { const unread = announcements.filter(a => (a.mode || 'confirm') === 'confirm' && !(a.confirmedBy || []).includes(currentUserName)).length; return unread > 0 ? <span className="absolute -top-1 -right-1 bg-red-500 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{unread}</span> : null; })()}
+             </button>
              {/* 厳密モードは「作業最適化」タブに統合（ヘッダーボタンは廃止） */}
-             <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 shadow-sm">
-               <Plus className="w-4 h-4" /> 入荷登録
+             <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-1.5 shadow-sm" title="入荷登録">
+               <Plus className="w-4 h-4" /> 登録
              </button>
            </div>
          </div>
        </header>
-       
-       <main className="flex-1 overflow-hidden relative bg-slate-100 p-4 h-[calc(100vh-3.5rem)]">
+       {hdrMenu && (
+         <>
+           <div className="fixed inset-0 z-[90]" onClick={() => setHdrMenu(null)} />
+           <div className="fixed z-[91] bg-white rounded-lg shadow-xl border border-slate-200 py-1 min-w-[160px]" style={{ top: hdrMenu.top, right: hdrMenu.right }}>
+             {hdrMenu.type === 'time' && (<>
+               <button onClick={() => { setHdrMenu(null); setShowIndirectModal(true); }} className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-center gap-2 text-slate-700 text-sm font-bold"><Coffee className="w-4 h-4 text-amber-600" /> 間接作業{activeIndirect && <span className="ml-auto w-2 h-2 rounded-full bg-amber-500 animate-pulse" />}</button>
+               <button onClick={() => { setHdrMenu(null); setShowDailySummary(true); }} className="w-full text-left px-3 py-2 hover:bg-teal-50 flex items-center gap-2 text-slate-700 text-sm font-bold"><Clock className="w-4 h-4 text-teal-600" /> 日次集計</button>
+             </>)}
+             {hdrMenu.type === 'docs' && (<>
+               <button onClick={() => { setHdrMenu(null); setShowWorkStandardsLib(true); }} className="w-full text-left px-3 py-2 hover:bg-orange-50 flex items-center gap-2 text-slate-700 text-sm font-bold"><BookOpen className="w-4 h-4 text-orange-600" /> 作業標準</button>
+               <button onClick={() => { setHdrMenu(null); setShowNoteModal(true); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 flex items-center gap-2 text-slate-700 text-sm font-bold"><FileText className="w-4 h-4 text-slate-600" /> ノート{notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length > 0 && <span className="ml-auto bg-amber-400 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length}</span>}</button>
+             </>)}
+             {hdrMenu.type === 'more' && (<>
+               <button onClick={() => { setHdrMenu(null); setShowHelp(true); }} className="w-full text-left px-3 py-2 hover:bg-blue-50 flex items-center gap-2 text-slate-700 text-sm font-bold"><HelpCircle className="w-4 h-4 text-blue-600" /> 使い方</button>
+               <button onClick={() => { setHdrMenu(null); setShowAnnouncementModal(true); }} className="w-full text-left px-3 py-2 hover:bg-purple-50 flex items-center gap-2 text-slate-700 text-sm font-bold"><Megaphone className="w-4 h-4 text-purple-600" /> お知らせ{(() => { const unread = announcements.filter(a => (a.mode || 'confirm') === 'confirm' && !(a.confirmedBy || []).includes(currentUserName)).length; return unread > 0 ? <span className="ml-auto bg-red-500 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{unread}</span> : null; })()}</button>
+             </>)}
+           </div>
+         </>
+       )}
+
+       <main className="flex-1 overflow-hidden relative bg-slate-100 h-[calc(100vh-3.5rem)] flex flex-col">
+         {(() => {
+           const parent = TAB_PARENT[activeTab] || activeTab;
+           const group = TAB_GROUPS[parent];
+           if (!group) return null;
+           return (
+             <div className="shrink-0 bg-white border-b border-slate-200 px-4 pt-1.5 flex gap-1">
+               {group.map(s => (
+                 <button key={s.id} onClick={() => setActiveTab(s.id)}
+                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-t-md text-sm font-bold border-b-2 transition-all ${activeTab === s.id ? 'border-blue-600 text-blue-600 bg-blue-50' : 'border-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-50'}`}>
+                   <s.icon className="w-4 h-4" /> {s.label}
+                 </button>
+               ))}
+             </div>
+           );
+         })()}
+         <div className="flex-1 min-h-0 overflow-hidden p-4 relative">
          {activeTab === 'main' && (
            <div className="h-full">
              {viewMode === 'dashboard' && <DashboardView onSetMode={setViewMode} lots={lots} workers={workers} handleMoveLot={handleMoveLot} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} setExecutionLotId={setExecutionLotId} settings={settings} templates={templates} onEditLot={onEditLot} onDeleteLot={onDeleteLot} handleImageUpload={handleImageUpload} saveSettings={saveSettings} mapZones={settings.mapZones} currentUserName={currentUserName} />}
@@ -20867,9 +24460,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              {viewMode === 'map-only' && <MapOnlyView onBack={() => setViewMode('dashboard')} lots={lots} workers={workers} templates={templates} handleMoveLot={handleMoveLot} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} setExecutionLotId={setExecutionLotId} settings={settings} handleImageUpload={handleImageUpload} saveSettings={saveSettings} mapZones={settings.mapZones} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
            </div>
          )}
-         {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} />}
+         {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} onRestore={restoreAllFromBackup} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
@@ -20877,16 +24470,24 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  <button onClick={() => setOptimizeView('target')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'target' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Target className="w-4 h-4" /> 目標時間最適化</button>
                  <button onClick={() => setOptimizeView('strict')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'strict' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><ShieldCheck className="w-4 h-4" /> 厳密モード{strictReviewCount > 0 && <span className="bg-amber-400 text-white text-[9px] rounded-full w-4 h-4 flex items-center justify-center font-black">{strictReviewCount}</span>}</button>
                  <button onClick={() => setOptimizeView('skill')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'skill' ? 'bg-white shadow text-orange-600' : 'text-slate-500 hover:text-slate-700'}`}><Award className="w-4 h-4" /> スキルマップ</button>
+                 <button onClick={() => setOptimizeView('modelgroup')} className={`px-4 py-1.5 rounded-md text-sm font-bold flex items-center gap-2 ${optimizeView === 'modelgroup' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Layers className="w-4 h-4" /> 型式グループ</button>
                </div>
                <span className="text-xs text-slate-400">データから現場を最適化：<b>目標時間</b>→<b>厳密モード</b>→<b>スキル</b>。将来は空き人材・エリアから自動配置の土台に。</span>
              </div>
              <div className="flex-1 min-h-0 overflow-hidden">
                {optimizeView === 'target' && <ProcessInsightsTab lots={lots} workers={workers} customTargetTimes={settings.customTargetTimes || {}} onSaveSettings={saveSettings} targetTimeHistory={settings.targetTimeHistory || []} settings={settings} saveData={saveData} currentUserName={currentUserName} />}
-               {optimizeView === 'strict' && (currentUserName === '管理者' ? <StrictModeManagerModal embedded lots={lots} templates={templates} rules={settings.strictModeRules || {}} history={strictModeHistory} currentUserName={currentUserName} maturityUnits={strictMaturityUnits} onSetMaturity={(n) => saveSettings({ strictMaturityUnits: n })} onDecide={handleStrictDecide} /> : <div className="bg-white rounded-xl border p-8 text-center text-slate-400">厳密モードの管理は管理者のみです。ヘッダー左上で「管理者」を選択してください。</div>)}
+               {optimizeView === 'strict' && (currentUserName === '管理者' ? <StrictModeManagerModal embedded lots={lots} templates={templates} rules={settings.strictModeRules || {}} history={strictModeHistory} currentUserName={currentUserName} maturityUnits={strictMaturityUnits} onSetMaturity={(n) => saveSettings({ strictMaturityUnits: n })} onDecide={handleStrictDecide} optimalByCombo={optimalByCombo} onDecideOptimal={handleOptimalDecide} onOpenAnalysis={(row) => setAnalysisCombo({ model: row.model, templateId: row.templateId, templateName: row.templateName })} /> : <div className="bg-white rounded-xl border p-8 text-center text-slate-400">厳密モードの管理は管理者のみです。ヘッダー左上で「管理者」を選択してください。</div>)}
                {optimizeView === 'skill' && <SkillMapView lots={lots} templates={templates} workers={workers} skills={settings.skills && settings.skills.length ? settings.skills : DEFAULT_SKILLS} workerSkills={settings.workerSkills || {}} canEdit={currentUserName === '管理者'} onSaveSkills={(list) => saveSettings({ skills: list })} onSaveWorkerSkill={(wn, sid, level) => { const ws = settings.workerSkills || {}; saveSettings({ workerSkills: { ...ws, [wn]: { ...(ws[wn] || {}), [sid]: level } } }); }} onSaveTemplateSkills={(tplId, reqSkills) => saveData('templates', tplId, { requiredSkills: reqSkills })} />}
+               {optimizeView === 'modelgroup' && (currentUserName === '管理者' ? <ModelGroupManager lots={lots} settings={settings} saveSettings={saveSettings} /> : <div className="bg-white rounded-xl border p-8 text-center text-slate-400">型式グループの管理は管理者のみです。</div>)}
              </div>
            </div>
          )}
+         {analysisCombo && <WorkOrderReviewModal combo={analysisCombo} lots={lots} settings={settings}
+           currentStrict={(settings.strictModeRules || {})[strictComboKey(analysisCombo.model, analysisCombo.templateId)]?.enabled ?? null}
+           onMakeStrict={() => { const key = strictComboKey(analysisCombo.model, analysisCombo.templateId); const row = (computeStrictEvidence(lots, templates, strictMaturityUnits) || []).find(r => r.key === key); if (row) handleStrictDecide(row, true); }}
+           onSetGuide={() => { const key = strictComboKey(analysisCombo.model, analysisCombo.templateId); const row = (computeStrictEvidence(lots, templates, strictMaturityUnits) || []).find(r => r.key === key); if (row) handleStrictDecide(row, false); }}
+           onEditTemplate={() => { const tpl = (templates || []).find(t => t.id === analysisCombo.templateId); if (tpl) { setEditingTemplate(tpl); setActiveTab('template-mgr'); } setAnalysisCombo(null); }}
+           onClose={() => setAnalysisCombo(null)} />}
          {activeTab === 'history' && <HistoryView lots={lots} workers={workers} templates={templates} saveData={saveData} onEditLot={onEditLot} onDeleteLot={onDeleteLot} />}
          {activeTab === 'template-mgr' && (
            editingTemplate ? (
@@ -20911,6 +24512,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          )}
          {activeTab === 'measurement-settings' && <MeasurementSettingsView settings={settings} saveSettings={saveSettings} comboPresets={settings?.comboPresets || []} templates={templates} />}
          {activeTab === 'templates' && <TemplatesView editingTemplate={editingTemplate} setEditingTemplate={setEditingTemplate} handleSaveTemplate={handleSaveTemplate} workers={workers} saveData={saveData} deleteData={deleteData} templates={templates} lots={lots} handleExcelImport={handleExcelImport} handleExcelDownload={handleExcelDownload} handleBackupExport={handleBackupExport} handleBackupImport={handleBackupImport} excelInputRef={excelInputRef} backupInputRef={backupInputRef} settings={settings} saveSettings={saveSettings} mapZones={settings.mapZones} deleteSettingsFields={deleteSettingsFields} />}
+         </div>
        </main>
        
        {/* Note Modal */}
@@ -20965,7 +24567,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              <div className="px-5 py-3 border-b bg-amber-50 flex items-center justify-between">
                <div>
                  <h3 className="text-lg font-black text-amber-900 flex items-center gap-2"><AlertTriangle className="w-5 h-5"/> 異常値検出 ({anomalyCount}件)</h3>
-                 <div className="text-xs text-amber-700 mt-0.5">ヒューマンエラー (押し間違い・押し忘れ等) を検出しています。各行の「修正」をタップして直してください。</div>
+                 <div className="text-xs text-amber-700 mt-0.5">押し忘れ・押し間違い等のヒントを色で表示。指図ごとの表で<b>全体を見て</b>判断し、セルをタップして直します。</div>
                </div>
                <div className="flex items-center gap-2">
                  {oldDataNeedingTimeEstimation > 0 && (
@@ -20973,7 +24575,6 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                      <Clock className="w-3.5 h-3.5"/> 古いデータ時刻推定 ({oldDataNeedingTimeEstimation})
                    </button>
                  )}
-                 {anomalyCount > 0 && <button onClick={fixAllAnomalies} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded shadow flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5"/> 一括修正</button>}
                  <button onClick={() => setShowAnomalyPanel(false)} className="p-1.5 hover:bg-amber-100 rounded"><X className="w-5 h-5 text-amber-700"/></button>
                </div>
              </div>
@@ -20981,34 +24582,13 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                {anomalies.length === 0 ? (
                  <div className="text-center py-12 text-emerald-600"><CheckCircle2 className="w-12 h-12 mx-auto mb-2"/> 異常値なし — データはクリーンです 🎉</div>
                ) : (
-                 <table className="w-full text-sm border-collapse">
-                   <thead className="bg-slate-100 sticky top-0">
-                     <tr className="border-b-2 border-slate-200">
-                       <th className="p-2 text-left font-bold text-xs">深刻度</th>
-                       <th className="p-2 text-left font-bold text-xs">ロット</th>
-                       <th className="p-2 text-left font-bold text-xs">型式</th>
-                       <th className="p-2 text-left font-bold text-xs">工程/台</th>
-                       <th className="p-2 text-left font-bold text-xs">内容</th>
-                       <th className="p-2 text-left font-bold text-xs">提案</th>
-                       <th className="p-2 text-right font-bold text-xs">操作</th>
-                     </tr>
-                   </thead>
-                   <tbody>
-                     {anomalies.map((a, i) => (
-                       <tr key={i} className={`border-b border-slate-100 ${a.severity === 'high' ? 'bg-rose-50/40' : a.severity === 'mid' ? 'bg-amber-50/40' : ''}`}>
-                         <td className="p-2 text-xs">{a.severity === 'high' ? '🔴 高' : a.severity === 'mid' ? '🟡 中' : '🟢 低'}</td>
-                         <td className="p-2 text-xs font-mono">{a.orderNo}</td>
-                         <td className="p-2 text-xs">{a.model}</td>
-                         <td className="p-2 text-xs">{a.stepTitle ? <><span className="font-bold">{a.stepTitle}</span>{a.unitNo && <span className="text-slate-500"> {a.unitNo}</span>}</> : '(ロット全体)'}</td>
-                         <td className="p-2 text-xs">{a.message}</td>
-                         <td className="p-2 text-xs text-slate-600">{a.suggestion}</td>
-                         <td className="p-2 text-right">
-                           <button onClick={() => fixAnomaly(a)} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold rounded shadow">修正</button>
-                         </td>
-                       </tr>
-                     ))}
-                   </tbody>
-                 </table>
+                 <>
+                   <div className="mb-3 text-[11px] text-slate-600 bg-amber-50 border border-amber-200 rounded-lg p-2.5 leading-relaxed">
+                     <b>色付き＝注意のヒント</b>です（<span className="text-rose-700 font-bold">赤</span>=0秒/4時間超/時刻の矛盾、<span className="text-amber-700 font-bold">黄</span>=5秒未満）。<u>判定ではありません</u>。<br/>
+                     <b>表全体を見て</b>、本当におかしい所だけセルをタップ →「目標で埋める / 実時間を手入力 / そのまま」で直してください。全体で見れば問題ない値はそのままでOKです。
+                   </div>
+                   {[...new Set(anomalies.map(a => a.lotId))].map(lotId => { const lot = lots.find(l => l.id === lotId); if (!lot) return null; return <LotTimeTable key={lotId} lot={lot} onSaveTasks={(nt) => saveData('lots', lotId, { tasks: nt })} />; })}
+                 </>
                )}
              </div>
              <div className="px-5 py-3 border-t bg-slate-50 text-xs text-slate-500">
@@ -21050,6 +24630,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            lots={lots}
            templates={templates}
            comboPresets={settings.comboPresets || []}
+           modelGroups={settings.modelGroups || []}
+           customTargetTimes={settings.customTargetTimes || {}}
+           overrunAlertConfig={settings.overrunAlert || {}}
            voiceSettingsConfig={settings.voiceSettings || {}}
            voiceCommandsConfig={settings.voiceCommands || null}
            undoTimeout={settings.undoTimeout || 5}
@@ -21065,6 +24648,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            strictModeThreshold={settings.strictModeThreshold || 5}
          />
        )}
+
+       {/* 管理者向けライブアラート: NG発生 + 進行中タスクの目標時間オーバーを右下に常時表示 */}
+       {currentUserName === '管理者' && <AdminLiveAlerts lots={lots} customTargetTimes={settings.customTargetTimes || {}} modelGroups={settings.modelGroups || []} />}
 
        {showLotModal && (
          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">

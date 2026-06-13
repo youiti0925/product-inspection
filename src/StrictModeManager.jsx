@@ -58,17 +58,23 @@ export function computeStrictEvidence(lots, templates, maturityUnits = 5) {
         (lotUnits[lot.orderNo] = lotUnits[lot.orderNo] || []).push({ unitNo: u + 1, ok, steps: arr.map(x => ({ title: x.title, dur: x.dur, isAuto: x.isAuto, start: x.start, end: x.end })) });
       }
     });
-    // 代表ロット = 実時刻のある台が最も多いロット(最大6台)。複数台の並行作業を見せる。
-    const lotsArr = Object.entries(lotUnits).map(([orderNo, units]) => ({ orderNo, units })).sort((a, b) => b.units.length - a.units.length);
+    // 代表ロット = 実際に時間(duration>0)が取れた工程が最も多いロット。並行作業は実時間が無いと見えないため。
+    const realDurs = (units) => units.reduce((a, u) => a + u.steps.filter(s => s.dur > 0).length, 0);
+    const lotsArr = Object.entries(lotUnits).map(([orderNo, units]) => ({ orderNo, units, real: realDurs(units) })).sort((a, b) => (b.real - a.real) || (b.units.length - a.units.length));
     const ganttLot = lotsArr[0] ? { orderNo: lotsArr[0].orderNo, units: lotsArr[0].units.slice(0, 6) } : null;
     const consistencyPct = timedUnits > 0 ? Math.round(consistentUnits / timedUnits * 100) : null;
-    const stepStats = Object.entries(durByStep).map(([title, a]) => ({ title, n: a.length, mean: Math.round(a.reduce((x, y) => x + y, 0) / a.length), std: stdev(a) }));
+    // バラつきは duration>0 (実際に時間が取れた台) だけで算出。0は「未記録」として除外し、記録台数を明示する。
+    const stepStats = Object.entries(durByStep).map(([title, all]) => {
+      const real = all.filter(d => d > 0);
+      return { title, started: all.length, timed: real.length, mean: real.length ? Math.round(real.reduce((x, y) => x + y, 0) / real.length) : 0, std: stdev(real) };
+    });
+    const timedStepCount = stepStats.filter(s => s.timed > 0).length;
     let quality = 'none';
     if (timedUnits === 0) quality = 'none';
     else if (timedUnits < maturityUnits) quality = 'thin';
     else if (consistencyPct >= 80) quality = 'good';
     else quality = 'unstable';
-    return { key, model, templateId: tid, templateName: tName(tid), completedUnits, timedUnits, consistentUnits, consistencyPct, quality, detail: { stepStats, ganttLot, lotCount: lotsArr.length } };
+    return { key, model, templateId: tid, templateName: tName(tid), completedUnits, timedUnits, consistentUnits, consistencyPct, quality, detail: { stepStats, ganttLot, lotCount: lotsArr.length, timedStepCount } };
   });
   rows.sort((a, b) => (b.timedUnits - a.timedUnits) || (b.completedUnits - a.completedUnits) || a.model.localeCompare(b.model));
   return rows;
@@ -123,7 +129,7 @@ function buildCompressedAxis(intervals, gapMs = 120000) {
 
 // 複数台の作業の流れ(ガント)。台を行に、工程を実時刻でバー表示(共通の横軸)。手動=青/自動=紫。
 // 同じ横軸なので「台Aの自動測定(紫)中に、台Bで手動(青)が動いている」=並行作業が見える。
-function MultiUnitGantt({ lot }) {
+export function MultiUnitGantt({ lot }) {
   if (!lot || !lot.units || !lot.units.length) return null;
   const allIv = lot.units.flatMap(u => u.steps.map(s => [s.start, s.end]));
   const { map, breaks } = buildCompressedAxis(allIv);
@@ -138,7 +144,8 @@ function MultiUnitGantt({ lot }) {
               {breaks.map((b, i) => <div key={'b' + i} className="absolute top-0 h-5 border-l border-dashed border-slate-300" style={{ left: b + '%' }} />)}
               {u.steps.map((s, i) => {
                 const l = map(s.start), w = Math.max(0.8, map(s.end) - l);
-                return <div key={i} className={`absolute top-0.5 h-4 rounded ${s.isAuto ? 'bg-violet-500' : 'bg-blue-500'} flex items-center overflow-hidden`} style={{ left: l + '%', width: w + '%' }} title={`${s.title}: ${s.dur}s`}>{w > 7 && <span className="text-[8px] text-white px-1 truncate leading-4">{s.title}</span>}</div>;
+                const noDur = !s.dur || s.dur <= 0; // 時間記録なし(0s)は薄い灰でマーカー表示(実作業と区別)
+                return <div key={i} className={`absolute top-0.5 h-4 rounded ${noDur ? 'bg-slate-300' : s.isAuto ? 'bg-violet-500' : 'bg-blue-500'} flex items-center overflow-hidden`} style={{ left: l + '%', width: w + '%' }} title={`${s.title}: ${noDur ? '時間記録なし' : s.dur + 's'}`}>{!noDur && w > 7 && <span className="text-[8px] text-white px-1 truncate leading-4">{s.title}</span>}</div>;
               })}
             </div>
           </div>
@@ -150,42 +157,60 @@ function MultiUnitGantt({ lot }) {
 
 // 組み合わせのエビデンス詳細(展開時)。工程ごとのバラつき + 台ごとの作業の流れ。
 function EvidenceDetail({ row }) {
-  const { stepStats, ganttLot } = row.detail;
+  const { stepStats, ganttLot, timedStepCount } = row.detail;
+  // ガントは「実時間(>0)が取れた工程」が代表ロットに十分あるときだけ意味がある(0sだらけだと並行作業を読めない)。
+  const ganttTotal = ganttLot ? ganttLot.units.reduce((a, u) => a + u.steps.length, 0) : 0;
+  const ganttReal = ganttLot ? ganttLot.units.reduce((a, u) => a + u.steps.filter(s => s.dur > 0).length, 0) : 0;
+  const ganttUseful = ganttTotal > 0 && ganttReal / ganttTotal >= 0.34;
   return (
     <div className="bg-slate-50 px-4 py-3 border-t border-slate-200">
       {row.timedUnits === 0 ? (
         <div className="text-sm text-slate-500">この組み合わせには<b>実時刻データ（作業の開始・終了の記録）がありません</b>。順番が安定しているかを判断する根拠がないため、厳密モードは推奨できません。まず実際に時間記録された台が貯まるのを待ってください。</div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-          {/* 工程ごとの時間バラつき */}
+          {/* 工程ごとの時間バラつき (実時間>0の台だけで算出) */}
           <div>
-            <div className="text-xs font-black text-slate-700 mb-1.5">工程ごとの時間のバラつき（実時刻 {row.timedUnits} 台ぶん）</div>
+            <div className="text-xs font-black text-slate-700 mb-1.5">工程ごとの時間のバラつき <span className="font-normal text-slate-400">（時間が記録された工程: {timedStepCount}/{stepStats.length}）</span></div>
             <div className="space-y-1">
               {stepStats.map(s => {
-                const ratio = s.mean > 0 ? Math.min(1, s.std / s.mean) : 0; // バラつき/平均
+                if (s.timed === 0) return (
+                  <div key={s.title} className="flex items-center gap-2 text-[11px]">
+                    <div className="w-28 truncate text-slate-400" title={s.title}>{s.title}</div>
+                    <div className="flex-1 h-2 rounded border border-dashed border-slate-300 bg-slate-50" />
+                    <div className="w-36 text-right text-slate-400 shrink-0">記録なし <span className="text-slate-300">0/{s.started}台</span></div>
+                  </div>
+                );
+                const reliable = s.timed >= 2;
+                const ratio = reliable && s.mean > 0 ? Math.min(1, s.std / s.mean) : 0;
                 return (
                   <div key={s.title} className="flex items-center gap-2 text-[11px]">
-                    <div className="w-28 truncate text-slate-600" title={s.title}>{s.title}</div>
-                    <div className="flex-1 flex items-center gap-1">
-                      <div className="flex-1 h-2 bg-slate-200 rounded overflow-hidden"><div className={`h-2 ${ratio > 0.4 ? 'bg-rose-400' : ratio > 0.15 ? 'bg-amber-400' : 'bg-emerald-400'}`} style={{ width: Math.max(4, ratio * 100) + '%' }} /></div>
+                    <div className="w-28 truncate text-slate-700 font-bold" title={s.title}>{s.title}</div>
+                    <div className="flex-1 h-2 bg-slate-200 rounded overflow-hidden">
+                      <div className={`h-2 ${!reliable ? 'bg-amber-300' : ratio > 0.4 ? 'bg-rose-400' : ratio > 0.15 ? 'bg-amber-400' : 'bg-emerald-400'}`} style={{ width: Math.max(4, (reliable ? ratio : 0.5) * 100) + '%' }} />
                     </div>
-                    <div className="w-32 text-right font-mono text-slate-600 shrink-0">平均{s.mean}s <span className="text-slate-400">±{s.std}s</span></div>
+                    <div className="w-36 text-right font-mono text-slate-600 shrink-0">平均{s.mean}s {reliable ? <span className="text-slate-400">±{s.std}s</span> : <span className="text-amber-600">(1台のみ)</span>}<span className="text-slate-400 ml-1">{s.timed}/{s.started}台</span></div>
                   </div>
                 );
               })}
             </div>
-            <div className="text-[10px] text-slate-400 mt-1">※ バーが短い(緑)＝時間が安定。長い(赤)＝台ごとにバラつき大。</div>
+            <div className="text-[10px] text-slate-400 mt-1">※ <b>時間(&gt;0)が記録された台だけ</b>で算出。<b>「記録なし」＝時間が取れていない工程</b>（順番のみ記録）。短い(緑)＝安定／長い(赤)＝バラつき大／1台のみ(橙)＝判定不可。</div>
           </div>
-          {/* 複数台の作業の流れ（並行作業のイメージ） */}
+          {/* 複数台の作業の流れ（並行作業のイメージ）— 実時間が十分あるときだけ */}
           <div>
             <div className="text-xs font-black text-slate-700 mb-1.5 flex items-center gap-2 flex-wrap">作業の流れ（並行作業のイメージ）
               <span className="inline-flex items-center gap-1 text-[10px] text-slate-500"><span className="w-2.5 h-2.5 rounded bg-blue-500 inline-block" /><Hand className="w-3 h-3" />手動</span>
               <span className="inline-flex items-center gap-1 text-[10px] text-slate-500"><span className="w-2.5 h-2.5 rounded bg-violet-500 inline-block" /><Cpu className="w-3 h-3" />自動測定</span>
             </div>
-            <div className="bg-white rounded border border-slate-200 p-2 max-h-72 overflow-auto">
-              <MultiUnitGantt lot={ganttLot} />
-            </div>
-            <div className="text-[10px] text-slate-400 mt-1">※ 全台が同じ横軸。<b>ある台の自動測定(紫)が動いている間に、別の台で手動(青)が進んでいれば、それが「自動測定中にできる作業」</b>です。台ごとの ✓＝テンプレ順どおり。</div>
+            {ganttUseful ? (
+              <>
+                <div className="bg-white rounded border border-slate-200 p-2 max-h-72 overflow-auto"><MultiUnitGantt lot={ganttLot} /></div>
+                <div className="text-[10px] text-slate-400 mt-1">※ 全台が同じ横軸。<b>ある台の自動測定(紫)中に別の台で手動(青)が進んでいれば「自動測定中にできる作業」</b>。細い灰色＝時間記録なし(0s)。✓＝テンプレ順どおり。</div>
+              </>
+            ) : (
+              <div className="bg-white rounded border border-dashed border-slate-300 p-4 text-[11px] text-slate-500 leading-relaxed">
+                <b>時間記録が不十分</b>で、作業の流れ（並行作業のイメージ）は表示できません。<br />各工程の<b>実作業時間</b>が記録された台が増えると表示されます。今は<b>順番の一貫性</b>のみで判断してください。
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -193,7 +218,7 @@ function EvidenceDetail({ row }) {
   );
 }
 
-export function StrictModeManagerModal({ lots, templates, rules = {}, history = [], currentUserName = '', maturityUnits = 5, onSetMaturity, onDecide, onClose, embedded = false }) {
+export function StrictModeManagerModal({ lots, templates, rules = {}, history = [], currentUserName = '', maturityUnits = 5, onSetMaturity, onDecide, onClose, embedded = false, optimalByCombo = {}, onDecideOptimal = null, onOpenAnalysis = null }) {
   const [view, setView] = useState('table');
   const [q, setQ] = useState('');
   const [onlyUndecided, setOnlyUndecided] = useState(false);
@@ -218,8 +243,8 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
         <div className="shrink-0 bg-gradient-to-r from-rose-700 to-rose-600 text-white px-5 py-3 flex items-center gap-3">
           <ShieldCheck className="w-6 h-6" />
           <div className="flex-1 min-w-0">
-            <div className="font-black text-lg leading-tight">厳密モード 一元管理（型式 × テンプレ）</div>
-            <div className="text-[11px] text-rose-100">目的＝確立した順番を守らせ、データの信頼性・作業漏れ防止・品質安定。<b>台数</b>と<b>順番の一貫性・バラつき</b>を見て、確立した組み合わせだけ厳密に。</div>
+            <div className="font-black text-lg leading-tight">作業データ分析・改善（型式 × テンプレ）</div>
+            <div className="text-[11px] text-rose-100">各コンボの実データを見て判断 →「<b>📊 実データ分析</b>」で全ロットの実作業を確認 → <b>厳密化／テンプレ改善／様子見</b>を選ぶ。厳密化はその中の1アクション。</div>
           </div>
           <div className="flex bg-white/15 rounded-lg p-0.5">
             <button onClick={() => setView('table')} className={`px-3 py-1.5 rounded text-xs font-bold ${view === 'table' ? 'bg-white text-rose-700' : 'text-white'}`}>管理表</button>
@@ -252,6 +277,7 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
                     <th className="px-3 py-2 font-black border-b border-slate-300 text-center">完了台数</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300">エビデンス（順番の一貫性）</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300 text-center">状態</th>
+                    <th className="px-3 py-2 font-black border-b border-slate-300">データ最適順（並行・一括）</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300">最終変更</th>
                     <th className="px-3 py-2 font-black border-b border-slate-300 text-center">操作</th>
                   </tr>
@@ -271,9 +297,54 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
                               <span className={`inline-flex items-center gap-1 text-[11px] font-black px-1.5 py-0.5 rounded border ${Q.cls}`}><Q.Icon className="w-3 h-3" />{Q.label}</span>
                               <span className="text-xs text-slate-600">{r.timedUnits > 0 ? `実時刻 ${r.timedUnits}台中 ${r.consistentUnits}台が順番どおり（${r.consistencyPct}%）` : '実時刻データなし'}</span>
                               <button onClick={() => toggle(r.key)} className="text-[11px] text-rose-600 hover:underline font-bold">{isOpen ? '閉じる' : '根拠を見る▼'}</button>
+                              {onOpenAnalysis && <button onClick={() => onOpenAnalysis(r)} className="text-[11px] bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-2 py-0.5 rounded flex items-center gap-1">📊 実データ分析</button>}
                             </div>
                           </td>
                           <td className="px-3 py-2 text-center"><StateBadge enabled={rule?.enabled} /></td>
+                          <td className="px-3 py-2 align-top">
+                            {(() => {
+                              const o = optimalByCombo[r.key];
+                              const oEnabled = rule?.optimalOrder?.enabled === true;
+                              if (!o) return <span className="text-[11px] text-slate-400">対象データなし</span>;
+                              const thin = !o.hasEnoughData;            // 時刻ありロットが3件未満
+                              const noTimeData = o.lotsWithTime === 0;
+                              return (
+                                <div className="flex flex-col gap-1 min-w-[200px]">
+                                  {/* データ素性を最初に正直に出す */}
+                                  <div className={`text-[10px] font-bold ${thin ? 'text-amber-700' : 'text-slate-500'}`}>
+                                    時刻データ {o.lotsWithTime}/{o.sampleLotCount}ロット{o.lotsNoTime > 0 && <span className="text-slate-400">（{o.lotsNoTime}件は時刻なしで除外）</span>}
+                                    {thin && <span className="ml-1 bg-amber-100 text-amber-800 px-1 rounded">データ不足・参考値</span>}
+                                  </div>
+                                  {noTimeData ? (
+                                    <div className="text-[11px] text-slate-400">時刻データが無く算出不可</div>
+                                  ) : (
+                                    <>
+                                      <div className="text-[11px] text-slate-600">
+                                        <b className="text-indigo-700">▲{o.savedPct}% 短縮</b>
+                                        <span className="text-slate-400"> ({Math.round(o.serialSec / 60)}→{Math.round(o.optimalSec / 60)}分)</span>
+                                      </div>
+                                      {o.batchSteps.length > 0
+                                        ? <div className="text-[10px] text-slate-500 leading-snug">まとめ作業: {o.batchSteps.map((b, i) => (
+                                            <span key={i} className="inline-block mr-1">
+                                              {b.title}
+                                              <span className={`ml-0.5 px-1 rounded ${b.confident ? 'bg-emerald-100 text-emerald-700 font-bold' : 'bg-slate-100 text-slate-400'}`}>{b.batched}/{b.total}={b.ratePct}%{b.confident ? '・確定' : '・参考'}</span>
+                                            </span>
+                                          ))}</div>
+                                        : <div className="text-[10px] text-slate-400">まとめ作業の実績なし（時刻データ上）</div>}
+                                    </>
+                                  )}
+                                  {onDecideOptimal && (
+                                    <button
+                                      onClick={() => onDecideOptimal(r, !oEnabled)}
+                                      disabled={rule?.enabled !== true || noTimeData}
+                                      title={rule?.enabled !== true ? 'まず「厳密」をONにしてください（最適順は厳密モードの“どの順番か”を決めるもの）' : (thin ? 'データが少ないので強制は非推奨（参考値）' : '')}
+                                      className={`mt-0.5 px-2 py-1 rounded text-[10px] font-bold border w-fit ${rule?.enabled !== true || noTimeData ? 'bg-slate-50 text-slate-300 border-slate-200 cursor-not-allowed' : oEnabled ? 'bg-indigo-600 text-white border-indigo-600' : thin ? 'bg-white text-amber-700 border-amber-300 hover:bg-amber-50' : 'bg-white text-indigo-700 border-indigo-300 hover:bg-indigo-50'}`}
+                                    >{oEnabled ? '✓ データ最適順を強制中' : thin ? '強制する（参考・非推奨）' : 'データ最適順を強制する'}</button>
+                                  )}
+                                </div>
+                              );
+                            })()}
+                          </td>
                           <td className="px-3 py-2 text-[11px] text-slate-500 whitespace-nowrap">{rule?.decidedAt ? <>{rule.decidedBy || '?'}<br />{fmtWhen(rule.decidedAt)}</> : '-'}</td>
                           <td className="px-3 py-2">
                             <div className="flex gap-1 justify-center">
@@ -283,11 +354,11 @@ export function StrictModeManagerModal({ lots, templates, rules = {}, history = 
                             </div>
                           </td>
                         </tr>
-                        {isOpen && <tr><td colSpan={8} className="p-0"><EvidenceDetail row={r} /></td></tr>}
+                        {isOpen && <tr><td colSpan={9} className="p-0"><EvidenceDetail row={r} /></td></tr>}
                       </React.Fragment>
                     );
                   })}
-                  {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-slate-400">該当する組み合わせがありません</td></tr>}
+                  {filtered.length === 0 && <tr><td colSpan={9} className="text-center py-10 text-slate-400">該当する組み合わせがありません</td></tr>}
                 </tbody>
               </table>
             </div>
