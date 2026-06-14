@@ -47,6 +47,7 @@ import { HelpManualModal, PRODUCT_HELP_SECTIONS } from './HelpManual.jsx';
 import { StrictModeManagerModal, computeStrictEvidence, strictComboKey, MultiUnitGantt } from './StrictModeManager.jsx';
 // スキルマップ（作業者×スキル：レベル＋回数）
 import { SkillMapView, DEFAULT_SKILLS } from './SkillMap.jsx';
+import RotaryMeasurementsPanel from './RotaryMeasurements.jsx';
 
 // --- 一度だけ実行: 管理者未承認の厳密モード(localStorageの古い残骸)を全消去して既定OFFに戻す ---
 // 厳密モードは「厳密モード一元管理(settings.strictModeRules)」での承認のみを正とする方針。
@@ -13620,7 +13621,7 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   );
 };
 
-const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [], onRestore = null }) => {
+const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [], onRestore = null, db = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('defects'); // 工程改善分析は「作業最適化」タブへ移動したため既定を不具合分析に
   const [selectedModel, setSelectedModel] = useState('all');
@@ -14045,6 +14046,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
               {activeMode === 'dashboard' && (<><Activity className="w-6 h-6 text-blue-600"/> 管理者ダッシュボード</>)}
               {activeMode === 'kpi' && (<><TrendingUp className="w-6 h-6 text-indigo-600"/> 経営分析（KPI詳細）</>)}
               {activeMode === 'achievement' && (<><Target className="w-6 h-6 text-emerald-600"/> 達成率分析</>)}
+              {activeMode === 'rotary' && (<><Ruler className="w-6 h-6 text-cyan-600"/> 分割測定結果</>)}
               {activeMode === 'audit' && (<><ClipboardCheck className="w-6 h-6 text-emerald-600"/> 提出前チェック・バックアップ</>)}
               {activeMode === 'defects' && (<><AlertTriangle className="w-6 h-6 text-rose-600"/> 不具合分析</>)}
               {activeMode === 'complaints' && (<><Megaphone className="w-6 h-6 text-purple-600"/> 軽微不良・改善提案</>)}
@@ -14059,6 +14061,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  <button onClick={()=>setActiveMode('dashboard')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='dashboard' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> ダッシュボード</button>
                  <button onClick={()=>setActiveMode('kpi')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='kpi' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><TrendingUp className="w-4 h-4"/> 経営分析</button>
                  <button onClick={()=>setActiveMode('achievement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='achievement' ? 'bg-white shadow text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}><Target className="w-4 h-4"/> 達成率</button>
+                 <button onClick={()=>setActiveMode('rotary')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='rotary' ? 'bg-white shadow text-cyan-600' : 'text-slate-500 hover:text-slate-700'}`}><Ruler className="w-4 h-4"/> 分割測定</button>
                  <button onClick={()=>setActiveMode('audit')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='audit' ? 'bg-white shadow text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}><ClipboardCheck className="w-4 h-4"/> 点検・バックアップ</button>
                  <button onClick={()=>setActiveMode('defects')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='defects' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><AlertTriangle className="w-4 h-4"/> 不具合分析</button>
                  <button onClick={()=>setActiveMode('complaints')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='complaints' ? 'bg-white shadow text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}><Megaphone className="w-4 h-4"/> 軽微不良・改善提案</button>
@@ -14068,7 +14071,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  <button onClick={()=>setActiveMode('monthly')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='monthly' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}><FileText className="w-4 h-4"/> 月次レポート</button>
                  <button onClick={()=>setActiveMode('export')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='export' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><DownloadCloud className="w-4 h-4"/> データ書き出し</button>
               </div>
-              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement'].includes(activeMode) && (
+              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
                 {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
                 <button onClick={async ()=>{
@@ -15458,6 +15461,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
            {activeMode === 'dashboard' && <ManagerDashboard lots={lots} settings={settings} />}
            {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
            {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
+           {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
            {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} currentUserName={currentUserName} onRestore={onRestore} />}
         </div>
      </div>
@@ -24462,7 +24466,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} onRestore={restoreAllFromBackup} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} onRestore={restoreAllFromBackup} db={db} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
