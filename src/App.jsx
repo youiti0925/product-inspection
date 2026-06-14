@@ -2086,17 +2086,20 @@ const nextOptimalMove = (steps, tasks, quantity, analysis, opts = {}) => {
   const BATCH_MIN_LOTS = opts.batchMinLots ?? 3;
   const isConfidentBatch = (o) => !!o && o.totalLots >= BATCH_MIN_LOTS && o.batchRate >= BATCH_THRESHOLD;
 
-  // ① 手動タスク進行中 → 次は出さない
+  // ① 手動タスク進行中 → 次は出さない (ロット1回工程は台概念が無いので除外。準備/片付けゲートは globalNextTask 側で処理)
   for (let si = 0; si < steps.length; si++) {
+    if (steps[si]?.lotOnce) continue;
     if (isAutoStep(steps[si])) continue;
     for (let u = 0; u < quantity; u++) if (statusOf(si, u) === 'processing') return null;
   }
 
   // 各台: 次工程(テンプレ順で最初の waiting/paused) と 機械占有(自動測定 processing) を求める
+  // ※ロット1回工程は台ごとの「次」にしない(globalNextTask のゲートで扱う)。ここで拾うと台indexを回数と取り違える。
   const unitNext = [], unitBusy = [];
   for (let u = 0; u < quantity; u++) {
     let next = -1, busy = false;
     for (let si = 0; si < steps.length; si++) {
+      if (steps[si]?.lotOnce) continue;
       const st = statusOf(si, u);
       if (isAutoStep(steps[si]) && st === 'processing') { busy = true; break; } // 機械占有 → この台は停止
       if (st === 'waiting' || st === 'paused') { next = si; break; }
@@ -6264,7 +6267,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         if (t.status !== 'ng') return;
         const parts = k.split('-');
         const unitIdxStr = parts.pop();
-        const stepIdOrIdx = parts.join('-');
+        let stepIdOrIdx = parts.join('-');
+        if (stepIdOrIdx.endsWith('-lot')) stepIdOrIdx = stepIdOrIdx.slice(0, -4); // ロット1回キー `${id}-lot-${k}` の正規化 (工程名が「不明」になるのを防ぐ)
         const step = (l.steps || []).find(s => s.id === stepIdOrIdx) || (l.steps || [])[parseInt(stepIdOrIdx)];
         ngTasks.push({
           orderNo: l.orderNo,
@@ -6532,7 +6536,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           // activeCustomTaskKey は step.id ベースの場合があるので parseActiveTaskKey で正規化
           const { stepIdx: sI, unitIdx: uI } = parseActiveTaskKey(activeCustomTaskKey);
           voiceToggleTask(sI, uI); // 現在を完了
-          const nextS = sI + 1;
+          let nextS = sI + 1;
+          // ロット1回(段取り)工程は音声「次工程」の着地点にしない (台indexを回数と取り違えるため。準備/片付けは画面タップで)
+          while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) nextS++;
           if (nextS < localSteps.length) {
             voiceToggleTask(nextS, uI); // 次工程の同じ台数を開始
             setActiveCustomTaskKey(`${nextS}-${uI}`);
@@ -6628,6 +6634,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           voiceToggleTask(sI, uI); // 現在を完了
           let nextS = sI, nextU = uI + 1;
           if (nextU >= lot.quantity) { nextS++; nextU = 0; }
+          // ロット1回(段取り)工程は音声「次」の着地点にしない (台indexを回数と取り違えるため。準備/片付けは画面タップで)
+          while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) { nextS++; nextU = 0; }
           if (nextS < localSteps.length) {
             voiceToggleTask(nextS, nextU); // 次を開始
             setActiveCustomTaskKey(`${nextS}-${nextU}`);
@@ -6706,7 +6714,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       // 次工程（同じ台数で次の工程）— "次"より先にチェック
       } else if (matchNextStep(norm) || matchNextStep(cmd)) {
         voiceToggleTask(sIdx, uIdx); // 現在を完了
-        const nextS = sIdx + 1;
+        let nextS = sIdx + 1;
+        while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) nextS++; // ロット1回工程は着地点にしない(準備/片付けはタップで)
         if (nextS < localSteps.length) {
           voiceToggleTask(nextS, uIdx); // 次工程の同じ台数
           // activeCustomTaskKey は数値index 形式で統一 (他の voice ハンドラと一致させる、parse 時 NaN を避ける)
@@ -6725,6 +6734,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         // 次のユニット/ステップを探す
         let nextS = sIdx, nextU = uIdx + 1;
         if (nextU >= lot.quantity) { nextS++; nextU = 0; }
+        while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) { nextS++; nextU = 0; } // ロット1回工程は着地点にしない
         if (nextS < localSteps.length) {
           voiceToggleTask(nextS, nextU); // 次を開始
           setActiveCustomTaskKey(`${nextS}-${nextU}`);
@@ -7202,39 +7212,27 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   const globalNextTask = useMemo(() => {
     const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
     const qty = lot.quantity || 1;
-    // ★データ最適順が承認されたコンボ → 実績データ駆動の nextOptimalMove に従う
-    if (optimalNextMove) {
-      const mv = optimalNextMove;
-      if (mv.type === 'batch') {
-        // バッチ指示: 先頭台を「次」として返しつつ isBatch/batchUnits を添える(個別タップは強制ブロック → まとめて開始へ誘導)
-        return { sIdx: mv.stepIdx, unitIdx: mv.units[0], isAuto: false, isBatch: true, batchUnits: mv.units };
-      }
-      return { sIdx: mv.stepIdx, unitIdx: mv.unitIdx, isAuto: mv.type === 'auto-start' };
-    }
     const getKey = (step, sIdx, u) => (step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
     const statusOf = (step, sIdx, u) => {
       const t = tasks[getKey(step, sIdx, u)] || tasks[`${sIdx}-${u}`];
       return t?.status || 'waiting';
     };
-    // 1) 手動タスクが進行中なら 次は出さない (作業者は手を動かしてる)
-    //    ロット1回工程の作業中(lot-キー)もここで検出する
+    // 1) 何かが進行中なら 次は出さない (手動タスク / ロット1回工程の計測中)。どのモードより先に判定する。
     const lotOnceRunning = localSteps.some(step => step?.lotOnce && lotOnceKeysOf(tasks, step).some(k => tasks[k]?.status === 'processing'));
     if (lotOnceRunning) return null;
     for (let si = 0; si < localSteps.length; si++) {
       const step = localSteps[si];
-      if (step?.lotOnce) continue; // ロット1回工程は下のゲート判定で別途扱う
+      if (step?.lotOnce) continue;
       if (isAutoStepFn(step)) continue;
       for (let u = 0; u < qty; u++) {
         if (statusOf(step, si, u) === 'processing') return null;
       }
     }
-    // ロット1回(段取り)工程のゲート判定: 1回でも完了/該当なし/NG/修正完了があれば「済」とみなす。
-    //   次に着手すべき回 = waiting/paused の最初の回 (無ければ0回目)。準備=先頭ゲート / 片付け=末尾ゲート。
+    // ロット1回(段取り)工程のゲート判定: 1回でも完了/該当なし/NG/修正完了があれば「済」。次に着手する回 = waiting/paused の最初(無ければ0回目)。準備=先頭ゲート / 片付け=末尾ゲート。
     const lotSatisfied = (step) => lotOnceKeysOf(tasks, step).some(k => ['completed', 'skipped', 'ng', 'rework-done'].includes(tasks[k]?.status));
     const lotNextOcc = (step) => { const ks = lotOnceKeysOf(tasks, step); for (let i = 0; i < ks.length; i++) { const s = tasks[ks[i]]?.status; if (s === 'waiting' || s === 'paused') return i; } return ks.length === 0 ? 0 : null; };
     const unitWorkLeft = (step, si) => { for (let u = 0; u < qty; u++) { const s = statusOf(step, si, u); if (s === 'waiting' || s === 'paused') return true; } return false; };
-    // 2) 先頭側のロット1回ゲート: テンプレ順で、手前に未着手の台作業が来るより前にある未済のロット1回工程を「次」にする (準備など)。
-    //    手前の台作業が残っている通常工程に当たったら、そこで打ち切って通常の台順ウォークへ。
+    // 2) 先頭側のロット1回ゲート(準備など)を最優先で「次」に。★データ最適順モードでも飛ばさないよう、optimalNextMove 参照より前に評価する。
     for (let si = 0; si < localSteps.length; si++) {
       const step = localSteps[si];
       if (step?.lotOnce) {
@@ -7242,6 +7240,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       } else if (unitWorkLeft(step, si)) {
         break;
       }
+    }
+    // 3) データ最適順が承認されたコンボ → 実績データ駆動の nextOptimalMove に従う (ロット1回は上のゲートで処理済 → ここは台の手のみ)
+    if (optimalNextMove) {
+      const mv = optimalNextMove;
+      if (mv.type === 'batch') {
+        return { sIdx: mv.stepIdx, unitIdx: mv.units[0], isAuto: false, isBatch: true, batchUnits: mv.units };
+      }
+      return { sIdx: mv.stepIdx, unitIdx: mv.unitIdx, isAuto: mv.type === 'auto-start' };
     }
     // 各台が「機械占有中 (自動測定 processing)」かどうか
     const unitHasRunningAuto = (u) => localSteps.some((step, si) => !step?.lotOnce && isAutoStepFn(step) && statusOf(step, si, u) === 'processing');
@@ -7275,6 +7281,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (!optimalNextMove || !strictOrderMode) return null;
     const gnt = globalNextTask;
     if (!gnt) return null; // 次が無い(手動進行中など)は通常処理へ委ねる
+    if (gnt.isLot) return null; // 次がロット1回ゲート(準備/片付け)のときは台タップを強制ブロックしない (バッジで案内・台はタップ可)
     if (gnt.isBatch && sIdx === gnt.sIdx && Array.isArray(gnt.batchUnits) && gnt.batchUnits.includes(uIdx)) {
       return { hint: `🔒 データ最適順: 「${localSteps[sIdx]?.title || ''}」は実績どおり“まとめて開始”で ${gnt.batchUnits.length}台 一括処理してください` };
     }
@@ -7692,6 +7699,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const nowTs = Date.now();
       if (u != null) {
         localSteps.forEach((step, si) => {
+          if (step?.lotOnce) return; // ロット1回(段取り)工程は台やり直しの対象外 (u=台番号を回数kと取り違え、無関係な段取りを巻き添えNGにしてしまうため)
           if (fromHere && si < refStep) return;
           const k = getTaskKey(si, u);
           const t = tasks[k];
@@ -12889,11 +12897,16 @@ const DataExportCenter = ({ lots = [], workers = [], indirectWork = [], settings
         const qty = l.quantity || 1;
         (l.steps || []).forEach((step, sIdx) => {
           let units = 0, totalSec = 0;
-          for (let u = 0; u < qty; u++) {
-            const t = (l.tasks || {})[`${step.id}-${u}`] || (l.tasks || {})[`${sIdx}-${u}`];
-            if (t && (t.status === 'completed' || t.status === 'ng') && (t.duration || 0) > 0) { units++; totalSec += t.duration; }
+          if (step.lotOnce) {
+            // ロット1回(段取り)工程は回数キー(lot-k)を集計。units=回数。
+            lotOnceKeysOf(l.tasks || {}, step).forEach(k => { const t = l.tasks[k]; if (t && (t.status === 'completed' || t.status === 'ng') && (t.duration || 0) > 0) { units++; totalSec += t.duration; } });
+          } else {
+            for (let u = 0; u < qty; u++) {
+              const t = (l.tasks || {})[`${step.id}-${u}`] || (l.tasks || {})[`${sIdx}-${u}`];
+              if (t && (t.status === 'completed' || t.status === 'ng') && (t.duration || 0) > 0) { units++; totalSec += t.duration; }
+            }
           }
-          if (units > 0) rows.push({ date: fmtDate(cMs), orderNo: l.orderNo || '', model: l.model || '', step: step.title || '', units, totalMin: Math.round(totalSec / 60), avgSec: Math.round(totalSec / units), _ts: cMs, _model: l.model || '', _worker: '', _order: l.orderNo || '' });
+          if (units > 0) rows.push({ date: fmtDate(cMs), orderNo: l.orderNo || '', model: l.model || '', step: (step.title || '') + (step.lotOnce ? '（段取り/回数）' : ''), units, totalMin: Math.round(totalSec / 60), avgSec: Math.round(totalSec / units), _ts: cMs, _model: l.model || '', _worker: '', _order: l.orderNo || '' });
         });
       });
     } else if (s === 'indirect') {
@@ -18790,6 +18803,11 @@ const EditTimeModal = ({ lot, onClose, onSave }) => {
   // 工程ごとの合計時間
   const stepTotal = (step, sIdx) => {
     let total = 0;
+    if (step?.lotOnce) {
+      // ロット1回(段取り)工程は回数キー(lot-k)を合計
+      lotOnceKeysOf(localTasks, step).forEach(k => { const t = localTasks[k]; if (t && (t.status === 'completed' || t.status === 'ng') && t.duration > 0) total += t.duration; });
+      return total;
+    }
     for (let u = 0; u < qty; u++) {
       const { task } = getTaskAndKey(step, sIdx, u);
       if (task && (task.status === 'completed' || task.status === 'ng') && task.duration > 0) total += task.duration;
@@ -18841,8 +18859,37 @@ const EditTimeModal = ({ lot, onClose, onSave }) => {
                         <span className="font-bold text-slate-700 truncate" title={step.title}>{step.title}</span>
                       </div>
                       {step.category && <div className="text-[10px] text-slate-400 mt-0.5">{step.category}</div>}
+                      {step.lotOnce && <div className="text-[9px] text-teal-600 font-bold mt-0.5">📦ロット1回(回数)</div>}
                     </td>
-                    {Array.from({ length: qty }).map((_, u) => {
+                    {step.lotOnce ? (() => {
+                      // ロット1回(段取り)工程: 台列の代わりに回数(lot-k)の入力を colSpan で並べる
+                      const loKeys = lotOnceKeysOf(localTasks, step);
+                      return (
+                        <td colSpan={qty} className="p-1 border-l border-slate-100">
+                          {loKeys.length === 0 ? (
+                            <span className="text-slate-300 text-[11px] pl-1">実績なし</span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-2">
+                              {loKeys.map((key, kIdx) => {
+                                const task = localTasks[key] || {};
+                                const editable = task.status === 'completed' || task.status === 'ng';
+                                return (
+                                  <div key={key} className={`flex items-center gap-1 rounded px-1.5 py-0.5 ${task.status === 'ng' ? 'bg-rose-50' : task.status === 'skipped' ? 'bg-slate-50' : 'bg-teal-50'}`}>
+                                    <span className="text-[10px] font-bold text-slate-600">{kIdx + 1}回目</span>
+                                    {editable ? (
+                                      <input type="number" value={task.duration || 0} onChange={(e) => handleDurationChange(key, e.target.value)} className={`w-16 border rounded px-1 py-0.5 text-right font-mono text-xs focus:ring-2 focus:ring-blue-500 outline-none ${task.status === 'ng' ? 'border-rose-300' : 'border-slate-300'}`} min="0" />
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400">{task.status === 'skipped' ? '該当なし' : task.status === 'paused' ? '停止' : task.status === 'processing' ? '進行中' : '未着手'}</span>
+                                    )}
+                                    {task.status === 'ng' && <span className="text-[9px] text-rose-600 font-bold">NG</span>}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    })() : Array.from({ length: qty }).map((_, u) => {
                       const { task, key } = getTaskAndKey(step, sIdx, u);
                       if (!task) return <td key={u} className="p-2 text-center text-slate-300 border-l border-slate-100">–</td>;
                       const isSkipped = task.status === 'skipped';
@@ -18886,7 +18933,8 @@ const EditTimeModal = ({ lot, onClose, onSave }) => {
                   return <td key={u} className="p-2 text-center font-mono text-xs border-l border-slate-300">{t > 0 ? fmtMin(t) : '–'}</td>;
                 })}
                 <td className="p-2 text-right font-mono bg-slate-300 border-l-2 border-slate-400">
-                  {fmtMin(Array.from({ length: qty }).reduce((acc, _, u) => acc + unitTotal(u), 0))}
+                  {/* 総合計 = 全工程の合計 (台数別合計はロット1回工程を含まないため、stepTotal の総和で取る) */}
+                  {fmtMin(steps.reduce((acc, step, sIdx) => acc + stepTotal(step, sIdx), 0))}
                 </td>
               </tr>
               {steps.length === 0 && <tr><td colSpan={qty + 2} className="p-4 text-center text-slate-500">工程がありません</td></tr>}
@@ -19205,6 +19253,8 @@ const ReportPreview = ({ lot: _originalLot, workers, onClose }) => {
       if (!obj) return obj;
       const result = {};
       Object.entries(obj).forEach(([key, val]) => {
+        // ロット1回(段取り)キー `${id}-lot-${k}` は台フィルタ対象外。回数を台番号と取り違えないようそのまま残す。
+        if (LOT_ONCE_RE.test(key)) { result[key] = val; return; }
         // パターン: <prefix>-<unitIdx> または <prefix>-<unitIdx>-<suffix>
         const m = key.match(/^(.+?)-(\d+)(?:-(.+))?$/);
         if (m) {
@@ -22218,6 +22268,18 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
       const d = new Date(toMs(lot.updatedAt || lot.createdAt) || Date.now());
       const dateStr = isNaN(d.getTime()) ? '-' : d.toLocaleString();
       (lot.steps || []).forEach((step, sIdx) => {
+        // ロット1回(段取り)工程: 台ではなく回数(lot-k)。ユニットNoは「回N」で台(#N)と区別 (取込側も対応)
+        if (step.lotOnce) {
+          lotOnceKeysOf(lot.tasks || {}, step).forEach((key, k) => {
+            const task = lot.tasks[key];
+            if (task?.status === 'completed' || task?.status === 'skipped') {
+              const eff = task.duration > 0 ? Math.round(((step.targetTime || 60) / task.duration) * 100) : 0;
+              const wName = workers.find(w => w.id === task.workerId)?.name || task.workerName || '-';
+              rows.push([dateStr, lot.model, lot.orderNo, `回${k + 1}`, step.category || '', step.title, task.status === 'completed' ? 'OK' : 'N/A', wName, task.duration || 0, step.targetTime || 60, eff].join(','));
+            }
+          });
+          return;
+        }
         for (let i = 0; i < (lot.quantity || 1); i++) {
           const task = lot.tasks?.[`${step.id}-${i}`] || lot.tasks?.[`${sIdx}-${i}`];
           if (task?.status === 'completed' || task?.status === 'skipped') {
@@ -22253,6 +22315,22 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
         if (!updates[matchLot.id]) updates[matchLot.id] = { tasks: JSON.parse(JSON.stringify(matchLot.tasks || {})) };
         const stepIndex = (matchLot.steps || []).findIndex(s => s.title === title && (category ? s.category === category : true)); if (stepIndex === -1) continue;
         const step = matchLot.steps[stepIndex];
+        // CSV取込で時刻情報がない場合は、ロットの completedAt or updatedAt を流用 (台/回数 共通)
+        const importEndTs = (typeof matchLot.completedAt === 'number' ? matchLot.completedAt : null) || Date.now();
+        // ロット1回(段取り)工程: ユニットNo「回N」を回数キー(lot-k)に書き戻す
+        if (unitNo.startsWith('回') && step.lotOnce) {
+          const occ = parseInt(unitNo.substring(1), 10) - 1;
+          if (isNaN(occ) || occ < 0) continue;
+          const loKey = `${step.id}-lot-${occ}`;
+          const ex = updates[matchLot.id].tasks[loKey];
+          updates[matchLot.id].tasks[loKey] = {
+            ...(ex || { startTime: null }), status: 'completed', duration,
+            workerName: workerName !== '-' ? workerName : (ex?.workerName || ''),
+            firstStartTime: ex?.firstStartTime || ex?.startTime || (duration > 0 ? importEndTs - duration * 1000 : importEndTs),
+            endTime: ex?.endTime || importEndTs,
+          };
+          continue;
+        }
         let unitIdx = -1; if (unitNo.startsWith('#')) unitIdx = parseInt(unitNo.substring(1), 10) - 1;
         if (unitIdx === -1 || unitIdx >= (matchLot.quantity || 1)) continue;
         const taskKey1 = `${step.id}-${unitIdx}`, taskKey2 = `${stepIndex}-${unitIdx}`;
@@ -24210,12 +24288,13 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          let cursor = (typeof lot.workStartTime === 'number' ? lot.workStartTime : null);
          if (!cursor && typeof lot.completedAt === 'number') cursor = lot.completedAt - totalSec * 1000;
          if (!cursor) { failed++; continue; }
-         // 工程順序通りに累積していく
+         // 工程順序通りに累積していく。ロット1回工程は回数キー(lot-k)、通常工程は台キー。
+         //   ※forEach コールバックなので return は「この回/台だけスキップして次へ」(continue相当)。旧 for+return は工程ごと中断するバグだった。
          steps.forEach((step, sIdx) => {
-           for (let u = 0; u < qty; u++) {
-             const key = `${step.id}-${u}`;
-             const altKey = `${sIdx}-${u}`;
-             const realKey = tasks[key] ? key : (tasks[altKey] ? altKey : key);
+           const keys = step.lotOnce
+             ? lotOnceKeysOf(tasks, step)
+             : Array.from({ length: qty }, (_, u) => (tasks[`${step.id}-${u}`] ? `${step.id}-${u}` : `${sIdx}-${u}`));
+           keys.forEach(realKey => {
              const t = tasks[realKey];
              if (!t || t.status !== 'completed' || !t.duration) return;
              if (t.firstStartTime && t.endTime) return; // 既に時刻あり
@@ -24223,7 +24302,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              const end = cursor + t.duration * 1000;
              tasks[realKey] = { ...t, firstStartTime: start, endTime: end, isEstimatedTime: true };
              cursor = end;
-           }
+           });
          });
          await saveData('lots', lot.id, {
            tasks,
