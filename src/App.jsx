@@ -313,6 +313,30 @@ const lotOnceKeysOf = (tasks, step) => Object.keys(tasks || {})
   .sort((a, b) => parseInt(a.slice(a.lastIndexOf('-') + 1)) - parseInt(b.slice(b.lastIndexOf('-') + 1)));
 const lotOnceCountOf = (tasks, step) => Math.max(1, lotOnceKeysOf(tasks, step).length); // 表示/分母用 (最低1回)
 
+// === 分割測定アプリ(rotary_table)連携 Phase2: 時間取り半自動連動 ===
+// Web→アプリ: rotaryCommands に prepare / start_capture を書く。アプリ→Web: rotaryEvents の done を購読し測定タイマーを自動停止。
+// マスタ settings.rotaryLink.enabled が true のときだけ動く (既定OFF)。工程に step.rotaryLink + step.rotaryRole('prepare'|'capture')。
+// 相関ID(workId) = ロット×台。prepare/start_capture/done をこのIDで結びつける (準備工程と測定工程は別工程でも同じ台なら同じID)。
+const ROTARY_CMD_COL = 'rotaryCommands';
+const ROTARY_EVT_COL = 'rotaryEvents';
+const rotaryWorkId = (lotId, unitIdx) => `${lotId}_u${unitIdx}`;
+const rotaryCmdDoc = (db, id) => doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', ROTARY_CMD_COL, id);
+// 指令を書く (prepare=準備工程の開始 / start_capture=測定工程の開始)。失敗してもタイマー自体は止めない(現場優先)。
+const writeRotaryCommand = async (db, kind, { workId, station, model, machine, mode }) => {
+  if (!db || !workId || !station) return { ok: false, reason: 'missing' };
+  try {
+    const id = kind === 'prepare' ? `${workId}_prepare` : `${workId}_start`;
+    const payload = kind === 'prepare'
+      ? { type: 'prepare', station, workId, model: model || '', machine: machine || '', mode: mode || '', status: 'pending', createdAt: serverTimestamp() }
+      : { type: 'start_capture', station, workId, status: 'pending', createdAt: serverTimestamp() };
+    await setDoc(rotaryCmdDoc(db, id), payload);
+    return { ok: true };
+  } catch (e) {
+    console.error('writeRotaryCommand failed', kind, e);
+    return { ok: false, reason: e?.message || 'error' };
+  }
+};
+
 // ロットの推定総時間。customTargetTimes があれば型式別較正値を使う。
 // ロット1回工程は台数を掛けず1回分のみ加算 (段取りは台数に比例しない)。
 const calculateLotEstimatedTime = (lot, customTargetTimes = null) => {
@@ -3881,6 +3905,9 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const [autoEndSec, setAutoEndSec] = useState(0);
   // ロット1回(段取り)工程: 台数分ではなく回数分の計測 (準備・片付け用)
   const [lotOnce, setLotOnce] = useState(false);
+  // 分割測定アプリ連携: この工程の開始で分割アプリへ指令を送る。role='prepare'(準備)/'capture'(測定開始)
+  const [rotaryLink, setRotaryLink] = useState(false);
+  const [rotaryRole, setRotaryRole] = useState('capture');
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
   const [pdfData, setPdfData] = useState(null);
@@ -3969,6 +3996,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       // 自動測定の既知時間 (経過で自動終了)。自動工程かつ有効かつ正の秒数のときのみ保存。
       ...(executionMode === 'batch' && autoEndEnabled && autoEndSec > 0 ? { autoEndEnabled: true, autoEndSec: Math.round(autoEndSec) } : {}),
       ...(lotOnce ? { lotOnce: true } : {}),  // ロット1回(段取り)工程
+      ...(rotaryLink ? { rotaryLink: true, rotaryRole } : {}),  // 分割測定アプリ連携(準備/測定開始の指令送信)
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
       // checklistItems は type 問わず保存可能 (測定 + チェックの併用OK)
       ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {})
@@ -3976,7 +4004,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); }
     resetInput();
   };
-  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); };
+  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); setRotaryLink(false); setRotaryRole('capture'); };
   const editStep = (s) => {
     setEditingStepId(s.id);
     setTitle(s.title);
@@ -3992,6 +4020,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     setAutoEndEnabled(!!s.autoEndEnabled);
     setAutoEndSec(s.autoEndSec || 0);
     setLotOnce(!!s.lotOnce);
+    setRotaryLink(!!s.rotaryLink);
+    setRotaryRole(s.rotaryRole || (s.type === 'measurement' ? 'capture' : 'prepare'));
     setChecklistItems(Array.isArray(s.checklistItems) ? s.checklistItems : []);
   };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
@@ -4117,6 +4147,25 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                   ONにすると、この工程は<b>台数分のボタンではなく「回数」のボタン</b>になります（10台でもボタン1個）。
                   5台ずつ持ち込み等で準備・片付けが複数回発生する場合は、作業画面の<b>「＋もう1回」</b>で回を追加できます。
                   目標時間は「1回あたり」の意味になり、1台目に段取り時間が混ざる問題が解消されます。
+                </div>
+              </div>
+
+              {/* 分割測定アプリ連携: この工程の開始で分割アプリへ指令を送る */}
+              <div className="bg-cyan-50 border border-cyan-200 rounded p-2 space-y-1.5">
+                <label className="flex items-center gap-2 text-xs font-bold text-cyan-800 cursor-pointer">
+                  <input type="checkbox" checked={rotaryLink} onChange={e => setRotaryLink(e.target.checked)} className="w-4 h-4 accent-cyan-600"/>
+                  🔗 分割測定アプリと連動（この工程の開始で指令を送る）
+                </label>
+                {rotaryLink && (
+                  <div className="flex items-center gap-1.5 pl-6">
+                    <span className="text-[11px] text-slate-600">送る指令:</span>
+                    <button type="button" onClick={() => setRotaryRole('prepare')} className={`px-2.5 py-1 text-[11px] font-bold rounded border ${rotaryRole === 'prepare' ? 'bg-cyan-600 text-white border-cyan-700' : 'bg-white text-cyan-700 border-cyan-300'}`}>準備 (prepare)</button>
+                    <button type="button" onClick={() => setRotaryRole('capture')} className={`px-2.5 py-1 text-[11px] font-bold rounded border ${rotaryRole === 'capture' ? 'bg-cyan-600 text-white border-cyan-700' : 'bg-white text-cyan-700 border-cyan-300'}`}>測定開始 (start_capture)</button>
+                  </div>
+                )}
+                <div className="text-[10px] text-cyan-700 leading-relaxed">
+                  「準備」工程の開始で機械へ条件をセット、「測定開始」工程の開始で分割アプリが測定を始め、測定完了でこの工程のタイマーが<b>自動で止まります</b>。
+                  開始時にステーション(PC)を選びます。<b>マスタ設定の「分割測定アプリ連携」がONのときだけ</b>動きます（既定OFF）。
                 </div>
               </div>
 
@@ -5615,7 +5664,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {} }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {} }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -7352,6 +7401,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 時間手入力: 押し忘れ等で時間が残らなかった工程に、手入力で時間(秒)を設定して完了にする。
   //   keys 複数で一括対応 (1台 or 全台)。
   const [timeInput, setTimeInput] = useState(null); // { keys:[key], label, min, sec } | null
+  // 分割測定アプリ連携(Phase2): 開始時のステーション選択 / 自動停止の追跡
+  const [rotaryStationPicker, setRotaryStationPicker] = useState(null); // { stepIdx, unitIdx, role, workId, defaultStation } | null
+  const rotaryTrackRef = useRef({});       // workId -> capture の taskKey (このセッションで start_capture を送った台。done で自動停止する対象)
+  const rotaryStationByWorkRef = useRef({}); // workId -> 選んだ station (prepare で選んだ値を capture でも既定に)
+  const rotarySessionStartRef = useRef(Date.now()); // 購読開始時刻。これ以前の done(replay)は無視する保険
   // 修正(リワーク)の編集・削除モーダル: 各修正の時間と「修正ごとの理由」を編集、行削除も可。NG理由(タスク全体)も編集。
   //   draft は state に保持し「保存」で一括コミット (入力中に書き込まない)。
   const [reworkEditor, setReworkEditor] = useState(null); // { key, label, ngReason, items:[{...rework, min, sec, reason}] } | null
@@ -7392,7 +7446,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     return `${stepIdx}-${unitIdx}`;
   };
 
-  const toggleTask = (stepIdx, unitIdx) => {
+  const toggleTask = (stepIdx, unitIdx, opts = {}) => {
     const key = getTaskKey(stepIdx, unitIdx);
     const newTasks = { ...tasks };
     const currentTask = tasks[key] || { status: 'waiting', duration: 0, startTime: null };
@@ -7422,6 +7476,17 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     }
 
     if (currentTask.status === 'waiting' || currentTask.status === 'paused') {
+      // 分割測定アプリ連携: 連動工程の開始はステーション選択を挟む (マスタON時のみ)。選択後にこの開始処理を skipRotary で再実行する。
+      const stepObj = (localSteps || [])[stepIdx];
+      if (!opts.skipRotary && rotaryConfig?.enabled && stepObj?.rotaryLink && db) {
+        const workId = rotaryWorkId(lot.id, unitIdx);
+        setRotaryStationPicker({
+          stepIdx, unitIdx, role: stepObj.rotaryRole || 'capture', workId,
+          stepTitle: stepObj.title || '',
+          defaultStation: rotaryStationByWorkRef.current[workId] || (rotaryConfig.stations || [])[0] || '',
+        });
+        return;
+      }
       const previousTasks = { ...tasks };
       const nowTs = Date.now();
       newTasks[key] = {
@@ -7454,6 +7519,69 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       startUndoTimer({ key, type: 'task', previousTasks });
     }
   };
+
+  // 分割測定アプリ連携: ステーションを選んで開始を確定する。station='' は「連動せず開始」(指令を送らず手動運用)。
+  const confirmRotaryStart = (station) => {
+    const p = rotaryStationPicker;
+    setRotaryStationPicker(null);
+    if (!p) return;
+    const { stepIdx, unitIdx, role, workId, stepTitle } = p;
+    // 先にタイマーを開始する (連動指令が失敗しても時間取りは進める=現場優先)。skipRotary で傍受を回避。
+    toggleTask(stepIdx, unitIdx, { skipRotary: true });
+    if (!station || !db) return;
+    rotaryStationByWorkRef.current[workId] = station;
+    const machine = lot.unitSerialNumbers?.[unitIdx] || '';
+    const payload = { workId, station, model: lot.model || '', machine, mode: stepTitle || '' };
+    if (role === 'prepare') {
+      writeRotaryCommand(db, 'prepare', payload);
+    } else {
+      // 測定開始: done イベントで自動停止する対象として登録 (このセッションで送った台のみ対象)
+      rotaryTrackRef.current[workId] = getTaskKey(stepIdx, unitIdx);
+      writeRotaryCommand(db, 'start_capture', payload);
+    }
+  };
+
+  // 分割測定アプリ連携: done イベントで測定タスクを自動停止 (processing のときだけ)。tasksRef で最新を読む。
+  const autoCompleteRotaryTask = (key, judgement) => {
+    const cur = (tasksRef.current || {})[key];
+    if (!cur || cur.status !== 'processing') return;
+    const now = Date.now();
+    const sessionDuration = cur.startTime ? Math.floor((now - cur.startTime) / 1000) : 0;
+    const nt = {
+      ...(tasksRef.current || {}),
+      [key]: {
+        ...cur, status: 'completed', duration: (cur.duration || 0) + sessionDuration, startTime: null,
+        endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now,
+        workerName: cur.workerName || inspectorName,
+        ...(judgement ? { rotaryJudgement: judgement } : {}),
+      },
+    };
+    tasksRef.current = nt;
+    setTasks(nt);
+    onSave({ tasks: nt, status: 'processing' });
+  };
+
+  // 分割測定アプリ連携: rotaryEvents の done を購読し、このセッションで start_capture を送った台の測定タイマーを自動停止する。
+  // replay 対策: rotaryTrackRef(=自分が送った台)に無い workId は無視 + 購読開始より前の done も無視。マスタON時のみ購読。
+  useEffect(() => {
+    if (!db || !rotaryConfig?.enabled) return;
+    rotarySessionStartRef.current = Date.now();
+    const q = query(collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', ROTARY_EVT_COL), where('type', '==', 'done'));
+    const unsub = onSnapshot(q, (snap) => {
+      snap.docChanges().forEach((c) => {
+        if (c.type !== 'added') return;
+        const e = c.doc.data();
+        const wid = e?.workId;
+        const key = wid && rotaryTrackRef.current[wid];
+        if (!key) return; // 自分が送った台でなければ無視 (他端末/過去データの done を踏まない)
+        const ts = e.createdAt?.toMillis ? e.createdAt.toMillis() : null;
+        if (ts != null && ts < rotarySessionStartRef.current - 5000) return; // 購読開始より前の done(replay)は無視
+        autoCompleteRotaryTask(key, e.judgement);
+        delete rotaryTrackRef.current[wid];
+      });
+    }, (err) => console.error('rotaryEvents subscribe failed', err));
+    return () => unsub();
+  }, [db, rotaryConfig?.enabled]);
 
   // 自動測定(batch+autoEnd)の予定秒数を解決。ロット工程→無ければ元テンプレの同一工程(id→題名)。
   const autoEndSecForStep = (step) => {
@@ -9479,6 +9607,45 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           {timeInputModal}
           {reworkEditorModal}
           {ngReasonPickerModal}
+          {/* 分割測定アプリ連携: 開始時のステーション選択 */}
+          {rotaryStationPicker && (() => {
+            const p = rotaryStationPicker;
+            const stations = Array.isArray(rotaryConfig?.stations) ? rotaryConfig.stations : [];
+            const machine = lot.unitSerialNumbers?.[p.unitIdx] || `${p.unitIdx + 1}台目`;
+            return (
+              <div className="fixed inset-0 z-[320] bg-black/50 flex items-center justify-center p-4" onClick={() => setRotaryStationPicker(null)}>
+                <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
+                  <div className="bg-cyan-600 text-white p-3 text-center font-bold flex items-center justify-center gap-2">
+                    <Ruler className="w-5 h-5" /> {p.role === 'prepare' ? '準備を送信' : '測定開始を送信'}
+                  </div>
+                  <div className="p-4 space-y-3">
+                    <div className="text-xs text-slate-500 text-center">
+                      {lot.model || '型式?'} ／ 機番 {machine}{p.stepTitle ? ` ／ ${p.stepTitle}` : ''}
+                    </div>
+                    <div className="text-sm font-bold text-slate-700 text-center">測定するステーション(PC)を選んでください</div>
+                    {stations.length > 0 ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        {stations.map((st) => (
+                          <button key={st} onClick={() => confirmRotaryStart(st)}
+                            className={`py-3 rounded-xl border font-bold text-sm ${st === p.defaultStation ? 'bg-cyan-600 text-white border-cyan-700 ring-2 ring-cyan-300' : 'bg-cyan-50 text-cyan-800 border-cyan-200 hover:bg-cyan-100'}`}>
+                            {st}{st === p.defaultStation ? ' ✓' : ''}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-rose-600 text-center bg-rose-50 border border-rose-200 rounded-lg p-2">
+                        ステーションが未登録です。マスタ設定→分割測定アプリ連携 で登録してください。
+                      </div>
+                    )}
+                    <div className="pt-2 border-t border-slate-100 space-y-1.5">
+                      <button onClick={() => confirmRotaryStart('')} className="w-full py-2 bg-slate-100 hover:bg-slate-200 rounded-xl text-slate-600 font-bold text-sm">連動せず開始（指令を送らない）</button>
+                      <button onClick={() => setRotaryStationPicker(null)} className="w-full py-1.5 text-slate-400 hover:text-slate-600 text-sm">やめる（開始しない）</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         {/* 測定画面 最大化モーダル (カスタム実行モード) */}
@@ -16871,6 +17038,47 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
              <span className="text-sm text-slate-500">秒</span>
            </div>
            <p className="text-xs text-slate-400 mt-2">ボタン押し間違い時に、この秒数以内であれば取り消しが可能です</p>
+         </div>
+
+         {/* 分割測定アプリ連携 (時間取り半自動連動) */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><Ruler className="w-5 h-5 text-cyan-600" /> 分割測定アプリ連携（時間取りの半自動化）</h3>
+           <p className="text-xs text-slate-400 mb-4">テンプレートで🔗連動を付けた工程の開始時に、分割測定アプリへ指令（準備／測定開始）を送り、測定完了で測定タイマーを自動停止します。<b className="text-rose-500">既定OFF。</b>分割測定アプリ側の設定（webapp_commands_enabled・ステーションID一致）が整ってからONにしてください。</p>
+           {(() => {
+             const rl = { enabled: false, stations: [], ...(settings.rotaryLink || {}) };
+             const setRL = (patch) => saveSettings({ rotaryLink: { ...rl, ...patch } });
+             const stations = Array.isArray(rl.stations) ? rl.stations : [];
+             return (
+               <div className="space-y-4">
+                 <label className="flex items-center gap-3 cursor-pointer">
+                   <input type="checkbox" checked={!!rl.enabled} onChange={e => setRL({ enabled: e.target.checked })} className="w-5 h-5 accent-cyan-600" />
+                   <span className="text-sm font-bold text-slate-700">連動を有効にする</span>
+                   <span className="text-xs text-slate-400">OFFの間は指令送信も自動停止も一切行いません（現在の手動運用のまま）</span>
+                 </label>
+                 <div>
+                   <label className="block text-sm font-bold text-slate-700 mb-1.5">ステーション（測定PC）一覧</label>
+                   <p className="text-[11px] text-slate-400 mb-2">作業開始時にここから選びます。分割測定アプリ側の <code className="bg-slate-100 px-1 rounded">webapp_station</code> と<b>同じ文字列</b>にしてください（例: PC-1, PC-3）。</p>
+                   <div className="flex flex-wrap gap-2 mb-2">
+                     {stations.map((st, i) => (
+                       <span key={i} className="inline-flex items-center gap-1 bg-cyan-50 border border-cyan-200 text-cyan-800 rounded-lg px-2.5 py-1 text-sm font-bold">
+                         {st}
+                         <button onClick={() => setRL({ stations: stations.filter((_, j) => j !== i) })} className="text-cyan-400 hover:text-rose-500"><X className="w-3.5 h-3.5" /></button>
+                       </span>
+                     ))}
+                     {stations.length === 0 && <span className="text-xs text-slate-400">未登録</span>}
+                   </div>
+                   <div className="flex gap-2">
+                     <input id="rotary-station-add" className="flex-1 max-w-xs border rounded px-2 py-1.5 text-sm" placeholder="ステーションIDを追加 (例: PC-3)" onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { const v = e.target.value.trim(); if (v && !stations.includes(v)) { setRL({ stations: [...stations, v] }); e.target.value = ''; } } }} />
+                     <button onClick={() => { const el = document.getElementById('rotary-station-add'); const v = el?.value.trim(); if (v && !stations.includes(v)) { setRL({ stations: [...stations, v] }); el.value = ''; } }} className="bg-cyan-600 text-white px-3 py-1.5 rounded text-sm font-bold hover:bg-cyan-700">追加</button>
+                   </div>
+                 </div>
+                 <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-2.5 leading-relaxed">
+                   <b>流れ:</b> 「準備」工程の開始 → 分割アプリへ条件を送信 ／ 「測定開始」工程の開始 → 分割アプリが測定開始 ／ 測定完了 → この工程の時間取りを自動終了。
+                   <br />送信済みの測定結果は <b>分析 → 分割測定</b> タブで確認できます。
+                 </div>
+               </div>
+             );
+           })()}
          </div>
 
          {/* 目標時間オーバー警告設定 (カスタム作業画面の点滅・音) */}
@@ -24637,6 +24845,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            modelGroups={settings.modelGroups || []}
            customTargetTimes={settings.customTargetTimes || {}}
            overrunAlertConfig={settings.overrunAlert || {}}
+           db={db}
+           rotaryConfig={settings.rotaryLink || {}}
            voiceSettingsConfig={settings.voiceSettings || {}}
            voiceCommandsConfig={settings.voiceCommands || null}
            undoTimeout={settings.undoTimeout || 5}
