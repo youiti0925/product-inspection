@@ -5434,11 +5434,12 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                   return (
                     <td colSpan={qty} className="p-1 border-l border-slate-100 align-middle">
                       <div className="flex flex-wrap items-center gap-1">
-                        {occs.map(({ k, t }) => { const c = cellContent(t, effTargets[sIdx] || 0); return (
+                        {occs.map(({ k, t }) => { const c = cellContent(t, effTargets[sIdx] || 0); const isNextOcc = !!(globalNextTask?.isLot && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === k && (t.status === 'waiting' || t.status === 'paused')); return (
                           <button key={k} onClick={() => onCellClick(sIdx, k)}
-                            className={`rounded px-2 relative overflow-hidden flex flex-col items-center justify-center leading-none transition-all ${c.cls}`}
+                            className={`rounded px-2 relative overflow-hidden flex flex-col items-center justify-center leading-none transition-all ${c.cls} ${isNextOcc ? 'ring-2 ring-emerald-400' : ''}`}
                             style={{ minHeight: D.cellMinH, minWidth: '64px', ...(c.style || {}) }}
-                            title={`${k + 1}回目 ${step.title} (${t.status})`}>
+                            title={`${k + 1}回目 ${step.title} (${t.status})${isNextOcc ? ' 👉 次にやる段取り' : ''}`}>
+                            {isNextOcc && <div className="absolute -top-2 -right-1 z-20 bg-emerald-500 text-white text-[10px] font-black px-1 py-0.5 rounded-full shadow-md ring-1 ring-white animate-bounce">次</div>}
                             <span className={D.cellMark}>{k + 1}回目{c.mark ? ` ${c.mark}` : ''}</span>
                             <span className={`${D.cellTime} ${dense ? '' : 'mt-1'}`}>{c.time}</span>
                             {c.pct != null && (
@@ -5464,7 +5465,7 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                   // 一括(バッチ=同一startTimeのprocessing群)は目標×Nと比較 (完了時に按分されるため)
                   const bN = (task.status === 'processing' && task.startTime) ? Math.max(1, Array.from({ length: qty }).reduce((n, _, uu) => { const t2 = getTask(step, sIdx, uu); return n + (t2.status === 'processing' && t2.startTime === task.startTime ? 1 : 0); }, 0)) : 1;
                   const c = cellContent(task, (effTargets[sIdx] || 0) * bN);
-                  const isNext = globalNextTask && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === u && (task.status === 'waiting' || task.status === 'paused');
+                  const isNext = globalNextTask && !globalNextTask.isLot && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === u && (task.status === 'waiting' || task.status === 'paused');
                   const isActive = activeCustomTaskKey === `${sIdx}-${u}`;
                   const reworks = task.reworks || [];
                   const reworkTotal = reworks.reduce((s, r) => s + (r.duration || 0), 0);
@@ -7221,26 +7222,47 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (lotOnceRunning) return null;
     for (let si = 0; si < localSteps.length; si++) {
       const step = localSteps[si];
-      if (step?.lotOnce) continue; // ロット1回工程は順序ガイド対象外 (回数は現場判断)
+      if (step?.lotOnce) continue; // ロット1回工程は下のゲート判定で別途扱う
       if (isAutoStepFn(step)) continue;
       for (let u = 0; u < qty; u++) {
         if (statusOf(step, si, u) === 'processing') return null;
       }
     }
+    // ロット1回(段取り)工程のゲート判定: 1回でも完了/該当なし/NG/修正完了があれば「済」とみなす。
+    //   次に着手すべき回 = waiting/paused の最初の回 (無ければ0回目)。準備=先頭ゲート / 片付け=末尾ゲート。
+    const lotSatisfied = (step) => lotOnceKeysOf(tasks, step).some(k => ['completed', 'skipped', 'ng', 'rework-done'].includes(tasks[k]?.status));
+    const lotNextOcc = (step) => { const ks = lotOnceKeysOf(tasks, step); for (let i = 0; i < ks.length; i++) { const s = tasks[ks[i]]?.status; if (s === 'waiting' || s === 'paused') return i; } return ks.length === 0 ? 0 : null; };
+    const unitWorkLeft = (step, si) => { for (let u = 0; u < qty; u++) { const s = statusOf(step, si, u); if (s === 'waiting' || s === 'paused') return true; } return false; };
+    // 2) 先頭側のロット1回ゲート: テンプレ順で、手前に未着手の台作業が来るより前にある未済のロット1回工程を「次」にする (準備など)。
+    //    手前の台作業が残っている通常工程に当たったら、そこで打ち切って通常の台順ウォークへ。
+    for (let si = 0; si < localSteps.length; si++) {
+      const step = localSteps[si];
+      if (step?.lotOnce) {
+        if (!lotSatisfied(step)) { const occ = lotNextOcc(step); if (occ != null) return { sIdx: si, unitIdx: occ, isLot: true, isAuto: false }; }
+      } else if (unitWorkLeft(step, si)) {
+        break;
+      }
+    }
     // 各台が「機械占有中 (自動測定 processing)」かどうか
     const unitHasRunningAuto = (u) => localSteps.some((step, si) => !step?.lotOnce && isAutoStepFn(step) && statusOf(step, si, u) === 'processing');
-    // 2)+3) 台順 × テンプレ順で最初の未着手を探す。機械占有中の台はスキップ。
+    // 3) 台順 × テンプレ順で最初の未着手を探す (通常工程のみ)。機械占有中の台はスキップ。
     for (let u = 0; u < qty; u++) {
       if (unitHasRunningAuto(u)) continue; // この台は自動測定中 → 作業者は触れない
       for (let si = 0; si < localSteps.length; si++) {
         const step = localSteps[si];
-        if (step?.lotOnce) continue; // ロット1回工程は「次」の対象にしない
+        if (step?.lotOnce) continue; // ロット1回工程はゲートで扱う
         const st = statusOf(step, si, u);
         if (st === 'waiting' || st === 'paused') {
           return { sIdx: si, unitIdx: u, isAuto: isAutoStepFn(step) };
         }
         // completed/skipped/ng → 次の工程へ。processing(自動) はこの台では上で除外済
       }
+    }
+    // 4) 全台作業が済んだ後の、末尾側の未済ロット1回工程 (片付けなど)
+    for (let si = 0; si < localSteps.length; si++) {
+      const step = localSteps[si];
+      if (!step?.lotOnce) continue;
+      if (!lotSatisfied(step)) { const occ = lotNextOcc(step); if (occ != null) return { sIdx: si, unitIdx: occ, isLot: true, isAuto: false }; }
     }
     return null;
   }, [tasks, localSteps, lot.quantity, otherAutoTick, optimalNextMove]);
@@ -9150,11 +9172,16 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                 const over = oaCfg.enabled && tgt > 0 && t.status === 'processing' && live >= tgt * ((oaCfg.overPct || 100) / 100);
                                 const warn = oaCfg.enabled && tgt > 0 && t.status === 'processing' && !over && live >= tgt * (oaCfg.warnPct / 100);
                                 const isNGo = t.status === 'ng' || t.status === 'reworking';
+                                // ロット1回工程も「次」ガイドの対象 (準備=先頭ゲート / 片付け=末尾ゲート)
+                                const isNextOcc = !!(globalNextTask?.isLot && globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === kIdx && (t.status === 'waiting' || t.status === 'paused'));
                                 return (
                                   <button key={k} onClick={() => toggleTask(sIdx, kIdx)}
-                                    className={`w-28 h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNGo ? 'bg-red-600 text-white' : over ? `text-white ${oaBlinkCls(oaCfg.overBlink)}` : getTaskStatusColor(t.status)}`}
+                                    className={`w-28 h-20 rounded-lg flex flex-col items-center justify-center border transition-all relative ${isNGo ? 'bg-red-600 text-white' : over ? `text-white ${oaBlinkCls(oaCfg.overBlink)}` : getTaskStatusColor(t.status)} ${isNextOcc && !over && !warn ? 'ring-4 ring-emerald-400 shadow-emerald-200 shadow-lg' : ''}`}
                                     style={over ? { backgroundColor: oaCfg.overColor, borderColor: oaCfg.overColor, boxShadow: `0 0 0 4px ${oaCfg.overColor}55` } : warn ? { boxShadow: `0 0 0 4px ${oaCfg.warnColor}` } : undefined}
-                                    title={t.status === 'processing' ? 'タップで完了' : t.status === 'waiting' ? 'タップで計測開始' : 'タップでメニュー'}>
+                                    title={isNextOcc ? '👉 次にやる段取り工程です' : t.status === 'processing' ? 'タップで完了' : t.status === 'waiting' ? 'タップで計測開始' : 'タップでメニュー'}>
+                                    {isNextOcc && (
+                                      <div className="absolute -top-2 -right-2 z-10 bg-emerald-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded-full shadow-lg animate-bounce flex items-center gap-0.5">👉 次</div>
+                                    )}
                                     <span className="text-sm font-bold">{kIdx + 1}回目</span>
                                     {isNGo ? <span className="text-xs font-black bg-white/20 px-1.5 rounded">NG</span> : <span className="text-sm font-mono font-bold mt-1">{t.status === 'skipped' ? '該当なし' : formatTime(live)}</span>}
                                     {tgt > 0 && !isNGo && <span className={`text-[9px] leading-none mt-0.5 font-mono ${over ? 'text-white font-bold' : 'opacity-50'}`}>{over ? '⏰超過 ' : ''}目標{formatTime(tgt)}</span>}
@@ -9197,9 +9224,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                              const reworks = task.reworks || [];
                              // 推奨順関連
                              // 全体で唯一の「次」タスクだけハイライト
-                             const isRecommendedNext = !!(stepIsGlobalNext && globalNextTask.unitIdx === uIdx && (task.status === 'waiting' || task.status === 'paused'));
+                             const isRecommendedNext = !!(stepIsGlobalNext && !globalNextTask.isLot && globalNextTask.unitIdx === uIdx && (task.status === 'waiting' || task.status === 'paused'));
                              // 順序外判定: 「次」が決まっていて、それより後ろ (同じ台でこの工程がまだ来てない or 別の台で先走り) を押そうとしている未着手タスク
-                             const isOutOfOrder = !!(globalNextTask && task.status === 'waiting' && !isRecommendedNext && (
+                             // ※「次」がロット1回ゲート(準備/片付け)のときは台セルを順序外扱いしない (台作業はブロックしない)
+                             const isOutOfOrder = !!(globalNextTask && !globalNextTask.isLot && task.status === 'waiting' && !isRecommendedNext && (
                                // 同じ工程行で、globalNext より後ろの台
                                (stepIsGlobalNext && uIdx > globalNextTask.unitIdx) ||
                                // globalNext より後ろの工程行 (台に関係なく先走り)
