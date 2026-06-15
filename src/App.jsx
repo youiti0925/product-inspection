@@ -319,6 +319,9 @@ const lotOnceCountOf = (tasks, step) => Math.max(1, lotOnceKeysOf(tasks, step).l
 // 相関ID(workId) = ロット×台。prepare/start_capture/done をこのIDで結びつける (準備工程と測定工程は別工程でも同じ台なら同じID)。
 const ROTARY_CMD_COL = 'rotaryCommands';
 const ROTARY_EVT_COL = 'rotaryEvents';
+// 分割アプリが prepare 指令の mode で条件マスタを切り替える6モード。文字列は分割アプリ側と完全一致させること。
+// 型式(model)+このモードで測定条件が決まる(回転/傾斜=どのマスタか, 分割/再現/合体=どの条件群か)。
+const ROTARY_MODES = ['回転分割', '傾斜分割', '回転再現性', '傾斜再現性', '回転分割+再現', '傾斜分割+再現'];
 const rotaryWorkId = (lotId, unitIdx) => `${lotId}_u${unitIdx}`;
 const rotaryCmdDoc = (db, id) => doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', ROTARY_CMD_COL, id);
 // 指令を書く (prepare=準備工程の開始 / start_capture=測定工程の開始)。失敗してもタイマー自体は止めない(現場優先)。
@@ -3911,6 +3914,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   // 分割測定アプリ連携: この工程の開始で分割アプリへ指令を送る。role='prepare'(準備)/'capture'(測定開始)
   const [rotaryLink, setRotaryLink] = useState(false);
   const [rotaryRole, setRotaryRole] = useState('capture');
+  // 測定モード(分割アプリが条件マスタを引くキー)。型式+このモードで条件が決まる。prepare 指令の mode として送る。
+  const [rotaryMode, setRotaryMode] = useState('回転分割');
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
   const [pdfData, setPdfData] = useState(null);
@@ -3999,7 +4004,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       // 自動測定の既知時間 (経過で自動終了)。自動工程かつ有効かつ正の秒数のときのみ保存。
       ...(executionMode === 'batch' && autoEndEnabled && autoEndSec > 0 ? { autoEndEnabled: true, autoEndSec: Math.round(autoEndSec) } : {}),
       ...(lotOnce ? { lotOnce: true } : {}),  // ロット1回(段取り)工程
-      ...(rotaryLink && !lotOnce && executionMode !== 'batch' ? { rotaryLink: true, rotaryRole } : {}),  // 分割測定アプリ連携(準備/測定開始の指令送信)。lotOnce/batchとは併用不可(workId採番が噛み合わない)
+      ...(rotaryLink && !lotOnce && executionMode !== 'batch' ? { rotaryLink: true, rotaryRole, rotaryMode } : {}),  // 分割測定アプリ連携(準備/測定開始の指令送信+測定モード)。lotOnce/batchとは併用不可(workId採番が噛み合わない)
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
       // checklistItems は type 問わず保存可能 (測定 + チェックの併用OK)
       ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {})
@@ -4007,7 +4012,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); }
     resetInput();
   };
-  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); setRotaryLink(false); setRotaryRole('capture'); };
+  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); setRotaryLink(false); setRotaryRole('capture'); setRotaryMode('回転分割'); };
   const editStep = (s) => {
     setEditingStepId(s.id);
     setTitle(s.title);
@@ -4025,6 +4030,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     setLotOnce(!!s.lotOnce);
     setRotaryLink(!!s.rotaryLink);
     setRotaryRole(s.rotaryRole || (s.type === 'measurement' ? 'capture' : 'prepare'));
+    setRotaryMode(s.rotaryMode || '回転分割');
     setChecklistItems(Array.isArray(s.checklistItems) ? s.checklistItems : []);
   };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
@@ -4167,15 +4173,25 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                     🔗 分割測定アプリと連動（この工程の開始で指令を送る）
                   </label>
                   {rotaryLink && (
-                    <div className="flex items-center gap-1.5 pl-6">
-                      <span className="text-[11px] text-slate-600">送る指令:</span>
-                      <button type="button" onClick={() => setRotaryRole('prepare')} className={`px-2.5 py-1 text-[11px] font-bold rounded border ${rotaryRole === 'prepare' ? 'bg-cyan-600 text-white border-cyan-700' : 'bg-white text-cyan-700 border-cyan-300'}`}>準備 (prepare)</button>
-                      <button type="button" onClick={() => setRotaryRole('capture')} className={`px-2.5 py-1 text-[11px] font-bold rounded border ${rotaryRole === 'capture' ? 'bg-cyan-600 text-white border-cyan-700' : 'bg-white text-cyan-700 border-cyan-300'}`}>測定開始 (start_capture)</button>
-                    </div>
+                    <>
+                      <div className="flex items-center gap-1.5 pl-6">
+                        <span className="text-[11px] text-slate-600">送る指令:</span>
+                        <button type="button" onClick={() => setRotaryRole('prepare')} className={`px-2.5 py-1 text-[11px] font-bold rounded border ${rotaryRole === 'prepare' ? 'bg-cyan-600 text-white border-cyan-700' : 'bg-white text-cyan-700 border-cyan-300'}`}>準備 (prepare)</button>
+                        <button type="button" onClick={() => setRotaryRole('capture')} className={`px-2.5 py-1 text-[11px] font-bold rounded border ${rotaryRole === 'capture' ? 'bg-cyan-600 text-white border-cyan-700' : 'bg-white text-cyan-700 border-cyan-300'}`}>測定開始 (start_capture)</button>
+                      </div>
+                      <div className="flex items-center gap-1.5 pl-6">
+                        <span className="text-[11px] text-slate-600">測定モード:</span>
+                        <select value={rotaryMode} onChange={e => setRotaryMode(e.target.value)} className="border border-cyan-300 rounded px-2 py-1 text-[11px] bg-white text-cyan-800 font-bold">
+                          {ROTARY_MODES.map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                        <span className="text-[10px] text-slate-400">型式＋このモードで条件が決まります</span>
+                      </div>
+                    </>
                   )}
                   <div className="text-[10px] text-cyan-700 leading-relaxed">
-                    「準備」工程の開始で機械へ条件をセット、「測定開始」工程の開始で分割アプリが測定を始め、測定完了でこの工程のタイマーが<b>自動で止まります</b>。
+                    「準備」工程の開始で<b>型式＋測定モード</b>を分割アプリへ送り条件をセット、「測定開始」工程の開始で測定が始まり、測定完了でこの工程のタイマーが<b>自動で止まります</b>。
                     開始時にステーション(PC)を選びます。<b>マスタ設定の「分割測定アプリ連携」がONのときだけ</b>動きます（既定OFF）。
+                    <br />※モードは分割アプリの「条件編集」マスタに、この型式が登録されている必要があります（未登録だと条件が入らず分割アプリ側で警告）。
                   </div>
                 </div>
               )}
@@ -7520,7 +7536,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         const workId = rotaryWorkId(lot.id, unitIdx);
         setRotaryStationPicker({
           stepIdx, unitIdx, role: stepObj.rotaryRole || 'capture', workId,
-          stepTitle: stepObj.title || '',
+          stepTitle: stepObj.title || '', rotaryMode: stepObj.rotaryMode || '',
           defaultStation: rotaryStationByWorkRef.current[workId] || (rotaryConfig.stations || [])[0] || '',
         });
         return;
@@ -7569,7 +7585,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (!station || !db) return;
     rotaryStationByWorkRef.current[workId] = station;
     const machine = lot.unitSerialNumbers?.[unitIdx] || '';
-    const payload = { workId, station, model: lot.model || '', machine, mode: stepTitle || '' };
+    // mode = テンプレで設定した測定モード(6種)。型式+モードで分割アプリが条件マスタを引く。工程タイトルではない。
+    const stepObj = (localSteps || [])[stepIdx];
+    const mode = stepObj?.rotaryMode || '';
+    const payload = { workId, station, model: lot.model || '', machine, mode };
     let res;
     if (role === 'prepare') {
       res = await writeRotaryCommand(db, 'prepare', payload);
@@ -7670,7 +7689,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         const rStation = rotaryStationByWorkRef.current[rWorkId];
         if (rStation) {
           rotaryTrackRef.current[rWorkId] = key;
-          writeRotaryCommand(db, 'start_capture', { workId: rWorkId, station: rStation, model: lot.model || '', machine: lot.unitSerialNumbers?.[completedTaskMenu.unitIdx] || '', mode: contStep.title || '' })
+          writeRotaryCommand(db, 'start_capture', { workId: rWorkId, station: rStation, model: lot.model || '', machine: lot.unitSerialNumbers?.[completedTaskMenu.unitIdx] || '', mode: contStep.rotaryMode || '' })
             .then(r => { if (r && !r.ok) setOrderHint('🔗 続き測定の指令送信に失敗しました。手動で完了してください。'); });
         } else {
           setOrderHint('🔗 続き測定は自動停止しません（前回ステーション不明）。終わったら手動で完了してください。');
@@ -9688,6 +9707,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                     <div className="text-xs text-slate-500 text-center">
                       {lot.model || '型式?'} ／ 機番 {machine}{p.stepTitle ? ` ／ ${p.stepTitle}` : ''}
                     </div>
+                    {p.role === 'prepare' && p.rotaryMode && (
+                      <div className="text-center"><span className="inline-block text-[11px] font-bold text-cyan-700 bg-cyan-50 border border-cyan-200 rounded px-2 py-0.5">測定モード: {p.rotaryMode}</span></div>
+                    )}
                     <div className="text-sm font-bold text-slate-700 text-center">測定するステーション(PC)を選んでください</div>
                     {stations.length > 0 ? (
                       <div className="grid grid-cols-2 gap-2">
