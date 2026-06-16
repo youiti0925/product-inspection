@@ -97,6 +97,24 @@ const uploadImageToStorage = async (base64DataUrl, pathHint = 'images') => {
   }
 };
 
+// PDF など画像以外のファイルを Cloud Storage へ。data URL から contentType を保持してアップロード。
+// 失敗時は null を返す (PDF を base64 のまま Firestore に入れると 1MB 上限を超えるため、base64 へはフォールバックしない)。
+const uploadFileToStorage = async (base64DataUrl, pathHint = 'files', ext = 'bin') => {
+  if (!base64DataUrl || typeof base64DataUrl !== 'string') return base64DataUrl;
+  if (!base64DataUrl.startsWith('data:')) return base64DataUrl; // 既に URL
+  try {
+    const storage = getStorageInstance();
+    if (!storage) return null;
+    const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}.${ext}`;
+    const ref = storageRef(storage, `artifacts/product-inspection-v1/${pathHint}/${fileId}`);
+    await uploadString(ref, base64DataUrl, 'data_url');
+    return await getDownloadURL(ref);
+  } catch (e) {
+    console.warn('File upload failed', e);
+    return null;
+  }
+};
+
 // ExcelJS / JSZip は動的 import で初回バンドルから除外 (各 ~1MB / ~100KB)
 let _ExcelJS = null;
 const loadExcelJS = async () => {
@@ -4079,6 +4097,35 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const [showPresetManager, setShowPresetManager] = useState(false);
   const [editingPresetKey, setEditingPresetKey] = useState(null);
   const [editingPresetName, setEditingPresetName] = useState('');
+  // テンプレ全体の総合資料 (手順書PDF・概要写真・全体説明)。工程ごとの資料とは別に、テンプレ単位で1セット。
+  const [overview, setOverview] = useState(() => {
+    const o = template?.overview || {};
+    return { images: Array.isArray(o.images) ? o.images : [], description: o.description || '', pdfs: Array.isArray(o.pdfs) ? o.pdfs : [] };
+  });
+  const [showOverviewEditor, setShowOverviewEditor] = useState(false);
+  const [showOverviewVideoTool, setShowOverviewVideoTool] = useState(false);
+  const overviewImgInputRef = useRef(null);
+  const overviewPdfInputRef = useRef(null);
+  const addOverviewImage = async (e) => {
+    const file = e.target.files?.[0]; if (!file) { return; }
+    try { const img = await resizeImage(file, 'workStandard'); const url = await uploadImageToStorage(img, 'template-overview'); setOverview(o => ({ ...o, images: [...o.images, url] })); }
+    catch { alert('画像エラー'); }
+    e.target.value = '';
+  };
+  const removeOverviewImage = (i) => setOverview(o => ({ ...o, images: o.images.filter((_, idx) => idx !== i) }));
+  const addOverviewPdf = async (e) => {
+    const file = e.target.files?.[0]; if (!file) { return; }
+    if (file.size > 9 * 1024 * 1024) { alert('PDFが大きすぎます。9MB以下にしてください。'); e.target.value = ''; return; }
+    try {
+      const b64 = await getBase64(file);
+      const url = await uploadFileToStorage(b64, 'template-overview-pdf', 'pdf');
+      if (!url) { alert('PDFのアップロードに失敗しました（Cloud Storage 未接続の可能性）。'); e.target.value = ''; return; }
+      setOverview(o => ({ ...o, pdfs: [...o.pdfs, { name: file.name || 'document.pdf', url }] }));
+    } catch { alert('PDFエラー'); }
+    e.target.value = '';
+  };
+  const removeOverviewPdf = (i) => setOverview(o => ({ ...o, pdfs: o.pdfs.filter((_, idx) => idx !== i) }));
+  const overviewHasContent = (overview.images?.length || 0) + (overview.pdfs?.length || 0) + ((overview.description || '').trim() ? 1 : 0) > 0;
 
   // Drawing State
   const [isDrawingMode, setIsDrawingMode] = useState(false);
@@ -4200,7 +4247,14 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
         if (!confirm(`このテンプレートのデータ量が ${(approxSize / 1024).toFixed(0)} KB と大きく、保存に失敗するリスクがあります（Firestore 1MB 上限）。\n\n対策: 画像を削減/圧縮してください。\n\nこのまま保存しますか？`)) return;
       }
     } catch {}
-    onSave({ id: template?.id, name, steps });
+    const overviewClean = {
+      images: overview.images || [],
+      description: (overview.description || '').trim(),
+      pdfs: (overview.pdfs || []).filter(p => p && p.url),
+    };
+    const hasOverview = overviewClean.images.length || overviewClean.description || overviewClean.pdfs.length;
+    // hasOverview が false のときは null を渡して既存の overview を消す (merge保存なので明示的にnull)
+    onSave({ id: template?.id, name, steps, overview: hasOverview ? overviewClean : null });
   };
 
   return (
@@ -4240,6 +4294,20 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       </div>
       <div className="flex-1 flex overflow-hidden">
         <div className="w-1/3 p-4 overflow-y-auto border-r bg-white">
+          {/* テンプレ全体の総合資料 (手順書PDF・概要写真・全体説明)。工程の上に配置 */}
+          <button type="button" onClick={() => setShowOverviewEditor(true)}
+            className={`w-full mb-3 p-3 rounded-xl border-2 text-left flex items-center gap-2.5 transition ${overviewHasContent ? 'border-cyan-300 bg-cyan-50 hover:bg-cyan-100' : 'border-dashed border-slate-300 bg-slate-50 hover:bg-slate-100'}`}>
+            <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${overviewHasContent ? 'bg-cyan-500 text-white' : 'bg-slate-300 text-white'}`}><FileText className="w-5 h-5"/></div>
+            <div className="min-w-0">
+              <div className="text-sm font-bold text-slate-800">📋 テンプレ全体の総合資料</div>
+              <div className="text-[11px] text-slate-500 truncate">
+                {overviewHasContent
+                  ? `${overview.images?.length || 0}枚 ／ PDF ${overview.pdfs?.length || 0} ／ 説明${(overview.description || '').trim() ? 'あり' : 'なし'}`
+                  : '手順書PDF・概要写真・全体説明をまとめて登録'}
+              </div>
+            </div>
+          </button>
+          <div className="text-[11px] font-bold text-slate-400 mb-1 px-1">工程一覧</div>
           <div className="space-y-2">{steps.map((s, i) => {
             const isAuto = s.executionMode === 'batch' || (s.title || '').includes('自動');
             const resTag = s.workResource;
@@ -5034,6 +5102,80 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
             onApply={({ images: imgs, description: d }) => { if (imgs && imgs.length) setImages(prev => [...prev, ...imgs]); if (d != null) setDescription(d); }}
             onClose={() => setShowVideoTool(false)}
           />
+        )}
+        {/* === テンプレ全体の総合資料エディタ (手順書PDF・概要写真・全体説明) === */}
+        {showOverviewEditor && (
+          <div className="absolute inset-0 z-[55] bg-black/40 flex items-center justify-center p-4" onClick={() => setShowOverviewEditor(false)}>
+            <div className="bg-white w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="bg-cyan-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+                <h3 className="font-bold flex items-center gap-2"><FileText className="w-5 h-5"/> テンプレ全体の総合資料</h3>
+                <button onClick={() => setShowOverviewEditor(false)} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+              </div>
+              <div className="p-4 overflow-y-auto space-y-4">
+                <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-2.5">
+                  このテンプレ全体に共通する資料です。工程ごとの写真とは別に、<b>手順書(PDF)・全体の概要写真・全体説明</b>をまとめて登録できます。作業画面のヘッダー「📋 資料」からいつでも開けます。<br/>
+                  <span className="text-cyan-700">※ここでの変更は、編集画面右上の「保存」を押したときに反映されます。</span>
+                </p>
+
+                {/* 全体説明 */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">全体説明 / 申し送り</label>
+                  <textarea value={overview.description} onChange={e => setOverview(o => ({ ...o, description: e.target.value }))} rows={4}
+                    className="w-full border rounded-lg p-2 text-sm" placeholder="このテンプレの作業全体の注意点・段取り・申し送り事項など"/>
+                </div>
+
+                {/* 概要写真 */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-bold text-slate-600">概要写真 ({overview.images?.length || 0}枚)</label>
+                    <div className="flex gap-1.5">
+                      <button type="button" onClick={() => overviewImgInputRef.current?.click()} className="px-2.5 py-1 text-xs font-bold rounded border border-slate-300 bg-white hover:bg-slate-50 flex items-center gap-1"><Camera className="w-3.5 h-3.5"/> 写真を追加</button>
+                      <button type="button" onClick={() => setShowOverviewVideoTool(true)} className="px-2.5 py-1 text-xs font-bold rounded border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 flex items-center gap-1">🎥 動画から</button>
+                    </div>
+                    <input type="file" ref={overviewImgInputRef} className="hidden" accept="image/*" onChange={addOverviewImage}/>
+                  </div>
+                  {overview.images?.length > 0 ? (
+                    <div className="grid grid-cols-4 gap-2">
+                      {overview.images.map((img, i) => (
+                        <div key={i} className="relative aspect-square border rounded-lg overflow-hidden group bg-slate-50">
+                          <img src={img} className="w-full h-full object-cover"/>
+                          <button onClick={() => removeOverviewImage(i)} className="absolute top-0.5 right-0.5 bg-rose-600 text-white rounded p-0.5 opacity-0 group-hover:opacity-100" title="削除"><X className="w-3.5 h-3.5"/></button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="text-xs text-slate-400 text-center py-3 border border-dashed rounded-lg">写真はまだありません</div>}
+                </div>
+
+                {/* PDF資料 */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-bold text-slate-600">PDF資料 (手順書など)</label>
+                    <button type="button" onClick={() => overviewPdfInputRef.current?.click()} className="px-2.5 py-1 text-xs font-bold rounded border border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100 flex items-center gap-1"><FileText className="w-3.5 h-3.5"/> PDFを追加</button>
+                    <input type="file" ref={overviewPdfInputRef} className="hidden" accept="application/pdf" onChange={addOverviewPdf}/>
+                  </div>
+                  {overview.pdfs?.length > 0 ? (
+                    <div className="space-y-1.5">
+                      {overview.pdfs.map((p, i) => (
+                        <div key={i} className="flex items-center gap-2 border rounded-lg px-2.5 py-1.5 bg-orange-50/50">
+                          <FileText className="w-4 h-4 text-orange-600 shrink-0"/>
+                          <a href={p.url} target="_blank" rel="noopener noreferrer" className="flex-1 min-w-0 text-sm text-slate-700 hover:text-orange-700 hover:underline truncate">{p.name || 'document.pdf'}</a>
+                          <button onClick={() => removeOverviewPdf(i)} className="text-slate-400 hover:text-rose-600 shrink-0" title="削除"><Trash2 className="w-4 h-4"/></button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="text-xs text-slate-400 text-center py-3 border border-dashed rounded-lg">PDFはまだありません（9MBまで）</div>}
+                </div>
+              </div>
+            </div>
+            {showOverviewVideoTool && (
+              <VideoToPhotosModal
+                contextLabel={name || 'テンプレ全体'}
+                existingDescription={overview.description || ''}
+                onApply={({ images: imgs, description: d }) => { if (imgs && imgs.length) setOverview(o => ({ ...o, images: [...o.images, ...imgs] })); if (d != null) setOverview(o => ({ ...o, description: d })); }}
+                onClose={() => setShowOverviewVideoTool(false)}
+              />
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -5875,6 +6017,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   }, [_lotProp, onClose]);
   // 検査中に途中経過の成績表をプレビューする (データ未入力部分は空白)
   const [showInProgressReport, setShowInProgressReport] = useState(false);
+  const [showOverview, setShowOverview] = useState(false); // テンプレ全体の総合資料ビューア
   // 作業順最適化モーダル
   const [showWorkOrderOptimizer, setShowWorkOrderOptimizer] = useState(false);
   // 推奨順ガイダンス: カスタムモードで「1台目から順番に」のルールを視覚化
@@ -9006,6 +9149,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                    <button onClick={onOpenWorkStandards} className="px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="作業標準ライブラリを開く"><BookOpen className="w-4 h-4"/> 作業標準</button>
                  )}
                  <button onClick={()=>setShowInProgressReport(true)} className="px-3 py-2 bg-teal-600 hover:bg-teal-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="途中経過の成績表を表示 (未入力は空白)"><Printer className="w-4 h-4"/> 成績表</button>
+                 {(() => { const ov = lotTemplate?.overview; const has = ov && (((ov.images?.length) || 0) + ((ov.pdfs?.length) || 0) + ((ov.description || '').trim() ? 1 : 0) > 0); return has ? (
+                   <button onClick={()=>setShowOverview(true)} className="px-3 py-2 bg-cyan-600 hover:bg-cyan-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="このテンプレの総合資料(手順書・概要)を見る"><FileText className="w-4 h-4"/> 資料</button>
+                 ) : null; })()}
                  {/* 報告ボタン統合: 1ボタンから 軽微不良 / 気づき・改善 / 不具合 を選ぶ (ボタン数削減) */}
                  <details className="relative" onClick={e => e.stopPropagation()}>
                    <summary className="px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap list-none cursor-pointer bg-purple-600 hover:bg-purple-700"><Megaphone className="w-4 h-4"/> 報告 ▾</summary>
@@ -10545,6 +10691,52 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           workers={workers}
           onClose={() => setShowInProgressReport(false)}
         />
+      )}
+
+      {/* テンプレ全体の総合資料ビューア (作業中に参照、読み取り専用) */}
+      {showOverview && lotTemplate?.overview && (
+        <div className="fixed inset-0 z-[130] bg-black/60 flex items-center justify-center p-4" onClick={() => setShowOverview(false)}>
+          <div className="bg-white w-full max-w-3xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="bg-cyan-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+              <h3 className="font-bold flex items-center gap-2"><FileText className="w-5 h-5"/> 総合資料 — {lotTemplate.name}</h3>
+              <button onClick={() => setShowOverview(false)} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+            </div>
+            <div className="p-4 overflow-y-auto space-y-4">
+              {(lotTemplate.overview.description || '').trim() && (
+                <div>
+                  <div className="text-xs font-bold text-slate-500 mb-1">全体説明 / 申し送り</div>
+                  <div className="text-sm text-slate-800 whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-lg p-3">{lotTemplate.overview.description}</div>
+                </div>
+              )}
+              {Array.isArray(lotTemplate.overview.pdfs) && lotTemplate.overview.pdfs.length > 0 && (
+                <div>
+                  <div className="text-xs font-bold text-slate-500 mb-1">PDF資料</div>
+                  <div className="space-y-1.5">
+                    {lotTemplate.overview.pdfs.map((p, i) => (
+                      <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 border rounded-lg px-3 py-2 bg-orange-50/60 hover:bg-orange-100 transition">
+                        <FileText className="w-5 h-5 text-orange-600 shrink-0"/>
+                        <span className="flex-1 min-w-0 text-sm font-bold text-slate-700 truncate">{p.name || 'document.pdf'}</span>
+                        <span className="text-[11px] text-orange-700 shrink-0">タップで開く ↗</span>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {Array.isArray(lotTemplate.overview.images) && lotTemplate.overview.images.length > 0 && (
+                <div>
+                  <div className="text-xs font-bold text-slate-500 mb-1">概要写真 ({lotTemplate.overview.images.length}枚) — タップで拡大</div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {lotTemplate.overview.images.map((img, i) => (
+                      <a key={i} href={img} target="_blank" rel="noopener noreferrer" className="block aspect-square border rounded-lg overflow-hidden bg-slate-50 hover:ring-2 hover:ring-cyan-400">
+                        <img src={img} className="w-full h-full object-cover"/>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* 作業順最適化 (ルールベース + AI + シミュレーション) */}
