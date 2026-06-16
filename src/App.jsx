@@ -2390,6 +2390,160 @@ JSON で次の形式で返してください:
   }
 };
 
+// 動画から切り出したコマ(複数の静止画)を Gemini に渡し、作業手順・注意点の説明下書きを作る。
+// frames: ['data:image/jpeg;base64,...', ...]。contextLabel: 工程名など文脈。返り: { description, points[] }
+const requestGeminiFramesDraft = async (frames, contextLabel = '', modelName = 'gemini-2.5-flash') => {
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
+  if (!apiKey) throw new Error('VITE_GEMINI_API_KEY が設定されていません。.env に API キーを設定してください。');
+  if (!frames || frames.length === 0) throw new Error('コマ(写真)がありません');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  const prompt = `これは製造業の検査・組立の作業を撮った動画から時系列順に切り出した連続写真です${contextLabel ? `（工程: ${contextLabel}）` : ''}。
+作業者がこの工程を正しく行うための「作業手順・注意点の説明文」の下書きを作ってください。
+- 写真から読み取れる事実だけに基づき、推測は控えめに（不明な点は書かない）。
+- 現場の作業者が読む前提で、簡潔・具体的に。手順は番号付き、注意点は箇条書き。
+- 日本語。誇張しない。
+JSON で次の形式で返してください:
+{ "description": "<手順と注意点をまとめた説明文(プレーンテキスト, 改行可)>",
+  "points": ["<重要ポイントを数個>"] }`;
+  const imgParts = frames.slice(0, 8).map(f => ({ inlineData: { mimeType: 'image/jpeg', data: String(f).replace(/^data:image\/\w+;base64,/, '') } }));
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: prompt }, ...imgParts] }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0.3 },
+  };
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`Gemini API エラー: HTTP ${res.status} - ${(await res.text()).slice(0, 200)}`);
+  const j = await res.json();
+  const text = j.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から空のレスポンスが返りました');
+  try { return JSON.parse(text); } catch { return { description: text, points: [] }; }
+};
+
+// 動画から資料を作るツール: 動画を選び、好きな場面を静止画(コマ)として切り出して参考写真に。AIで説明下書きも作れる。
+//   動画本体は保存しない(オブジェクトURLのみ)。切り出したコマだけ Cloud Storage にアップして onApply で返す。
+const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApply, onClose }) => {
+  const [videoUrl, setVideoUrl] = useState(null);
+  const videoRef = useRef(null);
+  const [frames, setFrames] = useState([]); // [{ id, dataUrl, t }]
+  const [desc, setDesc] = useState(existingDescription || '');
+  const [aiBusy, setAiBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [applying, setApplying] = useState(false);
+  const hasAiKey = !!(import.meta.env.VITE_GEMINI_API_KEY);
+
+  const pickVideo = (e) => {
+    const f = e.target.files?.[0]; if (!f) { return; }
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    setVideoUrl(URL.createObjectURL(f)); setFrames([]); setMsg('');
+    e.target.value = '';
+  };
+  const frameFromVideo = () => {
+    const v = videoRef.current; if (!v || !v.videoWidth) return null;
+    const c = document.createElement('canvas'); const MAX = 1100; let w = v.videoWidth, h = v.videoHeight;
+    if (w > h) { if (w > MAX) { h = Math.round(h * MAX / w); w = MAX; } } else { if (h > MAX) { w = Math.round(w * MAX / h); h = MAX; } }
+    c.width = w; c.height = h; c.getContext('2d').drawImage(v, 0, 0, w, h);
+    return { dataUrl: c.toDataURL('image/jpeg', 0.8), t: v.currentTime };
+  };
+  const grabFrame = () => {
+    const f = frameFromVideo(); if (!f) { setMsg('先に動画を再生位置に合わせてください'); return; }
+    setFrames(prev => [...prev, { id: `f${prev.length}-${Math.round(f.t * 1000)}`, ...f }]);
+  };
+  const autoSample = async (n = 6) => {
+    const v = videoRef.current; if (!v || !v.duration || !isFinite(v.duration)) { setMsg('動画を読み込んでから実行してください'); return; }
+    setMsg('コマを自動取得中…'); const wasPaused = v.paused; v.pause();
+    const out = [];
+    for (let i = 1; i <= n; i++) {
+      const t = (v.duration * i) / (n + 1);
+      await new Promise(res => { const on = () => { v.removeEventListener('seeked', on); setTimeout(res, 60); }; v.addEventListener('seeked', on); v.currentTime = t; });
+      const f = frameFromVideo(); if (f) out.push({ id: `a${i}-${Math.round(t * 1000)}`, ...f });
+    }
+    if (!wasPaused) v.play();
+    setFrames(prev => [...prev, ...out]); setMsg(`${out.length}コマ取得しました`);
+  };
+  const removeFrame = (id) => setFrames(prev => prev.filter(f => f.id !== id));
+  const runAi = async () => {
+    if (frames.length === 0) { setMsg('先にコマ(写真)を拾ってください'); return; }
+    setAiBusy(true); setMsg('');
+    try {
+      const r = await requestGeminiFramesDraft(frames.map(f => f.dataUrl), contextLabel);
+      const txt = (r.description || '') + (Array.isArray(r.points) && r.points.length ? `\n\n【要点】\n- ${r.points.join('\n- ')}` : '');
+      setDesc(prev => (prev && prev.trim()) ? `${prev}\n\n${txt}` : txt);
+      setMsg('AI下書きを反映しました（編集して確定してください）');
+    } catch (e) { setMsg('AI下書き失敗: ' + (e.message || '')); }
+    setAiBusy(false);
+  };
+  const apply = async () => {
+    if (frames.length === 0 && !(desc && desc.trim())) { setMsg('写真か説明文を用意してください'); return; }
+    setApplying(true); setMsg('写真を保存中…');
+    try {
+      const urls = [];
+      for (const f of frames) urls.push(await uploadImageToStorage(f.dataUrl, 'template-video-frames'));
+      onApply({ images: urls, description: desc });
+      onClose();
+    } catch (e) { setMsg('保存に失敗: ' + (e.message || '')); setApplying(false); }
+  };
+  useEffect(() => () => { if (videoUrl) URL.revokeObjectURL(videoUrl); }, [videoUrl]);
+
+  return (
+    <div className="fixed inset-0 z-[330] bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-indigo-600 text-white p-3 flex items-center justify-between shrink-0">
+          <div className="font-bold flex items-center gap-2"><Camera className="w-5 h-5" /> 動画から資料を作成{contextLabel ? `（${contextLabel}）` : ''}</div>
+          <button onClick={onClose} className="text-white/80 hover:text-white"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="flex-1 overflow-auto p-4 space-y-3">
+          {!videoUrl ? (
+            <label className="block border-2 border-dashed border-indigo-300 rounded-xl p-8 text-center cursor-pointer hover:bg-indigo-50">
+              <Camera className="w-10 h-10 mx-auto text-indigo-400 mb-2" />
+              <div className="font-bold text-indigo-700">動画を撮影 / 選択</div>
+              <div className="text-xs text-slate-500 mt-1">作業の動画から、必要な場面を写真として切り出します（動画自体は保存しません）</div>
+              <input type="file" accept="video/*" className="hidden" onChange={pickVideo} />
+            </label>
+          ) : (
+            <>
+              <video ref={videoRef} src={videoUrl} controls playsInline className="w-full max-h-[34vh] bg-black rounded-lg" />
+              <div className="flex flex-wrap gap-2">
+                <button onClick={grabFrame} className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-sm flex items-center gap-1.5"><Camera className="w-4 h-4" /> この場面を写真に</button>
+                <button onClick={() => autoSample(6)} className="px-3 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg font-bold text-sm">⚡ 自動で6コマ取得</button>
+                <label className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg font-bold text-sm cursor-pointer">別の動画<input type="file" accept="video/*" className="hidden" onChange={pickVideo} /></label>
+              </div>
+            </>
+          )}
+
+          {frames.length > 0 && (
+            <div>
+              <div className="text-xs font-bold text-slate-500 mb-1">拾った写真（{frames.length}枚）— タップで削除</div>
+              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                {frames.map(f => (
+                  <button key={f.id} onClick={() => removeFrame(f.id)} className="relative group rounded-lg overflow-hidden border border-slate-200" title="タップで削除">
+                    <img src={f.dataUrl} className="w-full h-20 object-cover" alt="コマ" />
+                    <span className="absolute top-0.5 right-0.5 bg-black/60 text-white text-[9px] px-1 rounded">{Math.floor(f.t)}秒</span>
+                    <span className="absolute inset-0 bg-rose-600/0 group-hover:bg-rose-600/30 flex items-center justify-center"><X className="w-5 h-5 text-white opacity-0 group-hover:opacity-100" /></span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-bold text-slate-500">説明文（手順・注意点）</span>
+              <button onClick={runAi} disabled={aiBusy || !hasAiKey} title={hasAiKey ? '' : 'AIキー(VITE_GEMINI_API_KEY)未設定'} className="text-[11px] font-bold px-2 py-1 rounded bg-violet-600 hover:bg-violet-700 text-white disabled:opacity-40 flex items-center gap-1">
+                {aiBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />} AIで説明文を作る
+              </button>
+            </div>
+            <textarea value={desc} onChange={e => setDesc(e.target.value)} rows={5} placeholder="手順や注意点。AIで下書きを作って手直しできます。" className="w-full border rounded-lg p-2 text-sm" />
+          </div>
+          {msg && <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded p-2">{msg}</div>}
+        </div>
+        <div className="p-3 border-t flex gap-2 shrink-0">
+          <button onClick={onClose} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 rounded-xl font-bold text-slate-600">やめる</button>
+          <button onClick={apply} disabled={applying} className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold disabled:opacity-50 flex items-center justify-center gap-2">{applying ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} 写真{frames.length > 0 ? `${frames.length}枚` : ''}と説明を登録</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const WorkerSummaryCard = ({ worker, lots }) => {
   // 進行中ロットがあれば 5秒毎に再描画 (live workStartTime 加算用)
   const [, setTick] = useState(0);
@@ -3918,6 +4072,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const [rotaryMode, setRotaryMode] = useState('回転分割');
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
+  const [showVideoTool, setShowVideoTool] = useState(false); // 動画から写真・説明を作るツール
   const [pdfData, setPdfData] = useState(null);
   const [editingStepId, setEditingStepId] = useState(null);
   const [measurementConfig, setMeasurementConfig] = useState(null);
@@ -4866,10 +5021,20 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                {images.length > 0 ? (<div className="w-full h-full relative group"><img src={images[activeImgIdx]} className="w-full h-full object-contain" /><div className="absolute top-2 left-2"><button onClick={()=>setIsDrawingMode(true)} className="bg-white/90 p-1.5 rounded shadow text-xs flex gap-1 items-center font-bold text-slate-700"><Brush className="w-3 h-3"/> 編集</button></div></div>) : (<div onClick={()=>fileInputRef.current?.click()} className="text-center text-slate-400 cursor-pointer hover:text-blue-500"><Camera className="w-8 h-8 mx-auto mb-1"/><span className="text-xs">追加</span></div>)}
                <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleImageUpload}/>
              </div>
-             {images.length > 0 && (<div className="flex gap-2 overflow-x-auto pb-1 mb-2">{images.map((img, i) => (<div key={i} onClick={()=>setActiveImgIdx(i)} className={`w-12 h-12 flex-none border rounded overflow-hidden cursor-pointer ${activeImgIdx===i?'ring-2 ring-blue-500':''}`}><img src={img} className="w-full h-full object-cover"/></div>))}</div>)}
+             {images.length > 0 && (<div className="flex gap-2 overflow-x-auto pb-1 mb-2">{images.map((img, i) => (<div key={i} className={`relative w-12 h-12 flex-none border rounded overflow-hidden cursor-pointer group ${activeImgIdx===i?'ring-2 ring-blue-500':''}`}><img src={img} onClick={()=>setActiveImgIdx(i)} className="w-full h-full object-cover"/><button onClick={(e)=>{e.stopPropagation(); setImages(prev=>prev.filter((_,j)=>j!==i)); setActiveImgIdx(p=>Math.max(0,Math.min(p, images.length-2)));}} className="absolute top-0 right-0 bg-rose-600 text-white rounded-bl px-0.5 opacity-0 group-hover:opacity-100" title="削除"><X className="w-3 h-3"/></button></div>))}</div>)}
+             {/* 動画から写真・説明を作る (動画は保存せずコマだけ参考写真に。AI下書きも可) */}
+             <button type="button" onClick={()=>setShowVideoTool(true)} className="w-full mb-2 py-2 border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-xs font-bold flex items-center justify-center gap-1.5"><Camera className="w-4 h-4"/> 🎥 動画から写真・説明を作る</button>
              <div className="mt-2 border-t pt-2"><label className="block text-xs font-bold text-slate-500 mb-1">PDF資料</label><button onClick={()=>pdfInputRef.current?.click()} className={`w-full py-2 border rounded text-xs flex items-center justify-center gap-2 ${pdfData ? 'bg-orange-50 text-orange-600 border-orange-200' : 'bg-slate-50 text-slate-500'}`}><FileText className="w-4 h-4"/> {pdfData ? '添付済' : '選択'}</button><input type="file" ref={pdfInputRef} className="hidden" accept="application/pdf" onChange={handlePdfUpload}/></div>
           </div>
         </div>
+        {showVideoTool && (
+          <VideoToPhotosModal
+            contextLabel={title || ''}
+            existingDescription={description || ''}
+            onApply={({ images: imgs, description: d }) => { if (imgs && imgs.length) setImages(prev => [...prev, ...imgs]); if (d != null) setDescription(d); }}
+            onClose={() => setShowVideoTool(false)}
+          />
+        )}
       </div>
     </div>
   );
@@ -9575,7 +9740,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                    <div className="bg-slate-50 rounded-lg border border-slate-200 p-2 shrink-0">
                      <div className="flex items-start gap-2">
                        {displayStep.images && displayStep.images.length > 0 && (
-                         <img src={displayStep.images[0]} className="w-16 h-16 object-contain rounded border border-slate-200 shrink-0 cursor-pointer" alt="参考" onClick={() => setMeasurementFullscreen(true)}/>
+                         <div className="relative shrink-0 cursor-pointer" onClick={() => setMeasurementFullscreen(true)}><img src={displayStep.images[0]} className="w-16 h-16 object-contain rounded border border-slate-200" alt="参考"/>{displayStep.images.length > 1 && <span className="absolute bottom-0 right-0 bg-black/70 text-white text-[9px] font-bold px-0.5 rounded">＋{displayStep.images.length - 1}</span>}</div>
                        )}
                        <div className="flex-1 min-w-0">
                          <div className="flex items-center gap-1 mb-0.5 flex-wrap">
@@ -10151,7 +10316,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-3 shrink-0 max-h-[36%] overflow-y-auto">
                    <div className="flex items-start gap-3">
                      {currentStep.images && currentStep.images.length > 0 && (
-                       <img src={currentStep.images[0]} className="w-24 h-24 object-contain rounded border border-slate-200 shrink-0 cursor-pointer" alt="参考" onClick={() => setMeasurementFullscreen(true)}/>
+                       <div className="relative shrink-0 cursor-pointer" onClick={() => setMeasurementFullscreen(true)}>
+                         <img src={currentStep.images[0]} className="w-24 h-24 object-contain rounded border border-slate-200" alt="参考"/>
+                         {currentStep.images.length > 1 && <span className="absolute bottom-0.5 right-0.5 bg-black/70 text-white text-[10px] font-bold px-1 rounded">＋{currentStep.images.length - 1}枚</span>}
+                       </div>
                      )}
                      <div className="flex-1 min-w-0">
                        <div className="flex items-center gap-2 mb-1 flex-wrap">
