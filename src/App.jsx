@@ -5524,7 +5524,8 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                           <div className="flex flex-wrap justify-center gap-0.5">
                             {reworks.map((rw, rIdx) => {
                               const live = !rw.endTime && task.status === 'reworking' && rIdx === reworks.length - 1;
-                              const t = live ? (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0) : (rw.duration || 0);
+                              // ライブ表示 = 確定済み(一時停止で積んだ分) + 現セッション分。一時停止中(reworkStartTime=null)は確定分のみ表示。
+                              const t = live ? ((rw.duration || 0) + (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0)) : (rw.duration || 0);
                               return (
                                 <span key={rIdx} title={`修正${rIdx + 1}回目: ${formatTime(t)}${rw.reason ? ` / 理由: ${rw.reason}` : ''}${onEditReworks ? ' (タップで編集・削除)' : ''}`}
                                   onClick={(e) => { if (onEditReworks) { e.stopPropagation(); onEditReworks(sIdx, u); } }}
@@ -6182,6 +6183,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           const sec = Math.floor((now - t.startTime) / 1000);
           // firstStartTime は維持 (最初に着手した時刻を覚えておく)
           newTasks[k] = { ...t, status: 'paused', duration: (t.duration || 0) + sec, startTime: null, pausedAt: now, firstStartTime: t.firstStartTime || t.startTime };
+        } else if (t?.status === 'reworking' && t.reworkStartTime) {
+          // 修正(リワーク)中の経過も一時停止で凍結する: 現セッション分を reworks[last].duration に確定し reworkStartTime をクリア。
+          //   これをしないと休憩・中断中も壁時計差分が進み続け、修正完了時に休憩・中断分が修正時間へ混入する(ユーザー報告のバグ)。
+          const sec = Math.floor((now - t.reworkStartTime) / 1000);
+          const reworks = [...(t.reworks || [])];
+          if (reworks.length > 0) reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: (reworks[reworks.length - 1].duration || 0) + sec };
+          newTasks[k] = { ...t, reworks, reworkStartTime: null, reworkPausedAt: now };
         } else {
           newTasks[k] = t;
         }
@@ -6198,6 +6206,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       Object.entries(tasks).forEach(([k, t]) => {
         if (t?.status === 'paused' && t.pausedAt) {
           newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null, firstStartTime: t.firstStartTime || now };
+        } else if (t?.status === 'reworking' && t.reworkPausedAt) {
+          // 一時停止していた修正(リワーク)を再開: reworkStartTime を再セット (積み上げ分は reworks[last].duration に確定済み)。
+          newTasks[k] = { ...t, reworkStartTime: now, reworkPausedAt: null };
         } else {
           newTasks[k] = t;
         }
@@ -7462,6 +7473,17 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 修正(リワーク)の編集・削除モーダル: 各修正の時間と「修正ごとの理由」を編集、行削除も可。NG理由(タスク全体)も編集。
   //   draft は state に保持し「保存」で一括コミット (入力中に書き込まない)。
   const [reworkEditor, setReworkEditor] = useState(null); // { key, label, ngReason, items:[{...rework, min, sec, reason}] } | null
+  // 修正(リワーク)を2回目以降に始めるとき「前回と同じ内容か/違う内容か」を確認する picker。
+  const [reworkReasonPicker, setReworkReasonPicker] = useState(null); // { key, label, prevReason, round } | null
+  // 2回目以降は同異確認、初回はそのまま開始。directKey 必須(completedTaskMenu は閉じているため)。
+  const startReworkWithPrompt = (key, label) => {
+    const t = tasks[key] || {};
+    const rws = t.reworks || [];
+    if (rws.length === 0) { handleTaskMenuAction('rework', key); return; }
+    const prevReason = [...rws].reverse().find(r => r.reason)?.reason || t.ngReason || '';
+    setCompletedTaskMenu(null);
+    setReworkReasonPicker({ key, label: label || '', prevReason, round: rws.length + 1 });
+  };
   const openReworkEditor = (key, label) => {
     const t = tasks[key] || {};
     const items = (t.reworks || []).map(r => ({ ...r, min: String(Math.floor((r.duration || 0) / 60)), sec: String((r.duration || 0) % 60), reason: r.reason || '' }));
@@ -7515,8 +7537,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const now = Date.now();
       const dur = currentTask.reworkStartTime ? Math.floor((now - currentTask.reworkStartTime) / 1000) : 0;
       const reworks = [...(currentTask.reworks || [])];
-      reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: dur, endTime: now };
-      newTasks[key] = { ...currentTask, status: 'completed', reworkStartTime: null, reworks, endTime: now, firstStartTime: currentTask.firstStartTime || currentTask.startTime || now, workerName: inspectorName };
+      // 加算式: 一時停止で確定済みの分(reworks[last].duration) + 再開後の現セッション分。pause を挟んでも休憩・中断分を混ぜず正しく積む。
+      reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: (reworks[reworks.length - 1]?.duration || 0) + dur, endTime: now };
+      newTasks[key] = { ...currentTask, status: 'completed', reworkStartTime: null, reworkPausedAt: null, reworks, endTime: now, firstStartTime: currentTask.firstStartTime || currentTask.startTime || now, workerName: inspectorName };
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
       startUndoTimer({ key, type: 'task', previousTasks });
@@ -7715,7 +7738,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       };
     } else if (action === 'rework') {
       const captured = captureSessionIfProcessing(currentTask);
-      const reworks = [...(captured.reworks || []), { startTime: Date.now(), duration: 0, round: (captured.reworks?.length || 0) + 1 }];
+      // ngReason 引数を「この修正回の理由」として記録する (2回目以降は同異確認 picker から渡る)。
+      const reworks = [...(captured.reworks || []), { startTime: Date.now(), duration: 0, round: (captured.reworks?.length || 0) + 1, ...(ngReason ? { reason: ngReason } : {}) }];
       newTasks[key] = { ...captured, status: 'reworking', reworkStartTime: Date.now(), reworks };
     } else if (action === 'rework-ok') {
       // 修正完了: firstStartTime は currentTask から維持される (spread で継承)
@@ -7960,7 +7984,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             )}
             {(isNG || isReworkDone) && (
               <>
-                <button onClick={() => handleTaskMenuAction('rework')} className="w-full py-3 bg-orange-500 hover:bg-orange-600 border border-orange-600 rounded-xl text-white font-bold text-sm flex items-center justify-center gap-2"><Wrench className="w-5 h-5"/> 修正作業 開始 {task.reworks?.length > 0 ? `(${task.reworks.length + 1}回目)` : ''}</button>
+                <button onClick={() => startReworkWithPrompt(key, unitLabel)} className="w-full py-3 bg-orange-500 hover:bg-orange-600 border border-orange-600 rounded-xl text-white font-bold text-sm flex items-center justify-center gap-2"><Wrench className="w-5 h-5"/> 修正作業 開始 {task.reworks?.length > 0 ? `(${task.reworks.length + 1}回目)` : ''}</button>
                 {isReworkDone && <button onClick={() => handleTaskMenuAction('rework-ok')} className="w-full py-3 bg-emerald-500 hover:bg-emerald-600 border border-emerald-600 rounded-xl text-white font-bold text-sm flex items-center justify-center gap-2"><CheckCircle2 className="w-5 h-5"/> 修正OK → 完了</button>}
                 {task.reworks?.length > 0 && (
                   <div className="mt-2 p-2 bg-orange-50 rounded-lg border border-orange-200">
@@ -8190,6 +8214,43 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           </div>
           <div className="p-2 border-t text-center">
             <button onClick={closePicker} className="text-slate-400 hover:text-slate-600 font-bold text-sm">キャンセル</button>
+          </div>
+        </div>
+      </div>
+    );
+  })();
+
+  // 修正(リワーク) 2回目以降の「前回と同じ内容か/違う内容か」確認モーダル
+  const reworkReasonPickerModal = reworkReasonPicker && (() => {
+    const p = reworkReasonPicker;
+    const opts = complaintOptions && complaintOptions.length > 0 ? complaintOptions : DEFAULT_COMPLAINT_OPTIONS;
+    const start = (reason) => { setReworkReasonPicker(null); handleTaskMenuAction('rework', p.key, reason); };
+    return (
+      <div className="fixed inset-0 z-[315] bg-black/60 flex items-center justify-center p-4" onClick={() => setReworkReasonPicker(null)}>
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="bg-orange-600 text-white p-3 text-center">
+            <div className="font-black text-base flex items-center justify-center gap-2"><Wrench className="w-5 h-5"/> {p.round}回目の修正 — 内容を確認</div>
+            <div className="text-[11px] opacity-90 mt-0.5">{p.label} ／ 前回の理由: {p.prevReason || '（記録なし）'}</div>
+          </div>
+          <div className="p-3 space-y-2">
+            {p.prevReason && (
+              <button onClick={() => start(p.prevReason)} className="w-full py-3 bg-orange-500 hover:bg-orange-600 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2">
+                ✓ 前回と同じ内容で続行（{p.prevReason}）
+              </button>
+            )}
+            <div className="text-[11px] font-bold text-slate-500 pt-1">違う内容（別の不具合）— 理由を選ぶ:</div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-[36vh] overflow-y-auto pr-0.5">
+              {opts.map(opt => (
+                <button key={opt} onClick={() => start(opt)} className="py-2 px-2 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-lg text-orange-700 font-bold text-xs text-center leading-tight min-h-[44px] flex items-center justify-center">{opt}</button>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button onClick={() => { const c = prompt('違う内容の理由を入力してください', ''); if (c && c.trim()) start(c.trim()); }} className="py-2 px-3 bg-slate-50 hover:bg-slate-100 border border-dashed border-slate-300 rounded-lg text-slate-600 font-bold text-xs">✎ その他 (自由入力)</button>
+              <button onClick={() => start(null)} className="py-2 px-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-slate-500 font-bold text-xs">理由を記録せず開始</button>
+            </div>
+          </div>
+          <div className="p-2 border-t text-center">
+            <button onClick={() => setReworkReasonPicker(null)} className="text-slate-400 hover:text-slate-600 font-bold text-sm">やめる</button>
           </div>
         </div>
       </div>
@@ -9380,13 +9441,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                      }
                                    }} title={rw.endTime ? `タップで編集・削除${rw.reason ? ` / 理由: ${rw.reason}` : ''}` : '修正中 (タップで完了)'} className={`h-14 rounded-lg flex flex-col items-center justify-center border text-xs font-bold transition-all ${rw.endTime ? 'bg-orange-100 text-orange-700 border-orange-300 hover:bg-orange-200' : 'bg-orange-500 text-white border-orange-600 animate-pulse'}`}>
                                      <span>修正{rIdx + 1} {rw.endTime ? '✎' : ''}</span>
-                                     <span className="font-mono text-[11px]">{formatTime(rw.endTime ? rw.duration : (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0))}</span>
+                                     <span className="font-mono text-[11px]">{formatTime(rw.endTime ? rw.duration : ((rw.duration || 0) + (task.reworkStartTime ? Math.floor((Date.now() - task.reworkStartTime) / 1000) : 0)))}</span>
                                      {rw.reason && <span className="text-[8px] leading-none truncate max-w-full px-1 opacity-80">{rw.reason}</span>}
                                    </button>
                                  ))}
                                  {/* 新しい修正作業開始ボタン（NG直後） */}
                                  {task.status === 'ng' && (
-                                   <button onClick={() => handleTaskMenuAction('rework', key)} className="h-10 rounded-lg flex items-center justify-center border border-dashed border-orange-400 bg-orange-50 hover:bg-orange-100 text-orange-600 text-xs font-bold gap-1">
+                                   <button onClick={() => startReworkWithPrompt(key, `#${uIdx + 1}`)} className="h-10 rounded-lg flex items-center justify-center border border-dashed border-orange-400 bg-orange-50 hover:bg-orange-100 text-orange-600 text-xs font-bold gap-1">
                                      <Wrench className="w-3 h-3"/> 修正{reworks.length + 1}
                                    </button>
                                  )}
@@ -9692,6 +9753,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           {timeInputModal}
           {reworkEditorModal}
           {ngReasonPickerModal}
+          {reworkReasonPickerModal}
           {/* 分割測定アプリ連携: 開始時のステーション選択 */}
           {rotaryStationPicker && (() => {
             const p = rotaryStationPicker;
@@ -14058,9 +14120,10 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       // 前期間カウント (件数比較用)
       const lotDefectsAll = (lot.interruptions || []).filter(i => i.type === 'defect');
       lotDefectsAll.forEach(d => { if (isInPrev(d.timestamp)) prevCount++; });
-      if (!isInDefectPeriod(lotTime)) return;
-      if (lot.status === 'completed' || lot.location === 'completed') totalCompletedLots++;
-      const lotDefects = lotDefectsAll;
+      // 率の分母(完了ロット数)はロット完了月で数える。※不具合自体は下で「不具合のtimestamp」で期間を絞る。
+      if (isInDefectPeriod(lotTime) && (lot.status === 'completed' || lot.location === 'completed')) totalCompletedLots++;
+      // 不具合は「不具合自身の発生時刻」で期間フィルタする (ロットの updatedAt で丸ごと落とさない=登録したのに出ないバグの根本対策。complaintStats と対称)。
+      const lotDefects = lotDefectsAll.filter(d => isInDefectPeriod(d.timestamp));
       if (lotDefects.length > 0) {
         defectLotCount++;
         lotDefects.forEach(d => {
