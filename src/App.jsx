@@ -2463,7 +2463,7 @@ const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApp
   };
   const grabFrame = () => {
     const f = frameFromVideo(); if (!f) { setMsg('先に動画を再生位置に合わせてください'); return; }
-    setFrames(prev => [...prev, { id: `f${prev.length}-${Math.round(f.t * 1000)}`, ...f }]);
+    setFrames(prev => [...prev, { id: `f-${Date.now()}-${Math.round(Math.random() * 1e6)}`, ...f }]);
   };
   const autoSample = async (n = 6) => {
     const v = videoRef.current; if (!v || !v.duration || !isFinite(v.duration)) { setMsg('動画を読み込んでから実行してください'); return; }
@@ -2471,8 +2471,17 @@ const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApp
     const out = [];
     for (let i = 1; i <= n; i++) {
       const t = (v.duration * i) / (n + 1);
-      await new Promise(res => { const on = () => { v.removeEventListener('seeked', on); setTimeout(res, 60); }; v.addEventListener('seeked', on); v.currentTime = t; });
-      const f = frameFromVideo(); if (f) out.push({ id: `a${i}-${Math.round(t * 1000)}`, ...f });
+      // seeked が発火しないケース(既に同位置/取りこぼし)でも前進するよう、二重解決防止フラグ+保険タイムアウト付き
+      await new Promise(res => {
+        let done = false;
+        const finish = () => { if (done) return; done = true; v.removeEventListener('seeked', on); res(); };
+        const on = () => { v.removeEventListener('seeked', on); setTimeout(finish, 60); };
+        if (Math.abs(v.currentTime - t) < 0.05) { setTimeout(finish, 60); return; } // 既に同位置=seeked非発火対策
+        v.addEventListener('seeked', on);
+        v.currentTime = t;
+        setTimeout(finish, 1500); // 保険(seeked取りこぼし時も前進)
+      });
+      const f = frameFromVideo(); if (f) out.push({ id: `a-${Date.now()}-${i}-${Math.round(Math.random() * 1e6)}`, ...f });
     }
     if (!wasPaused) v.play();
     setFrames(prev => [...prev, ...out]); setMsg(`${out.length}コマ取得しました`);
@@ -4240,19 +4249,19 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const handleSave = () => {
     if (!name.trim()) return alert('テンプレート名を入力してください');
     if (steps.length === 0) return alert('少なくとも1つの工程を追加してください');
-    // 1MB 上限警告 (Firestore document サイズ ~ 1MB)
-    try {
-      const approxSize = JSON.stringify(steps).length;
-      if (approxSize > 900_000) {
-        if (!confirm(`このテンプレートのデータ量が ${(approxSize / 1024).toFixed(0)} KB と大きく、保存に失敗するリスクがあります（Firestore 1MB 上限）。\n\n対策: 画像を削減/圧縮してください。\n\nこのまま保存しますか？`)) return;
-      }
-    } catch {}
     const overviewClean = {
       images: overview.images || [],
       description: (overview.description || '').trim(),
       pdfs: (overview.pdfs || []).filter(p => p && p.url),
     };
     const hasOverview = overviewClean.images.length || overviewClean.description || overviewClean.pdfs.length;
+    // 1MB 上限警告 (Firestore document サイズ ~ 1MB)。overview の概要写真(base64フォールバック分)も含めて計測する。
+    try {
+      const approxSize = JSON.stringify({ steps, overview: hasOverview ? overviewClean : null }).length;
+      if (approxSize > 900_000) {
+        if (!confirm(`このテンプレートのデータ量が ${(approxSize / 1024).toFixed(0)} KB と大きく、保存に失敗するリスクがあります（Firestore 1MB 上限）。\n\n対策: 画像を削減/圧縮してください。\n\nこのまま保存しますか？`)) return;
+      }
+    } catch {}
     // hasOverview が false のときは null を渡して既存の overview を消す (merge保存なので明示的にnull)
     onSave({ id: template?.id, name, steps, overview: hasOverview ? overviewClean : null });
   };
@@ -5089,7 +5098,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                {images.length > 0 ? (<div className="w-full h-full relative group"><img src={images[activeImgIdx]} className="w-full h-full object-contain" /><div className="absolute top-2 left-2"><button onClick={()=>setIsDrawingMode(true)} className="bg-white/90 p-1.5 rounded shadow text-xs flex gap-1 items-center font-bold text-slate-700"><Brush className="w-3 h-3"/> 編集</button></div></div>) : (<div onClick={()=>fileInputRef.current?.click()} className="text-center text-slate-400 cursor-pointer hover:text-blue-500"><Camera className="w-8 h-8 mx-auto mb-1"/><span className="text-xs">追加</span></div>)}
                <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleImageUpload}/>
              </div>
-             {images.length > 0 && (<div className="flex gap-2 overflow-x-auto pb-1 mb-2">{images.map((img, i) => (<div key={i} className={`relative w-12 h-12 flex-none border rounded overflow-hidden cursor-pointer group ${activeImgIdx===i?'ring-2 ring-blue-500':''}`}><img src={img} onClick={()=>setActiveImgIdx(i)} className="w-full h-full object-cover"/><button onClick={(e)=>{e.stopPropagation(); setImages(prev=>prev.filter((_,j)=>j!==i)); setActiveImgIdx(p=>Math.max(0,Math.min(p, images.length-2)));}} className="absolute top-0 right-0 bg-rose-600 text-white rounded-bl px-0.5 opacity-0 group-hover:opacity-100" title="削除"><X className="w-3 h-3"/></button></div>))}</div>)}
+             {images.length > 0 && (<div className="flex gap-2 overflow-x-auto pb-1 mb-2">{images.map((img, i) => (<div key={i} className={`relative w-12 h-12 flex-none border rounded overflow-hidden cursor-pointer group ${activeImgIdx===i?'ring-2 ring-blue-500':''}`}><img src={img} onClick={()=>setActiveImgIdx(i)} className="w-full h-full object-cover"/><button onClick={(e)=>{e.stopPropagation(); setImages(prev=>prev.filter((_,j)=>j!==i)); setActiveImgIdx(p=>{ const n = i < p ? p-1 : p; return Math.max(0, Math.min(n, images.length-2)); });}} className="absolute top-0 right-0 bg-rose-600 text-white rounded-bl px-0.5 opacity-0 group-hover:opacity-100" title="削除"><X className="w-3 h-3"/></button></div>))}</div>)}
              {/* 動画から写真・説明を作る (動画は保存せずコマだけ参考写真に。AI下書きも可) */}
              <button type="button" onClick={()=>setShowVideoTool(true)} className="w-full mb-2 py-2 border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-xs font-bold flex items-center justify-center gap-1.5"><Camera className="w-4 h-4"/> 🎥 動画から写真・説明を作る</button>
              <div className="mt-2 border-t pt-2"><label className="block text-xs font-bold text-slate-500 mb-1">PDF資料</label><button onClick={()=>pdfInputRef.current?.click()} className={`w-full py-2 border rounded text-xs flex items-center justify-center gap-2 ${pdfData ? 'bg-orange-50 text-orange-600 border-orange-200' : 'bg-slate-50 text-slate-500'}`}><FileText className="w-4 h-4"/> {pdfData ? '添付済' : '選択'}</button><input type="file" ref={pdfInputRef} className="hidden" accept="application/pdf" onChange={handlePdfUpload}/></div>
@@ -5105,7 +5114,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
         )}
         {/* === テンプレ全体の総合資料エディタ (手順書PDF・概要写真・全体説明) === */}
         {showOverviewEditor && (
-          <div className="absolute inset-0 z-[55] bg-black/40 flex items-center justify-center p-4" onClick={() => setShowOverviewEditor(false)}>
+          <div className="absolute inset-0 z-[55] bg-black/40 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) setShowOverviewEditor(false); }}>
             <div className="bg-white w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
               <div className="bg-cyan-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
                 <h3 className="font-bold flex items-center gap-2"><FileText className="w-5 h-5"/> テンプレ全体の総合資料</h3>
@@ -8000,6 +8009,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         const sec = Math.floor((Date.now() - t.startTime) / 1000);
         // firstStartTime は維持。startTime はセッション終了で null に。
         return { ...t, duration: (t.duration || 0) + sec, startTime: null, firstStartTime: t.firstStartTime || t.startTime };
+      }
+      // 修正中(reworking)で計測中なら、進行中セッションを reworks[last].duration に確定してから状態遷移する
+      // (これをやらないと NG/やり直しで進行中の修正時間が消える)。停止中(reworkStartTime=null)は再加算しない。
+      if (t?.status === 'reworking' && t?.reworkStartTime) {
+        const sec = Math.floor((Date.now() - t.reworkStartTime) / 1000);
+        const reworks = [...(t.reworks || [])];
+        if (reworks.length > 0) reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: (reworks[reworks.length - 1].duration || 0) + sec };
+        return { ...t, reworks, reworkStartTime: null, reworkPausedAt: null };
       }
       return t;
     };
@@ -14081,7 +14098,12 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
               <tr key={si} className="border-b border-slate-50">
                 <td className="px-2 py-1 font-bold sticky left-0 bg-white truncate max-w-[9rem]" title={s.title}>{s.title}</td>
                 <td className="px-1 py-1 text-center text-slate-400 font-mono">{s.targetTime || '-'}</td>
-                {Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = s.lotOnce ? `${u + 1}回目` : `#${u + 1}`; return (<td key={u} colSpan={s.lotOnce && colsOf(si) <= 1 ? qty : 1} className="px-0.5 py-0.5 text-center"><button onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`w-full min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`${s.lotOnce ? `📦${cellLabel} ` : ''}${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{s.lotOnce ? `${cellLabel} ` : ''}{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : '·'))}</button></td>); })}
+                {s.lotOnce ? (
+                  // ロット1回(段取り)工程: 回数分を1つの<td colSpan={qty}>にまとめ、中で回数チップをflex配置(複数回でも列がズレない)
+                  <td colSpan={qty} className="px-0.5 py-0.5"><div className="flex flex-wrap items-center gap-1 justify-center">{Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = `${u + 1}回目`; return (<button key={u} onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`📦${cellLabel} ${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{`${cellLabel} `}{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : '·'))}</button>); })}</div></td>
+                ) : (
+                  Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = `#${u + 1}`; return (<td key={u} className="px-0.5 py-0.5 text-center"><button onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`w-full min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : '·'))}</button></td>); })
+                )}
               </tr>
             ))}
           </tbody>
@@ -14471,15 +14493,19 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     const stepCounts = {};
     const workerCounts = {};
     const processCounts = {};
-    const monthlyCounts = {}; // YYYY-MM → count
+    const monthlyCounts = {}; // YYYY-MM → count (期間フィルタ内のみ。trendには使わない)
+    const monthlyCountsAll = {}; // YYYY-MM → count (全期間。月別推移グラフ=直近12ヶ月はこちらを使う=期間フィルタで潰れない)
     let prevCount = 0;
     const isInPrev = getPrevPeriodChecker();
 
     lots.forEach(lot => {
       const lotTime = lot.updatedAt || lot.entryAt || lot.createdAt;
-      // 前期間カウント (件数比較用)
+      // 前期間カウント (件数比較用) + 月別推移用の全期間カウント (期間フィルタに依存しない)
       const lotDefectsAll = (lot.interruptions || []).filter(i => i.type === 'defect');
-      lotDefectsAll.forEach(d => { if (isInPrev(d.timestamp)) prevCount++; });
+      lotDefectsAll.forEach(d => {
+        if (isInPrev(d.timestamp)) prevCount++;
+        if (d.timestamp) { const dd = new Date(d.timestamp); const ym = `${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}`; monthlyCountsAll[ym] = (monthlyCountsAll[ym] || 0) + 1; }
+      });
       // 率の分母(完了ロット数)はロット完了月で数える。※不具合自体は下で「不具合のtimestamp」で期間を絞る。
       if (isInDefectPeriod(lotTime) && (lot.status === 'completed' || lot.location === 'completed')) totalCompletedLots++;
       // 不具合は「不具合自身の発生時刻」で期間フィルタする (ロットの updatedAt で丸ごと落とさない=登録したのに出ないバグの根本対策。complaintStats と対称)。
@@ -14515,7 +14541,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       for (let i = 11; i >= 0; i--) {
         const dd = new Date(now.getFullYear(), now.getMonth() - i, 1);
         const ym = `${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}`;
-        trendMonths.push({ ym, label: `${dd.getMonth()+1}月`, count: monthlyCounts[ym] || 0 });
+        trendMonths.push({ ym, label: `${dd.getMonth()+1}月`, count: monthlyCountsAll[ym] || 0 });
       }
     }
     const diff = defects.length - prevCount;
@@ -14529,7 +14555,8 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     const stepCounts = {};
     const workerCounts = {};
     const modelCounts = {};
-    const monthlyCounts = {}; // YYYY-MM → count
+    const monthlyCounts = {}; // YYYY-MM → count (期間フィルタ内のみ)
+    const monthlyCountsAll = {}; // YYYY-MM → count (全期間。月別推移グラフ=直近12ヶ月はこちらを使う)
     const dayCounts = {}; // YYYY-MM-DD → count (1日平均算出用)
     let minTs = Infinity, maxTs = -Infinity;
     let prevCount = 0;
@@ -14538,6 +14565,8 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
     lots.forEach(lot => {
       const lotComplaints = (lot.interruptions || []).filter(i => i.type === 'complaint');
       lotComplaints.forEach(c => {
+        // 月別推移用の全期間カウント (期間フィルタに依存しない)
+        if (c.timestamp) { const d0 = new Date(c.timestamp); const ym0 = `${d0.getFullYear()}-${String(d0.getMonth()+1).padStart(2,'0')}`; monthlyCountsAll[ym0] = (monthlyCountsAll[ym0] || 0) + 1; }
         if (isInDefectPeriod(c.timestamp)) {
           const wname = (workers.find(x => x.id === c.workerName)?.name) || c.workerName || '不明';
           complaints.push({ ...c, lot, workerName: wname });
@@ -14571,7 +14600,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
       for (let i = 11; i >= 0; i--) {
         const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
         const ym = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-        trendMonths.push({ ym, label: `${d.getMonth()+1}月`, count: monthlyCounts[ym] || 0 });
+        trendMonths.push({ ym, label: `${d.getMonth()+1}月`, count: monthlyCountsAll[ym] || 0 });
       }
     }
     // 1日平均件数: フィルタ期間の日数 (実際にデータがあった範囲) で割る
@@ -19439,10 +19468,12 @@ const EditMeasurementModal = ({ lot, onClose, onSave }) => {
     const newValues = { ...prevValues, [inputId]: rawVal === '' ? null : parseFloat(rawVal) };
     newMR[valuesKey] = newValues;
 
-    // 再計算
+    // 再計算: 他工程の値を参照する式(cross-step)があるため、作業画面と同様に crossVals を渡す。
+    // crossVals は編集中の newMR から引く(同モーダル内で他工程も直した場合の一巡遅れ回避)。collectCrossStepValues が現工程は除外する。
     const step = measSteps.find(s => s.id === stepId);
     if (step) {
-      const calcResults = calculateMeasurementResults(newValues, step.measurementConfig);
+      const crossVals = collectCrossStepValues({ ...lot, measurementResults: newMR }, stepId);
+      const calcResults = calculateMeasurementResults(newValues, step.measurementConfig, crossVals);
       newMR[key] = { values: newValues, calcResults, timestamp: Date.now() };
     }
     setLocalMR(newMR);
