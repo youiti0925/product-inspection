@@ -15254,6 +15254,51 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   const maxWorker = Math.max(1, ...workerRows.map(w => w.median));
   const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
 
+  // === レポート出力(A4 PDF コンパクト/詳細 + Excel) ===
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const fmtS = pdcaFmtSec;
+  const repTitle = `工程分析レポート ― ${model}${templateId ? ' / ' + (tplOptions.find(t => t.id === templateId)?.name || '') : ''}`;
+  const repPeriod = `直近1年（〜${pdcaFmtDate(nowMs)}）`;
+  const repKpi = () => {
+    const withT = bd.rows.filter(r => r.target > 0);
+    const within = withT.filter(r => r.median <= r.target).length;
+    return { steps: bd.rows.length, sumMed: bd.rows.reduce((s, r) => s + r.median, 0), within, withT: withT.length, bottleneck: bd.rows[0]?.stepTitle || '—', topN: bd.rows[0]?.n || 0 };
+  };
+  const sigColor = (r) => r.target > 0 ? (r.median <= r.target ? '#16a34a' : (r.median <= r.target * 1.1 ? '#ca8a00' : '#dc2626')) : '#94a3b8';
+  const printReport = (detailed) => {
+    const k = repKpi();
+    let body = `<h1>${esc(repTitle)}</h1><div class="meta">期間: ${esc(repPeriod)} ・ 完了台数(最多工程): ${k.topN}台 ・ 発行: ${esc(pdcaFmtDate(nowMs))}</div>`;
+    body += `<div class="kg"><div class="k"><div class="v">${k.steps}</div><div class="l">工程数</div></div><div class="k"><div class="v">${fmtS(k.sumMed)}</div><div class="l">1台の合計(中央値)</div></div><div class="k"><div class="v">${k.withT ? Math.round(k.within / k.withT * 100) + '%' : '—'}</div><div class="l">目標内の工程</div></div><div class="k"><div class="v" style="font-size:12px">${esc(k.bottleneck)}</div><div class="l">最大ボトルネック</div></div></div>`;
+    body += `<h2>工程別の時間（大きい順＝直すべき順）</h2><table class="d"><thead><tr><th>順位</th><th>工程</th><th>台数</th><th>中央値</th><th>目標</th><th>目標比</th><th>年間合計</th><th>累積%</th></tr></thead><tbody>`;
+    bd.rows.forEach((r, i) => { const ratio = r.target > 0 ? Math.round(r.median / r.target * 100) : null; body += `<tr><td class="c">${i + 1}</td><td>${esc(r.stepTitle)}</td><td class="c">${r.n}</td><td class="c">${fmtS(r.median)}</td><td class="c">${r.target > 0 ? fmtS(r.target) : '—'}</td><td class="c" style="color:${sigColor(r)};font-weight:bold">${ratio != null ? ratio + '%' : '—'}</td><td class="c">${(r.totalSec / 3600).toFixed(1)}h</td><td class="c">${r.cumPct}%</td></tr>`; });
+    body += `</tbody></table>`;
+    if (detailed) {
+      body += `<h2>工程ごとのばらつき詳細</h2><table class="d"><thead><tr><th>工程</th><th>台数</th><th>平均</th><th>中央値</th><th>σ</th><th>CV</th><th>最小</th><th>最大</th><th>目標</th></tr></thead><tbody>`;
+      bd.rows.forEach(r => { body += `<tr><td>${esc(r.stepTitle)}</td><td class="c">${r.n}</td><td class="c">${fmtS(r.mean)}</td><td class="c">${fmtS(r.median)}</td><td class="c">${fmtS(r.sigma)}</td><td class="c">${Math.round(r.cv * 100)}%</td><td class="c">${fmtS(r.min)}</td><td class="c">${fmtS(r.max)}</td><td class="c">${r.target > 0 ? fmtS(r.target) : '—'}</td></tr>`; });
+      body += `</tbody></table><h2>各工程の実測値（検算用）</h2>`;
+      bd.rows.forEach(r => { body += `<div class="n"><b>${esc(r.stepTitle)}</b>（${r.n}台）: ${[...r.durations].sort((a, b) => a - b).map(fmtS).join('、')}</div>`; });
+    }
+    body += `<div class="n" style="margin-top:8px">計算定義: 中央値＝実績の真ん中の値（外れ値に強い）。年間合計＝直近1年の合計時間。0秒・4時間超の異常値は除外。</div>`;
+    const css = `@page{size:A4 portrait;margin:13mm}body{font-family:'Yu Gothic','Hiragino Kaku Gothic ProN',sans-serif;color:#1e293b;font-size:11px}h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:13px 0 4px;border-bottom:2px solid #2563eb;padding-bottom:2px;break-after:avoid}.meta{color:#64748b;font-size:10px;margin-bottom:8px}.kg{display:flex;gap:8px;margin:8px 0}.k{flex:1;border:1px solid #cbd5e1;border-radius:6px;padding:6px;text-align:center}.k .v{font-size:17px;font-weight:bold}.k .l{font-size:9px;color:#64748b}table.d{width:100%;border-collapse:collapse;margin-bottom:6px}table.d th,table.d td{border:1px solid #cbd5e1;padding:3px 5px;font-size:10px}table.d th{background:#dbeafe}.c{text-align:center}.n{font-size:9.5px;color:#475569;background:#f8fafc;border-left:3px solid #cbd5e1;padding:3px 6px;margin:3px 0}tr{break-inside:avoid}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}`;
+    const pw = window.open('', '_blank'); if (!pw) { alert('ポップアップを許可してください'); return; }
+    pw.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${esc(repTitle)}</title><style>${css}</style></head><body>${body}<scr` + `ipt>window.onload=function(){setTimeout(function(){window.print();},400);}</scr` + `ipt></body></html>`);
+    pw.document.close();
+  };
+  const exportExcel = async () => {
+    const ExcelJS = await loadExcelJS(); const wb = new ExcelJS.Workbook();
+    const s1 = wb.addWorksheet('工程別サマリー'); s1.pageSetup = { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1 };
+    s1.addRow([repTitle]); s1.addRow([`期間 ${repPeriod}`]); s1.addRow([]);
+    const hr = s1.addRow(['順位', '工程', '台数', '平均(s)', '中央値(s)', 'σ(s)', 'CV%', '最小(s)', '最大(s)', '目標(s)', '目標比%', '年間合計(h)', '累積%']);
+    hr.font = { bold: true, color: { argb: 'FFFFFFFF' } }; hr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } };
+    bd.rows.forEach((r, i) => { s1.addRow([i + 1, r.stepTitle, r.n, r.mean, r.median, r.sigma, Math.round(r.cv * 100), r.min, r.max, r.target || '', r.target > 0 ? Math.round(r.median / r.target * 100) : '', Math.round(r.totalSec / 3600 * 10) / 10, r.cumPct]); });
+    [6, 24, 6, 9, 9, 7, 6, 8, 8, 8, 8, 11, 8].forEach((w, i) => { s1.getColumn(i + 1).width = w; });
+    const s2 = wb.addWorksheet('各工程の実測値'); s2.addRow(['工程', '台ごとの実測秒(昇順)']); s2.getRow(1).font = { bold: true };
+    bd.rows.forEach(r => { s2.addRow([r.stepTitle, [...r.durations].sort((a, b) => a - b).join(', ')]); });
+    s2.getColumn(1).width = 24; s2.getColumn(2).width = 90;
+    const buf = await wb.xlsx.writeBuffer(); const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `工程分析_${model}_${pdcaFmtDate(nowMs).replace(/\//g, '')}.xlsx`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+
   return (
     <div className="space-y-3">
       {/* 選択 */}
@@ -15268,6 +15313,14 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
             {tplOptions.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
           </select>
         </div>
+        {bd.rows.length > 0 && (
+          <div className="flex items-center gap-1.5 w-full justify-end border-t border-blue-100 pt-2">
+            <span className="text-[11px] text-slate-500 mr-1">出力:</span>
+            <button onClick={() => printReport(false)} className="px-2.5 py-1 text-xs font-bold rounded border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 flex items-center gap-1"><Printer className="w-3.5 h-3.5" /> PDF(A4 1枚)</button>
+            <button onClick={() => printReport(true)} className="px-2.5 py-1 text-xs font-bold rounded border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 flex items-center gap-1"><Printer className="w-3.5 h-3.5" /> PDF(詳細)</button>
+            <button onClick={exportExcel} className="px-2.5 py-1 text-xs font-bold rounded border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 flex items-center gap-1"><FileSpreadsheet className="w-3.5 h-3.5" /> Excel</button>
+          </div>
+        )}
       </div>
 
       {bd.rows.length === 0 ? (
