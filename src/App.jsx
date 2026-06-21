@@ -26999,6 +26999,19 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      const id = templateData.id || generateId();
      saveData('templates', id, { ...templateData, id });
      setEditingTemplate(null);
+     // テンプレ変更を「未着手」の既存ロットに反映する(任意・確認制)。作業中/完了は実測データを守るため触らない。
+     //   未着手 = まだ一度も着手していない(workStartTime無し かつ どのタスクも firstStartTime 無し。規格の該当なしタスクは着手扱いにしない)。
+     if (Array.isArray(templateData.steps) && templateData.steps.length > 0) {
+       const isUntouched = (l) => !l.workStartTime && l.status !== 'completed' && l.location !== 'completed' && !Object.values(l.tasks || {}).some(t => t && t.firstStartTime);
+       const targets = (lots || []).filter(l => l.templateId === id && isUntouched(l));
+       if (targets.length > 0 && confirm(`このテンプレを使う「未着手」の検査ロット ${targets.length}件 にも、変更した工程を反映しますか？\n\n・反映する＝各ロットの工程が最新テンプレに更新されます\n・作業中／完了のロットは実測データを守るため反映しません`)) {
+         targets.forEach(l => {
+           const { steps, appliedStandard, naStepIds } = applyQualityStandardToSteps(l.model, templateData.steps, settings, id);
+           saveData('lots', l.id, { steps, ...(appliedStandard ? { appliedStandard } : {}), tasks: buildProfileSkippedTasks(steps, naStepIds, l.quantity || 1) });
+         });
+         alert(`✅ 未着手の ${targets.length}件 に最新テンプレを反映しました。`);
+       }
+     }
    };
    
    // --- Lot Edit Handlers ---
