@@ -15733,7 +15733,21 @@ const RawFixModal = ({ sample, target, fmt, onSave, onClose }) => {
 
 // === 工程分析ビュー: 型式(+テンプレ)を選び、データをそのままグラフで見る土台 ===
 // ①工程別パレート(どこが一番時間か) ②選択工程のバラつきヒストグラム+CV ③月次推移 ④作業者比較 ⑤根拠(n/最小最大)
-const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [], observationPlans = [], saveData = null, deleteData = null, currentUserName = '' }) => {
+// 工程分析→改善PDCA: 選択工程から改善カルテ(計画)を起票する純ヘルパー(ImprovementCardsPanel.createCard と同形)。
+const makeImprovementCard = (lots, { model, stepKey, stepTitle, category, source, customTargetTimes, modelGroups, currentUserName, nowMs }) => {
+  const startMs = nowMs - 90 * 86400000;
+  const baseStat = measureWindow(lots, { model, stepKey, customTargetTimes, modelGroups, startMs, endMs: nowMs });
+  const baseline = { ...baseStat, startMs, endMs: nowMs };
+  const id = generateId();
+  return {
+    id, createdAt: nowMs, createdBy: currentUserName || '?', status: 'plan',
+    model, stepKey, stepTitle: stepTitle || (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey), category: category || '',
+    kpi: 'time', source: source || { kind: 'manual', label: '手動作成' }, baseline,
+    problem: source?.problem || '', hypothesis: '', action: '', owner: '', dueDate: '',
+    log: [{ ts: nowMs, by: currentUserName || '?', type: 'create', note: `カルテ作成 (由来: ${source?.label || '手動'})` }],
+  };
+};
+const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [], observationPlans = [], improvements = [], saveData = null, deleteData = null, currentUserName = '', onGoToPdca = null }) => {
   const completed = useMemo(() => (lots || []).filter(l => l.status === 'completed' || l.location === 'completed'), [lots]);
   const models = useMemo(() => [...new Set(completed.map(l => l.model))].filter(Boolean).sort(), [completed]);
   const [model, setModel] = useState('');
@@ -15774,6 +15788,17 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   const planForSel = useMemo(() => sel ? resolveObsPlan(sel.stepKey) : null, [observationPlans, templateId, sel, model]);
   const elStats = useMemo(() => (sel && templateId) ? obsElementStats(lots, { model, templateId, stepKey: sel.stepKey, plan: planForSel }) : null, [lots, model, templateId, sel, planForSel]);
   const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
+  // 見ながら計画: この工程を改善カルテ(計画)にして改善PDCAへ。進行中カルテがあればそれを案内。
+  const cardedKeys = useMemo(() => new Set((improvements || []).filter(c => !['effective', 'noeffect', 'worse', 'rolledback'].includes(c.status)).map(c => `${c.model}||${c.stepKey}`)), [improvements]);
+  const selCarded = sel ? cardedKeys.has(`${model}||${sel.stepKey}`) : false;
+  const makeCard = () => {
+    if (!sel || !saveData) return;
+    const category = sel.stepKey.includes('_') ? sel.stepKey.slice(0, sel.stepKey.indexOf('_')) : '';
+    const problem = `${sel.stepTitle}: 中央値${fmt(sel.median)}${sel.target > 0 ? ` / 目標${fmt(sel.target)}（${sel.median > sel.target ? fmt(sel.median - sel.target) + '遅い' : '目標内'}）` : '（目標未設定）'}、年間合計${hrs(sel.totalSec)}、バラつきCV${Math.round(sel.cv * 100)}%（${sel.n}台）。`;
+    const card = makeImprovementCard(lots, { model, stepKey: sel.stepKey, stepTitle: sel.stepTitle, category, source: { kind: 'process-analysis', label: '工程分析から', problem }, customTargetTimes, modelGroups, currentUserName, nowMs });
+    saveData('improvements', card.id, card);
+    if (onGoToPdca) onGoToPdca();
+  };
   // === 修正モード: 選択工程の生データ(各指図の各台)を一覧→異常を直す ===
   const [fixMode, setFixMode] = useState(false);
   const [fixEdit, setFixEdit] = useState(null); // { sample } 編集対象
@@ -15934,6 +15959,11 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                 <span className="text-sm font-bold text-slate-700">② {sel.stepTitle} の中身</span>
                 <span className="text-xs text-slate-400">（{sel.n}台ぶん）</span>
                 {(() => { const [lbl, cls] = cvBadge(sel.cv); return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls}`}>{lbl}（CV {Math.round(sel.cv * 100)}%）</span>; })()}
+                {saveData && (
+                  selCarded
+                    ? <button onClick={() => onGoToPdca && onGoToPdca()} className="text-[11px] px-2.5 py-1 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-700 font-bold hover:bg-emerald-100 flex items-center gap-1"><ClipboardList className="w-3.5 h-3.5" />カルテ作成済み → PDCAへ</button>
+                    : <button onClick={makeCard} className="text-[11px] px-2.5 py-1 rounded-lg border-2 border-indigo-300 bg-indigo-50 text-indigo-700 font-black hover:bg-indigo-100 flex items-center gap-1" title="この工程を改善カルテ(計画)にして改善PDCAへ"><ClipboardList className="w-3.5 h-3.5" />📋 カルテ化（改善計画を立てる）</button>
+                )}
                 <div className="ml-auto flex items-center gap-1.5">
                   {saveData && (
                     <button onClick={() => setFixMode(m => !m)} className={`text-[11px] px-2 py-1 rounded border font-bold flex items-center gap-1 ${fixMode ? 'border-amber-400 bg-amber-100 text-amber-800' : 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'}`} title="グラフを見て生データの異常を感じたら直す">🔧 {fixMode ? '修正モード中' : '生データ修正'}</button>
@@ -16059,20 +16089,25 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
 };
 
 // 分析サブタブを5グループに整理 (フラットな13タブ→グループ→サブタブの2段ナビ)。機能は消さず位置だけ整理。
+// 分析タブを「データを正す→見る→計画→実行→定着」のPDCAの流れ順に並べる(2段ナビ)。番号で順番を明示。
 const ANALYSIS_GROUPS = [
-  { key: 'status', label: '現状を見る', tabs: [
-    { k: 'process-analysis', l: '工程分析（データを見る）', color: 'text-blue-600' },
-    { k: 'dashboard', l: 'ダッシュボード', color: 'text-blue-600' },
-    { k: 'achievement', l: '達成率', color: 'text-emerald-600' },
-    { k: 'kpi', l: '経営分析', color: 'text-indigo-600' },
+  { key: 'fix', label: '① データを正す', tabs: [
+    { k: 'anomaly', l: '要確認（異常値・該当なし）', color: 'text-amber-600' },
   ] },
-  { key: 'quality', label: '品質', tabs: [
+  { key: 'see', label: '② 現状を見る', tabs: [
+    { k: 'process-analysis', l: '工程分析（データを見る）', color: 'text-blue-600' },
+    { k: 'achievement', l: '達成率', color: 'text-emerald-600' },
     { k: 'defects', l: '不具合分析', color: 'text-rose-600' },
     { k: 'complaints', l: '軽微不良・改善提案', color: 'text-purple-600' },
+    { k: 'dashboard', l: 'ダッシュボード', color: 'text-blue-600' },
+    { k: 'kpi', l: '経営分析', color: 'text-indigo-600' },
   ] },
-  { key: 'kaizen', label: '改善', tabs: [
+  { key: 'kaizen', label: '③④ 改善（計画→実行→効果）', tabs: [
     { k: 'pdca', l: '改善PDCA（重点工程→対策→効果）', color: 'text-indigo-600' },
-    { k: 'improvement', l: '目標時間の見直し・AI洞察', color: 'text-indigo-600' },
+    { k: 'improvement', l: 'AI洞察・乖離アラート', color: 'text-indigo-600' },
+  ] },
+  { key: 'standardize', label: '⑤ 基準を固める（定着）', tabs: [
+    { k: 'standardize', l: '目標時間・厳密モードへ', color: 'text-indigo-600' },
   ] },
   { key: 'people', label: '人・配分', tabs: [
     { k: 'worker-eval', l: '作業者評価', color: 'text-amber-600', admin: true },
@@ -16085,7 +16120,7 @@ const ANALYSIS_GROUPS = [
     { k: 'rotary', l: '分割測定', color: 'text-cyan-600' },
   ] },
 ];
-const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], onRestore = null, db = null }) => {
+const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('process-analysis'); // 既定=工程分析(データを見る土台)。グループは activeMode から導出
   const activeGroup = ANALYSIS_GROUPS.find(g => g.tabs.some(t => t.k === activeMode)) || ANALYSIS_GROUPS[0];
@@ -16526,7 +16561,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
               {activeMode === 'complaints' && (<><Megaphone className="w-6 h-6 text-purple-600"/> 軽微不良・改善提案</>)}
               {activeMode === 'direct-indirect' && (<><Activity className="w-6 h-6 text-teal-600"/> 直間分析</>)}
               {activeMode === 'worker-eval' && (<><Users className="w-6 h-6 text-amber-600"/> 作業者評価</>)}
-              {activeMode === 'improvement' && (<><Zap className="w-6 h-6 text-indigo-600"/> 改善ヒント</>)}
+              {activeMode === 'improvement' && (<><Zap className="w-6 h-6 text-indigo-600"/> AI洞察・乖離アラート</>)}
+              {activeMode === 'anomaly' && (<><AlertTriangle className="w-6 h-6 text-amber-600"/> ① データを正す（要確認）</>)}
+              {activeMode === 'standardize' && (<><ShieldCheck className="w-6 h-6 text-indigo-600"/> ⑤ 基準を固める（定着）</>)}
               {activeMode === 'pdca' && (<><ClipboardList className="w-6 h-6 text-indigo-600"/> 改善PDCA (改善カルテ)</>)}
               {activeMode === 'monthly' && (<><FileText className="w-6 h-6 text-slate-700"/> 月次レポート</>)}
             </h2>
@@ -17939,9 +17976,37 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
            {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
-           {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} />}
+           {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} improvements={improvements} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onGoToPdca={() => setActiveMode('pdca')} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
            {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} currentUserName={currentUserName} onRestore={onRestore} />}
+           {/* ① データを正す: 要確認(異常値・該当なし)。ヘッダーの浮いたバッジと同じ中身を流れの先頭に置く。 */}
+           {activeMode === 'anomaly' && (
+             <div className="space-y-3">
+               <div className="text-[11px] text-slate-600 bg-amber-50 border border-amber-200 rounded-lg p-2.5 leading-relaxed">
+                 <b>まず土台＝データを正す。</b>0秒・4時間超・時刻矛盾などの<b>怪しい値</b>を直すか「<b className="text-amber-700">該当なし(対象外)</b>」にしてから、②で分析します（汚れたデータだと分析が嘘になります）。<br/>
+                 セルをタップ →「目標で埋める / 実時間を手入力 / 📦該当なし / そのまま」。<b>工程名タップ</b>で「#2以降をまとめて該当なし」（ロットで1回だけの工程の過去データ向け）。
+               </div>
+               {anomalies.length === 0
+                 ? <div className="text-center py-12 text-emerald-600"><CheckCircle2 className="w-12 h-12 mx-auto mb-2" /> 怪しい値はありません — データはクリーンです 🎉</div>
+                 : [...new Set(anomalies.map(a => a.lotId))].map(lotId => { const lot = lots.find(l => l.id === lotId); if (!lot) return null; return <LotTimeTable key={lotId} lot={lot} onSaveTasks={(nt) => saveData('lots', lotId, { tasks: nt })} />; })}
+             </div>
+           )}
+           {/* ⑤ 基準を固める: 目標時間最適化・厳密モード(別画面)へ。改善が定着したらここで標準を更新/固定。 */}
+           {activeMode === 'standardize' && (
+             <div className="max-w-2xl mx-auto space-y-3">
+               <div className="text-sm text-slate-600 bg-indigo-50 border border-indigo-200 rounded-lg p-3 leading-relaxed">
+                 改善（③④）で効果が出たら、<b>その成果を「標準」に反映して定着</b>させます。基準時間を更新し、安定した作業順を固定します。
+               </div>
+               <button onClick={() => onGoOptimize && onGoOptimize('target')} className="w-full text-left bg-white border-2 border-indigo-200 hover:border-indigo-400 rounded-xl p-4 flex items-center gap-3 transition">
+                 <div className="bg-indigo-100 p-2.5 rounded-lg shrink-0"><Target className="w-6 h-6 text-indigo-600" /></div>
+                 <div className="flex-1"><div className="font-black text-slate-800">目標時間最適化 →</div><div className="text-xs text-slate-500 mt-0.5">実績に合わせて基準時間（目標）を更新。誰が・いつ・何を・根拠つきで管理。</div></div>
+               </button>
+               <button onClick={() => onGoOptimize && onGoOptimize('strict')} className="w-full text-left bg-white border-2 border-rose-200 hover:border-rose-400 rounded-xl p-4 flex items-center gap-3 transition">
+                 <div className="bg-rose-100 p-2.5 rounded-lg shrink-0"><ShieldCheck className="w-6 h-6 text-rose-600" /></div>
+                 <div className="flex-1"><div className="font-black text-slate-800">厳密モード →</div><div className="text-xs text-slate-500 mt-0.5">十分データが貯まった型式で、最適な作業順を「1台目から順番」に固定し、飛ばしを防ぐ。</div></div>
+               </button>
+             </div>
+           )}
         </div>
      </div>
    );
@@ -27130,7 +27195,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} onRestore={restoreAllFromBackup} db={db} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
