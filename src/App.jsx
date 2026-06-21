@@ -514,6 +514,41 @@ const stepBreakdown = (lots, { model, templateId, startMs = 0, endMs = Infinity,
   let cum = 0; rows.forEach(r => { cum += r.totalSec; r.cumPct = Math.round(cum / grand * 100); r.sharePct = Math.round(r.totalSec / grand * 1000) / 10; });
   return { rows, grandTotalSec: grand };
 };
+// === じっと見るモード(要素作業分割)のヘルパー ===
+// 観測プランの検索: (templateId, stepKey, model) を優先し、model未指定の全型式共通プランにフォールバック
+const findObsPlan = (plans, templateId, stepKey, model) => {
+  if (!templateId || !stepKey) return null;
+  const ps = (plans || []).filter(p => p.enabled && p.templateId === templateId && p.stepKey === stepKey && Array.isArray(p.elements) && p.elements.length);
+  return ps.find(p => p.model && p.model === model) || ps.find(p => !p.model) || null;
+};
+// 要素別の実績集計: 完了タスクの elementDurations を要素IDごとに集める→中央値/n
+const obsElementStats = (lots, { model, templateId, stepKey, plan }) => {
+  const byEl = {};
+  let observedUnits = 0; // 内訳(elementDurations)を持つ完了台の実数 = 「何台ぶんの観測か」
+  (lots || []).forEach(l => {
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    if (model && l.model !== model) return;
+    if (templateId && l.templateId !== templateId) return;
+    (l.steps || []).forEach((step, idx) => {
+      if (targetTimeStepKey(step) !== stepKey || step.lotOnce) return; // 段取り(回数ベース)は第1版対象外
+      for (let u = 0; u < (l.quantity || 1); u++) {
+        const t = (l.tasks || {})[`${step.id}-${u}`] || (l.tasks || {})[`${idx}-${u}`];
+        if (!t || !t.elementDurations) continue;
+        const entries = Object.entries(t.elementDurations).filter(([, sec]) => sec > 0);
+        if (!entries.length) continue;
+        observedUnits++; // この台は内訳ありの1観測
+        entries.forEach(([eid, sec]) => { (byEl[eid] = byEl[eid] || []).push(sec); });
+      }
+    });
+  });
+  const els = (plan?.elements || []).map(e => ({ id: e.id, label: e.label, durations: byEl[e.id] || [] }));
+  // プランに無い要素IDも拾う(過去の観測)
+  Object.keys(byEl).forEach(eid => { if (!els.some(e => e.id === eid)) els.push({ id: eid, label: '(削除された要素)', durations: byEl[eid] }); });
+  const rows = els.map(e => ({ id: e.id, label: e.label, n: e.durations.length, median: medianOf(e.durations), durations: e.durations }));
+  const total = rows.reduce((s, r) => s + r.median, 0) || 1;
+  rows.forEach(r => { r.sharePct = Math.round(r.median / total * 1000) / 10; });
+  return { rows: rows.sort((a, b) => b.median - a.median), totalMedian: total, observedUnits };
+};
 // ヒストグラム: durations を bins 個の階級に分ける
 const histogramOf = (durations, bins = 8) => {
   if (!durations || !durations.length) return { buckets: [], min: 0, max: 0, width: 0 };
@@ -6259,7 +6294,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {} }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [] }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -6463,6 +6498,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
   const [showPdf, setShowPdf] = useState(false);
   const [activeCustomTaskKey, setActiveCustomTaskKey] = useState(null);
+
+  // じっと見るモード: 進行中タスクの「要素ラップ」を記録 (連続ラップ方式)。
+  //   { taskKey: [{ elementId, atMs }] }。Firestore には完了時にまとめて書く (タップ毎の書込はしない)。
+  //   ref はミラー = 完了処理(toggleTask)が stale closure を踏まずに最新ラップを読むため。
+  const [elementLaps, setElementLaps] = useState({});
+  const elementLapsRef = useRef({});
 
   // activeCustomTaskKey は "数値idx-unit" or "stepId-unit" の2形式が混在する。
   // 安全に stepIdx/unitIdx を取り出すヘルパー (voice ハンドラ・描画両方で利用)
@@ -8133,6 +8174,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       }
       const previousTasks = { ...tasks };
       const nowTs = Date.now();
+      // じっと見る: 新規着手(初回)は前回の観測ラップを破棄。再開(firstStartTimeあり)はラップを保持。
+      if (!currentTask.firstStartTime) clearElementLaps(key);
       newTasks[key] = {
         ...currentTask,
         status: 'processing',
@@ -8148,7 +8191,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const previousTasks = { ...tasks };
       const now = Date.now();
       const sessionDuration = currentTask.startTime ? Math.floor((now - currentTask.startTime) / 1000) : 0;
-      newTasks[key] = {
+      const completed = {
         ...currentTask,
         status: 'completed',
         duration: currentTask.duration + sessionDuration,
@@ -8158,10 +8201,97 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         firstStartTime: currentTask.firstStartTime || (currentTask.startTime || now),
         workerName: inspectorName, // 台ごとの作業者を記録 (担当切替に追従)
       };
+      // じっと見る: ラップがあれば要素別時間を添付 (クリーン&完結のみ Σ要素=工程時間。歪む場合は内訳を付けない)。
+      const elData = buildElementData(key, completed, now);
+      if (elData) { completed.elementMarks = elData.elementMarks; if (elData.elementDurations) completed.elementDurations = elData.elementDurations; }
+      newTasks[key] = completed;
       setTasks(newTasks);
       onSave({ tasks: newTasks, status: 'processing' });
       startUndoTimer({ key, type: 'task', previousTasks });
+      clearElementLaps(key); // 完了したらラップは常に破棄(次回着手・続きに残さない)
     }
+  };
+
+  // === じっと見るモード(要素作業分割) のラップ記録 ===
+  // 進行中タスクの観測プランを解決 (activeCustomTaskKey 基準)。lotOnce / 無効プラン / 要素ゼロ は対象外。
+  const activeObs = useMemo(() => {
+    if (!activeCustomTaskKey) return null;
+    const { stepIdx, unitIdx, isLot } = parseActiveTaskKey(activeCustomTaskKey);
+    const step = localSteps[stepIdx];
+    if (!step || step.lotOnce || isLot) return null; // ロット1回工程は第1版では対象外
+    const key = step.id ? `${step.id}-${unitIdx}` : `${stepIdx}-${unitIdx}`;
+    const t = tasks[key];
+    if (!t || t.status !== 'processing') return null;
+    const plan = findObsPlan(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model);
+    if (!plan || plan.enabled === false || !(plan.elements || []).length) return null;
+    return { key, step, stepIdx, unitIdx, plan, els: plan.elements };
+  }, [activeCustomTaskKey, localSteps, tasks, observationPlans, lot.templateId, lot.model]);
+
+  // ラップを1つ記録 = 「今やっている要素が終わった」。elementId はいま閉じる要素 (= 既存ラップ数番目の要素)。
+  const recordElementLap = (key, elementId) => {
+    setElementLaps(prev => {
+      const arr = [...(prev[key] || []), { elementId, atMs: Date.now() }];
+      const next = { ...prev, [key]: arr };
+      elementLapsRef.current = next;
+      return next;
+    });
+  };
+  // 直前のラップを取り消す (押し間違いの救済)。
+  const undoElementLap = (key) => {
+    setElementLaps(prev => {
+      const arr = (prev[key] || []).slice(0, -1);
+      const next = { ...prev, [key]: arr };
+      elementLapsRef.current = next;
+      return next;
+    });
+  };
+  // タスクの観測ラップを破棄 (新規開始・やり直し時に前回分を残さない)。
+  const clearElementLaps = (key) => {
+    if (!elementLapsRef.current[key]) return;
+    setElementLaps(prev => { const next = { ...prev }; delete next[key]; elementLapsRef.current = next; return next; });
+  };
+  // 完了時: ラップから要素別時間を算出 (連続ラップ方式: Σ要素 = 工程時間 を必ず保証)。
+  //   壁時計のラップ間隔を比率にして task.duration へ正規化 (休憩はあっても合計は工程時間に一致)。
+  //   返り値 { elementMarks, elementDurations } を完了タスクに添付。ラップ無しなら null (観測せず=非破壊)。
+  const buildElementData = (key, taskObj, endMs) => {
+    const t0base = taskObj.firstStartTime || 0;
+    // 前セッションの古いラップ(中断→やり直し等で残存)を除外 = 自己修復。今回の着手以降のラップのみ採用。
+    const laps = (elementLapsRef.current[key] || []).filter(m => m.atMs >= t0base && m.atMs <= endMs).slice().sort((a, b) => a.atMs - b.atMs);
+    if (!laps.length) return null;
+    const dur = taskObj.duration || 0;
+    if (dur <= 0) return null;
+    const marks = laps.map(m => ({ elementId: m.elementId, atMs: m.atMs }));
+    // プラン要素(完了時に再解決)
+    const { stepIdx } = parseActiveTaskKey(key);
+    const step = localSteps[stepIdx];
+    const plan = step ? findObsPlan(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model) : null;
+    const els = plan?.elements || [];
+    const t0 = taskObj.firstStartTime || laps[0].atMs;
+    const wallSpanSec = (endMs - t0) / 1000;
+    // 内訳を「採用」する条件 = ①全要素の区切りを刻んだ(完結) ②計測が連続(休憩/続き等の壁時計ギャップが無い=壁時計≒実測)。
+    //   どちらかが崩れると比率配分が歪むので、内訳(elementDurations)は付けず marks のみ残す = 誤った数字を出さない(集計から自動除外)。
+    //   これで continue(続き)/一時停止跨ぎ/途中ラップ未完了/プラン縮小 のいずれでも「嘘の内訳」を作らない。
+    const complete = els.length >= 2 && laps.length === els.length - 1;
+    const clean = wallSpanSec <= dur + Math.max(8, dur * 0.15);
+    if (!complete || !clean) return { elementMarks: marks, elementDurations: null };
+    // 連続ラップ → 比率正規化で Σ要素 = 工程時間 を厳密化。
+    const boundaries = [t0, ...laps.map(m => m.atMs), endMs];
+    // 区間 i の要素ID: i<laps.length は そのラップが閉じた要素、最後の区間は「いま計測中」=els[laps.length](縮小時は現プラン末尾へ)
+    const segIds = [...laps.map(m => m.elementId), (els[laps.length]?.id) || (els[els.length - 1]?.id) || laps[laps.length - 1].elementId];
+    const raw = [];
+    for (let i = 0; i < boundaries.length - 1; i++) raw.push(Math.max(0, boundaries[i + 1] - boundaries[i]));
+    const totalRaw = raw.reduce((a, b) => a + b, 0) || 1;
+    const durations = {};
+    let acc = 0;
+    raw.forEach((r, i) => { const id = segIds[i]; const v = Math.round(dur * r / totalRaw); durations[id] = (durations[id] || 0) + v; acc += v; });
+    // 丸め誤差を吸収し Σ=dur を厳密保証。負分を捨てないよう、差を載せても非負になる区間の要素へ寄せる。
+    const diff = dur - acc;
+    if (diff !== 0) {
+      let i = segIds.length - 1;
+      while (i > 0 && (durations[segIds[i]] || 0) + diff < 0) i--;
+      durations[segIds[i]] = Math.max(0, (durations[segIds[i]] || 0) + diff);
+    }
+    return { elementMarks: marks, elementDurations: durations };
   };
 
   // 分割測定アプリ連携: ステーションを選んで開始を確定する。station='' は「連動せず開始」(指令を送らず手動運用)。
@@ -8280,6 +8410,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const isAutoCont = autoEndSecForStep(contStep) > 0;
       newTasks[key] = { ...currentTask, status: 'processing', startTime: nowTs, firstStartTime: currentTask.firstStartTime || nowTs, ...(isAutoCont ? { autoEnded: false } : {}) };
       setActiveCustomTaskKey(key);
+      clearElementLaps(key); // じっと見る: 続きは別セッション。前回ラップを残さない(続きは壁時計ギャップで内訳対象外になる)
+
       // 分割測定 連動(測定開始)工程を「作業の続き」で延長する場合: done自動停止は完了時に追跡を外しているため、
       //   前回選んだステーションで start_capture を再送し、再び自動停止の対象に登録する(再武装)。station 不明なら手動完了に委ねる。
       if (rotaryConfig?.enabled && contStep?.rotaryLink && !contStep?.lotOnce && (contStep.rotaryRole || 'capture') === 'capture' && db) {
@@ -9659,6 +9791,51 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                      ))
                    : <LiveParallelGuide guide={liveParallelGuide} fmtTime={formatTime} onHide={toggleParallelGuide} />
                )}
+               {/* じっと見る観測パネル: 観測プランのある工程を計測中だけ表示。要素を順に区切る(連続ラップ方式)。 */}
+               {activeObs && (() => {
+                 const { key, step, unitIdx, els } = activeObs;
+                 const laps = elementLaps[key] || [];
+                 const lapsN = laps.length;
+                 const now = Date.now();
+                 const task = tasks[key] || {};
+                 const t0 = task.firstStartTime || (laps[0]?.atMs) || now;
+                 const boundStart = (i) => i === 0 ? t0 : laps[i - 1].atMs;
+                 return (
+                   <div className="mb-3 rounded-xl border-2 border-blue-400 bg-gradient-to-r from-blue-50 to-sky-50 p-3 shadow-sm">
+                     <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+                       <div className="text-sm font-black text-blue-800 flex items-center gap-1.5"><Eye className="w-4 h-4" /> じっと見る観測中 — 「{step.title}」#{unitIdx + 1}台目</div>
+                       <span className="text-[10px] text-blue-500 font-bold">要素を順に区切る（合計＝この工程の時間）</span>
+                     </div>
+                     <div className="flex flex-wrap gap-1.5 mb-2">
+                       {els.map((el, i) => {
+                         const done = i < lapsN;
+                         const current = i === lapsN;
+                         const raw = done ? Math.floor((laps[i].atMs - boundStart(i)) / 1000) : current ? Math.floor((now - boundStart(i)) / 1000) : 0;
+                         return (
+                           <div key={el.id} className={`px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 border ${done ? 'bg-blue-600 text-white border-blue-700' : current ? 'bg-white text-blue-800 border-blue-500 ring-2 ring-blue-300' : 'bg-white/50 text-slate-400 border-slate-200'}`}>
+                             <span className="opacity-70">{i + 1}.</span><span>{el.label}</span>
+                             {done && <span className="font-mono bg-white/25 px-1 rounded">{formatTime(raw)}</span>}
+                             {current && <span className="font-mono text-blue-600 animate-pulse">{formatTime(raw)} 計測中</span>}
+                           </div>
+                         );
+                       })}
+                     </div>
+                     <div className="flex items-center gap-2">
+                       {lapsN < els.length - 1 ? (
+                         <button onClick={() => recordElementLap(key, els[lapsN].id)} className="flex-1 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white text-sm font-black px-3 py-2.5 rounded-lg shadow flex items-center justify-center gap-1.5 transition">
+                           ⏱ 「{els[lapsN].label}」完了 → 次の要素へ
+                         </button>
+                       ) : (
+                         <div className="flex-1 text-center text-xs text-blue-700 font-bold bg-blue-100 rounded-lg py-2.5">最後の要素「{els[els.length - 1]?.label}」を計測中 — この工程を完了すると締まります</div>
+                       )}
+                       {lapsN > 0 && (
+                         <button onClick={() => undoElementLap(key)} className="px-3 py-2.5 rounded-lg border border-slate-300 bg-white text-slate-500 text-xs font-bold hover:bg-slate-50 active:scale-95 transition">1つ戻す</button>
+                       )}
+                     </div>
+                     <div className="text-[10px] text-slate-400 mt-1.5">※ 上の時間は速報値。最後まで区切って一気に計測した時だけ内訳を記録します（途中で一時停止・続きにすると内訳は記録されず、工程の合計時間だけ残ります）。テンプレ本体は変更しません。</div>
+                   </div>
+                 );
+               })()}
                {/* 厳密モード推奨バナー: データが十分貯まったテンプレで提案 (誰でも型式ごとに有効化可・作業中いつでも切替) */}
                {showStrictSuggestion && (
                  <div className="mb-3 bg-gradient-to-r from-rose-50 to-amber-50 border-2 border-rose-300 rounded-xl p-3 flex items-start gap-3">
@@ -14394,7 +14571,7 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
   );
 };
 
-const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], improvements = [], currentUserName = '', onRestore = null }) => {
+const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], improvements = [], observationPlans = [], currentUserName = '', onRestore = null }) => {
   const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
   const isCompleted = (l) => l.status === 'completed' || l.location === 'completed';
   const ord = (l) => l.orderNo || l.id;
@@ -14430,9 +14607,9 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   const errCount = issues.filter(i => i.sev === 'err').length;
   const warnCount = issues.filter(i => i.sev === 'warn').length;
 
-  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length, 改善カルテ: (improvements || []).length };
+  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length, 改善カルテ: (improvements || []).length, 観測プラン: (observationPlans || []).length };
   const doBackup = () => {
-    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, improvements, lots };
+    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, improvements, observationPlans, lots };
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url;
     a.download = `バックアップ_製品検査_${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -14446,7 +14623,7 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   const [rstChk, setRstChk] = useState(false);
   const [rstProg, setRstProg] = useState({ done: 0, total: 0 });
   const [rstMsg, setRstMsg] = useState('');
-  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業', improvements: '改善カルテ' };
+  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業', improvements: '改善カルテ', observationPlans: '観測プラン' };
   const curIdSet = (arr) => new Set((arr || []).map(x => x && x.id).filter(Boolean));
   const diffOf = (cur, bk) => {
     const cs = curIdSet(cur); let create = 0, over = 0;
@@ -14461,7 +14638,7 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
       const app = parsed && parsed.meta && parsed.meta.app;
       if (app && app !== 'product-inspection') { setRst({ err: `このファイルは「${app}」用のバックアップです。製品検査アプリには取り込めません（データ破損防止のためブロックしました）。`, fileName: f.name }); setRstMsg(''); setRstPhase('error'); return; }
       if (!parsed || (!Array.isArray(parsed.lots) && !parsed.settings)) { setRst({ err: 'バックアップ形式ではないようです（lots / settings が見つかりません）。', fileName: f.name }); setRstMsg(''); setRstPhase('error'); return; }
-      const diff = { lots: diffOf(lots, parsed.lots), templates: diffOf(templates, parsed.templates), workers: diffOf(workers, parsed.workers), indirectWork: diffOf(indirectWork, parsed.indirectWork), improvements: diffOf(improvements, parsed.improvements) };
+      const diff = { lots: diffOf(lots, parsed.lots), templates: diffOf(templates, parsed.templates), workers: diffOf(workers, parsed.workers), indirectWork: diffOf(indirectWork, parsed.indirectWork), improvements: diffOf(improvements, parsed.improvements), observationPlans: diffOf(observationPlans, parsed.observationPlans) };
       setRst({ parsed, diff, fileName: f.name, meta: parsed.meta || {} }); setRstConfirm(''); setRstChk(false); setRstMsg(''); setRstPhase('preview');
     } catch (err) { setRst({ err: 'ファイルの読み込み/解析に失敗しました: ' + (err.message || err), fileName: f.name }); setRstMsg(''); setRstPhase('error'); }
     finally { if (fileRef.current) fileRef.current.value = ''; }
@@ -15182,6 +15359,75 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
   );
 };
 
+// じっと見るモード=工程を要素作業に分けて観測するプランの編集(テンプレ本体は壊さず別コレクションに保存)
+const ObservationPlanEditor = ({ plan, templateId, stepKey, stepTitle, model, models = [], allPlans = [], saveData, deleteData, onClose }) => {
+  const [elements, setElements] = useState(() => (plan?.elements?.length ? plan.elements.map(e => ({ ...e })) : [{ id: generateId(), label: '' }, { id: generateId(), label: '' }]));
+  const [scopeModel, setScopeModel] = useState(plan?.model || '');
+  const [enabled, setEnabled] = useState(plan ? plan.enabled !== false : true);
+  const [busy, setBusy] = useState(false);
+  const addEl = () => setElements(p => [...p, { id: generateId(), label: '' }]);
+  const setLabel = (i, v) => setElements(p => p.map((e, j) => j === i ? { ...e, label: v } : e));
+  const removeEl = (i) => setElements(p => p.filter((_, j) => j !== i));
+  const move = (i, d) => setElements(p => { const a = [...p]; const j = i + d; if (j < 0 || j >= a.length) return a; [a[i], a[j]] = [a[j], a[i]]; return a; });
+  const save = async () => {
+    const els = elements.filter(e => (e.label || '').trim()).map((e, i) => ({ id: e.id, label: e.label.trim(), order: i }));
+    if (els.length < 2) { alert('要素を2つ以上入力してください（1つでは分割になりません）'); return; }
+    setBusy(true);
+    // 対象スコープ(全型式='' / 特定型式)ごとに別プラン。同一(templateId,stepKey,scope)の既存があればそのidを再利用(重複防止)、
+    //   無ければ新規発番。スコープを変えた時に元スコープのプランをidごと上書きで壊さない。
+    const targetScope = scopeModel || '';
+    const same = (allPlans || []).find(p => p.templateId === templateId && p.stepKey === stepKey && (p.model || '') === targetScope);
+    const id = same?.id || generateId();
+    await saveData('observationPlans', id, { id, templateId, stepKey, stepTitle, model: targetScope, enabled, elements: els, updatedAt: Date.now() });
+    setBusy(false); onClose();
+  };
+  const del = async () => { if (!plan?.id || !deleteData) return; if (!confirm('この観測プランを削除しますか？（記録済みの要素データは残ります）')) return; await deleteData('observationPlans', plan.id); onClose(); };
+  return (
+    <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white w-full max-w-lg max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-blue-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <h3 className="font-bold flex items-center gap-2"><Eye className="w-5 h-5" /> じっと見る — 「{stepTitle}」を要素に分ける</h3>
+          <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+        </div>
+        <div className="p-4 overflow-y-auto space-y-3 text-sm">
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-2.5 text-[12px] text-blue-900">
+            この工程を、作業の中の小さな単位（要素）に分けて観測します。<b>合計は元の工程時間のまま</b>で、要素ごとの内訳も取れます。次に作業者がこの工程を計測すると、要素ごとの「区切り」ボタンが出ます。
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-1"><label className="text-xs font-bold text-slate-600">要素（始まり→終わりの順に）</label><label className="flex items-center gap-1 text-[11px] text-slate-500"><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />ON（作業画面で区切りボタンを出す）</label></div>
+            <div className="space-y-1.5">
+              {elements.map((e, i) => (
+                <div key={e.id} className="flex items-center gap-1.5">
+                  <span className="text-xs text-slate-400 w-4">{i + 1}</span>
+                  <input value={e.label} onChange={ev => setLabel(i, ev.target.value)} placeholder={i === 0 ? '例: 治具に取り付け' : (i === 1 ? '例: 測定' : '例: 取り外し・記録')} className="flex-1 border rounded p-1.5 text-sm" />
+                  <button onClick={() => move(i, -1)} disabled={i === 0} className="text-slate-300 hover:text-slate-600 disabled:opacity-30"><ArrowUp className="w-4 h-4" /></button>
+                  <button onClick={() => move(i, 1)} disabled={i === elements.length - 1} className="text-slate-300 hover:text-slate-600 disabled:opacity-30"><ArrowDown className="w-4 h-4" /></button>
+                  <button onClick={() => removeEl(i)} className="text-slate-300 hover:text-rose-500"><Trash2 className="w-4 h-4" /></button>
+                </div>
+              ))}
+            </div>
+            <button onClick={addEl} className="mt-1.5 text-xs px-2.5 py-1 border border-blue-200 bg-blue-50 text-blue-700 rounded font-bold">＋ 要素を追加</button>
+          </div>
+          <div className="text-[11px] text-slate-500 bg-slate-50 border rounded p-2 leading-relaxed">
+            コツ：1要素は<b>6秒以上</b>（短すぎると人手で測れない）。始まり/終わりは<b>はっきりした目印</b>（機械の音・治具の掛け外し・工具を置く・手の方向転換）で区切る。<b>手作業と機械の自動</b>は分ける。
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-slate-600">対象:</label>
+            <select value={scopeModel} onChange={e => setScopeModel(e.target.value)} className="border rounded px-2 py-1 text-xs">
+              <option value="">このテンプレの全型式</option>
+              {models.map(m => <option key={m} value={m}>{m} だけ</option>)}
+            </select>
+          </div>
+        </div>
+        <div className="px-4 py-3 border-t flex items-center justify-between shrink-0">
+          {plan?.id && deleteData ? <button onClick={del} className="text-xs text-rose-500 hover:text-rose-700 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> プラン削除</button> : <span />}
+          <button onClick={save} disabled={busy} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-sm">保存</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // 個別値プロット(strip/individual value plot): 横一本に全台の点+中央値の太線+目標の点線。
 // 少数n(2〜15台)でも破綻せず、誰でも分かる(箱ひげが読めない人向け)。n≥6でQ1-Q3の薄帯を足す。div/SVG自前描画。
 const StripPlot = ({ values = [], target = 0 }) => {
@@ -15227,7 +15473,7 @@ const StripPlot = ({ values = [], target = 0 }) => {
 
 // === 工程分析ビュー: 型式(+テンプレ)を選び、データをそのままグラフで見る土台 ===
 // ①工程別パレート(どこが一番時間か) ②選択工程のバラつきヒストグラム+CV ③月次推移 ④作業者比較 ⑤根拠(n/最小最大)
-const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [] }) => {
+const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [], observationPlans = [], saveData = null, deleteData = null, currentUserName = '' }) => {
   const completed = useMemo(() => (lots || []).filter(l => l.status === 'completed' || l.location === 'completed'), [lots]);
   const models = useMemo(() => [...new Set(completed.map(l => l.model))].filter(Boolean).sort(), [completed]);
   const [model, setModel] = useState('');
@@ -15237,6 +15483,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
     return ids.map(id => ({ id, name: templates.find(t => t.id === id)?.name || id }));
   }, [completed, model, templates]);
   const [templateId, setTemplateId] = useState('');
+  const [obsEditor, setObsEditor] = useState(false);
   const nowMs = Date.now();
   const bd = useMemo(() => stepBreakdown(lots, { model, templateId: templateId || undefined, startMs: nowMs - 365 * 86400000, endMs: nowMs, customTargetTimes, modelGroups }), [lots, model, templateId, customTargetTimes, modelGroups]);
   const [selKey, setSelKey] = useState('');
@@ -15252,6 +15499,17 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   const maxTrend = Math.max(1, ...trend.map(t => t.median));
   const workerRows = useMemo(() => sel ? Object.entries(sel.workers).map(([w, ds]) => ({ name: (workers.find(x => x.id === w)?.name) || w, median: medianOf(ds), n: ds.length })).filter(x => x.n >= 1).sort((a, b) => a.median - b.median) : [], [sel, workers]);
   const maxWorker = Math.max(1, ...workerRows.map(w => w.median));
+  // じっと見るモード: 選択工程の観測プラン + 要素別実績。
+  //   作業画面/集計が記録に使う findObsPlan(有効&型式専用優先) と同じ解決にして表示と記録のプランを一致させる。
+  //   有効プランが無い時だけ、無効/空プランも編集できるよう「型式専用→全型式」の順で決定的にフォールバック。
+  const planForSel = useMemo(() => {
+    if (!sel || !templateId) return null;
+    const live = findObsPlan(observationPlans, templateId, sel.stepKey, model);
+    if (live) return live;
+    const ps = (observationPlans || []).filter(p => p.templateId === templateId && p.stepKey === sel.stepKey);
+    return ps.find(p => p.model && p.model === model) || ps.find(p => !p.model) || null;
+  }, [observationPlans, templateId, sel, model]);
+  const elStats = useMemo(() => (sel && templateId) ? obsElementStats(lots, { model, templateId, stepKey: sel.stepKey, plan: planForSel }) : null, [lots, model, templateId, sel, planForSel]);
   const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
 
   // === レポート出力(A4 PDF コンパクト/詳細 + Excel) ===
@@ -15355,6 +15613,11 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                 <span className="text-sm font-bold text-slate-700">② {sel.stepTitle} の中身</span>
                 <span className="text-xs text-slate-400">（{sel.n}台ぶん）</span>
                 {(() => { const [lbl, cls] = cvBadge(sel.cv); return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls}`}>{lbl}（CV {sel.cv}）</span>; })()}
+                {saveData && !sel.stepKey?.includes('lot') && (
+                  templateId
+                    ? <button onClick={() => setObsEditor(true)} className="ml-auto text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{planForSel ? 'じっと見る設定' : 'じっと見る（要素に分ける）'}</button>
+                    : <span className="ml-auto text-[10px] text-slate-400">要素に分けるにはテンプレを選択</span>
+                )}
               </div>
               {/* 統計サマリ */}
               <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 text-center">
@@ -15400,10 +15663,33 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                   </div>
                 </div>
               )}
+              {/* ⑤ 要素別の内訳(じっと見る) */}
+              {(planForSel || (elStats && elStats.observedUnits > 0)) && (
+                <div className="border-t border-slate-100 pt-2">
+                  <div className="text-xs font-bold text-blue-700 mb-1 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />⑤ 要素別の内訳（じっと見る）{planForSel && planForSel.enabled === false && <span className="text-[10px] text-slate-400 font-normal">（観測OFF）</span>}</div>
+                  {elStats && elStats.observedUnits > 0 ? (
+                    <div className="space-y-1">
+                      {(() => { const maxEl = Math.max(1, ...elStats.rows.map(r => r.median)); return elStats.rows.map((r, i) => (
+                        <div key={r.id} className="flex items-center gap-2 text-xs">
+                          <span className="w-32 truncate shrink-0 text-slate-700">{i + 1}. {r.label}</span>
+                          <div className="flex-1 h-2.5 bg-slate-100 rounded overflow-hidden"><div className="h-full bg-blue-400" style={{ width: `${Math.max(2, Math.round(r.median / maxEl * 100))}%` }} /></div>
+                          <span className="font-mono text-slate-600 w-28 text-right shrink-0">{fmt(r.median)}・{r.sharePct}%・{r.n}台</span>
+                        </div>
+                      )); })()}
+                      <div className="text-[10px] text-slate-400">各要素の中央値の合計（参考）＝{fmt(elStats.totalMedian)}。一番長い要素＝この工程のボトルネック。{elStats.observedUnits}台ぶんの観測（各要素の台数は右端）。中央値の合計は工程の中央値と完全一致はしません（各台の合計は工程時間に一致）。</div>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-500">観測プランあり（{planForSel?.elements?.length || 0}要素）。作業画面でこの工程を計測すると、要素ごとの内訳がここに出ます。</div>
+                  )}
+                </div>
+              )}
               <div className="text-[10px] text-slate-400">この画面は集計を見るだけ（データは変更しません）。改善したい工程は「改善PDCA」タブの重点工程からカルテ化して対策→効果確認へ。</div>
             </div>
           )}
         </>
+      )}
+      {obsEditor && sel && templateId && (
+        <ObservationPlanEditor plan={planForSel} templateId={templateId} stepKey={sel.stepKey} stepTitle={sel.stepTitle} model={model} models={models} allPlans={observationPlans} saveData={saveData} deleteData={deleteData} onClose={() => setObsEditor(false)} />
       )}
     </div>
   );
@@ -15436,7 +15722,7 @@ const ANALYSIS_GROUPS = [
     { k: 'rotary', l: '分割測定', color: 'text-cyan-600' },
   ] },
 ];
-const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], templates = [], onRestore = null, db = null }) => {
+const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], onRestore = null, db = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('process-analysis'); // 既定=工程分析(データを見る土台)。グループは activeMode から導出
   const activeGroup = ANALYSIS_GROUPS.find(g => g.tabs.some(t => t.k === activeMode)) || ANALYSIS_GROUPS[0];
@@ -17290,9 +17576,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
            {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
-           {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} />}
+           {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
-           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} currentUserName={currentUserName} onRestore={onRestore} />}
+           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} currentUserName={currentUserName} onRestore={onRestore} />}
         </div>
      </div>
    );
@@ -24421,6 +24707,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    // State: Indirect Work (間接作業)
    const [indirectWork, setIndirectWork] = useState([]);
    const [improvementCards, setImprovementCards] = useState([]); // 改善PDCAカルテ (improvements コレクション)
+   const [observationPlans, setObservationPlans] = useState([]); // じっと見るモード=要素作業分割の観測プラン (observationPlans コレクション)
    const [showIndirectModal, setShowIndirectModal] = useState(false);
    const [showDailySummary, setShowDailySummary] = useState(false);
    const [showShiftHandover, setShowShiftHandover] = useState(false);
@@ -24547,6 +24834,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        onSnapshot(getPath('announcements'), (snap) => setAnnouncements(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(getPath('indirectWork'), (snap) => setIndirectWork(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.startTime || 0) - (a.startTime || 0)))),
        onSnapshot(getPath('improvements'), (snap) => setImprovementCards(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
+       onSnapshot(getPath('observationPlans'), (snap) => setObservationPlans(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), (snap) => {
          if (snap.exists()) {
             const data = snap.data();
@@ -24686,6 +24974,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        ['workers', parsed.workers],
        ['indirectWork', parsed.indirectWork],
        ['improvements', parsed.improvements],
+       ['observationPlans', parsed.observationPlans],
      ];
      const total = cols.reduce((n, [, a]) => n + (Array.isArray(a) ? a.length : 0), 0) + 1; // +1: settings/config
      let done = 0;
@@ -26478,7 +26767,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} templates={templates} onRestore={restoreAllFromBackup} db={db} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} onRestore={restoreAllFromBackup} db={db} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
@@ -26651,6 +26940,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            overrunAlertConfig={settings.overrunAlert || {}}
            db={db}
            rotaryConfig={settings.rotaryLink || {}}
+           observationPlans={observationPlans}
            voiceSettingsConfig={settings.voiceSettings || {}}
            voiceCommandsConfig={settings.voiceCommands || null}
            undoTimeout={settings.undoTimeout || 5}
