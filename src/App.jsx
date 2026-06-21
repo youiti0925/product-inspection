@@ -331,6 +331,110 @@ const lotOnceKeysOf = (tasks, step) => Object.keys(tasks || {})
   .sort((a, b) => parseInt(a.slice(a.lastIndexOf('-') + 1)) - parseInt(b.slice(b.lastIndexOf('-') + 1)));
 const lotOnceCountOf = (tasks, step) => Math.max(1, lotOnceKeysOf(tasks, step).length); // 表示/分母用 (最低1回)
 
+// === 改善PDCA: 効果測定エンジン (純関数) ===
+// 指定の型式×工程×期間窓で、時間統計(平均/中央値/σ/CV/最小最大)・達成率・不具合件数を出す。
+// 窓は「タスク完了時刻(endTime優先, 無ければロット完了/更新時刻)」で切る (updatedAtは作業中ロットで揺れるため標本の時刻には使わない)。
+const toMsAny = (raw) => {
+  if (raw == null) return null;
+  if (typeof raw === 'number') return raw;
+  if (raw.seconds) return raw.seconds * 1000;
+  const t = new Date(raw).getTime();
+  return isNaN(t) ? null : t;
+};
+const PDCA_MIN_N = 5;            // 効果判定に必要な片側の最小標本数
+const PDCA_THRESHOLD_PCT = 5;    // 改善/悪化と判定する変化率しきい値(%)
+const PDCA_STALE_DAYS = 14;      // 対策実施から効果が出ない/悪化を「放置」と見なす日数
+const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGroups = [], startMs = 0, endMs = Infinity } = {}) => {
+  const samples = []; // {d, tgt}
+  let defectCount = 0;
+  const titlePart = stepKey ? (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey) : null;
+  (lots || []).forEach(l => {
+    if (!l) return;
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    if (model && l.model !== model) return;
+    const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
+    (l.steps || []).forEach((step, idx) => {
+      if (stepKey && targetTimeStepKey(step) !== stepKey) return;
+      const effTarget = getEffectiveTargetTime(step, l.model, customTargetTimes, modelGroups);
+      const keys = step.lotOnce
+        ? lotOnceKeysOf(l.tasks || {}, step)
+        : Array.from({ length: l.quantity || 1 }, (_, i) => ((l.tasks || {})[`${step.id}-${i}`] !== undefined ? `${step.id}-${i}` : `${idx}-${i}`));
+      keys.forEach(k => {
+        const t = (l.tasks || {})[k];
+        if (!t) return;
+        if (t.status !== 'completed' && t.status !== 'ng') return;
+        if (t.samplingSkipped) return;
+        const d = t.duration || 0; if (d <= 0) return;
+        const ms = toMsAny(t.endTime) || lotMs;
+        if (ms == null || ms < startMs || ms > endMs) return;
+        samples.push({ d, tgt: effTarget });
+      });
+    });
+    // 不具合件数: 不具合自身の timestamp で窓を切る (ロット updatedAt で丸ごと落とさない=製品の正しいパターン)
+    (l.interruptions || []).filter(i => i.type === 'defect').forEach(dft => {
+      const ms = toMsAny(dft.timestamp);
+      if (ms == null || ms < startMs || ms > endMs) return;
+      if (titlePart && (dft.stepInfo?.title || '') !== titlePart) return;
+      defectCount++;
+    });
+  });
+  const ds = samples.map(x => x.d).sort((a, b) => a - b);
+  const n = ds.length;
+  const sum = ds.reduce((a, b) => a + b, 0);
+  const mean = n ? sum / n : 0;
+  const median = n ? (n % 2 ? ds[(n - 1) / 2] : (ds[n / 2 - 1] + ds[n / 2]) / 2) : 0;
+  const variance = n ? ds.reduce((a, b) => a + (b - mean) ** 2, 0) / n : 0;
+  const sigma = Math.sqrt(variance);
+  const sumTgt = samples.reduce((a, x) => a + (x.tgt || 0), 0);
+  const within = samples.filter(x => x.tgt > 0 && x.d <= x.tgt).length;
+  return {
+    n, mean: Math.round(mean), median: Math.round(median), sigma: Math.round(sigma),
+    cv: mean > 0 ? Math.round((sigma / mean) * 1000) / 1000 : 0,
+    min: n ? ds[0] : 0, max: n ? ds[n - 1] : 0,
+    achievementRate: sum > 0 && sumTgt > 0 ? Math.round((sumTgt / sum) * 1000) / 10 : null,
+    within, sumTgt, sumAct: sum, defectCount,
+  };
+};
+// 効果判定: KPIに応じて 改善/悪化/横ばい/標本不足 を返す。時間/σ/不具合=小さいほど良い、達成率=大きいほど良い。
+const PDCA_KPIS = { time: '工程時間(中央値)', sigma: 'ばらつき(σ)', achievement: '達成率', defectRate: '不具合件数' };
+const pdcaKpiValue = (stat, kpi) => {
+  if (!stat) return null;
+  if (kpi === 'achievement') return stat.achievementRate;
+  if (kpi === 'sigma') return stat.sigma;
+  if (kpi === 'defectRate') return stat.defectCount;
+  return stat.median || stat.mean;
+};
+const computeVerdict = (baseline, after, kpi = 'time') => {
+  const label = PDCA_KPIS[kpi] || PDCA_KPIS.time;
+  const higherBetter = kpi === 'achievement';
+  if (!baseline || !after) return { result: 'insufficient', reason: '測定データなし', label };
+  const nB = baseline.n || 0, nA = after.n || 0;
+  const bv = pdcaKpiValue(baseline, kpi), av = pdcaKpiValue(after, kpi);
+  // 件数系(不具合)以外は片側5標本以上を要求
+  if (kpi !== 'defectRate' && (nB < PDCA_MIN_N || nA < PDCA_MIN_N)) {
+    return { result: 'insufficient', reason: `標本不足(前${nB}/後${nA}件・各${PDCA_MIN_N}件以上必要)`, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
+  }
+  if (bv == null || av == null || bv === 0) return { result: 'insufficient', reason: '比較値が不足', label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
+  const deltaPct = ((av - bv) / Math.abs(bv)) * 100;
+  let result;
+  if (higherBetter) result = deltaPct >= PDCA_THRESHOLD_PCT ? 'improved' : (deltaPct <= -PDCA_THRESHOLD_PCT ? 'worse' : 'flat');
+  else result = deltaPct <= -PDCA_THRESHOLD_PCT ? 'improved' : (deltaPct >= PDCA_THRESHOLD_PCT ? 'worse' : 'flat');
+  return { result, deltaPct: Math.round(deltaPct * 10) / 10, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
+};
+// 改善テーマ候補: 完了ロットに現れる 型式×工程 を列挙 (カルテ化の入口・乖離候補算出に使う)
+const enumerateModelSteps = (lots) => {
+  const map = new Map();
+  (lots || []).forEach(l => {
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    (l.steps || []).forEach(step => {
+      const sk = targetTimeStepKey(step);
+      const key = `${l.model}||${sk}`;
+      if (!map.has(key)) map.set(key, { model: l.model, stepKey: sk, stepTitle: step.title, category: step.category || '' });
+    });
+  });
+  return [...map.values()];
+};
+
 // === 分割測定アプリ(rotary_table)連携 Phase2: 時間取り半自動連動 ===
 // Web→アプリ: rotaryCommands に prepare / start_capture を書く。アプリ→Web: rotaryEvents の done を購読し測定タイマーを自動停止。
 // マスタ settings.rotaryLink.enabled が true のときだけ動く (既定OFF)。工程に step.rotaryLink + step.rotaryRole('prepare'|'capture')。
@@ -13873,13 +13977,23 @@ const AchievementRateView = ({ lots = [], customTargetTimes = {}, settings = {},
 //  ①時間オーバー: 進行中タスク(全作業者)が目標時間を超過  ②NG発生: 未修正のNGタスク
 //  5秒毎に再集計。読み取りのみ。「30分非表示」で一時ミュート可。
 // =============================================================================
-const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [] }) => {
+const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [], improvements = [] }) => {
   const [tick, setTick] = useState(0);
   const [open, setOpen] = useState(false);
   const [mutedUntil, setMutedUntil] = useState(0);
   useEffect(() => { const iv = setInterval(() => setTick(t => t + 1), 5000); return () => clearInterval(iv); }, []);
-  const { overs, ngs } = useMemo(() => {
-    const overs = []; const ngs = []; const now = Date.now();
+  const { overs, ngs, stales } = useMemo(() => {
+    const overs = []; const ngs = []; const stales = []; const now = Date.now();
+    // 改善PDCA: 対策実施から一定日数が経っても効果が出ない/悪化しているカルテ(効果測定中)を「放置」として警告
+    (improvements || []).forEach(im => {
+      if (im.status !== 'measuring' || !im.actionDate || !im.baseline) return;
+      const days = Math.floor((now - im.actionDate) / 86400000);
+      if (days < PDCA_STALE_DAYS) return;
+      const a = measureWindow(lots, { model: im.model, stepKey: im.stepKey, customTargetTimes, modelGroups, startMs: im.actionDate, endMs: now });
+      const v = computeVerdict(im.baseline, a, im.kpi || 'time');
+      if (v.result === 'improved') return; // 効いていれば放置ではない
+      stales.push({ id: im.id, model: im.model, title: im.stepTitle || im.stepKey, days, verdict: v });
+    });
     (lots || []).forEach(l => {
       if (l.status === 'completed') return;
       const steps = l.steps || []; const qty = l.quantity || 1; const tasks = l.tasks || {};
@@ -13917,9 +14031,9 @@ const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [] }
       });
     });
     overs.sort((a, b) => (b.sec / b.tgt) - (a.sec / a.tgt));
-    return { overs, ngs };
-  }, [lots, tick, customTargetTimes, modelGroups]);
-  const total = overs.length + ngs.length;
+    return { overs, ngs, stales };
+  }, [lots, tick, customTargetTimes, modelGroups, improvements]);
+  const total = overs.length + ngs.length + stales.length;
   const fmtMS = (s) => { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
   if (!total || Date.now() < mutedUntil) return null;
   return (
@@ -13929,6 +14043,7 @@ const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [] }
           <span className="font-black text-sm flex items-center gap-2">⚠ 作業アラート
             {overs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">⏰ 時間オーバー {overs.length}</span>}
             {ngs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">🛑 NG {ngs.length}</span>}
+            {stales.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">📋 効果なし {stales.length}</span>}
           </span>
           <span className="text-xs font-bold">{open ? '閉じる ▼' : '詳細 ▲'}</span>
         </button>
@@ -13946,6 +14061,13 @@ const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [] }
                 <div className="flex items-center gap-1.5"><span className="font-black text-rose-600">🛑 {n.reworking ? 'NG修正中' : 'NG発生'}</span><span className="font-mono text-slate-500">{n.ord}</span><span className="text-slate-400 truncate">{n.model}</span></div>
                 <div className="mt-0.5 font-bold text-slate-700 truncate">{n.title} #{n.u + 1}{n.worker ? <span className="font-normal text-slate-500"> ／ {n.worker}</span> : null}</div>
                 {n.reason && <div className="text-slate-500 truncate" title={n.reason}>理由: {n.reason}</div>}
+              </div>
+            ))}
+            {stales.map(s => (
+              <div key={'s' + s.id} className="px-3 py-2 text-xs bg-amber-50/60">
+                <div className="flex items-center gap-1.5"><span className="font-black text-amber-700">📋 改善が効いていない</span><span className="text-slate-400 truncate">{s.model}</span></div>
+                <div className="mt-0.5 font-bold text-slate-700 truncate">{s.title}</div>
+                <div className="text-slate-500">実施から{s.days}日経過 ・ {s.verdict?.label}: {s.verdict?.result === 'worse' ? '悪化' : (s.verdict?.result === 'insufficient' ? '標本不足' : '横ばい')}{s.verdict?.deltaPct != null && s.verdict.result === 'worse' ? ` (${s.verdict.deltaPct > 0 ? '+' : ''}${s.verdict.deltaPct}%)` : ''}</div>
               </div>
             ))}
             <div className="px-3 py-2 bg-slate-50 flex items-center justify-between">
@@ -14126,7 +14248,7 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
   );
 };
 
-const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], currentUserName = '', onRestore = null }) => {
+const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], improvements = [], currentUserName = '', onRestore = null }) => {
   const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
   const isCompleted = (l) => l.status === 'completed' || l.location === 'completed';
   const ord = (l) => l.orderNo || l.id;
@@ -14162,9 +14284,9 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   const errCount = issues.filter(i => i.sev === 'err').length;
   const warnCount = issues.filter(i => i.sev === 'warn').length;
 
-  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length };
+  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length, 改善カルテ: (improvements || []).length };
   const doBackup = () => {
-    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, lots };
+    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, improvements, lots };
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url;
     a.download = `バックアップ_製品検査_${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -14325,7 +14447,436 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   );
 };
 
-const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, currentUserName = '', indirectWork = [], templates = [], onRestore = null, db = null }) => {
+// =============================================================================
+//  改善PDCA (改善カルテ) — 問題発見→計画→実施→自動 before/after 効果測定→定着/再計画/差戻し
+//  記録は消さずアーカイブに残し、エビデンス(統計・期間窓・対策内容・監査ログ)を詳細に保持する。
+// =============================================================================
+const PDCA_STATUS_META = {
+  plan: { label: '計画', col: '計画', color: 'bg-slate-100 text-slate-700 border-slate-300', dot: 'bg-slate-400' },
+  doing: { label: '実施中', col: '実施中', color: 'bg-blue-100 text-blue-700 border-blue-300', dot: 'bg-blue-500' },
+  measuring: { label: '効果測定中', col: '効果測定中', color: 'bg-amber-100 text-amber-700 border-amber-300', dot: 'bg-amber-500' },
+  effective: { label: '効果あり(定着)', col: '完了', color: 'bg-emerald-100 text-emerald-700 border-emerald-300', dot: 'bg-emerald-500' },
+  noeffect: { label: '効果なし', col: '完了', color: 'bg-slate-200 text-slate-600 border-slate-400', dot: 'bg-slate-500' },
+  worse: { label: '悪化', col: '完了', color: 'bg-rose-100 text-rose-700 border-rose-300', dot: 'bg-rose-500' },
+  rolledback: { label: '差し戻し', col: '完了', color: 'bg-purple-100 text-purple-700 border-purple-300', dot: 'bg-purple-500' },
+};
+const PDCA_COLS = ['計画', '実施中', '効果測定中', '完了'];
+const pdcaFmtSec = (s) => { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const pdcaFmtDate = (ts) => { if (!ts) return '—'; const d = new Date(ts); return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`; };
+const pdcaFmtDateTime = (ts) => { if (!ts) return '—'; const d = new Date(ts); return `${pdcaFmtDate(ts)} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+const pdcaKpiDisplay = (stat, kpi) => {
+  const v = pdcaKpiValue(stat, kpi);
+  if (v == null) return '—';
+  if (kpi === 'achievement') return `${v}%`;
+  if (kpi === 'defectRate') return `${v}件`;
+  return pdcaFmtSec(v); // time / sigma は秒
+};
+const PdcaVerdictBadge = ({ v }) => {
+  if (!v) return null;
+  const m = { improved: ['▲ 改善', 'bg-emerald-500'], worse: ['▼ 悪化', 'bg-rose-500'], flat: ['— 横ばい', 'bg-slate-400'], insufficient: ['⏳ 測定中', 'bg-amber-400'] }[v.result] || ['—', 'bg-slate-400'];
+  const showPct = v.deltaPct != null && (v.result === 'improved' || v.result === 'worse');
+  return <span className={`px-2 py-0.5 rounded text-white text-xs font-bold ${m[1]}`}>{m[0]}{showPct ? ` ${v.deltaPct > 0 ? '+' : ''}${v.deltaPct}%` : ''}</span>;
+};
+
+// 改善カルテ 月次推移ミニグラフ: 主指標の月次値を棒で描き、対策実施月を境に色分け(実施前=灰/実施後=緑)
+const PdcaMiniTrend = ({ lots, model, stepKey, kpi, customTargetTimes, modelGroups, actionDate, months = 6 }) => {
+  const data = useMemo(() => {
+    const out = []; const now = new Date();
+    for (let i = months - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const start = d.getTime();
+      const end = new Date(now.getFullYear(), now.getMonth() - i + 1, 1).getTime() - 1;
+      const stat = measureWindow(lots, { model, stepKey, customTargetTimes, modelGroups, startMs: start, endMs: end });
+      out.push({ label: `${d.getMonth() + 1}月`, monthStart: start, val: pdcaKpiValue(stat, kpi), n: stat.n });
+    }
+    return out;
+  }, [lots, model, stepKey, kpi, customTargetTimes, modelGroups, months]);
+  const vals = data.filter(x => x.val != null).map(x => x.val);
+  if (vals.length === 0) return <div className="text-[10px] text-slate-400 py-2">推移データなし</div>;
+  const max = Math.max(...vals, 1);
+  const actMonthStart = actionDate ? new Date(new Date(actionDate).getFullYear(), new Date(actionDate).getMonth(), 1).getTime() : null;
+  const fmtV = (v) => v == null ? '' : (kpi === 'achievement' ? `${Math.round(v)}%` : (kpi === 'defectRate' ? `${v}` : pdcaFmtSec(v)));
+  return (
+    <div>
+      <div className="flex items-end gap-1 h-24">
+        {data.map((x, i) => {
+          const isAfter = actMonthStart != null && x.monthStart >= actMonthStart;
+          const h = x.val != null ? Math.max(4, (x.val / max) * 72) : 0;
+          return (
+            <div key={i} className="flex-1 flex flex-col items-center justify-end" title={`${x.label} n=${x.n}台`}>
+              <div className="text-[8px] text-slate-500 leading-none mb-0.5">{fmtV(x.val)}</div>
+              <div className={`w-full rounded-t ${x.val == null ? 'bg-slate-100' : isAfter ? 'bg-emerald-400' : 'bg-slate-300'}`} style={{ height: `${h}px` }} />
+              <div className={`text-[8px] mt-0.5 ${isAfter ? 'text-emerald-600 font-bold' : 'text-slate-400'}`}>{x.label}</div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="text-[9px] text-slate-400 mt-1 flex items-center gap-2"><span className="inline-flex items-center gap-1"><span className="w-2 h-2 bg-slate-300 rounded-sm" />実施前</span><span className="inline-flex items-center gap-1"><span className="w-2 h-2 bg-emerald-400 rounded-sm" />実施後</span>{actionDate ? `・対策実施: ${pdcaFmtDate(actionDate)}` : '・未実施'}</div>
+    </div>
+  );
+};
+
+// 改善カルテ 詳細モーダル: タイムライン + ベースライン/実施後の統計を並べ、効果判定・定着/再計画/差戻しまで
+const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGroups = [], saveData, deleteData, currentUserName = '', onClose }) => {
+  const [edit, setEdit] = useState({
+    problem: card.problem || '', hypothesis: card.hypothesis || '', action: card.action || '',
+    owner: card.owner || '', dueDate: card.dueDate || '', kpi: card.kpi || 'time',
+    changeNote: card.changeNote || '', changeOld: card.changeOld || '', changeNew: card.changeNew || '',
+  });
+  const [busy, setBusy] = useState(false);
+  const isClosed = ['effective', 'noeffect', 'worse', 'rolledback'].includes(card.status);
+  // 実施後の統計: 閉じたカルテは凍結値、それ以外はライブ計算
+  const afterLive = useMemo(() => card.actionDate ? measureWindow(lots, { model: card.model, stepKey: card.stepKey, customTargetTimes, modelGroups, startMs: card.actionDate, endMs: Date.now() }) : null, [lots, card.actionDate, card.model, card.stepKey, customTargetTimes, modelGroups]);
+  const after = (isClosed && card.afterFrozen) ? card.afterFrozen : afterLive;
+  const verdict = useMemo(() => (card.actionDate && card.baseline) ? ((isClosed && card.verdictFrozen) ? card.verdictFrozen : computeVerdict(card.baseline, after, edit.kpi)) : null, [card, after, edit.kpi, isClosed]);
+
+  const patch = async (p, logEntry) => {
+    setBusy(true);
+    const log = [...(card.log || [])];
+    if (logEntry) log.push({ ts: Date.now(), by: currentUserName || '?', ...logEntry });
+    await saveData('improvements', card.id, { ...p, log });
+    setBusy(false);
+  };
+  const savePlan = () => patch({ problem: edit.problem, hypothesis: edit.hypothesis, action: edit.action, owner: edit.owner, dueDate: edit.dueDate, kpi: edit.kpi, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew }, { type: 'edit', note: '計画/内容を編集' });
+  const markDoing = () => patch({ status: 'doing' }, { type: 'status', note: '実施中に変更' });
+  const recordAction = () => {
+    const now = Date.now();
+    patch({ status: 'measuring', actionDate: now, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew }, { type: 'do', note: `対策を実施 (${edit.changeNote || '内容未記入'})` });
+  };
+  const closeWith = (status) => {
+    // 実施後統計と判定を凍結して恒久エビデンス化
+    const frozen = afterLive || null;
+    const v = (card.baseline && frozen) ? computeVerdict(card.baseline, frozen, edit.kpi) : null;
+    const label = PDCA_STATUS_META[status]?.label || status;
+    patch({ status, afterFrozen: frozen, verdictFrozen: v, closedAt: Date.now(), closedBy: currentUserName || '?' }, { type: 'close', note: `判定: ${label}` });
+  };
+  const reopen = () => patch({ status: 'measuring', closedAt: null, closedBy: null, afterFrozen: null, verdictFrozen: null }, { type: 'status', note: '再オープン(効果測定中へ)' });
+  const doDelete = async () => { if (!deleteData) return; if (!confirm('このカルテを削除しますか？(元に戻せません)')) return; await deleteData('improvements', card.id); onClose(); };
+
+  const meta = PDCA_STATUS_META[card.status] || PDCA_STATUS_META.plan;
+  const StatRows = ({ b, a, kpi }) => {
+    const rows = [
+      ['標本数', b ? `${b.n}台` : '—', a ? `${a.n}台` : '—'],
+      ['中央値', b ? pdcaFmtSec(b.median) : '—', a ? pdcaFmtSec(a.median) : '—'],
+      ['平均', b ? pdcaFmtSec(b.mean) : '—', a ? pdcaFmtSec(a.mean) : '—'],
+      ['ばらつき σ', b ? pdcaFmtSec(b.sigma) : '—', a ? pdcaFmtSec(a.sigma) : '—'],
+      ['変動係数 CV', b ? `${Math.round(b.cv * 100)}%` : '—', a ? `${Math.round(a.cv * 100)}%` : '—'],
+      ['最小〜最大', b ? `${pdcaFmtSec(b.min)}〜${pdcaFmtSec(b.max)}` : '—', a ? `${pdcaFmtSec(a.min)}〜${pdcaFmtSec(a.max)}` : '—'],
+      ['達成率', b && b.achievementRate != null ? `${b.achievementRate}%` : '—', a && a.achievementRate != null ? `${a.achievementRate}%` : '—'],
+      ['目標内(台)', b ? `${b.within}/${b.n}` : '—', a ? `${a.within}/${a.n}` : '—'],
+      ['不具合件数', b ? `${b.defectCount}件` : '—', a ? `${a.defectCount}件` : '—'],
+    ];
+    return (
+      <table className="w-full text-xs border-collapse">
+        <thead><tr className="bg-slate-100"><th className="px-2 py-1 text-left border">指標</th><th className="px-2 py-1 text-right border">改善前(ベースライン)</th><th className="px-2 py-1 text-right border">実施後</th></tr></thead>
+        <tbody>{rows.map((r, i) => (<tr key={i}><td className="px-2 py-1 border text-slate-600">{r[0]}</td><td className="px-2 py-1 border text-right font-mono">{r[1]}</td><td className="px-2 py-1 border text-right font-mono font-bold">{r[2]}</td></tr>))}</tbody>
+      </table>
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white w-full max-w-3xl max-h-[92vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-indigo-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <div className="min-w-0">
+            <div className="font-bold flex items-center gap-2 truncate"><ClipboardList className="w-5 h-5 shrink-0" /> {card.model || '型式?'} ／ {card.stepTitle || card.stepKey || '工程?'}</div>
+            <div className="text-[11px] opacity-80">主指標: {PDCA_KPIS[card.kpi] || PDCA_KPIS.time}{card.source?.label ? ` ・由来: ${card.source.label}` : ''}</div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className={`px-2 py-1 rounded text-xs font-bold border ${meta.color}`}>{meta.label}</span>
+            <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+          </div>
+        </div>
+        <div className="p-4 overflow-y-auto space-y-4 text-sm">
+          {/* タイムライン */}
+          <div className="flex items-center gap-1 text-[11px] flex-wrap bg-slate-50 border rounded-lg p-2">
+            {[['検知', card.createdAt], ['計画', card.createdAt], ['実施', card.actionDate], ['効果測定', card.actionDate], ['判定', card.closedAt]].map((s, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <span className="text-slate-300">→</span>}
+                <span className={`px-2 py-0.5 rounded ${s[1] ? 'bg-indigo-100 text-indigo-700 font-bold' : 'bg-slate-100 text-slate-400'}`}>{s[0]}{s[1] ? ` ${pdcaFmtDate(s[1])}` : ''}</span>
+              </React.Fragment>
+            ))}
+            {verdict && <span className="ml-auto"><PdcaVerdictBadge v={verdict} /></span>}
+          </div>
+
+          {/* 計画(Plan) */}
+          <div className="border rounded-lg p-3 space-y-2">
+            <div className="text-xs font-bold text-slate-500 flex items-center justify-between">計画 (Plan)
+              <select value={edit.kpi} onChange={e => setEdit(p => ({ ...p, kpi: e.target.value }))} className="border rounded px-1.5 py-0.5 text-[11px] font-normal" disabled={isClosed}>
+                {Object.entries(PDCA_KPIS).map(([k, v]) => <option key={k} value={k}>主指標: {v}</option>)}
+              </select>
+            </div>
+            <div><label className="block text-[10px] text-slate-400">問題 / 現状</label><textarea value={edit.problem} onChange={e => setEdit(p => ({ ...p, problem: e.target.value }))} rows={2} className="w-full border rounded p-1.5 text-xs" disabled={isClosed} placeholder="例: 準備工程が目標の1.7倍かかっている" /></div>
+            <div className="grid grid-cols-2 gap-2">
+              <div><label className="block text-[10px] text-slate-400">仮説 (なぜ)</label><textarea value={edit.hypothesis} onChange={e => setEdit(p => ({ ...p, hypothesis: e.target.value }))} rows={2} className="w-full border rounded p-1.5 text-xs" disabled={isClosed} placeholder="例: 治具の位置が遠い" /></div>
+              <div><label className="block text-[10px] text-slate-400">対策 (どうする)</label><textarea value={edit.action} onChange={e => setEdit(p => ({ ...p, action: e.target.value }))} rows={2} className="w-full border rounded p-1.5 text-xs" disabled={isClosed} placeholder="例: 治具を手元へ移動・目標を見直す" /></div>
+            </div>
+            <div className="flex gap-2">
+              <div className="flex-1"><label className="block text-[10px] text-slate-400">担当</label><input value={edit.owner} onChange={e => setEdit(p => ({ ...p, owner: e.target.value }))} className="w-full border rounded p-1.5 text-xs" disabled={isClosed} /></div>
+              <div><label className="block text-[10px] text-slate-400">期限</label><input type="date" value={edit.dueDate} onChange={e => setEdit(p => ({ ...p, dueDate: e.target.value }))} className="border rounded p-1.5 text-xs" disabled={isClosed} /></div>
+            </div>
+            {!isClosed && <button onClick={savePlan} disabled={busy} className="text-xs px-3 py-1.5 bg-slate-700 text-white rounded font-bold">計画を保存</button>}
+          </div>
+
+          {/* ベースライン + 実施後 の比較 (エビデンス) */}
+          <div className="border rounded-lg p-3 space-y-2">
+            <div className="text-xs font-bold text-slate-500">エビデンス: 改善前 → 実施後</div>
+            <div className="text-[10px] text-slate-400">
+              ベースライン期間: {card.baseline ? `${pdcaFmtDate(card.baseline.startMs)} 〜 ${pdcaFmtDate(card.baseline.endMs)}` : '—'}
+              {card.actionDate ? ` ／ 実施後: ${pdcaFmtDate(card.actionDate)} 〜 ${isClosed && card.closedAt ? pdcaFmtDate(card.closedAt) : '現在'}` : ' ／ 実施後: 未実施'}
+            </div>
+            <StatRows b={card.baseline} a={after} kpi={edit.kpi} />
+            <div className="pt-1">
+              <div className="text-[10px] text-slate-400 mb-0.5">月次推移 ({PDCA_KPIS[edit.kpi] || PDCA_KPIS.time}) — 対策実施を境に色が変わります</div>
+              <PdcaMiniTrend lots={lots} model={card.model} stepKey={card.stepKey} kpi={edit.kpi} customTargetTimes={customTargetTimes} modelGroups={modelGroups} actionDate={card.actionDate} />
+            </div>
+            {verdict && (
+              <div className="flex items-center gap-2 text-xs bg-slate-50 border rounded p-2">
+                <PdcaVerdictBadge v={verdict} />
+                <span className="text-slate-600">{verdict.label}: {pdcaKpiDisplay(card.baseline, edit.kpi)} → {pdcaKpiDisplay(after, edit.kpi)}{verdict.reason ? ` (${verdict.reason})` : ''}</span>
+              </div>
+            )}
+          </div>
+
+          {/* 実施(Do) */}
+          {!isClosed && (
+            <div className="border rounded-lg p-3 space-y-2 bg-blue-50/40">
+              <div className="text-xs font-bold text-slate-500">実施 (Do) — 対策を行った記録</div>
+              <div className="grid grid-cols-3 gap-2">
+                <div><label className="block text-[10px] text-slate-400">変更前</label><input value={edit.changeOld} onChange={e => setEdit(p => ({ ...p, changeOld: e.target.value }))} className="w-full border rounded p-1.5 text-xs" placeholder="例 目標300s" /></div>
+                <div><label className="block text-[10px] text-slate-400">変更後</label><input value={edit.changeNew} onChange={e => setEdit(p => ({ ...p, changeNew: e.target.value }))} className="w-full border rounded p-1.5 text-xs" placeholder="例 目標240s" /></div>
+                <div><label className="block text-[10px] text-slate-400">内容メモ</label><input value={edit.changeNote} onChange={e => setEdit(p => ({ ...p, changeNote: e.target.value }))} className="w-full border rounded p-1.5 text-xs" placeholder="治具移動 等" /></div>
+              </div>
+              <div className="flex gap-2">
+                {card.status === 'plan' && <button onClick={markDoing} disabled={busy} className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded font-bold">実施中にする</button>}
+                <button onClick={recordAction} disabled={busy} className="text-xs px-3 py-1.5 bg-amber-600 text-white rounded font-bold">対策を実施した(今日) → 効果測定へ</button>
+              </div>
+              <div className="text-[10px] text-slate-400">「対策を実施した」を押すと、その日を境に before/after を自動測定します。{after && after.n < PDCA_MIN_N ? `(実施後 ${after.n}台・${PDCA_MIN_N}台たまると判定可)` : ''}</div>
+            </div>
+          )}
+
+          {/* 判定(Act) */}
+          {card.actionDate && !isClosed && (
+            <div className="border rounded-lg p-3 space-y-2 bg-emerald-50/40">
+              <div className="text-xs font-bold text-slate-500">判定 (Act) — 効果を見て次へ</div>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={() => closeWith('effective')} disabled={busy} className="text-xs px-3 py-1.5 bg-emerald-600 text-white rounded font-bold">効果あり → 定着(標準化)</button>
+                <button onClick={() => closeWith('noeffect')} disabled={busy} className="text-xs px-3 py-1.5 bg-slate-500 text-white rounded font-bold">効果なし → 完了</button>
+                <button onClick={() => closeWith('worse')} disabled={busy} className="text-xs px-3 py-1.5 bg-rose-600 text-white rounded font-bold">悪化 → 完了</button>
+                <button onClick={() => closeWith('rolledback')} disabled={busy} className="text-xs px-3 py-1.5 bg-purple-600 text-white rounded font-bold">元に戻す(差し戻し)</button>
+              </div>
+              <div className="text-[10px] text-slate-400">判定すると実施後の統計が「恒久エビデンス」として凍結保存され、いつでも見返せます。</div>
+            </div>
+          )}
+          {isClosed && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-500">判定: {pdcaFmtDateTime(card.closedAt)} ・ {card.closedBy}</span>
+              {!busy && <button onClick={reopen} className="text-[11px] px-2 py-1 border rounded text-slate-600 hover:bg-slate-50">再オープン</button>}
+            </div>
+          )}
+
+          {/* 監査ログ(タイムライン) */}
+          {Array.isArray(card.log) && card.log.length > 0 && (
+            <div className="border rounded-lg p-3">
+              <div className="text-xs font-bold text-slate-500 mb-1">記録 (監査ログ)</div>
+              <div className="space-y-1">
+                {[...card.log].reverse().map((e, i) => (
+                  <div key={i} className="text-[11px] flex items-start gap-2"><span className="text-slate-400 font-mono shrink-0">{pdcaFmtDateTime(e.ts)}</span><span className="text-slate-700">{e.note || e.type}</span><span className="text-slate-400 ml-auto shrink-0">{e.by}</span></div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex justify-between pt-1">
+            <span className="text-[10px] text-slate-400">作成: {pdcaFmtDateTime(card.createdAt)} ・ {card.createdBy}</span>
+            {deleteData && <button onClick={doDelete} className="text-xs text-rose-500 hover:text-rose-700 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> 削除</button>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 改善PDCA パネル: 候補(乖離検知)→カルテ化、カンバンボード(計画/実施中/効果測定中/完了)、検索
+const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, saveData, deleteData, customTargetTimes = {}, modelGroups = [], currentUserName = '', templates = [] }) => {
+  const [openId, setOpenId] = useState(null);
+  const [search, setSearch] = useState('');
+  const [showCandidates, setShowCandidates] = useState(true);
+  const [newModel, setNewModel] = useState('');
+  const [newStepKey, setNewStepKey] = useState('');
+  const nowMs = Date.now();
+  const WIN = 90 * 86400000; // 候補/ベースラインの既定窓 = 直近90日
+
+  // 既にカルテ化済み(完了以外)の 型式×工程 セット
+  const activeKeys = useMemo(() => {
+    const s = new Set();
+    (improvements || []).forEach(c => { if (!['effective', 'noeffect', 'worse', 'rolledback'].includes(c.status)) s.add(`${c.model}||${c.stepKey}`); });
+    return s;
+  }, [improvements]);
+
+  // 改善テーマ候補: 直近90日で目標から±30%以上乖離した 型式×工程
+  const candidates = useMemo(() => {
+    const out = [];
+    enumerateModelSteps(lots).forEach(ms => {
+      if (activeKeys.has(`${ms.model}||${ms.stepKey}`)) return;
+      const stat = measureWindow(lots, { model: ms.model, stepKey: ms.stepKey, customTargetTimes, modelGroups, startMs: nowMs - WIN, endMs: nowMs });
+      if (stat.n < PDCA_MIN_N || !stat.sumTgt) return;
+      const avgTgt = stat.sumTgt / stat.n;
+      if (avgTgt <= 0) return;
+      // 中央値ベースの乖離 (平均は外れ値=0秒/上限14400秒に過敏なため、表示中央値と一致させる)
+      const ratio = (stat.median || stat.mean) / avgTgt;
+      if (ratio >= 1.3 || ratio <= 0.7) out.push({ ...ms, stat, ratio, avgTgt });
+    });
+    return out.sort((a, b) => Math.abs(b.ratio - 1) - Math.abs(a.ratio - 1)).slice(0, 12);
+  }, [lots, activeKeys, customTargetTimes, modelGroups]);
+
+  const modelOptions = useMemo(() => [...new Set(enumerateModelSteps(lots).map(m => m.model))].filter(Boolean).sort(), [lots]);
+  const stepOptions = useMemo(() => enumerateModelSteps(lots).filter(m => m.model === newModel), [lots, newModel]);
+
+  const createCard = (model, stepKey, stepTitle, category, source) => {
+    const startMs = nowMs - WIN;
+    const baseStat = measureWindow(lots, { model, stepKey, customTargetTimes, modelGroups, startMs, endMs: nowMs });
+    const baseline = { ...baseStat, startMs, endMs: nowMs };
+    const id = generateId();
+    const card = {
+      id, createdAt: nowMs, createdBy: currentUserName || '?', status: 'plan',
+      model, stepKey, stepTitle: stepTitle || (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey), category: category || '',
+      kpi: 'time', source: source || { kind: 'manual', label: '手動作成' }, baseline,
+      problem: source?.problem || '', hypothesis: '', action: '', owner: '', dueDate: '',
+      log: [{ ts: nowMs, by: currentUserName || '?', type: 'create', note: `カルテ作成 (由来: ${source?.label || '手動'})` }],
+    };
+    saveData('improvements', id, card);
+    setOpenId(id);
+  };
+  const cardFromCandidate = (c) => {
+    const over = c.ratio >= 1;
+    createCard(c.model, c.stepKey, c.stepTitle, c.category, {
+      kind: 'drift', label: `目標乖離 ${Math.round(c.ratio * 100)}% (${over ? '超過' : '過少'})`,
+      problem: `${c.stepTitle} が目標(${pdcaFmtSec(c.avgTgt)})に対し実績中央値 ${pdcaFmtSec(c.stat.median)} ・平均 ${pdcaFmtSec(c.stat.mean)} (標本${c.stat.n}台, 目標比 ${Math.round(c.ratio * 100)}%)`,
+    });
+  };
+
+  // ライブ効果判定(対策実施済みカルテ)
+  const liveVerdict = (c) => {
+    if (!c.actionDate || !c.baseline) return null;
+    if (['effective', 'noeffect', 'worse', 'rolledback'].includes(c.status) && c.verdictFrozen) return c.verdictFrozen;
+    const a = measureWindow(lots, { model: c.model, stepKey: c.stepKey, customTargetTimes, modelGroups, startMs: c.actionDate, endMs: nowMs });
+    return computeVerdict(c.baseline, a, c.kpi || 'time');
+  };
+
+  const filtered = useMemo(() => {
+    const kw = search.trim().toLowerCase();
+    if (!kw) return improvements;
+    return (improvements || []).filter(c => `${c.model || ''} ${c.stepTitle || ''} ${c.owner || ''} ${c.problem || ''}`.toLowerCase().includes(kw));
+  }, [improvements, search]);
+  const byCol = useMemo(() => {
+    const m = { 計画: [], 実施中: [], 効果測定中: [], 完了: [] };
+    filtered.forEach(c => { const col = PDCA_STATUS_META[c.status]?.col || '計画'; (m[col] = m[col] || []).push(c); });
+    return m;
+  }, [filtered]);
+
+  const openCard = (improvements || []).find(c => c.id === openId) || null;
+  const summary = useMemo(() => {
+    const total = improvements.length;
+    const running = improvements.filter(c => ['plan', 'doing', 'measuring'].includes(c.status)).length;
+    const effective = improvements.filter(c => c.status === 'effective').length;
+    return { total, running, effective };
+  }, [improvements]);
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 justify-between">
+          <div className="flex items-center gap-2 text-sm text-indigo-900">
+            <ClipboardList className="w-5 h-5 text-indigo-600 shrink-0" />
+            <span><b>改善PDCA</b> — 問題を見つけて対策し、<b>実施日の前後で自動的に効果を測定</b>します。記録は消えず、いつでも見返せます。</span>
+          </div>
+          <div className="flex items-center gap-3 text-xs text-slate-600 shrink-0">
+            <span>全 <b>{summary.total}</b> 件</span>
+            <span>進行中 <b className="text-amber-600">{summary.running}</b></span>
+            <span>定着 <b className="text-emerald-600">{summary.effective}</b></span>
+          </div>
+        </div>
+        <div className="mt-2 relative max-w-md">
+          <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="型式・工程・担当・問題で検索" className="w-full pl-8 pr-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+        </div>
+      </div>
+
+      {/* 改善テーマ候補 (乖離検知) */}
+      <div className="border border-amber-200 rounded-xl overflow-hidden">
+        <button onClick={() => setShowCandidates(s => !s)} className="w-full px-3 py-2 bg-amber-50 text-amber-800 text-sm font-bold flex items-center justify-between">
+          <span className="flex items-center gap-2"><AlertTriangle className="w-4 h-4" /> 改善テーマ候補 ({candidates.length}) — 目標から大きくズレた工程</span>
+          <span className="text-xs">{showCandidates ? '▲' : '▼'}</span>
+        </button>
+        {showCandidates && (
+          <div className="p-2 space-y-1.5 max-h-64 overflow-auto">
+            {candidates.length === 0 && <div className="text-center text-slate-400 text-xs py-3">大きな乖離は見つかりませんでした (直近90日・標本5台以上)</div>}
+            {candidates.map((c, i) => {
+              const over = c.ratio >= 1;
+              return (
+                <div key={i} className="flex items-center gap-2 border rounded-lg px-2.5 py-1.5 bg-white">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold text-slate-800 truncate">{c.model} ／ {c.stepTitle}</div>
+                    <div className="text-[11px] text-slate-500">実績中央値 {pdcaFmtSec(c.stat.median)} / 目標 {pdcaFmtSec(c.avgTgt)} ・{c.stat.n}台</div>
+                  </div>
+                  <span className={`px-1.5 py-0.5 rounded text-white text-[10px] font-bold ${over ? 'bg-rose-500' : 'bg-blue-500'}`}>{over ? '超過' : '過少'} {Math.round(c.ratio * 100)}%</span>
+                  <button onClick={() => cardFromCandidate(c)} className="text-[11px] px-2 py-1 bg-indigo-600 text-white rounded font-bold shrink-0">カルテ化</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* 手動でカルテ作成 */}
+      <div className="flex items-center gap-2 flex-wrap bg-white border rounded-xl p-2">
+        <span className="text-xs font-bold text-slate-500">手動でカルテ:</span>
+        <select value={newModel} onChange={e => { setNewModel(e.target.value); setNewStepKey(''); }} className="border rounded px-2 py-1 text-xs">
+          <option value="">型式を選択</option>
+          {modelOptions.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <select value={newStepKey} onChange={e => setNewStepKey(e.target.value)} className="border rounded px-2 py-1 text-xs" disabled={!newModel}>
+          <option value="">工程を選択</option>
+          {stepOptions.map(s => <option key={s.stepKey} value={s.stepKey}>{s.stepTitle}</option>)}
+        </select>
+        <button onClick={() => { const s = stepOptions.find(x => x.stepKey === newStepKey); if (s) { createCard(s.model, s.stepKey, s.stepTitle, s.category, { kind: 'manual', label: '手動作成' }); setNewModel(''); setNewStepKey(''); } }} disabled={!newStepKey} className="text-xs px-3 py-1 bg-slate-700 text-white rounded font-bold disabled:bg-slate-300">＋ 作成</button>
+      </div>
+
+      {/* カンバンボード */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+        {PDCA_COLS.map(col => (
+          <div key={col} className="bg-slate-50 border border-slate-200 rounded-xl p-2 min-h-[120px]">
+            <div className="text-xs font-bold text-slate-600 mb-2 px-1 flex items-center justify-between">{col}<span className="text-slate-400">{(byCol[col] || []).length}</span></div>
+            <div className="space-y-1.5">
+              {(byCol[col] || []).map(c => {
+                const meta = PDCA_STATUS_META[c.status] || PDCA_STATUS_META.plan;
+                const v = liveVerdict(c);
+                return (
+                  <button key={c.id} onClick={() => setOpenId(c.id)} className="w-full text-left bg-white border rounded-lg p-2 hover:border-indigo-300 transition">
+                    <div className="flex items-center gap-1.5 mb-0.5"><span className={`w-2 h-2 rounded-full shrink-0 ${meta.dot}`} /><span className="text-xs font-bold text-slate-800 truncate">{c.model}</span></div>
+                    <div className="text-[11px] text-slate-600 truncate">{c.stepTitle || c.stepKey}</div>
+                    <div className="flex items-center gap-1 mt-1 flex-wrap">
+                      <span className="text-[9px] px-1 py-0.5 rounded bg-slate-100 text-slate-500">{PDCA_KPIS[c.kpi] || PDCA_KPIS.time}</span>
+                      {v && <PdcaVerdictBadge v={v} />}
+                    </div>
+                  </button>
+                );
+              })}
+              {(byCol[col] || []).length === 0 && <div className="text-center text-slate-300 text-[11px] py-2">なし</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {openCard && (
+        <ImprovementCardModal card={openCard} lots={lots} customTargetTimes={customTargetTimes} modelGroups={modelGroups} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onClose={() => setOpenId(null)} />
+      )}
+    </div>
+  );
+};
+
+const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], templates = [], onRestore = null, db = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('defects'); // 工程改善分析は「作業最適化」タブへ移動したため既定を不具合分析に
   const [selectedModel, setSelectedModel] = useState('all');
@@ -14765,6 +15316,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
               {activeMode === 'direct-indirect' && (<><Activity className="w-6 h-6 text-teal-600"/> 直間分析</>)}
               {activeMode === 'worker-eval' && (<><Users className="w-6 h-6 text-amber-600"/> 作業者評価</>)}
               {activeMode === 'improvement' && (<><Zap className="w-6 h-6 text-indigo-600"/> 改善ヒント</>)}
+              {activeMode === 'pdca' && (<><ClipboardList className="w-6 h-6 text-indigo-600"/> 改善PDCA (改善カルテ)</>)}
               {activeMode === 'monthly' && (<><FileText className="w-6 h-6 text-slate-700"/> 月次レポート</>)}
             </h2>
             <div className="flex items-center gap-3">
@@ -14780,10 +15332,11 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
                  <button onClick={()=>setActiveMode('direct-indirect')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='direct-indirect' ? 'bg-white shadow text-teal-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> 直間分析</button>
                  {currentUserName === '管理者' && <button onClick={()=>setActiveMode('worker-eval')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='worker-eval' ? 'bg-white shadow text-amber-600' : 'text-slate-500 hover:text-slate-700'}`}><Users className="w-4 h-4"/> 作業者評価</button>}
                  <button onClick={()=>setActiveMode('improvement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='improvement' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Zap className="w-4 h-4"/> 改善ヒント</button>
+                 <button onClick={()=>setActiveMode('pdca')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='pdca' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><ClipboardList className="w-4 h-4"/> 改善PDCA</button>
                  <button onClick={()=>setActiveMode('monthly')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='monthly' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}><FileText className="w-4 h-4"/> 月次レポート</button>
                  <button onClick={()=>setActiveMode('export')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='export' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><DownloadCloud className="w-4 h-4"/> データ書き出し</button>
               </div>
-              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary'].includes(activeMode) && (
+              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
                 {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
                 <button onClick={async ()=>{
@@ -16168,13 +16721,14 @@ const AnalysisView = ({ lots, logs, workers, saveData, settings, saveSettings, c
              );
            })()}
 
-           {activeMode === 'monthly' && <MonthlyReportView lots={lots} workers={workers} settings={settings} customTargetTimes={settings.customTargetTimes || {}} targetTimeHistory={settings.targetTimeHistory || []} currentUserName={currentUserName} templates={templates} indirectWork={indirectWork} onSaveSettings={saveSettings} />}
+           {activeMode === 'monthly' && <MonthlyReportView lots={lots} workers={workers} settings={settings} customTargetTimes={settings.customTargetTimes || {}} targetTimeHistory={settings.targetTimeHistory || []} improvements={improvements} currentUserName={currentUserName} templates={templates} indirectWork={indirectWork} onSaveSettings={saveSettings} />}
            {activeMode === 'export' && <DataExportCenter lots={lots} workers={workers} indirectWork={indirectWork} settings={settings} currentUserName={currentUserName} saveSettings={saveSettings} />}
            {activeMode === 'dashboard' && <ManagerDashboard lots={lots} settings={settings} />}
            {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
            {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
-           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} currentUserName={currentUserName} onRestore={onRestore} />}
+           {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
+           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} currentUserName={currentUserName} onRestore={onRestore} />}
         </div>
      </div>
    );
@@ -21923,7 +22477,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
 // ・PDF (ブラウザ印刷) + Excel (多シート) の両方を出力。
 // ・PLAN は lot.dueDate ベースで当月の予定を集計、ACTUAL は lot.completedAt ベースで当月の実績を集計。
 // =====================================================================================
-const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTargetTimes = {}, targetTimeHistory = [], currentUserName = '', templates = [], indirectWork = [], onSaveSettings }) => {
+const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTargetTimes = {}, targetTimeHistory = [], improvements = [], currentUserName = '', templates = [], indirectWork = [], onSaveSettings }) => {
   // ---- 月選択 (既定: 当月) ----
   const ymNow = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
   const [selectedMonth, setSelectedMonth] = useState(ymNow());
@@ -22201,6 +22755,26 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     };
   }, [lots, workers, monthRange]);
 
+  // 改善PDCA(改善カルテ)の当月集計: 作成/実施/判定/定着/効果なし + 削減時間・不具合減
+  const pdcaData = useMemo(() => {
+    const all = improvements || [];
+    const created = all.filter(c => inMonth(c.createdAt));
+    const acted = all.filter(c => c.actionDate && inMonth(c.actionDate));
+    const judged = all.filter(c => c.closedAt && inMonth(c.closedAt));
+    const effective = judged.filter(c => c.status === 'effective');
+    const noeffect = judged.filter(c => c.status === 'noeffect' || c.status === 'worse');
+    const running = all.filter(c => ['plan', 'doing', 'measuring'].includes(c.status));
+    let savedSec = 0, defectCut = 0;
+    effective.forEach(c => {
+      const b = c.baseline, a = c.afterFrozen;
+      if (b && a) {
+        if ((c.kpi || 'time') === 'time' || c.kpi === 'sigma') savedSec += Math.max(0, (b.median || 0) - (a.median || 0)) * (a.n || 0);
+        defectCut += Math.max(0, (b.defectCount || 0) - (a.defectCount || 0));
+      }
+    });
+    return { createdN: created.length, actedN: acted.length, judgedN: judged.length, effectiveN: effective.length, noeffectN: noeffect.length, runningN: running.length, savedHours: savedSec / 3600, defectCut, effective, noeffect };
+  }, [improvements, monthRange]);
+
   // ---- TARGET TIME 更新履歴 (当月) — TargetTimeHistoryPanel と同じく行にフラット化 ----
   const targetUpdates = useMemo(() => {
     const rows = [];
@@ -22387,8 +22961,27 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     });
     body += `</tbody></table>`;
     if (targetUpdates.length > 0) body += `<div class="note">当月は ${targetUpdates.length} 件の目標時間を更新しました。各行の「旧→新(秒)」が変更内容、「エビデンス」が変更根拠 (対象期間の実績サンプル数・平均・標準偏差) です。</div>`;
-    // §7 所感 + 注記
-    body += `<h2>§7 所感</h2><div class="comment-box">${comment ? esc(comment) : '<span style="color:#94a3b8">（記載なし）</span>'}</div>`;
+    // §7 改善PDCA(改善カルテ)
+    body += `<h2>§7 改善PDCA（改善カルテ）</h2>`;
+    body += `<div class="kpi-grid">
+      <div class="kpi"><div class="v">${pdcaData.createdN}</div><div class="l">当月 起票</div></div>
+      <div class="kpi"><div class="v" style="color:#2563eb">${pdcaData.actedN}</div><div class="l">当月 実施</div></div>
+      <div class="kpi"><div class="v" style="color:#059669">${pdcaData.effectiveN}</div><div class="l">定着(効果あり)</div></div>
+      <div class="kpi"><div class="v" style="color:#059669">${pdcaData.savedHours >= 0.1 ? pdcaData.savedHours.toFixed(1) + 'h' : '—'}</div><div class="l">削減時間/月</div></div>
+      <div class="kpi"><div class="v" style="color:#e11d48">${pdcaData.defectCut || 0}</div><div class="l">不具合 減</div></div>
+    </div>`;
+    const pdcaVL = { improved: '改善', worse: '悪化', flat: '横ばい', insufficient: '標本不足' };
+    const monthCards = [...pdcaData.effective, ...pdcaData.noeffect];
+    body += `<table class="data"><thead><tr><th>型式</th><th>工程</th><th>主指標</th><th>改善前→実施後</th><th>判定</th><th>実施日</th><th>担当</th><th>由来</th></tr></thead><tbody>`;
+    if (monthCards.length === 0) body += `<tr><td colspan="8" class="muted">当月に判定した改善はありません</td></tr>`;
+    else monthCards.forEach(c => {
+      const v = c.verdictFrozen; const res = PDCA_STATUS_META[c.status]?.label || '';
+      body += `<tr><td>${esc(c.model || '—')}</td><td>${esc(c.stepTitle || c.stepKey || '—')}</td><td>${esc(PDCA_KPIS[c.kpi] || PDCA_KPIS.time)}</td><td class="c">${esc(pdcaKpiDisplay(c.baseline, c.kpi || 'time'))} → ${esc(pdcaKpiDisplay(c.afterFrozen, c.kpi || 'time'))}${v && v.deltaPct != null ? ` (${v.deltaPct > 0 ? '+' : ''}${v.deltaPct}%)` : ''}</td><td>${esc(res)}${v ? ` / ${esc(pdcaVL[v.result] || '')}` : ''}</td><td>${esc(fmtDate(c.actionDate))}</td><td>${esc(c.owner || '—')}</td><td style="font-size:9.5px">${esc(c.source?.label || '—')}</td></tr>`;
+    });
+    body += `</tbody></table>`;
+    body += `<div class="note">改善PDCA=問題発見→対策→<b>対策実施日の前後で同じ工程の実績を自動比較</b>し効果を判定。「改善前→実施後」は主指標(中央値/達成率等)の変化、「判定」は定着/効果なし。進行中 ${pdcaData.runningN} 件。</div>`;
+    // §8 所感 + 注記
+    body += `<h2>§8 所感</h2><div class="comment-box">${comment ? esc(comment) : '<span style="color:#94a3b8">（記載なし）</span>'}</div>`;
     body += `<h3>算出根拠注記</h3><div class="note"><ul style="margin:0;padding-left:16px">
       <li>実作業工数 = 完了ロットの完了タスク所要時間(duration)の合計。タスク記録が無い場合はロット総作業時間で代替。</li>
       <li>集計対象 = <b>完了日(completedAt)</b>が当月内の完了ロット。週次は完了日を月曜始まりの週へ割り当て。</li>
@@ -22526,6 +23119,20 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
       R = addDataRow(s8, R, [fmtDateTime(u.timestamp), u.targetType === 'app' ? '外観図' : '型式', u.targetValue || '', `${u.category ? `[${u.category}] ` : ''}${u.title || ''}`, u.oldTime, u.newTime, u.strategyName || '—', ev, u.by || '—'], st, [4, 5]);
     });
     [18, 10, 16, 22, 9, 9, 12, 40, 12].forEach((w, i) => { s8.getColumn(i + 1).width = w; });
+    // PDCA改善(改善カルテ)
+    const s9 = wb.addWorksheet('PDCA改善');
+    let R9 = 1;
+    R9 = titleRow(s9, R9, `改善PDCA（${monthTitle}）`, 8); R9++;
+    R9 = addDataRow(s9, R9, [`起票 ${pdcaData.createdN} / 実施 ${pdcaData.actedN} / 定着 ${pdcaData.effectiveN} / 効果なし ${pdcaData.noeffectN} / 進行中 ${pdcaData.runningN}`, '', '', '', '', '', '', ''], st);
+    R9 = addDataRow(s9, R9, [`削減時間/月: ${pdcaData.savedHours >= 0.1 ? pdcaData.savedHours.toFixed(1) + 'h' : '—'} / 不具合減: ${pdcaData.defectCut || 0}件`, '', '', '', '', '', '', ''], st); R9++;
+    R9 = addHeaderRow(s9, R9, ['型式', '工程', '主指標', '改善前', '実施後', '変化%', '判定', '実施日'], st);
+    const monthCards9 = [...pdcaData.effective, ...pdcaData.noeffect];
+    if (monthCards9.length === 0) R9 = addDataRow(s9, R9, ['当月に判定した改善はありません', '', '', '', '', '', '', ''], st);
+    else monthCards9.forEach(c => {
+      const v = c.verdictFrozen;
+      R9 = addDataRow(s9, R9, [c.model || '—', c.stepTitle || c.stepKey || '—', PDCA_KPIS[c.kpi] || PDCA_KPIS.time, pdcaKpiDisplay(c.baseline, c.kpi || 'time'), pdcaKpiDisplay(c.afterFrozen, c.kpi || 'time'), v && v.deltaPct != null ? `${v.deltaPct > 0 ? '+' : ''}${v.deltaPct}%` : '—', PDCA_STATUS_META[c.status]?.label || '', fmtDate(c.actionDate)], st);
+    });
+    [16, 22, 14, 12, 12, 10, 16, 12].forEach((w, i) => { s9.getColumn(i + 1).width = w; });
     // 所感
     if (comment) { const cell = s1.getRow(R + 2).getCell(1); s1.mergeCells(R + 2, 1, R + 2, 4); cell.value = `所感: ${comment}`; cell.alignment = { wrapText: true, vertical: 'top' }; cell.font = { italic: true }; }
     await downloadWb(wb, `月次業務実績_${selectedMonth}.xlsx`);
@@ -22708,6 +23315,18 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
                 <div className="border border-rose-200 bg-rose-50 rounded-lg p-2 text-center"><div className="text-[10px] text-rose-600">不具合</div><div className="text-lg font-black text-rose-700">{q.defects.length}<span className="text-[10px] font-normal">件</span></div></div>
                 <div className="border border-purple-200 bg-purple-50 rounded-lg p-2 text-center"><div className="text-[10px] text-purple-600">軽微不良</div><div className="text-lg font-black text-purple-700">{q.complaints.length}<span className="text-[10px] font-normal">件</span></div></div>
                 <div className="border border-indigo-200 bg-indigo-50 rounded-lg p-2 text-center"><div className="text-[10px] text-indigo-600">気づき改善</div><div className="text-lg font-black text-indigo-700">{q.improvements.length}<span className="text-[10px] font-normal">件</span></div></div>
+              </div>
+              {/* 改善PDCA(改善カルテ) 当月サマリー */}
+              <div className="mt-2 border border-emerald-200 bg-emerald-50/60 rounded-lg p-2">
+                <div className="text-[11px] font-bold text-emerald-800 mb-1 flex items-center gap-1"><ClipboardList className="w-3.5 h-3.5"/> 改善PDCA（当月）</div>
+                <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5 text-center">
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">起票</div><div className="text-base font-black text-slate-700">{pdcaData.createdN}</div></div>
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">実施</div><div className="text-base font-black text-blue-700">{pdcaData.actedN}</div></div>
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">定着</div><div className="text-base font-black text-emerald-700">{pdcaData.effectiveN}</div></div>
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">削減/月</div><div className="text-sm font-black text-emerald-700">{pdcaData.savedHours >= 0.1 ? `${pdcaData.savedHours.toFixed(1)}h` : '—'}</div></div>
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">不具合減</div><div className="text-base font-black text-rose-700">{pdcaData.defectCut || 0}</div></div>
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1">進行中 {pdcaData.runningN}件 ・ 効果なし完了 {pdcaData.noeffectN}件</div>
               </div>
               <div className="text-[11px] text-slate-600">
                 <span className="font-bold">当月の目標時間更新:</span> {targetUpdates.length > 0 ? `${targetUpdates.length}件` : 'なし'}
@@ -23232,6 +23851,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
    // State: Indirect Work (間接作業)
    const [indirectWork, setIndirectWork] = useState([]);
+   const [improvementCards, setImprovementCards] = useState([]); // 改善PDCAカルテ (improvements コレクション)
    const [showIndirectModal, setShowIndirectModal] = useState(false);
    const [showDailySummary, setShowDailySummary] = useState(false);
    const [showShiftHandover, setShowShiftHandover] = useState(false);
@@ -23357,6 +23977,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        onSnapshot(getPath('notes'), (snap) => setNotes(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(getPath('announcements'), (snap) => setAnnouncements(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(getPath('indirectWork'), (snap) => setIndirectWork(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.startTime || 0) - (a.startTime || 0)))),
+       onSnapshot(getPath('improvements'), (snap) => setImprovementCards(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), (snap) => {
          if (snap.exists()) {
             const data = snap.data();
@@ -23495,6 +24116,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        ['templates', parsed.templates],
        ['workers', parsed.workers],
        ['indirectWork', parsed.indirectWork],
+       ['improvements', parsed.improvements],
      ];
      const total = cols.reduce((n, [, a]) => n + (Array.isArray(a) ? a.length : 0), 0) + 1; // +1: settings/config
      let done = 0;
@@ -25287,7 +25909,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} templates={templates} onRestore={restoreAllFromBackup} db={db} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} templates={templates} onRestore={restoreAllFromBackup} db={db} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
@@ -25477,7 +26099,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        )}
 
        {/* 管理者向けライブアラート: NG発生 + 進行中タスクの目標時間オーバーを右下に常時表示 */}
-       {currentUserName === '管理者' && <AdminLiveAlerts lots={lots} customTargetTimes={settings.customTargetTimes || {}} modelGroups={settings.modelGroups || []} />}
+       {currentUserName === '管理者' && <AdminLiveAlerts lots={lots} customTargetTimes={settings.customTargetTimes || {}} modelGroups={settings.modelGroups || []} improvements={improvementCards} />}
 
        {showLotModal && (
          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
