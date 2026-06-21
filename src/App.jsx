@@ -15126,9 +15126,36 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
   );
 };
 
+// 分析サブタブを5グループに整理 (フラットな13タブ→グループ→サブタブの2段ナビ)。機能は消さず位置だけ整理。
+const ANALYSIS_GROUPS = [
+  { key: 'status', label: '現状を見る', tabs: [
+    { k: 'dashboard', l: 'ダッシュボード', color: 'text-blue-600' },
+    { k: 'achievement', l: '達成率', color: 'text-emerald-600' },
+    { k: 'kpi', l: '経営分析', color: 'text-indigo-600' },
+  ] },
+  { key: 'quality', label: '品質', tabs: [
+    { k: 'defects', l: '不具合分析', color: 'text-rose-600' },
+    { k: 'complaints', l: '軽微不良・改善提案', color: 'text-purple-600' },
+  ] },
+  { key: 'kaizen', label: '改善', tabs: [
+    { k: 'pdca', l: '改善PDCA（重点工程→対策→効果）', color: 'text-indigo-600' },
+    { k: 'improvement', l: '目標時間の見直し・AI洞察', color: 'text-indigo-600' },
+  ] },
+  { key: 'people', label: '人・配分', tabs: [
+    { k: 'worker-eval', l: '作業者評価', color: 'text-amber-600', admin: true },
+    { k: 'direct-indirect', l: '直間分析', color: 'text-teal-600' },
+  ] },
+  { key: 'record', label: '記録・出力', tabs: [
+    { k: 'monthly', l: '月次レポート', color: 'text-slate-800' },
+    { k: 'audit', l: '点検・バックアップ', color: 'text-emerald-600' },
+    { k: 'export', l: 'データ書き出し', color: 'text-blue-600' },
+    { k: 'rotary', l: '分割測定', color: 'text-cyan-600' },
+  ] },
+];
 const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], templates = [], onRestore = null, db = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
-  const [activeMode, setActiveMode] = useState('defects'); // 工程改善分析は「作業最適化」タブへ移動したため既定を不具合分析に
+  const [activeMode, setActiveMode] = useState('pdca'); // 既定=改善PDCA(重点工程)。グループは activeMode から導出
+  const activeGroup = ANALYSIS_GROUPS.find(g => g.tabs.some(t => t.k === activeMode)) || ANALYSIS_GROUPS[0];
   const [selectedModel, setSelectedModel] = useState('all');
   const [targetTolerance, setTargetTolerance] = useState(20); // % for USL/LSL (analysisData の Excel/PDF 出力で使用)
   // 旧 filterMode/filterStartDate/filterEndDate と isInFilterPeriod は削除。
@@ -15570,21 +15597,22 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
               {activeMode === 'monthly' && (<><FileText className="w-6 h-6 text-slate-700"/> 月次レポート</>)}
             </h2>
             <div className="flex items-center gap-3">
-              <div className="flex bg-slate-200 p-1 rounded-lg">
-                 {/* 工程改善分析(目標時間最適化)は「作業最適化」タブに移動 */}
-                 <button onClick={()=>setActiveMode('dashboard')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='dashboard' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> ダッシュボード</button>
-                 <button onClick={()=>setActiveMode('kpi')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='kpi' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><TrendingUp className="w-4 h-4"/> 経営分析</button>
-                 <button onClick={()=>setActiveMode('achievement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='achievement' ? 'bg-white shadow text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}><Target className="w-4 h-4"/> 達成率</button>
-                 <button onClick={()=>setActiveMode('rotary')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='rotary' ? 'bg-white shadow text-cyan-600' : 'text-slate-500 hover:text-slate-700'}`}><Ruler className="w-4 h-4"/> 分割測定</button>
-                 <button onClick={()=>setActiveMode('audit')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='audit' ? 'bg-white shadow text-emerald-600' : 'text-slate-500 hover:text-slate-700'}`}><ClipboardCheck className="w-4 h-4"/> 点検・バックアップ</button>
-                 <button onClick={()=>setActiveMode('defects')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='defects' ? 'bg-white shadow text-rose-600' : 'text-slate-500 hover:text-slate-700'}`}><AlertTriangle className="w-4 h-4"/> 不具合分析</button>
-                 <button onClick={()=>setActiveMode('complaints')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='complaints' ? 'bg-white shadow text-purple-600' : 'text-slate-500 hover:text-slate-700'}`}><Megaphone className="w-4 h-4"/> 軽微不良・改善提案</button>
-                 <button onClick={()=>setActiveMode('direct-indirect')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='direct-indirect' ? 'bg-white shadow text-teal-600' : 'text-slate-500 hover:text-slate-700'}`}><Activity className="w-4 h-4"/> 直間分析</button>
-                 {currentUserName === '管理者' && <button onClick={()=>setActiveMode('worker-eval')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='worker-eval' ? 'bg-white shadow text-amber-600' : 'text-slate-500 hover:text-slate-700'}`}><Users className="w-4 h-4"/> 作業者評価</button>}
-                 <button onClick={()=>setActiveMode('improvement')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='improvement' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Zap className="w-4 h-4"/> 改善ヒント</button>
-                 <button onClick={()=>setActiveMode('pdca')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='pdca' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><ClipboardList className="w-4 h-4"/> 改善PDCA</button>
-                 <button onClick={()=>setActiveMode('monthly')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='monthly' ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}><FileText className="w-4 h-4"/> 月次レポート</button>
-                 <button onClick={()=>setActiveMode('export')} className={`px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 ${activeMode==='export' ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}><DownloadCloud className="w-4 h-4"/> データ書き出し</button>
+              <div className="flex flex-col gap-1.5">
+                 {/* 1段目: グループ (5つ) */}
+                 <div className="flex bg-slate-200 p-1 rounded-lg flex-wrap">
+                   {ANALYSIS_GROUPS.map(g => {
+                     const vis = g.tabs.filter(t => !t.admin || currentUserName === '管理者');
+                     if (vis.length === 0) return null;
+                     const on = activeGroup.key === g.key;
+                     return <button key={g.key} onClick={() => setActiveMode(vis[0].k)} className={`px-4 py-2 rounded-md text-sm font-bold ${on ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}>{g.label}</button>;
+                   })}
+                 </div>
+                 {/* 2段目: 選択中グループのサブタブ */}
+                 <div className="flex gap-1 flex-wrap">
+                   {activeGroup.tabs.filter(t => !t.admin || currentUserName === '管理者').map(t => (
+                     <button key={t.k} onClick={() => setActiveMode(t.k)} className={`px-3 py-1.5 rounded-md text-xs font-bold border ${activeMode === t.k ? `bg-white shadow ${t.color} border-slate-300` : 'text-slate-500 border-transparent hover:bg-slate-100'}`}>{t.l}</button>
+                   ))}
+                 </div>
               </div>
               {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
