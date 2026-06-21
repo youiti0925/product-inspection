@@ -15792,10 +15792,12 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   const cardedKeys = useMemo(() => new Set((improvements || []).filter(c => !['effective', 'noeffect', 'worse', 'rolledback'].includes(c.status)).map(c => `${c.model}||${c.stepKey}`)), [improvements]);
   const selCarded = sel ? cardedKeys.has(`${model}||${sel.stepKey}`) : false;
   const makeCard = () => {
-    if (!sel || !saveData) return;
-    const category = sel.stepKey.includes('_') ? sel.stepKey.slice(0, sel.stepKey.indexOf('_')) : '';
-    const problem = `${sel.stepTitle}: 中央値${fmt(sel.median)}${sel.target > 0 ? ` / 目標${fmt(sel.target)}（${sel.median > sel.target ? fmt(sel.median - sel.target) + '遅い' : '目標内'}）` : '（目標未設定）'}、年間合計${hrs(sel.totalSec)}、バラつきCV${Math.round(sel.cv * 100)}%（${sel.n}台）。`;
-    const card = makeImprovementCard(lots, { model, stepKey: sel.stepKey, stepTitle: sel.stepTitle, category, source: { kind: 'process-analysis', label: '工程分析から', problem }, customTargetTimes, modelGroups, currentUserName, nowMs });
+    // 連打の重複起票を本体でもガード(UIボタン差し替えはonSnapshot反映までラグがあるため)。category は行が持つ正しい値を使う(_含み対策)。
+    if (!sel || !saveData || cardedKeys.has(`${model}||${sel.stepKey}`)) return;
+    const card = makeImprovementCard(lots, { model, stepKey: sel.stepKey, stepTitle: sel.stepTitle, category: sel.category || '', source: { kind: 'process-analysis', label: '工程分析から' }, customTargetTimes, modelGroups, currentUserName, nowMs });
+    // 問題文は凍結baseline(=PDCAの証拠表と同じ値)から組み立て、ユーザーが見た数字と保存値を一致させる(監査是正)。年間合計は直近1年の参考値。
+    const b = card.baseline || {};
+    card.problem = `${sel.stepTitle}: 中央値${fmt(b.median || 0)}（直近90日・${b.n || 0}台）${b.avgTarget > 0 ? ` / 目標${fmt(b.avgTarget)}（${(b.median || 0) > b.avgTarget ? fmt((b.median || 0) - b.avgTarget) + '遅い' : '目標内'}）` : '（目標未設定）'}、バラつきCV${Math.round((b.cv || 0) * 100)}%。参考: 直近1年の年間合計 ${hrs(sel.totalSec)}。`;
     saveData('improvements', card.id, card);
     if (onGoToPdca) onGoToPdca();
   };
@@ -16585,7 +16587,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    ))}
                  </div>
               </div>
-              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca', 'process-analysis'].includes(activeMode) && (
+              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca', 'process-analysis', 'anomaly', 'standardize'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
                 {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
                 <button onClick={async ()=>{
