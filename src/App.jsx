@@ -15360,11 +15360,56 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
 };
 
 // じっと見るモード=工程を要素作業に分けて観測するプランの編集(テンプレ本体は壊さず別コレクションに保存)
+// じっと見るの使い方ガイド(3ステップ+具体例)。「使い方が謎」への対応=設定/計測/確認のどこで何をするかを明示。
+const ObsHelpModal = ({ onClose }) => {
+  const Where = ({ children, color }) => <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${color}`}>{children}</span>;
+  return (
+    <div className="fixed inset-0 z-[215] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white w-full max-w-md max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-blue-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <h3 className="font-bold flex items-center gap-2"><Eye className="w-5 h-5" /> じっと見るの使い方</h3>
+          <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+        </div>
+        <div className="p-4 overflow-y-auto space-y-3 text-sm text-slate-700">
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-2.5 text-[12px] text-blue-900">
+            <b>「じっと見る」</b>は、1つの工程を小さな動作（要素）に分けて、<b>どの動作が一番時間を食っているか</b>を見る機能です。改善の的（ボトルネック）が分かります。
+          </div>
+          <div className="space-y-2.5">
+            <div className="flex gap-2">
+              <div className="shrink-0 w-6 h-6 rounded-full bg-blue-600 text-white font-bold flex items-center justify-center text-xs">1</div>
+              <div className="flex-1"><div className="font-bold flex items-center gap-1.5"><Where color="bg-blue-100 text-blue-700">この画面で 設定</Where>要素に分ける</div>
+                <div className="text-[12px] text-slate-600 mt-0.5">工程を選んで <b>「じっと見る（要素に分ける）」</b>→ 動作を順番に<b>2つ以上</b>登録（例: ①治具に取付 ②測る ③外す）→ 対象の型式/テンプレを選んで保存。</div></div>
+            </div>
+            <div className="flex gap-2">
+              <div className="shrink-0 w-6 h-6 rounded-full bg-blue-600 text-white font-bold flex items-center justify-center text-xs">2</div>
+              <div className="flex-1"><div className="font-bold flex items-center gap-1.5"><Where color="bg-emerald-100 text-emerald-700">作業画面で 計測</Where>区切りながら計る</div>
+                <div className="text-[12px] text-slate-600 mt-0.5">次にこの工程を<b>時間取り</b>すると、画面の上に要素ボタンが出ます。1つの動作が終わるたびに <b>「⏱ ○○ 完了 → 次の要素へ」</b> を押す。最後の動作はそのまま工程を完了。</div>
+                <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-1">※ 途中で一時停止・「作業の続き」にすると内訳は記録されず、工程の合計時間だけ残ります（最後まで一気に区切った時だけ内訳が付きます）。</div></div>
+            </div>
+            <div className="flex gap-2">
+              <div className="shrink-0 w-6 h-6 rounded-full bg-blue-600 text-white font-bold flex items-center justify-center text-xs">3</div>
+              <div className="flex-1"><div className="font-bold flex items-center gap-1.5"><Where color="bg-blue-100 text-blue-700">この画面で 確認</Where>内訳を見る</div>
+                <div className="text-[12px] text-slate-600 mt-0.5">何台か計ると、下の <b>「⑤ 要素別の内訳」</b> に各動作の時間と割合が出ます。<b>一番長い動作＝ボトルネック</b> → そこを「改善PDCA」で対策。</div></div>
+            </div>
+          </div>
+          <div className="bg-slate-50 border rounded-lg p-2.5 text-[12px]">
+            <div className="font-bold text-slate-700 mb-1">例</div>
+            「測定」工程（1台 1:20）を ①治具に取付 ②測る ③外す に分けたら、<b>②測る が 50秒で一番長い</b>と分かる → 治具や手順を見直す的が決まる。
+          </div>
+          <div className="text-[11px] text-slate-500 leading-relaxed">
+            <b>コツ:</b> 1要素は<b>6秒以上</b>（短すぎると人手で測れない）。始まり/終わりは<b>はっきりした目印</b>（機械の音・治具の掛け外し・工具を置く）で区切る。<b>手作業と機械の自動</b>は分ける。
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
 const ObservationPlanEditor = ({ plan, templateId, stepKey, stepTitle, model, models = [], allPlans = [], saveData, deleteData, onClose }) => {
   const [elements, setElements] = useState(() => (plan?.elements?.length ? plan.elements.map(e => ({ ...e })) : [{ id: generateId(), label: '' }, { id: generateId(), label: '' }]));
   const [scopeModel, setScopeModel] = useState(plan?.model || '');
   const [enabled, setEnabled] = useState(plan ? plan.enabled !== false : true);
   const [busy, setBusy] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const addEl = () => setElements(p => [...p, { id: generateId(), label: '' }]);
   const setLabel = (i, v) => setElements(p => p.map((e, j) => j === i ? { ...e, label: v } : e));
   const removeEl = (i) => setElements(p => p.filter((_, j) => j !== i));
@@ -15387,8 +15432,12 @@ const ObservationPlanEditor = ({ plan, templateId, stepKey, stepTitle, model, mo
       <div className="bg-white w-full max-w-lg max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className="bg-blue-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
           <h3 className="font-bold flex items-center gap-2"><Eye className="w-5 h-5" /> じっと見る — 「{stepTitle}」を要素に分ける</h3>
-          <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+          <div className="flex items-center gap-1.5">
+            <button onClick={() => setShowHelp(true)} className="px-2.5 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">❓使い方</button>
+            <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+          </div>
         </div>
+        {showHelp && <ObsHelpModal onClose={() => setShowHelp(false)} />}
         <div className="p-4 overflow-y-auto space-y-3 text-sm">
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-2.5 text-[12px] text-blue-900">
             この工程を、作業の中の小さな単位（要素）に分けて観測します。<b>合計は元の工程時間のまま</b>で、要素ごとの内訳も取れます。次に作業者がこの工程を計測すると、要素ごとの「区切り」ボタンが出ます。
@@ -15678,6 +15727,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   }, [completed, model, templates]);
   const [templateId, setTemplateId] = useState('');
   const [obsEditor, setObsEditor] = useState(false);
+  const [obsHelp, setObsHelp] = useState(false);
   const nowMs = Date.now();
   const bd = useMemo(() => stepBreakdown(lots, { model, templateId: templateId || undefined, startMs: nowMs - 365 * 86400000, endMs: nowMs, customTargetTimes, modelGroups }), [lots, model, templateId, customTargetTimes, modelGroups]);
   const [selKey, setSelKey] = useState('');
@@ -15693,16 +15743,16 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   const maxTrend = Math.max(1, ...trend.map(t => t.median));
   const workerRows = useMemo(() => sel ? Object.entries(sel.workers).map(([w, ds]) => ({ name: (workers.find(x => x.id === w)?.name) || w, median: medianOf(ds), n: ds.length })).filter(x => x.n >= 1).sort((a, b) => a.median - b.median) : [], [sel, workers]);
   const maxWorker = Math.max(1, ...workerRows.map(w => w.median));
-  // じっと見るモード: 選択工程の観測プラン + 要素別実績。
-  //   作業画面/集計が記録に使う findObsPlan(有効&型式専用優先) と同じ解決にして表示と記録のプランを一致させる。
-  //   有効プランが無い時だけ、無効/空プランも編集できるよう「型式専用→全型式」の順で決定的にフォールバック。
-  const planForSel = useMemo(() => {
-    if (!sel || !templateId) return null;
-    const live = findObsPlan(observationPlans, templateId, sel.stepKey, model);
+  // じっと見るモード: 観測プラン解決を1関数に集約=画面/PDF/Excel で同じプラン(=同じ要素ラベル・出る出ない)になる(監査是正)。
+  //   作業/集計が記録に使う findObsPlan(有効&型式専用優先) を最優先、無ければ無効/空プランも編集できるよう「型式専用→全型式」で決定的にフォールバック。
+  const resolveObsPlan = (stepKey) => {
+    if (!templateId || !stepKey) return null;
+    const live = findObsPlan(observationPlans, templateId, stepKey, model);
     if (live) return live;
-    const ps = (observationPlans || []).filter(p => p.templateId === templateId && p.stepKey === sel.stepKey);
+    const ps = (observationPlans || []).filter(p => p.templateId === templateId && p.stepKey === stepKey);
     return ps.find(p => p.model && p.model === model) || ps.find(p => !p.model) || null;
-  }, [observationPlans, templateId, sel, model]);
+  };
+  const planForSel = useMemo(() => sel ? resolveObsPlan(sel.stepKey) : null, [observationPlans, templateId, sel, model]);
   const elStats = useMemo(() => (sel && templateId) ? obsElementStats(lots, { model, templateId, stepKey: sel.stepKey, plan: planForSel }) : null, [lots, model, templateId, sel, planForSel]);
   const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
   // === 修正モード: 選択工程の生データ(各指図の各台)を一覧→異常を直す ===
@@ -15717,9 +15767,12 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   };
   const saveFix = (newSec) => {
     if (!fixEdit || !saveData) return;
+    const v = Math.max(0, Math.round(newSec));
+    // 修正ツールが異常値を再投入しないよう確認(0=集計から消える / 4時間超=外れ値のまま)。
+    if ((v <= 0 || v > 14400) && !confirm(v <= 0 ? '0秒は集計から除外され、グラフから消えます。このまま保存しますか？' : '4時間を超える値は異常値（外れ値）のままになります。このまま保存しますか？')) return;
     const lot = (lots || []).find(l => l.id === fixEdit.sample.lotId); if (!lot) { setFixEdit(null); return; }
     const tk = fixEdit.sample.taskKey; const cur = (lot.tasks || {})[tk]; if (!cur) { setFixEdit(null); return; }
-    const tasks = { ...(lot.tasks || {}), [tk]: { ...cur, duration: Math.max(0, Math.round(newSec)), manualTime: true } };
+    const tasks = { ...(lot.tasks || {}), [tk]: { ...cur, duration: v, manualTime: true } };
     saveData('lots', lot.id, { tasks });
     setFixEdit(null);
   };
@@ -15738,7 +15791,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   // 各工程の per-row 派生(推移/作業者/要素)。レポートで工程ごとのグラフを描くため。
   const trendOf = (monthly) => Object.keys(monthly || {}).sort().slice(-8).map(ym => ({ label: `${parseInt(ym.slice(5))}月`, median: medianOf(monthly[ym]), n: monthly[ym].length }));
   const workersOf = (wk) => Object.entries(wk || {}).map(([w, ds]) => ({ label: (workers.find(x => x.id === w)?.name) || w, value: medianOf(ds), n: ds.length })).filter(x => x.n >= 1).sort((a, b) => a.value - b.value);
-  const elStatsOf = (stepKey) => templateId ? obsElementStats(lots, { model, templateId, stepKey, plan: findObsPlan(observationPlans, templateId, stepKey, model) }) : null;
+  const elStatsOf = (stepKey) => templateId ? obsElementStats(lots, { model, templateId, stepKey, plan: resolveObsPlan(stepKey) }) : null;
   const printReport = (detailed) => {
     const k = repKpi();
     let body = `<h1>${esc(repTitle)}</h1><div class="meta">期間: ${esc(repPeriod)} ・ 完了台数(最多工程): ${k.topN}台 ・ 発行: ${esc(pdcaFmtDate(nowMs))}</div>`;
@@ -15755,7 +15808,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
         const [cvl] = cvBadge(r.cv);
         const strip = svgStrip(r.durations, r.target, { w: 740, h: 124 });
         const tr = trendOf(r.monthly); const trendSvg = svgTrend(tr, r.target, { w: 360, h: 140 });
-        const wb = svgBars(workersOf(r.workers), { w: 360, color: '#0d9488', target: r.target });
+        const wb = workersOf(r.workers).length > 1 ? svgBars(workersOf(r.workers), { w: 360, color: '#0d9488', target: r.target }) : '';
         const es = elStatsOf(r.stepKey); const elem = (es && es.observedUnits > 0) ? svgElement(es.rows, { w: 740 }) : '';
         body += `<div class="proc"><div class="ph">${i + 1}. ${esc(r.stepTitle)} <span class="sub">${r.n}台 ・ 中央値${fmtS(r.median)} ・ σ${fmtS(r.sigma)} ・ CV${Math.round(r.cv * 100)}%（${cvl}）${r.target > 0 ? ' ・ 目標' + fmtS(r.target) + '（' + (r.median <= r.target ? '達成' : '超過') + '）' : ''}</span></div>`;
         body += `<div class="cl">ばらつき（1台ずつの実測・点が散る＝不安定）</div><div class="chart">${strip}</div>`;
@@ -15764,7 +15817,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
         body += `</div>`;
       });
     }
-    body += `<div class="n" style="margin-top:8px">読み方: パレート＝棒が年間合計時間（色は目標比 緑◯/黄やや超/赤超過）、折線が累積%。左ほど「時間の山」で直す効果が大。ばらつき＝点が1台ずつの実測、太線が真ん中、赤点線が目標。中央値＝真ん中の実績（外れ値に強い）。0秒・4時間超の異常値は除外。</div>`;
+    body += `<div class="n" style="margin-top:8px">読み方: パレート＝棒が年間合計時間（色は目標比 緑◯/黄やや超/赤超過）、折線が累積%。左ほど「時間の山」で直す効果が大。ばらつき＝点が1台ずつの実測、太線が真ん中、赤点線が目標。中央値＝真ん中の実績（外れ値に強い）。0秒は集計から除外。4時間超など極端な値は外れ値として点でも表示し計算にも含みます（画面の「生データ修正」で直せます）。</div>`;
     const css = `@page{size:A4 portrait;margin:12mm}body{font-family:'Yu Gothic','Hiragino Kaku Gothic ProN',sans-serif;color:#1e293b;font-size:11px}h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:13px 0 5px;border-bottom:2px solid #2563eb;padding-bottom:2px;break-after:avoid}.meta{color:#64748b;font-size:10px;margin-bottom:8px}.kg{display:flex;gap:8px;margin:8px 0}.k{flex:1;border:1px solid #cbd5e1;border-radius:6px;padding:6px;text-align:center}.k .v{font-size:17px;font-weight:bold}.k .l{font-size:9px;color:#64748b}.chart{border:1px solid #e2e8f0;border-radius:6px;padding:3px;margin:3px 0 8px;background:#fff}.chart svg{width:100%;height:auto;display:block}.cc{display:flex;gap:8px}.half{flex:1;min-width:0}.cl{font-size:10px;color:#475569;font-weight:bold;margin:5px 0 1px}.proc{break-inside:avoid;border-top:1px solid #e2e8f0;padding-top:6px;margin-top:8px}.ph{font-size:12px;font-weight:bold;color:#1e3a8a}.ph .sub{font-size:9.5px;font-weight:normal;color:#64748b}table.d{width:100%;border-collapse:collapse;margin-bottom:6px}table.d th,table.d td{border:1px solid #cbd5e1;padding:3px 5px;font-size:10px}table.d th{background:#dbeafe}.c{text-align:center}.n{font-size:9.5px;color:#475569;background:#f8fafc;border-left:3px solid #cbd5e1;padding:4px 6px;margin:3px 0;break-inside:avoid}tr{break-inside:avoid}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}`;
     const pw = window.open('', '_blank'); if (!pw) { alert('ポップアップを許可してください'); return; }
     pw.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${esc(repTitle)}</title><style>${css}</style></head><body>${body}<scr` + `ipt>window.onload=function(){setTimeout(function(){window.print();},500);}</scr` + `ipt></body></html>`);
@@ -15861,10 +15914,13 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-sm font-bold text-slate-700">② {sel.stepTitle} の中身</span>
                 <span className="text-xs text-slate-400">（{sel.n}台ぶん）</span>
-                {(() => { const [lbl, cls] = cvBadge(sel.cv); return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls}`}>{lbl}（CV {sel.cv}）</span>; })()}
+                {(() => { const [lbl, cls] = cvBadge(sel.cv); return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls}`}>{lbl}（CV {Math.round(sel.cv * 100)}%）</span>; })()}
                 <div className="ml-auto flex items-center gap-1.5">
                   {saveData && (
                     <button onClick={() => setFixMode(m => !m)} className={`text-[11px] px-2 py-1 rounded border font-bold flex items-center gap-1 ${fixMode ? 'border-amber-400 bg-amber-100 text-amber-800' : 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'}`} title="グラフを見て生データの異常を感じたら直す">🔧 {fixMode ? '修正モード中' : '生データ修正'}</button>
+                  )}
+                  {!sel.stepKey?.includes('lot') && (
+                    <button onClick={() => setObsHelp(true)} className="text-[11px] px-2 py-1 rounded border border-slate-200 bg-white text-slate-500 font-bold hover:bg-slate-50" title="じっと見るの使い方">❓使い方</button>
                   )}
                   {saveData && !sel.stepKey?.includes('lot') && (
                     templateId
@@ -15950,7 +16006,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
               {/* ⑤ 要素別の内訳(じっと見る) */}
               {(planForSel || (elStats && elStats.observedUnits > 0)) && (
                 <div className="border-t border-slate-100 pt-2">
-                  <div className="text-xs font-bold text-blue-700 mb-1 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />⑤ 要素別の内訳（じっと見る）{planForSel && planForSel.enabled === false && <span className="text-[10px] text-slate-400 font-normal">（観測OFF）</span>}</div>
+                  <div className="text-xs font-bold text-blue-700 mb-1 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />⑤ 要素別の内訳（じっと見る）{planForSel && planForSel.enabled === false && <span className="text-[10px] text-slate-400 font-normal">（観測OFF）</span>}<button onClick={() => setObsHelp(true)} className="ml-1 text-[10px] text-slate-400 underline font-normal hover:text-blue-600">使い方</button></div>
                   {elStats && elStats.observedUnits > 0 ? (
                     <div className="space-y-1">
                       {(() => { const maxEl = Math.max(1, ...elStats.rows.map(r => r.median)); return elStats.rows.map((r, i) => (
@@ -15963,7 +16019,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                       <div className="text-[10px] text-slate-400">各要素の中央値の合計（参考）＝{fmt(elStats.totalMedian)}。一番長い要素＝この工程のボトルネック。{elStats.observedUnits}台ぶんの観測（各要素の台数は右端）。中央値の合計は工程の中央値と完全一致はしません（各台の合計は工程時間に一致）。</div>
                     </div>
                   ) : (
-                    <div className="text-[11px] text-slate-500">観測プランあり（{planForSel?.elements?.length || 0}要素）。作業画面でこの工程を計測すると、要素ごとの内訳がここに出ます。</div>
+                    <div className="text-[11px] text-slate-500">観測プランあり（{planForSel?.elements?.length || 0}要素）。<b className="text-emerald-700">次にこの工程を作業画面で時間取りすると</b>、要素ボタンが出て、ここに内訳が出ます。<button onClick={() => setObsHelp(true)} className="text-blue-600 underline">使い方を見る</button></div>
                   )}
                 </div>
               )}
@@ -15975,6 +16031,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
       {obsEditor && sel && templateId && (
         <ObservationPlanEditor plan={planForSel} templateId={templateId} stepKey={sel.stepKey} stepTitle={sel.stepTitle} model={model} models={models} allPlans={observationPlans} saveData={saveData} deleteData={deleteData} onClose={() => setObsEditor(false)} />
       )}
+      {obsHelp && <ObsHelpModal onClose={() => setObsHelp(false)} />}
       {fixEdit && <RawFixModal sample={fixEdit.sample} target={sel?.target || 0} fmt={fmt} onSave={saveFix} onClose={() => setFixEdit(null)} />}
     </div>
   );
