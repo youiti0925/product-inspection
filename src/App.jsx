@@ -14530,6 +14530,18 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
   const colsOf = (si) => { const st = steps[si]; if (!st?.lotOnce) return qty; return Math.max(1, Object.keys(tasks).filter(k => k.startsWith(`${st.id}-lot-`)).length); };
   const anomOf = (t) => { if (!t || t.status !== 'completed') return null; const d = t.duration || 0; if (!d) return 'high'; if (d < 5) return 'mid'; if (d > 14400) return 'high'; if (t.firstStartTime && t.endTime && t.endTime < t.firstStartTime) return 'high'; return null; };
   const apply = (key, sec) => { const cur = tasks[key] || {}; onSaveTasks({ ...tasks, [key]: { ...cur, status: 'completed', duration: Math.round(sec), startTime: null, endTime: cur.endTime || Date.now(), firstStartTime: cur.firstStartTime || Date.now(), manualTime: true } }); setTi(null); };
+  // 該当なし(対象外)にする = この台はこの工程に該当しない(例: ロットで1回だけの段取りの2台目以降)。集計・異常判定から除外される。
+  const markSkip = (key) => { const cur = tasks[key] || {}; onSaveTasks({ ...tasks, [key]: { ...cur, status: 'skipped', skipReason: cur.skipReason || '該当なし(対象外)', skipAt: cur.skipAt || Date.now(), endTime: cur.endTime || Date.now() } }); setTi(null); };
+  // 該当なしを解除 = 測定値(完了)に戻す。元の duration はそのまま残るので直近の実測に復帰する。
+  const unskip = (key) => { const cur = tasks[key] || {}; onSaveTasks({ ...tasks, [key]: { ...cur, status: 'completed' } }); setTi(null); };
+  // 一括: この工程の #2以降(=1台目以外)を該当なしにする。「ロットで1回だけ」設定前の過去データ片付け用(2台目から3秒等のゴミ)。1台目は残す。
+  const rowSkipFromSecond = (si) => {
+    const st = steps[si]; if (st?.lotOnce) return; const n = colsOf(si); if (n <= 1) return;
+    if (!confirm(`「${st.title}」の #2以降（${n - 1}台）を「該当なし(対象外)」にしますか？\n1台目だけ残します。ロットで1回だけの工程の過去データ向けです（後で個別に解除できます）。`)) return;
+    const nt = { ...tasks };
+    for (let u = 1; u < n; u++) { const key = keyOf(si, u); const cur = nt[key]; if (cur && cur.status === 'completed') nt[key] = { ...cur, status: 'skipped', skipReason: '該当なし(2台目以降)', skipAt: Date.now(), endTime: cur.endTime || Date.now() }; }
+    onSaveTasks(nt);
+  };
   let anom = 0; steps.forEach((s, si) => { for (let u = 0; u < colsOf(si); u++) if (anomOf(getT(si, u))) anom++; });
   const tiTotal = ti ? (parseInt(ti.min) || 0) * 60 + (parseInt(ti.sec) || 0) : 0;
   return (
@@ -14541,13 +14553,13 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
           <tbody>
             {steps.map((s, si) => (
               <tr key={si} className="border-b border-slate-50">
-                <td className="px-2 py-1 font-bold sticky left-0 bg-white truncate max-w-[9rem]" title={s.title}>{s.title}</td>
+                <td className="px-2 py-1 font-bold sticky left-0 bg-white truncate max-w-[9rem]">{s.lotOnce ? <span title={s.title}>{s.title}</span> : <button onClick={() => rowSkipFromSecond(si)} className="text-left hover:text-amber-700 hover:underline truncate w-full" title={`「${s.title}」の #2以降を該当なし(対象外)にする（ロットで1回だけの工程の過去データ向け）`}>{s.title}</button>}</td>
                 <td className="px-1 py-1 text-center text-slate-400 font-mono">{s.targetTime || '-'}</td>
                 {s.lotOnce ? (
                   // ロット1回(段取り)工程: 回数分を1つの<td colSpan={qty}>にまとめ、中で回数チップをflex配置(複数回でも列がズレない)
-                  <td colSpan={qty} className="px-0.5 py-0.5"><div className="flex flex-wrap items-center gap-1 justify-center">{Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = `${u + 1}回目`; return (<button key={u} onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`📦${cellLabel} ${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{`${cellLabel} `}{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : '·'))}</button>); })}</div></td>
+                  <td colSpan={qty} className="px-0.5 py-0.5"><div className="flex flex-wrap items-center gap-1 justify-center">{Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = `${u + 1}回目`; return (<button key={u} onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`📦${cellLabel} ${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{`${cellLabel} `}{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '対象外' : (t?.status === 'ng' ? 'NG' : '·'))}</button>); })}</div></td>
                 ) : (
-                  Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = `#${u + 1}`; return (<td key={u} className="px-0.5 py-0.5 text-center"><button onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`w-full min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '—' : (t?.status === 'ng' ? 'NG' : '·'))}</button></td>); })
+                  Array.from({ length: colsOf(si) }, (_, u) => { const key = keyOf(si, u); const t = getT(si, u); const a = anomOf(t); const isDone = t?.status === 'completed'; const bg = a ? (a === 'high' ? 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-300' : 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-300') : (isDone ? 'bg-slate-50 text-slate-700' : 'text-slate-300'); const cellLabel = `#${u + 1}`; return (<td key={u} className="px-0.5 py-0.5 text-center"><button onClick={() => setTi({ key, label: `${s.title} ${cellLabel}`, min: String(Math.floor((t?.duration || 0) / 60) || ''), sec: String((t?.duration || 0) % 60 || ''), targetSec: s.targetTime || 0 })} className={`w-full min-w-[2.6rem] rounded px-1 py-0.5 font-mono font-bold ${bg} hover:opacity-80`} title={`${isDone ? 'タップで直す' : (t?.status || '未着手')}`}>{isDone ? fmt(t.duration) : (t?.status === 'skipped' ? '対象外' : (t?.status === 'ng' ? 'NG' : '·'))}</button></td>); })
                 )}
               </tr>
             ))}
@@ -14557,12 +14569,17 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
       {ti && (
         <div className="fixed inset-0 z-[330] bg-black/50 flex items-center justify-center p-4" onClick={() => setTi(null)}>
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="bg-indigo-600 text-white p-3 text-center font-bold text-sm">{ti.label} の時間を直す</div>
+            <div className="bg-indigo-600 text-white p-3 text-center font-bold text-sm">{ti.label} を直す</div>
             <div className="p-4 space-y-3">
+              {(tasks[ti.key]?.status === 'skipped') && <div className="text-center text-[11px] text-slate-500 bg-slate-50 border rounded py-1">現在「該当なし(対象外)」です</div>}
               <div className="flex items-center justify-center gap-1.5"><input type="number" min="0" value={ti.min} onChange={e => setTi(p => ({ ...p, min: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" /><span className="font-bold text-sm">分</span><input type="number" min="0" max="59" value={ti.sec} onChange={e => setTi(p => ({ ...p, sec: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" /><span className="font-bold text-sm">秒</span></div>
               <div className="text-center text-xs text-slate-400">= {tiTotal} 秒</div>
               {ti.targetSec > 0 && <button onClick={() => setTi(p => ({ ...p, min: String(Math.floor(ti.targetSec / 60)), sec: String(ti.targetSec % 60) }))} className="w-full py-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg text-blue-700 font-bold text-xs">目標 {ti.targetSec}秒 を入れる</button>}
-              <div className="flex gap-2"><button onClick={() => setTi(null)} className="flex-1 py-2.5 border rounded-xl font-bold text-slate-600 hover:bg-slate-50">そのまま</button><button disabled={tiTotal <= 0} onClick={() => apply(ti.key, tiTotal)} className={`flex-1 py-2.5 rounded-xl font-bold text-white ${tiTotal > 0 ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-300 cursor-not-allowed'}`}>確定</button></div>
+              <div className="flex gap-2"><button onClick={() => setTi(null)} className="flex-1 py-2.5 border rounded-xl font-bold text-slate-600 hover:bg-slate-50">そのまま（変更しない）</button><button disabled={tiTotal <= 0} onClick={() => apply(ti.key, tiTotal)} className={`flex-1 py-2.5 rounded-xl font-bold text-white ${tiTotal > 0 ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-300 cursor-not-allowed'}`}>この時間で確定</button></div>
+              {/* 該当なし(対象外): ロットで1回だけの工程の2台目以降など、本来やらない台。集計・異常から除外。 */}
+              {tasks[ti.key]?.status === 'skipped'
+                ? <button onClick={() => unskip(ti.key)} className="w-full py-2 border border-slate-300 rounded-xl font-bold text-slate-600 hover:bg-slate-50 text-sm">該当なしを解除（測定値に戻す）</button>
+                : <button onClick={() => markSkip(ti.key)} className="w-full py-2 border-2 border-amber-300 bg-amber-50 rounded-xl font-bold text-amber-700 hover:bg-amber-100 text-sm">📦 該当なし（対象外）にする<div className="text-[10px] font-normal text-amber-600">この台はこの工程をやらない／ロットで1回だけ等。集計・異常から外します</div></button>}
             </div>
           </div>
         </div>
@@ -27236,7 +27253,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  <>
                    <div className="mb-3 text-[11px] text-slate-600 bg-amber-50 border border-amber-200 rounded-lg p-2.5 leading-relaxed">
                      <b>色付き＝注意のヒント</b>です（<span className="text-rose-700 font-bold">赤</span>=0秒/4時間超/時刻の矛盾、<span className="text-amber-700 font-bold">黄</span>=5秒未満）。<u>判定ではありません</u>。<br/>
-                     <b>表全体を見て</b>、本当におかしい所だけセルをタップ →「目標で埋める / 実時間を手入力 / そのまま」で直してください。全体で見れば問題ない値はそのままでOKです。
+                     セルをタップ →「目標で埋める / 実時間を手入力 / <b className="text-amber-700">📦該当なし(対象外)</b> / そのまま」。<br/>
+                     <b className="text-amber-700">該当なし(対象外)</b>＝この台はこの工程をやらない（例: 制御装置用意など「ロットで1回だけ」の工程の2台目以降）。集計・異常から外れます。<b>工程名をタップ</b>すると「#2以降をまとめて該当なし」にできます（過去データの片付け用・1台目は残す）。
                    </div>
                    {[...new Set(anomalies.map(a => a.lotId))].map(lotId => { const lot = lots.find(l => l.id === lotId); if (!lot) return null; return <LotTimeTable key={lotId} lot={lot} onSaveTasks={(nt) => saveData('lots', lotId, { tasks: nt })} />; })}
                  </>
