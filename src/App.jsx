@@ -437,6 +437,37 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
     totalCostSec: totalCost,
   };
 };
+const medianOf = (arr) => { if (!arr || !arr.length) return 0; const s = [...arr].sort((a, b) => a - b); const n = s.length; return n % 2 ? s[(n - 1) / 2] : Math.round((s[n / 2 - 1] + s[n / 2]) / 2); };
+// 重点工程の詳細: 集計に使ったロット一覧(根拠データ=自分で確認できる) + 他型式の同工程との比較
+const profitDetail = (lots, settings, { model, stepKey, startMs = 0, endMs = Infinity }) => {
+  const customTargetTimes = settings?.customTargetTimes || {};
+  const modelGroups = modelGroupsOf(settings);
+  const titlePart = stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey;
+  const srcLots = [];
+  let target = 0;
+  const byModel = {}; // 同じ工程タイトルの実績を型式別に集める(類似比較用)
+  (lots || []).forEach(l => {
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
+    (l.steps || []).forEach((step, idx) => {
+      const sk = targetTimeStepKey(step);
+      const sameTitle = (step.title || '') === titlePart;
+      if (sk !== stepKey && !sameTitle) return;
+      const keys = step.lotOnce ? lotOnceKeysOf(l.tasks || {}, step) : Array.from({ length: l.quantity || 1 }, (_, i) => (l.tasks || {})[`${step.id}-${i}`] !== undefined ? `${step.id}-${i}` : `${idx}-${i}`);
+      const durs = [];
+      keys.forEach(k => { const t = (l.tasks || {})[k]; if (!t) return; if (t.status !== 'completed' && t.status !== 'ng') return; if (t.samplingSkipped) return; const d = t.duration || 0; if (d <= 0) return; const ms = toMsAny(t.endTime) || lotMs; if (ms == null || ms < startMs || ms > endMs) return; durs.push(d); });
+      if (!durs.length) return;
+      if (sameTitle) (byModel[l.model] = byModel[l.model] || []).push(...durs);
+      if (sk === stepKey && l.model === model) {
+        target = getEffectiveTargetTime(step, l.model, customTargetTimes, modelGroups);
+        srcLots.push({ orderNo: l.orderNo || l.id, completedAt: lotMs, count: durs.length, median: medianOf(durs) });
+      }
+    });
+  });
+  const compares = Object.entries(byModel).map(([m, ds]) => ({ model: m, median: medianOf(ds), n: ds.length })).sort((a, b) => a.median - b.median);
+  srcLots.sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+  return { srcLots, target, compares, titlePart };
+};
 // 統計オブジェクトの窓日数 (古いカルテ等で days 欠落時は startMs/endMs から復元)
 const pdcaWindowDays = (stat) => {
   if (!stat) return 1;
@@ -14763,9 +14794,92 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
   );
 };
 
-// 改善PDCA パネル: 候補(乖離検知)→カルテ化、カンバンボード(計画/実施中/効果測定中/完了)、検索
+// 重点工程の詳細モーダル: なぜ上位なのか + 計算の内訳(実数つき) + 類似比較 + 根拠データ(確認用)
+const ProfitDetailModal = ({ row, lots = [], settings = {}, rate = 0, onClose, onCardize, alreadyCarded }) => {
+  const detail = useMemo(() => profitDetail(lots, settings, { model: row.model, stepKey: row.stepKey, startMs: Date.now() - 365 * 86400000, endMs: Date.now() }), [lots, settings, row.model, row.stepKey]);
+  const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
+  const hrs = (sec) => `${(sec / 3600).toFixed(1)}時間`;
+  const gap = Math.abs(row.median - row.target);
+  const overUnder = row.median > row.target ? '遅い' : (row.median < row.target ? '速い' : '同じ');
+  const myCompIdx = detail.compares.findIndex(c => c.model === row.model);
+  const slowerThan = detail.compares.length > 1 ? detail.compares.length - 1 - myCompIdx : 0; // 自分より速い型式の数
+  return (
+    <div className="fixed inset-0 z-[210] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white w-full max-w-2xl max-h-[92vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-slate-800 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <h3 className="font-bold flex items-center gap-2 min-w-0"><TrendingUp className="w-5 h-5 shrink-0" /><span className="truncate">{row.model} ／ {row.stepTitle}</span></h3>
+          <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold shrink-0">閉じる</button>
+        </div>
+        <div className="p-4 overflow-y-auto space-y-4 text-sm text-slate-700">
+          {/* なぜ上位か(一言) */}
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+            <div className="font-bold text-slate-800 mb-1">なぜこの工程が上位なのか</div>
+            この工程は1年で合計 <b>{hrs(row.annualCostSec)}</b>{rate > 0 ? <>（人件費にすると <b>{yen(row.annualCostYen)}</b>）</> : null} かかっています。
+            {row.hasTarget
+              ? <> 1台あたり目標 {pdcaFmtSec(row.target)} に対し実績は {pdcaFmtSec(row.median)} で、目標より <b>{pdcaFmtSec(gap)} {overUnder}</b>です。{row.reductionPerUnit > 0 ? <> 目標まで縮めれば年 <b className="text-emerald-700">{hrs(row.annualSaveSec)}{rate > 0 ? `（${yen(row.annualSaveYen)}）` : ''}</b> 浮きます。</> : <> 既に目標より速いので、これ以上の短縮余地は小さいです（コストの山として把握用）。</>}</>
+              : <> この工程は目標時間が未設定のため、削減見込は出していません（時間の山として把握用）。</>}
+          </div>
+
+          {/* 計算の内訳(実数つき) */}
+          <div>
+            <div className="font-bold text-slate-800 mb-1">計算の内訳（実際の数字）</div>
+            <table className="w-full text-xs border-collapse">
+              <tbody>
+                <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500 w-1/2">① 年間台数（直近1年の完了数）</td><td className="py-1.5 text-right font-mono font-bold">{row.annualUnits.toLocaleString()} 台/年</td></tr>
+                <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">② 1台あたりの時間（実績の中央値・{detail.srcLots.reduce((s, x) => s + x.count, 0)}台ぶん）</td><td className="py-1.5 text-right font-mono font-bold">{pdcaFmtSec(row.median)}</td></tr>
+                <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">③ 年間の合計時間 ＝ ① × ②</td><td className="py-1.5 text-right font-mono font-bold">{hrs(row.annualCostSec)}</td></tr>
+                {rate > 0 && <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">④ 年間人件費 ＝ ③ × 時給{yen(rate)}/時</td><td className="py-1.5 text-right font-mono font-bold">{yen(row.annualCostYen)}</td></tr>}
+                <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">⑤ 1台あたりの目標</td><td className="py-1.5 text-right font-mono">{row.hasTarget ? pdcaFmtSec(row.target) : '未設定'}</td></tr>
+                {row.hasTarget && <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">⑥ 1台あたりの短縮余地 ＝ ② − ⑤</td><td className="py-1.5 text-right font-mono">{row.reductionPerUnit > 0 ? pdcaFmtSec(row.reductionPerUnit) : '0（目標より速い）'}</td></tr>}
+                {row.hasTarget && row.reductionPerUnit > 0 && <tr><td className="py-1.5 text-emerald-700 font-bold">⑦ 年間削減見込 ＝ ① × ⑥{rate > 0 ? ' × 時給' : ''}</td><td className="py-1.5 text-right font-mono font-bold text-emerald-700">{hrs(row.annualSaveSec)}{rate > 0 ? ` ＝ ${yen(row.annualSaveYen)}` : ''}</td></tr>}
+              </tbody>
+            </table>
+            <div className="text-[10px] text-slate-400 mt-1">※ 中央値＝実績の真ん中の値（極端に速い/遅い台に引っぱられないため平均でなく中央値）。年間台数は直近1年の完了数。</div>
+          </div>
+
+          {/* 類似比較 */}
+          {detail.compares.length > 1 && (
+            <div>
+              <div className="font-bold text-slate-800 mb-1">他の型式の同じ「{detail.titlePart}」と比べて</div>
+              <div className="text-[12px] text-slate-600 mb-1">{slowerThan > 0 ? <>この型式は他より <b>{slowerThan}型式ぶん遅い</b>方です。</> : <>この型式は同工程の中で速い方です。</>}（中央値が小さいほど速い）</div>
+              <table className="w-full text-xs border-collapse">
+                <thead><tr className="bg-slate-100 text-slate-500"><th className="px-2 py-1 text-left">型式</th><th className="px-2 py-1 text-right">1台の中央値</th><th className="px-2 py-1 text-right">台数</th></tr></thead>
+                <tbody>{detail.compares.slice(0, 8).map((c, i) => (<tr key={i} className={`border-b border-slate-50 ${c.model === row.model ? 'bg-amber-50 font-bold' : ''}`}><td className="px-2 py-1">{c.model}{c.model === row.model ? '（この工程）' : ''}</td><td className="px-2 py-1 text-right font-mono">{pdcaFmtSec(c.median)}</td><td className="px-2 py-1 text-right font-mono text-slate-400">{c.n}</td></tr>))}</tbody>
+              </table>
+            </div>
+          )}
+
+          {/* 根拠データ(確認用) */}
+          <div>
+            <div className="font-bold text-slate-800 mb-1">根拠データ（この一覧から計算しています・確認用）</div>
+            <div className="max-h-48 overflow-auto border rounded-lg">
+              <table className="w-full text-xs border-collapse">
+                <thead className="sticky top-0 bg-slate-100 text-slate-500"><tr><th className="px-2 py-1 text-left">指図</th><th className="px-2 py-1 text-right">完了日</th><th className="px-2 py-1 text-right">台数</th><th className="px-2 py-1 text-right">この工程の中央値</th></tr></thead>
+                <tbody>
+                  {detail.srcLots.length === 0 && <tr><td colSpan={4} className="text-center text-slate-400 py-3">該当データなし</td></tr>}
+                  {detail.srcLots.map((s, i) => (<tr key={i} className="border-b border-slate-50"><td className="px-2 py-1 font-mono">{s.orderNo}</td><td className="px-2 py-1 text-right text-slate-500">{pdcaFmtDate(s.completedAt)}</td><td className="px-2 py-1 text-right font-mono">{s.count}</td><td className="px-2 py-1 text-right font-mono">{pdcaFmtSec(s.median)}</td></tr>))}
+                </tbody>
+              </table>
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">指図 {detail.srcLots.length} 件・合計 {detail.srcLots.reduce((s, x) => s + x.count, 0)} 台。この台数と時間から上の②③を計算しています。</div>
+          </div>
+
+          {/* CTA */}
+          <div className="flex justify-end pt-1">
+            {alreadyCarded
+              ? <span className="text-xs text-slate-400">この工程は改善カルテ作成済みです</span>
+              : <button onClick={() => { onCardize(row); onClose(); }} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-sm">この工程を改善テーマにする（カルテ化）</button>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 改善PDCA パネル: 重点工程→カルテ化、カンバンボード(計画/実施中/効果測定中/完了)、検索
 const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, saveData, deleteData, customTargetTimes = {}, modelGroups = [], currentUserName = '', templates = [] }) => {
   const [openId, setOpenId] = useState(null);
+  const [detailRow, setDetailRow] = useState(null);
   const [search, setSearch] = useState('');
   const [showHelp, setShowHelp] = useState(false);
   const [hideLowFreq, setHideLowFreq] = useState(true);
@@ -14808,7 +14922,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
   const cardFromRanking = (r) => {
     const saving = ranking.rate > 0 ? `約 ${yen(r.annualSaveYen)}/年` : `年間 約${Math.round(r.annualSaveSec / 3600)}時間`;
     createCard(r.model, r.stepKey, r.stepTitle, r.category, {
-      kind: 'profit', label: `儲けどころ ${saving}`,
+      kind: 'profit', label: `重点工程 ${saving}`,
       problem: `${r.stepTitle}: 年間${r.annualUnits}台・実績中央値${pdcaFmtSec(r.median)}${r.hasTarget ? ` / 目標${pdcaFmtSec(r.target)}（1台${pdcaFmtSec(r.reductionPerUnit)}の短縮余地）` : '（目標未設定）'}。目標まで詰めると ${saving} の削減見込。`,
     });
   };
@@ -14861,26 +14975,29 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
         </div>
       </div>
 
-      {/* 儲けどころランキング: どこを直せば一番お金になるか (年間台数×実績×時給) */}
+      {/* 重点工程ランキング: 年間でかかっている時間・コストが大きい順。行クリックで詳細(計算の内訳+根拠データ) */}
       <div className="border border-emerald-200 rounded-xl overflow-hidden">
         <div className="px-3 py-2 bg-emerald-50 text-emerald-900 text-sm font-bold flex items-center justify-between gap-2 flex-wrap">
-          <span className="flex items-center gap-2"><TrendingUp className="w-4 h-4" /> 儲けどころ — どこを直すと一番お金になるか</span>
+          <span className="flex items-center gap-2"><TrendingUp className="w-4 h-4" /> 重点工程 — 年間でかかっている時間が大きい順</span>
           <div className="flex items-center gap-3 text-[11px] font-normal">
             {ranking.rate > 0
-              ? <span>年間人件費 計 <b className="text-slate-700 text-sm">{yen(ranking.totalCostYen)}</b> ・ 削減見込 <b className="text-emerald-700 text-sm">{yen(ranking.totalSaveYen)}</b></span>
+              ? <span>年間人件費 計 <b className="text-slate-700 text-sm">{yen(ranking.totalCostYen)}</b> ・ 短縮できれば <b className="text-emerald-700 text-sm">{yen(ranking.totalSaveYen)}</b></span>
               : <span className="text-amber-600">時給未設定（経営分析タブで設定すると円換算）</span>}
-            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={hideLowFreq} onChange={e => setHideLowFreq(e.target.checked)} className="accent-emerald-600" />低頻度(年10台未満)を隠す</label>
+            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={hideLowFreq} onChange={e => setHideLowFreq(e.target.checked)} className="accent-emerald-600" />年10台未満を隠す</label>
           </div>
+        </div>
+        <div className="px-3 py-1.5 bg-white text-[11px] text-slate-500 border-b">
+          <b className="text-slate-700">読み方：</b>1年でその工程に合計どれだけ時間がかかっているかの大きい順です。<b>行をクリック</b>すると「年間◯台 × 1台◯分 = 年◯時間」の計算の内訳と、集計に使った指図一覧（確認用）が見られます。
         </div>
         <div className="overflow-auto max-h-80">
           <table className="w-full text-xs border-collapse">
             <thead className="sticky top-0 bg-slate-100 text-slate-500">
               <tr>
                 <th className="px-2 py-1.5 text-left font-bold">型式 × 工程</th>
-                <th className="px-2 py-1.5 text-right font-bold">年間台数</th>
-                <th className="px-2 py-1.5 text-right font-bold">単台 → 目標</th>
-                <th className="px-2 py-1.5 text-right font-bold">年間人件費</th>
-                <th className="px-2 py-1.5 text-right font-bold">年間削減見込</th>
+                <th className="px-2 py-1.5 text-right font-bold" title="直近1年に完了した台数">年間台数<div className="text-[9px] font-normal text-slate-400">台/年</div></th>
+                <th className="px-2 py-1.5 text-right font-bold" title="1台あたりの実績(中央値) → 目標">1台の時間→目標<div className="text-[9px] font-normal text-slate-400">分:秒</div></th>
+                <th className="px-2 py-1.5 text-right font-bold" title="年間台数 × 1台の時間 × 時給">年間人件費<div className="text-[9px] font-normal text-slate-400">{ranking.rate > 0 ? '円/年' : '時間/年'}</div></th>
+                <th className="px-2 py-1.5 text-right font-bold" title="目標まで縮めたら浮く分">短縮できれば<div className="text-[9px] font-normal text-slate-400">{ranking.rate > 0 ? '円/年' : '時間/年'}</div></th>
                 <th className="px-2 py-1.5"></th>
               </tr>
             </thead>
@@ -14890,8 +15007,8 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
                 const carded = activeKeys.has(`${r.model}||${r.stepKey}`);
                 const barPct = Math.max(2, Math.round(r.annualCostSec / maxCost * 100));
                 return (
-                  <tr key={i} className={`border-b border-slate-50 ${r.lowFreq ? 'opacity-50' : ''}`}>
-                    <td className="px-2 py-1.5"><div className="font-bold text-slate-800 truncate max-w-[12rem]" title={`${r.model} / ${r.stepTitle}`}>{r.model} ／ {r.stepTitle}</div>{r.lowFreq && <span className="text-[10px] text-amber-600">年{r.annualUnits}台・後回し</span>}{!r.hasTarget && <span className="text-[10px] text-slate-400">目標未設定</span>}</td>
+                  <tr key={i} onClick={() => setDetailRow(r)} className={`border-b border-slate-50 cursor-pointer hover:bg-emerald-50/50 ${r.lowFreq ? 'opacity-50' : ''}`}>
+                    <td className="px-2 py-1.5"><div className="font-bold text-slate-800 truncate max-w-[12rem] flex items-center gap-1" title={`${r.model} / ${r.stepTitle}（クリックで詳細）`}><span className="text-slate-300">{i + 1}.</span>{r.model} ／ {r.stepTitle}</div>{r.lowFreq && <span className="text-[10px] text-amber-600">年{r.annualUnits}台・後回し</span>}{!r.hasTarget && <span className="text-[10px] text-slate-400">目標未設定</span>}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{r.annualUnits.toLocaleString()}</td>
                     <td className="px-2 py-1.5 text-right font-mono whitespace-nowrap">{pdcaFmtSec(r.median)}<span className="text-slate-400"> → {r.hasTarget ? pdcaFmtSec(r.target) : '—'}</span></td>
                     <td className="px-2 py-1.5 text-right">
@@ -14906,7 +15023,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
                     <td className="px-2 py-1.5 text-right">
                       {carded
                         ? <span className="text-[10px] text-slate-400">カルテ有</span>
-                        : <button onClick={() => cardFromRanking(r)} className="text-[11px] px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-bold whitespace-nowrap">カルテ化</button>}
+                        : <button onClick={(e) => { e.stopPropagation(); cardFromRanking(r); }} className="text-[11px] px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-bold whitespace-nowrap">カルテ化</button>}
                     </td>
                   </tr>
                 );
@@ -14964,6 +15081,10 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
         <ImprovementCardModal card={openCard} lots={lots} customTargetTimes={customTargetTimes} modelGroups={modelGroups} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onClose={() => setOpenId(null)} />
       )}
 
+      {detailRow && (
+        <ProfitDetailModal row={detailRow} lots={lots} settings={settings} rate={ranking.rate} onClose={() => setDetailRow(null)} onCardize={cardFromRanking} alreadyCarded={activeKeys.has(`${detailRow.model}||${detailRow.stepKey}`)} />
+      )}
+
       {showHelp && (
         <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) setShowHelp(false); }}>
           <div className="bg-white w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
@@ -14973,13 +15094,13 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
             </div>
             <div className="p-4 overflow-y-auto space-y-4 text-sm text-slate-700">
               <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
-                <div className="font-bold text-emerald-800 mb-1">この画面は「どこを直すと一番お金になるか」から始めます</div>
-                上の<b>儲けどころ</b>表は <b>年間台数 × 1台の短縮余地 × 時給</b> で並んでいます。上にあるほど、直したときの年間削減額(¥)が大きい工程です。台数が少ない工程は金額が小さく自動で下位になり、「年1回しか来ないから後回し」が一目で分かります。
+                <div className="font-bold text-emerald-800 mb-1">この画面は「どの工程に時間とお金がかかっているか」から始めます</div>
+                上の<b>重点工程</b>表は <b>年間台数 × 1台の時間</b>（＝1年でその工程に合計どれだけ時間がかかっているか）が大きい順です。台数が多くて時間がかかる工程ほど上に来ます。<b>行をクリック</b>すると、その数字がどう計算されたか（実数つき）と、集計に使った指図一覧（確認用）が見られます。年10台未満の工程は金額が小さく自動で下位＝「年1回しか来ないから後回し」が分かります。
               </div>
               <div>
                 <div className="font-bold text-slate-800 mb-1">進め方（5ステップ）</div>
                 <ol className="list-decimal pl-5 space-y-1.5">
-                  <li><b>選ぶ</b>：儲けどころ表の上位の行で「カルテ化」を押す（＝改善テーマが1枚のカルテになる。今の実績が自動で記録されます＝ベースライン）。</li>
+                  <li><b>選ぶ</b>：重点工程表の上位の行をクリックして詳細を確認 →「カルテ化」を押す（＝改善テーマが1枚のカルテになる。今の実績が自動で記録されます＝ベースライン）。</li>
                   <li><b>計画(P)</b>：カルテを開いて「問題／仮説／対策／担当／期限」を書く。主指標（工程時間・ばらつき・達成率・不具合）も選べます。</li>
                   <li><b>実施(D)</b>：対策をしたら「対策を実施した(今日)」を押す。<b>この日を境に</b>前後の実績を自動で比べ始めます。</li>
                   <li><b>効果確認(C)</b>：実施後の台数が5台たまると、改善前→実施後の中央値・ばらつき・達成率が並び、<b>▲改善／▼悪化／横ばい</b>を自動判定。月次推移グラフも実施前=灰／実施後=緑で出ます。</li>
