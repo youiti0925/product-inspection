@@ -468,6 +468,54 @@ const profitDetail = (lots, settings, { model, stepKey, startMs = 0, endMs = Inf
   srcLots.sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
   return { srcLots, target, compares, titlePart };
 };
+
+// === 工程分析の土台: 型式(+テンプレ)別に、工程ごとの実績を集計してグラフ用に返す純関数 ===
+// 各工程の durations(生データ) + 中央値/平均/σ/CV/最小最大 + 作業者別 + 月別、を返す。Pareto は totalSec(時間の山)順。
+const stepBreakdown = (lots, { model, templateId, startMs = 0, endMs = Infinity, customTargetTimes = {}, modelGroups = [] } = {}) => {
+  const byStep = new Map();
+  (lots || []).forEach(l => {
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    if (model && l.model !== model) return;
+    if (templateId && l.templateId !== templateId) return;
+    const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
+    (l.steps || []).forEach((step, idx) => {
+      const sk = targetTimeStepKey(step);
+      const keys = step.lotOnce
+        ? lotOnceKeysOf(l.tasks || {}, step)
+        : Array.from({ length: l.quantity || 1 }, (_, i) => ((l.tasks || {})[`${step.id}-${i}`] !== undefined ? `${step.id}-${i}` : `${idx}-${i}`));
+      keys.forEach(k => {
+        const t = (l.tasks || {})[k]; if (!t) return;
+        if (t.status !== 'completed' && t.status !== 'ng') return;
+        if (t.samplingSkipped) return;
+        const d = t.duration || 0; if (d <= 0) return;
+        const ms = toMsAny(t.endTime) || lotMs; if (ms == null || ms < startMs || ms > endMs) return;
+        let e = byStep.get(sk);
+        if (!e) { e = { stepKey: sk, stepTitle: step.title, category: step.category || '', durations: [], workers: {}, monthly: {}, target: getEffectiveTargetTime(step, l.model, customTargetTimes, modelGroups) }; byStep.set(sk, e); }
+        e.durations.push(d);
+        const w = (t.workerName || '?'); (e.workers[w] = e.workers[w] || []).push(d);
+        const dt = new Date(ms); const ym = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`; (e.monthly[ym] = e.monthly[ym] || []).push(d);
+      });
+    });
+  });
+  const rows = [...byStep.values()].map(e => {
+    const ds = [...e.durations].sort((a, b) => a - b); const n = ds.length; const sum = ds.reduce((a, b) => a + b, 0); const mean = n ? sum / n : 0;
+    const variance = n ? ds.reduce((a, b) => a + (b - mean) ** 2, 0) / n : 0; const sigma = Math.sqrt(variance);
+    return { ...e, n, totalSec: sum, mean: Math.round(mean), median: medianOf(ds), sigma: Math.round(sigma), cv: mean > 0 ? Math.round(sigma / mean * 1000) / 1000 : 0, min: n ? ds[0] : 0, max: n ? ds[n - 1] : 0 };
+  }).sort((a, b) => b.totalSec - a.totalSec);
+  const grand = rows.reduce((s, r) => s + r.totalSec, 0) || 1;
+  let cum = 0; rows.forEach(r => { cum += r.totalSec; r.cumPct = Math.round(cum / grand * 100); r.sharePct = Math.round(r.totalSec / grand * 1000) / 10; });
+  return { rows, grandTotalSec: grand };
+};
+// ヒストグラム: durations を bins 個の階級に分ける
+const histogramOf = (durations, bins = 8) => {
+  if (!durations || !durations.length) return { buckets: [], min: 0, max: 0, width: 0 };
+  const min = Math.min(...durations), max = Math.max(...durations);
+  if (max <= min) return { buckets: [{ lo: min, hi: max, count: durations.length }], min, max, width: 0 };
+  const width = (max - min) / bins;
+  const buckets = Array.from({ length: bins }, (_, i) => ({ lo: min + i * width, hi: min + (i + 1) * width, count: 0 }));
+  durations.forEach(d => { let bi = Math.floor((d - min) / width); if (bi >= bins) bi = bins - 1; if (bi < 0) bi = 0; buckets[bi].count++; });
+  return { buckets, min, max, width };
+};
 // 統計オブジェクトの窓日数 (古いカルテ等で days 欠落時は startMs/endMs から復元)
 const pdcaWindowDays = (stat) => {
   if (!stat) return 1;
@@ -15126,9 +15174,156 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
   );
 };
 
+// === 工程分析ビュー: 型式(+テンプレ)を選び、データをそのままグラフで見る土台 ===
+// ①工程別パレート(どこが一番時間か) ②選択工程のバラつきヒストグラム+CV ③月次推移 ④作業者比較 ⑤根拠(n/最小最大)
+const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [] }) => {
+  const completed = useMemo(() => (lots || []).filter(l => l.status === 'completed' || l.location === 'completed'), [lots]);
+  const models = useMemo(() => [...new Set(completed.map(l => l.model))].filter(Boolean).sort(), [completed]);
+  const [model, setModel] = useState('');
+  useEffect(() => { if ((!model || !models.includes(model)) && models.length) setModel(models[0]); }, [models]); // eslint-disable-line
+  const tplOptions = useMemo(() => {
+    const ids = [...new Set(completed.filter(l => l.model === model).map(l => l.templateId))].filter(Boolean);
+    return ids.map(id => ({ id, name: templates.find(t => t.id === id)?.name || id }));
+  }, [completed, model, templates]);
+  const [templateId, setTemplateId] = useState('');
+  const nowMs = Date.now();
+  const bd = useMemo(() => stepBreakdown(lots, { model, templateId: templateId || undefined, startMs: nowMs - 365 * 86400000, endMs: nowMs, customTargetTimes, modelGroups }), [lots, model, templateId, customTargetTimes, modelGroups]);
+  const [selKey, setSelKey] = useState('');
+  useEffect(() => { setSelKey(bd.rows[0]?.stepKey || ''); }, [model, templateId, bd.rows.length]); // eslint-disable-line
+  const sel = bd.rows.find(r => r.stepKey === selKey) || bd.rows[0] || null;
+  const fmt = pdcaFmtSec;
+  const hrs = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)}時間` : `${Math.round(s / 60)}分`;
+  const hist = sel ? histogramOf(sel.durations, 8) : null;
+  const maxBucket = hist ? Math.max(1, ...hist.buckets.map(b => b.count)) : 1;
+  const maxStepTotal = Math.max(1, ...bd.rows.map(r => r.totalSec));
+  const trend = useMemo(() => {
+    if (!sel) return [];
+    return Object.keys(sel.monthly).sort().slice(-8).map(ym => ({ ym, label: `${parseInt(ym.slice(5))}月`, median: medianOf(sel.monthly[ym]), n: sel.monthly[ym].length }));
+  }, [sel]);
+  const maxTrend = Math.max(1, ...trend.map(t => t.median));
+  const workerRows = useMemo(() => sel ? Object.entries(sel.workers).map(([w, ds]) => ({ name: (workers.find(x => x.id === w)?.name) || w, median: medianOf(ds), n: ds.length })).filter(x => x.n >= 1).sort((a, b) => a.median - b.median) : [], [sel, workers]);
+  const maxWorker = Math.max(1, ...workerRows.map(w => w.median));
+  const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
+
+  return (
+    <div className="space-y-3">
+      {/* 選択 */}
+      <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2 text-sm text-blue-900"><BarChart3 className="w-5 h-5 text-blue-600 shrink-0" /><b>工程分析</b> — 取ったデータをそのまま見る（直近1年）</div>
+        <div className="flex items-center gap-2 ml-auto flex-wrap">
+          <span className="text-xs text-slate-500">型式</span>
+          <select value={model} onChange={e => setModel(e.target.value)} className="border rounded px-2 py-1 text-sm min-w-[8rem]">{models.map(m => <option key={m} value={m}>{m}</option>)}</select>
+          <span className="text-xs text-slate-500">テンプレ</span>
+          <select value={templateId} onChange={e => setTemplateId(e.target.value)} className="border rounded px-2 py-1 text-sm">
+            <option value="">全テンプレ</option>
+            {tplOptions.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {bd.rows.length === 0 ? (
+        <div className="text-center text-slate-400 py-16">この型式の完了データがまだありません。</div>
+      ) : (
+        <>
+          {/* ① 工程別パレート */}
+          <div className="border border-slate-200 rounded-xl p-3">
+            <div className="text-sm font-bold text-slate-700 mb-2">① 工程別の時間 — どの工程が一番かかっているか（行クリックで下に詳細）</div>
+            <div className="space-y-1">
+              {bd.rows.map((r, i) => {
+                const on = sel && r.stepKey === sel.stepKey;
+                return (
+                  <button key={r.stepKey} onClick={() => setSelKey(r.stepKey)} className={`w-full text-left rounded-lg px-2 py-1.5 transition ${on ? 'bg-blue-50 ring-1 ring-blue-300' : 'hover:bg-slate-50'}`}>
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-slate-300 w-4 shrink-0">{i + 1}</span>
+                      <span className="font-bold text-slate-800 truncate w-40 shrink-0" title={r.stepTitle}>{r.stepTitle}</span>
+                      <div className="flex-1 h-3 bg-slate-100 rounded overflow-hidden"><div className="h-full bg-blue-500" style={{ width: `${Math.max(2, Math.round(r.totalSec / maxStepTotal * 100))}%` }} /></div>
+                      <span className="font-mono text-slate-600 w-32 text-right shrink-0">{fmt(r.median)}/台・計{hrs(r.totalSec)}</span>
+                      <span className="font-mono text-blue-700 font-bold w-12 text-right shrink-0">{r.sharePct}%</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">棒の長さ＝その工程の年間合計時間（時間の山）。%＝全工程に占める割合。中央値＝1台の真ん中の実績。</div>
+          </div>
+
+          {sel && (
+            <div className="border border-slate-200 rounded-xl p-3 space-y-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-sm font-bold text-slate-700">② {sel.stepTitle} の中身</span>
+                <span className="text-xs text-slate-400">（{sel.n}台ぶん）</span>
+                {(() => { const [lbl, cls] = cvBadge(sel.cv); return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls}`}>{lbl}（CV {sel.cv}）</span>; })()}
+              </div>
+              {/* 統計サマリ */}
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 text-center">
+                {[['中央値', fmt(sel.median)], ['平均', fmt(sel.mean)], ['ばらつきσ', fmt(sel.sigma)], ['最小', fmt(sel.min)], ['最大', fmt(sel.max)], ['目標', sel.target > 0 ? fmt(sel.target) : '未設定']].map((s, i) => (
+                  <div key={i} className="bg-slate-50 rounded-lg p-1.5"><div className="text-[10px] text-slate-500">{s[0]}</div><div className="text-sm font-bold font-mono text-slate-800">{s[1]}</div></div>
+                ))}
+              </div>
+              {/* ヒストグラム */}
+              <div>
+                <div className="text-xs text-slate-500 mb-1">ばらつき（実績の分布）— 山が鋭い=安定／なだらか=バラつき大</div>
+                <div className="flex items-end gap-1 h-28">
+                  {hist.buckets.map((b, i) => {
+                    const inTarget = sel.target > 0 && b.lo <= sel.target && sel.target < b.hi;
+                    return (
+                      <div key={i} className="flex-1 flex flex-col items-center justify-end" title={`${fmt(b.lo)}〜${fmt(b.hi)}：${b.count}台`}>
+                        <div className="text-[9px] text-slate-500">{b.count || ''}</div>
+                        <div className={`w-full rounded-t ${inTarget ? 'bg-amber-400' : 'bg-blue-400'}`} style={{ height: `${Math.max(3, Math.round(b.count / maxBucket * 88))}px` }} />
+                        <div className="text-[8px] text-slate-400 mt-0.5">{fmt(b.lo)}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {sel.target > 0 && (() => {
+                  const inRange = sel.target >= hist.min && sel.target <= hist.max;
+                  const dir = sel.median > sel.target ? `目標より ${fmt(sel.median - sel.target)} 遅い` : (sel.median < sel.target ? `目標より ${fmt(sel.target - sel.median)} 速い` : '目標どおり');
+                  return <div className="text-[10px] text-slate-400 mt-0.5">{inRange ? `オレンジ＝目標(${fmt(sel.target)})の階級。` : `目標 ${fmt(sel.target)} はこの分布の外。`}中央値は{dir}。</div>;
+                })()}
+              </div>
+              {/* ③ 推移 */}
+              {trend.length > 1 && (
+                <div>
+                  <div className="text-xs text-slate-500 mb-1">③ 月別の推移（中央値）— 速くなっている/遅くなっている</div>
+                  <div className="flex items-end gap-1.5 h-20">
+                    {trend.map((t, i) => (
+                      <div key={i} className="flex-1 flex flex-col items-center justify-end" title={`${t.label} 中央値${fmt(t.median)}・${t.n}台`}>
+                        <div className="text-[9px] text-slate-500">{fmt(t.median)}</div>
+                        <div className="w-full rounded-t bg-emerald-400" style={{ height: `${Math.max(3, Math.round(t.median / maxTrend * 60))}px` }} />
+                        <div className="text-[8px] text-slate-400">{t.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* ④ 作業者比較 */}
+              {workerRows.length > 1 && (
+                <div>
+                  <div className="text-xs text-slate-500 mb-1">④ 作業者別の中央値（速い順）</div>
+                  <div className="space-y-1">
+                    {workerRows.map((w, i) => (
+                      <div key={i} className="flex items-center gap-2 text-xs">
+                        <span className="w-24 truncate shrink-0 text-slate-700">{w.name}</span>
+                        <div className="flex-1 h-2.5 bg-slate-100 rounded overflow-hidden"><div className="h-full bg-teal-500" style={{ width: `${Math.max(2, Math.round(w.median / maxWorker * 100))}%` }} /></div>
+                        <span className="font-mono text-slate-600 w-20 text-right shrink-0">{fmt(w.median)}・{w.n}台</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="text-[10px] text-slate-400">この画面は集計を見るだけ（データは変更しません）。改善したい工程は「改善PDCA」タブの重点工程からカルテ化して対策→効果確認へ。</div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
 // 分析サブタブを5グループに整理 (フラットな13タブ→グループ→サブタブの2段ナビ)。機能は消さず位置だけ整理。
 const ANALYSIS_GROUPS = [
   { key: 'status', label: '現状を見る', tabs: [
+    { k: 'process-analysis', l: '工程分析（データを見る）', color: 'text-blue-600' },
     { k: 'dashboard', l: 'ダッシュボード', color: 'text-blue-600' },
     { k: 'achievement', l: '達成率', color: 'text-emerald-600' },
     { k: 'kpi', l: '経営分析', color: 'text-indigo-600' },
@@ -15154,7 +15349,7 @@ const ANALYSIS_GROUPS = [
 ];
 const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], templates = [], onRestore = null, db = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
-  const [activeMode, setActiveMode] = useState('pdca'); // 既定=改善PDCA(重点工程)。グループは activeMode から導出
+  const [activeMode, setActiveMode] = useState('process-analysis'); // 既定=工程分析(データを見る土台)。グループは activeMode から導出
   const activeGroup = ANALYSIS_GROUPS.find(g => g.tabs.some(t => t.k === activeMode)) || ANALYSIS_GROUPS[0];
   const [selectedModel, setSelectedModel] = useState('all');
   const [targetTolerance, setTargetTolerance] = useState(20); // % for USL/LSL (analysisData の Excel/PDF 出力で使用)
@@ -15584,6 +15779,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
             <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
               {activeMode === 'process' && (<><TrendingUp className="w-6 h-6 text-blue-600"/> 工程改善分析</>)}
               {activeMode === 'dashboard' && (<><Activity className="w-6 h-6 text-blue-600"/> 管理者ダッシュボード</>)}
+              {activeMode === 'process-analysis' && (<><BarChart3 className="w-6 h-6 text-blue-600"/> 工程分析（データを見る）</>)}
               {activeMode === 'kpi' && (<><TrendingUp className="w-6 h-6 text-indigo-600"/> 経営分析（KPI詳細）</>)}
               {activeMode === 'achievement' && (<><Target className="w-6 h-6 text-emerald-600"/> 達成率分析</>)}
               {activeMode === 'rotary' && (<><Ruler className="w-6 h-6 text-cyan-600"/> 分割測定結果</>)}
@@ -15614,7 +15810,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    ))}
                  </div>
               </div>
-              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca'].includes(activeMode) && (
+              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca', 'process-analysis'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
                 {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
                 <button onClick={async ()=>{
@@ -17005,6 +17201,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
            {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
+           {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
            {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} currentUserName={currentUserName} onRestore={onRestore} />}
         </div>
