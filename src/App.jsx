@@ -15726,6 +15726,8 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
     return ids.map(id => ({ id, name: templates.find(t => t.id === id)?.name || id }));
   }, [completed, model, templates]);
   const [templateId, setTemplateId] = useState('');
+  // 型式を選んだら、その型式の最初のテンプレを既定で選ぶ=「じっと見る」「要素別の内訳」が最初から出る(全テンプレだと隠れていた)。
+  useEffect(() => { setTemplateId(tplOptions[0]?.id || ''); }, [model]); // eslint-disable-line
   const [obsEditor, setObsEditor] = useState(false);
   const [obsHelp, setObsHelp] = useState(false);
   const nowMs = Date.now();
@@ -15925,7 +15927,9 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                   {saveData && !sel.stepKey?.includes('lot') && (
                     templateId
                       ? <button onClick={() => setObsEditor(true)} className="text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{planForSel ? 'じっと見る設定' : 'じっと見る（要素に分ける）'}</button>
-                      : <span className="text-[10px] text-slate-400">要素に分けるにはテンプレを選択</span>
+                      : tplOptions.length
+                        ? <button onClick={() => { setTemplateId(tplOptions[0].id); setObsEditor(true); }} className="text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />じっと見る（要素に分ける）</button>
+                        : <span className="text-[10px] text-slate-400">この型式に完了データがありません</span>
                   )}
                 </div>
               </div>
