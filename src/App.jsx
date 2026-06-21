@@ -438,6 +438,14 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
   };
 };
 const medianOf = (arr) => { if (!arr || !arr.length) return 0; const s = [...arr].sort((a, b) => a - b); const n = s.length; return n % 2 ? s[(n - 1) / 2] : Math.round((s[n / 2 - 1] + s[n / 2]) / 2); };
+// 五数要約(四分位は標本6未満ではnull=少数で不安定なため出さない。IE/Six Sigmaの定石)
+const statsOf = (values) => {
+  const ds = [...(values || [])].filter(v => v > 0).sort((a, b) => a - b); const n = ds.length;
+  if (!n) return { n: 0, min: 0, max: 0, median: 0, mean: 0, q1: null, q3: null };
+  const mean = ds.reduce((a, b) => a + b, 0) / n;
+  const q = (p) => { const idx = (n - 1) * p, lo = Math.floor(idx), hi = Math.ceil(idx); return lo === hi ? ds[lo] : Math.round(ds[lo] + (ds[hi] - ds[lo]) * (idx - lo)); };
+  return { n, min: ds[0], max: ds[n - 1], median: medianOf(ds), mean: Math.round(mean), q1: n >= 6 ? q(0.25) : null, q3: n >= 6 ? q(0.75) : null };
+};
 // 重点工程の詳細: 集計に使ったロット一覧(根拠データ=自分で確認できる) + 他型式の同工程との比較
 const profitDetail = (lots, settings, { model, stepKey, startMs = 0, endMs = Infinity }) => {
   const customTargetTimes = settings?.customTargetTimes || {};
@@ -15174,6 +15182,49 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
   );
 };
 
+// 個別値プロット(strip/individual value plot): 横一本に全台の点+中央値の太線+目標の点線。
+// 少数n(2〜15台)でも破綻せず、誰でも分かる(箱ひげが読めない人向け)。n≥6でQ1-Q3の薄帯を足す。div/SVG自前描画。
+const StripPlot = ({ values = [], target = 0 }) => {
+  const ds = (values || []).filter(v => v > 0);
+  const st = statsOf(ds);
+  const fmt = pdcaFmtSec;
+  if (!ds.length) return <div className="text-xs text-slate-400 py-2">データなし</div>;
+  const W = 520, H = 86, padL = 12, padR = 12, baseY = 54;
+  let lo = Math.min(st.min, target > 0 ? target : st.min);
+  let hi = Math.max(st.max, target > 0 ? target : st.max);
+  const span0 = hi - lo || 1; lo -= span0 * 0.1; hi += span0 * 0.1; if (hi <= lo) hi = lo + 1;
+  const x = (v) => padL + (v - lo) / (hi - lo) * (W - padL - padR);
+  const binW = (hi - lo) / 48; const stk = {};
+  const pts = ds.map(v => { const key = Math.round((v - lo) / binW); const s = (stk[key] = (stk[key] || 0)); stk[key]++; return { v, cx: x(v), stack: s }; });
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 130 }} preserveAspectRatio="xMidYMid meet">
+        <line x1={padL} y1={baseY} x2={W - padR} y2={baseY} stroke="#cbd5e1" strokeWidth="1" />
+        {st.q1 != null && st.q3 != null && (
+          <g><rect x={x(st.q1)} y={baseY - 11} width={Math.max(1, x(st.q3) - x(st.q1))} height="22" fill="#3b82f6" opacity="0.12" />
+            <text x={(x(st.q1) + x(st.q3)) / 2} y={baseY - 14} fontSize="8" fill="#64748b" textAnchor="middle">多くの台がこの幅</text></g>
+        )}
+        {target > 0 && (
+          <g><line x1={x(target)} y1="12" x2={x(target)} y2={baseY + 6} stroke="#e11d48" strokeWidth="1.5" strokeDasharray="3 3" />
+            <text x={x(target)} y="10" fontSize="9" fill="#e11d48" textAnchor="middle" fontWeight="bold">目標 {fmt(target)}</text></g>
+        )}
+        {pts.map((p, i) => { const over = target > 0 && p.v > target; return <circle key={i} cx={p.cx} cy={baseY - p.stack * 8} r="4" fill={over ? '#e11d48' : '#2563eb'} opacity="0.85" />; })}
+        <line x1={x(st.median)} y1={baseY - 20} x2={x(st.median)} y2={baseY + 6} stroke="#0f172a" strokeWidth="3" />
+        <text x={Math.min(W - 30, Math.max(30, x(st.median)))} y={H - 4} fontSize="10" fill="#0f172a" textAnchor="middle" fontWeight="bold">真ん中 {fmt(st.median)}</text>
+        <text x={x(st.min)} y={baseY + 18} fontSize="8" fill="#94a3b8" textAnchor="middle">{fmt(st.min)}</text>
+        <text x={x(st.max)} y={baseY + 18} fontSize="8" fill="#94a3b8" textAnchor="middle">{fmt(st.max)}</text>
+      </svg>
+      <div className="text-[10px] text-slate-400 flex flex-wrap gap-x-3 gap-y-0.5 mt-0.5">
+        <span><span className="text-blue-600">●</span> 各台の実測（{ds.length}台）</span>
+        <span><b className="text-slate-700">┃</b> 真ん中の台</span>
+        {st.q1 != null && <span>薄い帯＝多くの台がこの範囲</span>}
+        {target > 0 && <span className="text-rose-500">┊目標／赤点＝目標より遅い台</span>}
+      </div>
+      <div className="text-[10px] text-slate-500 mt-1 font-mono break-words">実測{ds.length}台: {[...ds].sort((a, b) => a - b).map(fmt).join('、 ')}</div>
+    </div>
+  );
+};
+
 // === 工程分析ビュー: 型式(+テンプレ)を選び、データをそのままグラフで見る土台 ===
 // ①工程別パレート(どこが一番時間か) ②選択工程のバラつきヒストグラム+CV ③月次推移 ④作業者比較 ⑤根拠(n/最小最大)
 const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [] }) => {
@@ -15193,8 +15244,6 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   const sel = bd.rows.find(r => r.stepKey === selKey) || bd.rows[0] || null;
   const fmt = pdcaFmtSec;
   const hrs = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)}時間` : `${Math.round(s / 60)}分`;
-  const hist = sel ? histogramOf(sel.durations, 8) : null;
-  const maxBucket = hist ? Math.max(1, ...hist.buckets.map(b => b.count)) : 1;
   const maxStepTotal = Math.max(1, ...bd.rows.map(r => r.totalSec));
   const trend = useMemo(() => {
     if (!sel) return [];
@@ -15260,26 +15309,13 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                   <div key={i} className="bg-slate-50 rounded-lg p-1.5"><div className="text-[10px] text-slate-500">{s[0]}</div><div className="text-sm font-bold font-mono text-slate-800">{s[1]}</div></div>
                 ))}
               </div>
-              {/* ヒストグラム */}
+              {/* ばらつき = 個別値プロット(全台の点+真ん中の線+目標線)。少数台でも見やすい */}
               <div>
-                <div className="text-xs text-slate-500 mb-1">ばらつき（実績の分布）— 山が鋭い=安定／なだらか=バラつき大</div>
-                <div className="flex items-end gap-1 h-28">
-                  {hist.buckets.map((b, i) => {
-                    const inTarget = sel.target > 0 && b.lo <= sel.target && sel.target < b.hi;
-                    return (
-                      <div key={i} className="flex-1 flex flex-col items-center justify-end" title={`${fmt(b.lo)}〜${fmt(b.hi)}：${b.count}台`}>
-                        <div className="text-[9px] text-slate-500">{b.count || ''}</div>
-                        <div className={`w-full rounded-t ${inTarget ? 'bg-amber-400' : 'bg-blue-400'}`} style={{ height: `${Math.max(3, Math.round(b.count / maxBucket * 88))}px` }} />
-                        <div className="text-[8px] text-slate-400 mt-0.5">{fmt(b.lo)}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-                {sel.target > 0 && (() => {
-                  const inRange = sel.target >= hist.min && sel.target <= hist.max;
-                  const dir = sel.median > sel.target ? `目標より ${fmt(sel.median - sel.target)} 遅い` : (sel.median < sel.target ? `目標より ${fmt(sel.target - sel.median)} 速い` : '目標どおり');
-                  return <div className="text-[10px] text-slate-400 mt-0.5">{inRange ? `オレンジ＝目標(${fmt(sel.target)})の階級。` : `目標 ${fmt(sel.target)} はこの分布の外。`}中央値は{dir}。</div>;
-                })()}
+                <div className="text-xs text-slate-500 mb-1">ばらつき — 1台ずつの実測を点で表示（点が散らばる=バラつき大）</div>
+                <StripPlot values={sel.durations} target={sel.target} />
+                {sel.target > 0 && (
+                  <div className="text-[10px] text-slate-400 mt-1">中央値は{sel.median > sel.target ? `目標より ${fmt(sel.median - sel.target)} 遅い` : (sel.median < sel.target ? `目標より ${fmt(sel.target - sel.median)} 速い` : '目標どおり')}。{sel.cv >= 0.5 ? '点がかなり散らばっている＝作業のやり方が安定していない可能性。' : (sel.cv < 0.3 ? '点がまとまっている＝安定した作業。' : '')}</div>
+                )}
               </div>
               {/* ③ 推移 */}
               {trend.length > 1 && (
