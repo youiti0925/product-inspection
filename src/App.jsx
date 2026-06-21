@@ -15471,6 +15471,200 @@ const StripPlot = ({ values = [], target = 0 }) => {
   );
 };
 
+// === 工程分析レポート用のグラフ生成(SVG文字列を返す純関数) ===
+//   画面の div/SVG と同じ「見やすく加工したグラフ」を、PDF(インラインSVG) と Excel(SVG→PNG) で共用する。
+//   Chart.js 等は使わない(バンドル維持)。少数n(2〜20)でも破綻しない設計。
+const svgEsc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const SVG_FONT = "'Yu Gothic','Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif";
+const svgWrap = (w, h, inner) => `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg" font-family="${SVG_FONT}"><rect width="${w}" height="${h}" fill="#ffffff"/>${inner}</svg>`;
+
+// 工程別パレート: 棒=年間合計時間(降順) + 折線=累積% + 80%基準線。どの工程が「時間の山」かを一目で。
+const svgPareto = (rows, { w = 760, h = 320, fmt = pdcaFmtSec } = {}) => {
+  const data = (rows || []).filter(r => r.totalSec > 0);
+  if (!data.length) return '';
+  const n = data.length, padL = 50, padR = 50, padT = 22, padB = 70;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const maxTot = Math.max(...data.map(r => r.totalSec));
+  const slot = plotW / n, barW = Math.min(46, slot * 0.6);
+  const cx = (i) => padL + slot * i + slot / 2;
+  const yBar = (v) => padT + plotH - (v / maxTot) * plotH;
+  const yCum = (p) => padT + plotH - (p / 100) * plotH;
+  let s = '';
+  for (let g = 0; g <= 4; g++) { const yy = padT + plotH * g / 4; s += `<line x1="${padL}" y1="${yy}" x2="${w - padR}" y2="${yy}" stroke="#eef2f7" stroke-width="1"/><text x="${padL - 5}" y="${yy + 3}" font-size="8" fill="#94a3b8" text-anchor="end">${(maxTot * (4 - g) / 4 / 3600).toFixed(1)}</text>`; }
+  // 累積%線/80%基準線は工程が2つ以上のときだけ(1工程ではパレートにならない)
+  if (n >= 2) { const y80 = yCum(80); s += `<line x1="${padL}" y1="${y80}" x2="${w - padR}" y2="${y80}" stroke="#f59e0b" stroke-width="1.2" stroke-dasharray="5 3"/><text x="${w - padR + 3}" y="${y80 + 3}" font-size="8.5" fill="#d97706">80%</text>`; }
+  data.forEach((r, i) => {
+    const bx = cx(i) - barW / 2, by = yBar(r.totalSec), bh = padT + plotH - by;
+    const col = r.target > 0 ? (r.median <= r.target ? '#22c55e' : (r.median <= r.target * 1.1 ? '#eab308' : '#ef4444')) : '#3b82f6';
+    s += `<rect x="${bx}" y="${by}" width="${barW}" height="${Math.max(0, bh)}" fill="${col}" rx="2"/>`;
+    s += `<text x="${cx(i)}" y="${by - 12}" font-size="9" fill="#64748b" text-anchor="middle">${i + 1}</text>`; // 順位番号(モノクロでも序列が残る)
+    s += `<text x="${cx(i)}" y="${by - 3}" font-size="8.5" fill="#334155" text-anchor="middle" font-weight="bold">${(r.totalSec / 3600).toFixed(1)}h</text>`;
+    const lab = (r.stepTitle || '').length > 8 ? (r.stepTitle.slice(0, 7) + '…') : (r.stepTitle || '');
+    s += `<text x="${cx(i)}" y="${padT + plotH + 13}" font-size="8.5" fill="#334155" text-anchor="end" transform="rotate(-30 ${cx(i)} ${padT + plotH + 13})">${svgEsc(lab)}</text>`;
+  });
+  if (n >= 2) {
+    let path = ''; data.forEach((r, i) => { path += (i === 0 ? 'M' : 'L') + cx(i).toFixed(1) + ' ' + yCum(r.cumPct).toFixed(1) + ' '; });
+    s += `<path d="${path}" fill="none" stroke="#ea580c" stroke-width="2"/>`;
+    data.forEach((r, i) => { s += `<circle cx="${cx(i)}" cy="${yCum(r.cumPct)}" r="2.6" fill="#ea580c"/>` + (i % Math.ceil(n / 8) === 0 || i === n - 1 ? `<text x="${cx(i)}" y="${yCum(r.cumPct) - 5}" font-size="7.5" fill="#9a3412" text-anchor="middle">${r.cumPct}%</text>` : ''); });
+    s += `<text x="${w - padR + 4}" y="${padT - 7}" font-size="9" fill="#9a3412" text-anchor="end">累積%</text>`;
+  }
+  s += `<text x="${padL - 4}" y="${padT - 7}" font-size="9" fill="#64748b">合計(h)</text>`;
+  s += `<text x="${padL}" y="${h - 4}" font-size="8.5" fill="#94a3b8">棒=年間合計時間(色=目標比 緑◯/黄やや/赤超・番号=順位)・折線=累積% (左の工程ほど直す効果大)</text>`;
+  return svgWrap(w, h, s);
+};
+
+// 個別値プロット(ばらつき): 横一本に全台の点+中央値の太線+目標の点線。少数nでも見やすい(箱ひげ/ヒスト不要)。
+const svgStrip = (values, target, { w = 720, h = 130, fmt = pdcaFmtSec } = {}) => {
+  const ds = (values || []).filter(v => v > 0); if (!ds.length) return '';
+  const st = statsOf(ds);
+  const padL = 16, padR = 16, baseY = Math.round(h * 0.56);
+  let lo = Math.min(st.min, target > 0 ? target : st.min), hi = Math.max(st.max, target > 0 ? target : st.max);
+  const span0 = hi - lo || 1; lo -= span0 * 0.1; hi += span0 * 0.1; if (hi <= lo) hi = lo + 1;
+  const x = (v) => padL + (v - lo) / (hi - lo) * (w - padL - padR);
+  const binW = (hi - lo) / 48, stk = {};
+  const pts = ds.map(v => { const key = Math.round((v - lo) / binW); const sc = (stk[key] = (stk[key] || 0)); stk[key]++; return { v, cx: x(v), stack: sc }; });
+  // 積層が高いと点が枠外に出るので、積層最大に応じてオフセットを縮める保険(調査指摘)
+  const maxStack = Math.max(0, ...pts.map(p => p.stack));
+  const off = Math.min(9, Math.max(4, (baseY - 26) / Math.max(1, maxStack)));
+  let s = `<line x1="${padL}" y1="${baseY}" x2="${w - padR}" y2="${baseY}" stroke="#cbd5e1" stroke-width="1"/>`;
+  if (st.q1 != null && st.q3 != null) s += `<rect x="${x(st.q1)}" y="${baseY - 13}" width="${Math.max(1, x(st.q3) - x(st.q1))}" height="26" fill="#3b82f6" opacity="0.12"/><text x="${(x(st.q1) + x(st.q3)) / 2}" y="${baseY - 16}" font-size="8" fill="#64748b" text-anchor="middle">多くの台がこの幅</text>`;
+  if (target > 0) s += `<line x1="${x(target)}" y1="14" x2="${x(target)}" y2="${baseY + 7}" stroke="#e11d48" stroke-width="1.5" stroke-dasharray="3 3"/><text x="${x(target)}" y="11" font-size="9" fill="#e11d48" text-anchor="middle" font-weight="bold">目標 ${fmt(target)}</text>`;
+  pts.forEach(p => { const over = target > 0 && p.v > target; s += `<circle cx="${p.cx}" cy="${baseY - p.stack * off}" r="4.2" fill="${over ? '#e11d48' : '#2563eb'}" opacity="0.85"/>`; });
+  s += `<line x1="${x(st.median)}" y1="${baseY - 22}" x2="${x(st.median)}" y2="${baseY + 7}" stroke="#0f172a" stroke-width="3"/><text x="${Math.min(w - 34, Math.max(34, x(st.median)))}" y="${h - 6}" font-size="10" fill="#0f172a" text-anchor="middle" font-weight="bold">真ん中 ${fmt(st.median)}</text>`;
+  s += `<text x="${x(st.min)}" y="${baseY + 19}" font-size="8" fill="#94a3b8" text-anchor="middle">${fmt(st.min)}</text><text x="${x(st.max)}" y="${baseY + 19}" font-size="8" fill="#94a3b8" text-anchor="middle">${fmt(st.max)}</text>`;
+  return svgWrap(w, h, s);
+};
+
+// 月別推移(ランチャート): 中央値の折線+点+全体中央値の中心線。速くなっている/遅くなっているの傾向。
+const svgTrend = (trend, target, { w = 720, h = 150, fmt = pdcaFmtSec } = {}) => {
+  const d = (trend || []).filter(t => t.median > 0); if (d.length < 2) return '';
+  const padL = 44, padR = 14, padT = 16, padB = 26, plotW = w - padL - padR, plotH = h - padT - padB;
+  const vals = d.map(t => t.median).concat(target > 0 ? [target] : []);
+  let lo = Math.min(...vals), hi = Math.max(...vals); const sp = hi - lo || 1; lo -= sp * 0.12; hi += sp * 0.12; if (hi <= lo) hi = lo + 1;
+  const x = (i) => padL + (d.length === 1 ? plotW / 2 : plotW * i / (d.length - 1));
+  const y = (v) => padT + plotH - (v - lo) / (hi - lo) * plotH;
+  const center = medianOf(d.map(t => t.median));
+  let s = '';
+  for (let g = 0; g <= 3; g++) { const yy = padT + plotH * g / 3; s += `<line x1="${padL}" y1="${yy}" x2="${w - padR}" y2="${yy}" stroke="#eef2f7"/><text x="${padL - 4}" y="${yy + 3}" font-size="8" fill="#94a3b8" text-anchor="end">${fmt(Math.round(hi - (hi - lo) * g / 3))}</text>`; }
+  if (target > 0) s += `<line x1="${padL}" y1="${y(target)}" x2="${w - padR}" y2="${y(target)}" stroke="#e11d48" stroke-width="1" stroke-dasharray="3 3"/><text x="${w - padR}" y="${y(target) - 3}" font-size="8" fill="#e11d48" text-anchor="end">目標</text>`;
+  s += `<line x1="${padL}" y1="${y(center)}" x2="${w - padR}" y2="${y(center)}" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>`;
+  let path = ''; d.forEach((t, i) => { path += (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ' ' + y(t.median).toFixed(1) + ' '; });
+  s += `<path d="${path}" fill="none" stroke="#059669" stroke-width="2.2"/>`;
+  d.forEach((t, i) => { s += `<circle cx="${x(i)}" cy="${y(t.median)}" r="3" fill="#059669"/><text x="${x(i)}" y="${y(t.median) - 6}" font-size="7.5" fill="#047857" text-anchor="middle">${fmt(t.median)}</text><text x="${x(i)}" y="${h - 8}" font-size="8" fill="#64748b" text-anchor="middle">${svgEsc(t.label)}</text>`; });
+  return svgWrap(w, h, s);
+};
+
+// 横棒(作業者別など): ラベル+棒+値。速い順/小さい順。
+const svgBars = (rows, { w = 720, rowH = 22, color = '#0d9488', fmt = pdcaFmtSec, max = 0, target = 0 } = {}) => {
+  const d = (rows || []).filter(r => r.value > 0); if (!d.length) return '';
+  const h = 12 + d.length * rowH, padL = 110, padR = 70, plotW = w - padL - padR;
+  const mx = max || Math.max(...d.map(r => r.value), target > 0 ? target : 0);
+  let s = '';
+  // 共通基準=目標の縦線(これより右に出た人=目標未達がひと目で分かる: 調査指摘)
+  if (target > 0 && target <= mx) { const tx = padL + target / mx * plotW; s += `<line x1="${tx}" y1="4" x2="${tx}" y2="${h - 4}" stroke="#e11d48" stroke-width="1.2" stroke-dasharray="3 3"/><text x="${tx}" y="${h - 1}" font-size="8" fill="#e11d48" text-anchor="middle">目標</text>`; }
+  d.forEach((r, i) => {
+    const yy = 8 + i * rowH; const bw = Math.max(2, r.value / mx * plotW);
+    s += `<text x="${padL - 6}" y="${yy + rowH / 2 + 1}" font-size="9.5" fill="#334155" text-anchor="end">${svgEsc((r.label || '').length > 12 ? r.label.slice(0, 11) + '…' : r.label)}</text>`;
+    s += `<rect x="${padL}" y="${yy + 3}" width="${bw}" height="${rowH - 8}" fill="${target > 0 && r.value > target ? '#e11d48' : color}" rx="2"/>`;
+    s += `<text x="${padL + bw + 5}" y="${yy + rowH / 2 + 1}" font-size="9" fill="#475569">${fmt(r.value)}${r.n ? '・' + r.n + '台' : ''}</text>`;
+  });
+  return svgWrap(w, h, s);
+};
+
+// 要素別の内訳(積み上げ帯): 工程の「中身」の構成。一番長い要素=ボトルネック。合計時間も明記(調査指摘=100%帯だけにしない)。
+const svgElement = (rows, { w = 720, fmt = pdcaFmtSec } = {}) => {
+  const d = (rows || []).filter(r => r.median > 0); if (!d.length) return '';
+  const total = d.reduce((s, r) => s + r.median, 0) || 1;
+  const padL = 14, padR = 14, barY = 26, barH = 30, plotW = w - padL - padR;
+  const palette = ['#2563eb', '#0ea5e9', '#14b8a6', '#22c55e', '#eab308', '#f97316', '#ef4444', '#a855f7'];
+  let x = padL, s = `<text x="${padL}" y="18" font-size="9.5" fill="#334155" font-weight="bold">要素の合計 ${fmt(total)}（一番長い要素＝ボトルネック）</text>`;
+  d.forEach((r, i) => { const segW = r.median / total * plotW; const col = palette[i % palette.length];
+    s += `<rect x="${x.toFixed(1)}" y="${barY}" width="${segW.toFixed(1)}" height="${barH}" fill="${col}"/>`;
+    if (segW > 34) s += `<text x="${(x + segW / 2).toFixed(1)}" y="${barY + barH / 2 + 3}" font-size="9" fill="#ffffff" text-anchor="middle" font-weight="bold">${r.sharePct}%</text>`;
+    x += segW;
+  });
+  // 凡例(折り返し)
+  let lx = padL, ly = barY + barH + 14;
+  d.forEach((r, i) => { const col = palette[i % palette.length]; const label = `${svgEsc(r.label)} ${fmt(r.median)}`; const wEst = 16 + label.length * 7.2;
+    if (lx + wEst > w - padR) { lx = padL; ly += 16; }
+    s += `<rect x="${lx}" y="${ly - 8}" width="9" height="9" fill="${col}"/><text x="${lx + 13}" y="${ly}" font-size="8.8" fill="#334155">${label}</text>`;
+    lx += wEst;
+  });
+  return svgWrap(w, barY + barH + 14 + (ly - (barY + barH + 14)) + 14, s);
+};
+
+// SVG文字列→PNG dataURL (Excel埋め込み用)。canvasに描いて2倍解像度で出力。失敗時 null。
+const svgToPng = (svg, w, h) => new Promise((resolve) => {
+  try {
+    if (!svg) { resolve(null); return; }
+    const img = new Image();
+    const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      try {
+        const scale = 2, canvas = document.createElement('canvas');
+        canvas.width = w * scale; canvas.height = h * scale;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.scale(scale, scale); ctx.drawImage(img, 0, 0, w, h);
+        const out = canvas.toDataURL('image/png');
+        URL.revokeObjectURL(url); resolve(out);
+      } catch { URL.revokeObjectURL(url); resolve(null); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  } catch { resolve(null); }
+});
+
+// 工程分析の生データを provenance つきで収集(修正モード用)= 選択工程の各実測値が「どの指図のどの台か」。
+const processRawSamples = (lots, { model, templateId, stepKey }) => {
+  const out = [];
+  (lots || []).forEach(l => {
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    if (model && l.model !== model) return;
+    if (templateId && l.templateId !== templateId) return;
+    (l.steps || []).forEach((step, idx) => {
+      if (targetTimeStepKey(step) !== stepKey || step.lotOnce) return;
+      for (let u = 0; u < (l.quantity || 1); u++) {
+        const tk = step.id ? `${step.id}-${u}` : `${idx}-${u}`;
+        const t = (l.tasks || {})[tk] || (l.tasks || {})[`${idx}-${u}`];
+        if (!t || (t.status !== 'completed' && t.status !== 'ng')) continue;
+        const dur = t.duration || 0;
+        out.push({ lotId: l.id, taskKey: (l.tasks || {})[tk] ? tk : `${idx}-${u}`, workOrder: l.workOrderNumber || l.orderNumber || l.id, unitIdx: u, value: dur, manual: !!t.manualTime, completedAt: toMsAny(t.endTime) || toMsAny(l.completedAt) || toMsAny(l.updatedAt) || 0 });
+      }
+    });
+  });
+  return out.sort((a, b) => b.value - a.value);
+};
+
+// 生データ修正モーダル: 1台の実測値を 分:秒 で直す(目標で埋めるクイックも)。
+const RawFixModal = ({ sample, target, fmt, onSave, onClose }) => {
+  const init = sample?.value || 0;
+  const [mm, setMm] = useState(Math.floor(init / 60));
+  const [ss, setSs] = useState(init % 60);
+  const total = (parseInt(mm) || 0) * 60 + (parseInt(ss) || 0);
+  return (
+    <div className="fixed inset-0 z-[210] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white w-full max-w-xs rounded-2xl shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-amber-500 text-white px-4 py-3 font-bold flex items-center gap-2">🔧 実測値を修正</div>
+        <div className="p-4 space-y-3">
+          <div className="text-xs text-slate-500">指図 {sample.workOrder} ／ {sample.unitIdx + 1}台目<br />現在: <b className="font-mono text-slate-700">{fmt(sample.value)}</b></div>
+          <div className="flex items-center justify-center gap-2">
+            <input type="number" value={mm} onChange={e => setMm(e.target.value)} className="w-16 border rounded p-2 text-center text-lg font-mono" /><span className="text-sm">分</span>
+            <input type="number" value={ss} onChange={e => setSs(e.target.value)} className="w-16 border rounded p-2 text-center text-lg font-mono" /><span className="text-sm">秒</span>
+          </div>
+          <div className="text-center text-sm text-slate-600">= <b className="font-mono">{fmt(total)}</b></div>
+          {target > 0 && <button onClick={() => { setMm(Math.floor(target / 60)); setSs(target % 60); }} className="w-full text-xs py-1.5 rounded border border-blue-200 bg-blue-50 text-blue-700 font-bold">目標（{fmt(target)}）で埋める</button>}
+        </div>
+        <div className="px-4 py-3 border-t flex gap-2">
+          <button onClick={onClose} className="flex-1 py-2 rounded border border-slate-300 text-slate-600 font-bold text-sm">キャンセル</button>
+          <button onClick={() => onSave(total)} className="flex-1 py-2 rounded bg-amber-600 hover:bg-amber-700 text-white font-bold text-sm">保存</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // === 工程分析ビュー: 型式(+テンプレ)を選び、データをそのままグラフで見る土台 ===
 // ①工程別パレート(どこが一番時間か) ②選択工程のバラつきヒストグラム+CV ③月次推移 ④作業者比較 ⑤根拠(n/最小最大)
 const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates = [], customTargetTimes = {}, modelGroups = [], observationPlans = [], saveData = null, deleteData = null, currentUserName = '' }) => {
@@ -15511,6 +15705,24 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   }, [observationPlans, templateId, sel, model]);
   const elStats = useMemo(() => (sel && templateId) ? obsElementStats(lots, { model, templateId, stepKey: sel.stepKey, plan: planForSel }) : null, [lots, model, templateId, sel, planForSel]);
   const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
+  // === 修正モード: 選択工程の生データ(各指図の各台)を一覧→異常を直す ===
+  const [fixMode, setFixMode] = useState(false);
+  const [fixEdit, setFixEdit] = useState(null); // { sample } 編集対象
+  const rawSamples = useMemo(() => (fixMode && sel) ? processRawSamples(lots, { model, templateId: templateId || undefined, stepKey: sel.stepKey }) : [], [fixMode, sel, lots, model, templateId]);
+  // 異常判定(ヒント): 0秒/5秒未満/4時間超 = 物理的に怪しい(赤)。中央値から大きく外れる(>2σ かつ ±50%超) = 統計的外れ値(黄)。
+  const sampleFlag = (v) => {
+    if (v <= 0 || v < 5 || v > 14400) return 'bad';
+    if (sel && sel.median > 0) { const dev = Math.abs(v - sel.median); if ((sel.sigma > 0 && dev > 2 * sel.sigma) && (v > sel.median * 1.5 || v < sel.median * 0.5)) return 'warn'; }
+    return '';
+  };
+  const saveFix = (newSec) => {
+    if (!fixEdit || !saveData) return;
+    const lot = (lots || []).find(l => l.id === fixEdit.sample.lotId); if (!lot) { setFixEdit(null); return; }
+    const tk = fixEdit.sample.taskKey; const cur = (lot.tasks || {})[tk]; if (!cur) { setFixEdit(null); return; }
+    const tasks = { ...(lot.tasks || {}), [tk]: { ...cur, duration: Math.max(0, Math.round(newSec)), manualTime: true } };
+    saveData('lots', lot.id, { tasks });
+    setFixEdit(null);
+  };
 
   // === レポート出力(A4 PDF コンパクト/詳細 + Excel) ===
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -15523,38 +15735,75 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
     return { steps: bd.rows.length, sumMed: bd.rows.reduce((s, r) => s + r.median, 0), within, withT: withT.length, bottleneck: bd.rows[0]?.stepTitle || '—', topN: bd.rows[0]?.n || 0 };
   };
   const sigColor = (r) => r.target > 0 ? (r.median <= r.target ? '#16a34a' : (r.median <= r.target * 1.1 ? '#ca8a00' : '#dc2626')) : '#94a3b8';
+  // 各工程の per-row 派生(推移/作業者/要素)。レポートで工程ごとのグラフを描くため。
+  const trendOf = (monthly) => Object.keys(monthly || {}).sort().slice(-8).map(ym => ({ label: `${parseInt(ym.slice(5))}月`, median: medianOf(monthly[ym]), n: monthly[ym].length }));
+  const workersOf = (wk) => Object.entries(wk || {}).map(([w, ds]) => ({ label: (workers.find(x => x.id === w)?.name) || w, value: medianOf(ds), n: ds.length })).filter(x => x.n >= 1).sort((a, b) => a.value - b.value);
+  const elStatsOf = (stepKey) => templateId ? obsElementStats(lots, { model, templateId, stepKey, plan: findObsPlan(observationPlans, templateId, stepKey, model) }) : null;
   const printReport = (detailed) => {
     const k = repKpi();
     let body = `<h1>${esc(repTitle)}</h1><div class="meta">期間: ${esc(repPeriod)} ・ 完了台数(最多工程): ${k.topN}台 ・ 発行: ${esc(pdcaFmtDate(nowMs))}</div>`;
     body += `<div class="kg"><div class="k"><div class="v">${k.steps}</div><div class="l">工程数</div></div><div class="k"><div class="v">${fmtS(k.sumMed)}</div><div class="l">1台の合計(中央値)</div></div><div class="k"><div class="v">${k.withT ? Math.round(k.within / k.withT * 100) + '%' : '—'}</div><div class="l">目標内の工程</div></div><div class="k"><div class="v" style="font-size:12px">${esc(k.bottleneck)}</div><div class="l">最大ボトルネック</div></div></div>`;
-    body += `<h2>工程別の時間（大きい順＝直すべき順）</h2><table class="d"><thead><tr><th>順位</th><th>工程</th><th>台数</th><th>中央値</th><th>目標</th><th>目標比</th><th>年間合計</th><th>累積%</th></tr></thead><tbody>`;
+    // ★ 主役 = 工程別パレートのグラフ(実測値の羅列でなく、加工した1枚で「どこが時間の山か」)
+    body += `<h2>工程別の時間 — どこが時間の山か（左の工程ほど直す効果が大きい）</h2><div class="chart">${svgPareto(bd.rows, { w: 780, h: 300 })}</div>`;
+    body += `<table class="d"><thead><tr><th>順位</th><th>工程</th><th>台数</th><th>中央値</th><th>目標</th><th>目標比</th><th>年間合計</th><th>累積%</th></tr></thead><tbody>`;
     bd.rows.forEach((r, i) => { const ratio = r.target > 0 ? Math.round(r.median / r.target * 100) : null; body += `<tr><td class="c">${i + 1}</td><td>${esc(r.stepTitle)}</td><td class="c">${r.n}</td><td class="c">${fmtS(r.median)}</td><td class="c">${r.target > 0 ? fmtS(r.target) : '—'}</td><td class="c" style="color:${sigColor(r)};font-weight:bold">${ratio != null ? ratio + '%' : '—'}</td><td class="c">${(r.totalSec / 3600).toFixed(1)}h</td><td class="c">${r.cumPct}%</td></tr>`; });
     body += `</tbody></table>`;
     if (detailed) {
-      body += `<h2>工程ごとのばらつき詳細</h2><table class="d"><thead><tr><th>工程</th><th>台数</th><th>平均</th><th>中央値</th><th>σ</th><th>CV</th><th>最小</th><th>最大</th><th>目標</th></tr></thead><tbody>`;
-      bd.rows.forEach(r => { body += `<tr><td>${esc(r.stepTitle)}</td><td class="c">${r.n}</td><td class="c">${fmtS(r.mean)}</td><td class="c">${fmtS(r.median)}</td><td class="c">${fmtS(r.sigma)}</td><td class="c">${Math.round(r.cv * 100)}%</td><td class="c">${fmtS(r.min)}</td><td class="c">${fmtS(r.max)}</td><td class="c">${r.target > 0 ? fmtS(r.target) : '—'}</td></tr>`; });
-      body += `</tbody></table><h2>各工程の実測値（検算用）</h2>`;
-      bd.rows.forEach(r => { body += `<div class="n"><b>${esc(r.stepTitle)}</b>（${r.n}台）: ${[...r.durations].sort((a, b) => a - b).map(fmtS).join('、')}</div>`; });
+      // ★ 工程ごとの「中身」グラフ(ばらつき個別値プロット + 月別推移 + 作業者別 + 要素別内訳)
+      body += `<h2>工程ごとの中身 — ばらつき・推移・作業者・要素</h2>`;
+      bd.rows.forEach((r, i) => {
+        const [cvl] = cvBadge(r.cv);
+        const strip = svgStrip(r.durations, r.target, { w: 740, h: 124 });
+        const tr = trendOf(r.monthly); const trendSvg = svgTrend(tr, r.target, { w: 360, h: 140 });
+        const wb = svgBars(workersOf(r.workers), { w: 360, color: '#0d9488', target: r.target });
+        const es = elStatsOf(r.stepKey); const elem = (es && es.observedUnits > 0) ? svgElement(es.rows, { w: 740 }) : '';
+        body += `<div class="proc"><div class="ph">${i + 1}. ${esc(r.stepTitle)} <span class="sub">${r.n}台 ・ 中央値${fmtS(r.median)} ・ σ${fmtS(r.sigma)} ・ CV${Math.round(r.cv * 100)}%（${cvl}）${r.target > 0 ? ' ・ 目標' + fmtS(r.target) + '（' + (r.median <= r.target ? '達成' : '超過') + '）' : ''}</span></div>`;
+        body += `<div class="cl">ばらつき（1台ずつの実測・点が散る＝不安定）</div><div class="chart">${strip}</div>`;
+        if (trendSvg || wb) body += `<div class="cc">${trendSvg ? `<div class="half"><div class="cl">月別の推移（中央値）</div>${trendSvg}</div>` : '<div class="half"></div>'}${wb ? `<div class="half"><div class="cl">作業者別（速い順）</div>${wb}</div>` : '<div class="half"></div>'}</div>`;
+        if (elem) body += `<div class="cl">要素別の内訳（じっと見る・工程の中身の構成比）</div><div class="chart">${elem}</div>`;
+        body += `</div>`;
+      });
     }
-    body += `<div class="n" style="margin-top:8px">計算定義: 中央値＝実績の真ん中の値（外れ値に強い）。年間合計＝直近1年の合計時間。0秒・4時間超の異常値は除外。</div>`;
-    const css = `@page{size:A4 portrait;margin:13mm}body{font-family:'Yu Gothic','Hiragino Kaku Gothic ProN',sans-serif;color:#1e293b;font-size:11px}h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:13px 0 4px;border-bottom:2px solid #2563eb;padding-bottom:2px;break-after:avoid}.meta{color:#64748b;font-size:10px;margin-bottom:8px}.kg{display:flex;gap:8px;margin:8px 0}.k{flex:1;border:1px solid #cbd5e1;border-radius:6px;padding:6px;text-align:center}.k .v{font-size:17px;font-weight:bold}.k .l{font-size:9px;color:#64748b}table.d{width:100%;border-collapse:collapse;margin-bottom:6px}table.d th,table.d td{border:1px solid #cbd5e1;padding:3px 5px;font-size:10px}table.d th{background:#dbeafe}.c{text-align:center}.n{font-size:9.5px;color:#475569;background:#f8fafc;border-left:3px solid #cbd5e1;padding:3px 6px;margin:3px 0}tr{break-inside:avoid}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}`;
+    body += `<div class="n" style="margin-top:8px">読み方: パレート＝棒が年間合計時間（色は目標比 緑◯/黄やや超/赤超過）、折線が累積%。左ほど「時間の山」で直す効果が大。ばらつき＝点が1台ずつの実測、太線が真ん中、赤点線が目標。中央値＝真ん中の実績（外れ値に強い）。0秒・4時間超の異常値は除外。</div>`;
+    const css = `@page{size:A4 portrait;margin:12mm}body{font-family:'Yu Gothic','Hiragino Kaku Gothic ProN',sans-serif;color:#1e293b;font-size:11px}h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;margin:13px 0 5px;border-bottom:2px solid #2563eb;padding-bottom:2px;break-after:avoid}.meta{color:#64748b;font-size:10px;margin-bottom:8px}.kg{display:flex;gap:8px;margin:8px 0}.k{flex:1;border:1px solid #cbd5e1;border-radius:6px;padding:6px;text-align:center}.k .v{font-size:17px;font-weight:bold}.k .l{font-size:9px;color:#64748b}.chart{border:1px solid #e2e8f0;border-radius:6px;padding:3px;margin:3px 0 8px;background:#fff}.chart svg{width:100%;height:auto;display:block}.cc{display:flex;gap:8px}.half{flex:1;min-width:0}.cl{font-size:10px;color:#475569;font-weight:bold;margin:5px 0 1px}.proc{break-inside:avoid;border-top:1px solid #e2e8f0;padding-top:6px;margin-top:8px}.ph{font-size:12px;font-weight:bold;color:#1e3a8a}.ph .sub{font-size:9.5px;font-weight:normal;color:#64748b}table.d{width:100%;border-collapse:collapse;margin-bottom:6px}table.d th,table.d td{border:1px solid #cbd5e1;padding:3px 5px;font-size:10px}table.d th{background:#dbeafe}.c{text-align:center}.n{font-size:9.5px;color:#475569;background:#f8fafc;border-left:3px solid #cbd5e1;padding:4px 6px;margin:3px 0;break-inside:avoid}tr{break-inside:avoid}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}`;
     const pw = window.open('', '_blank'); if (!pw) { alert('ポップアップを許可してください'); return; }
-    pw.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${esc(repTitle)}</title><style>${css}</style></head><body>${body}<scr` + `ipt>window.onload=function(){setTimeout(function(){window.print();},400);}</scr` + `ipt></body></html>`);
+    pw.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${esc(repTitle)}</title><style>${css}</style></head><body>${body}<scr` + `ipt>window.onload=function(){setTimeout(function(){window.print();},500);}</scr` + `ipt></body></html>`);
     pw.document.close();
   };
+  const [busyExcel, setBusyExcel] = useState(false);
   const exportExcel = async () => {
+    setBusyExcel(true);
+    try {
     const ExcelJS = await loadExcelJS(); const wb = new ExcelJS.Workbook();
+    // ① グラフシート(主役) — SVGをPNG化して埋め込み。実測値の羅列でなく加工グラフ。
+    const dimOf = (svg) => { const m = /viewBox="0 0 ([\d.]+) ([\d.]+)"/.exec(svg || ''); return m ? { w: +m[1], h: +m[2] } : { w: 720, h: 140 }; };
+    const g = wb.addWorksheet('グラフ'); g.pageSetup = { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1 };
+    g.getColumn(1).width = 2;
+    let gr = 0;
+    const addTitle = (text, size = 12, color = 'FF1E3A8A') => { const r = g.getRow(gr + 1); r.getCell(2).value = text; r.getCell(2).font = { bold: true, size, color: { argb: color } }; gr += 2; };
+    const placeImg = async (svg) => { if (!svg) return; const { w, h } = dimOf(svg); const png = await svgToPng(svg, w, h); if (!png) return; const b64 = png.split(',')[1]; if (!b64) return; const id = wb.addImage({ base64: b64, extension: 'png' }); g.addImage(id, { tl: { col: 1, row: gr }, ext: { width: w, height: h } }); gr += Math.ceil(h / 15) + 2; };
+    addTitle(repTitle, 14, 'FF0F172A'); addTitle('工程別の時間（パレート）— どこが時間の山か', 12);
+    await placeImg(svgPareto(bd.rows, { w: 760, h: 300 }));
+    for (const r of bd.rows) {
+      addTitle(`${r.stepTitle} — ${r.n}台 ・ 中央値${fmtS(r.median)} ・ CV${Math.round(r.cv * 100)}%${r.target > 0 ? ' ・ 目標' + fmtS(r.target) : ''}`, 11);
+      await placeImg(svgStrip(r.durations, r.target, { w: 720, h: 124 }));
+      const tr = trendOf(r.monthly); if (tr.length > 1) await placeImg(svgTrend(tr, r.target, { w: 540, h: 150 }));
+      const wr = workersOf(r.workers); if (wr.length > 1) await placeImg(svgBars(wr, { w: 540, color: '#0d9488', target: r.target }));
+      const es = elStatsOf(r.stepKey); if (es && es.observedUnits > 0) await placeImg(svgElement(es.rows, { w: 720 }));
+    }
+    // ② データシート(検算・加工用に残す)
     const s1 = wb.addWorksheet('工程別サマリー'); s1.pageSetup = { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1 };
     s1.addRow([repTitle]); s1.addRow([`期間 ${repPeriod}`]); s1.addRow([]);
     const hr = s1.addRow(['順位', '工程', '台数', '平均(s)', '中央値(s)', 'σ(s)', 'CV%', '最小(s)', '最大(s)', '目標(s)', '目標比%', '年間合計(h)', '累積%']);
     hr.font = { bold: true, color: { argb: 'FFFFFFFF' } }; hr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } };
-    bd.rows.forEach((r, i) => { s1.addRow([i + 1, r.stepTitle, r.n, r.mean, r.median, r.sigma, Math.round(r.cv * 100), r.min, r.max, r.target || '', r.target > 0 ? Math.round(r.median / r.target * 100) : '', Math.round(r.totalSec / 3600 * 10) / 10, r.cumPct]); });
+    bd.rows.forEach((r, i) => { const row = s1.addRow([i + 1, r.stepTitle, r.n, r.mean, r.median, r.sigma, Math.round(r.cv * 100), r.min, r.max, r.target || '', r.target > 0 ? Math.round(r.median / r.target * 100) : '', Math.round(r.totalSec / 3600 * 10) / 10, r.cumPct]); if (r.target > 0) { const c = row.getCell(11); c.font = { bold: true, color: { argb: r.median <= r.target ? 'FF16A34A' : (r.median <= r.target * 1.1 ? 'FFCA8A00' : 'FFDC2626') } }; } });
     [6, 24, 6, 9, 9, 7, 6, 8, 8, 8, 8, 11, 8].forEach((w, i) => { s1.getColumn(i + 1).width = w; });
     const s2 = wb.addWorksheet('各工程の実測値'); s2.addRow(['工程', '台ごとの実測秒(昇順)']); s2.getRow(1).font = { bold: true };
     bd.rows.forEach(r => { s2.addRow([r.stepTitle, [...r.durations].sort((a, b) => a - b).join(', ')]); });
     s2.getColumn(1).width = 24; s2.getColumn(2).width = 90;
     const buf = await wb.xlsx.writeBuffer(); const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `工程分析_${model}_${pdcaFmtDate(nowMs).replace(/\//g, '')}.xlsx`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    } catch (e) { console.error('Excel出力に失敗', e); alert('Excel出力に失敗しました'); } finally { setBusyExcel(false); }
   };
 
   return (
@@ -15576,7 +15825,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
             <span className="text-[11px] text-slate-500 mr-1">出力:</span>
             <button onClick={() => printReport(false)} className="px-2.5 py-1 text-xs font-bold rounded border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 flex items-center gap-1"><Printer className="w-3.5 h-3.5" /> PDF(A4 1枚)</button>
             <button onClick={() => printReport(true)} className="px-2.5 py-1 text-xs font-bold rounded border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 flex items-center gap-1"><Printer className="w-3.5 h-3.5" /> PDF(詳細)</button>
-            <button onClick={exportExcel} className="px-2.5 py-1 text-xs font-bold rounded border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 flex items-center gap-1"><FileSpreadsheet className="w-3.5 h-3.5" /> Excel</button>
+            <button onClick={exportExcel} disabled={busyExcel} className={`px-2.5 py-1 text-xs font-bold rounded border flex items-center gap-1 ${busyExcel ? 'border-slate-200 bg-slate-100 text-slate-400' : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'}`}><FileSpreadsheet className="w-3.5 h-3.5" /> {busyExcel ? '生成中…' : 'Excel(グラフ入り)'}</button>
           </div>
         )}
       </div>
@@ -15613,11 +15862,16 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                 <span className="text-sm font-bold text-slate-700">② {sel.stepTitle} の中身</span>
                 <span className="text-xs text-slate-400">（{sel.n}台ぶん）</span>
                 {(() => { const [lbl, cls] = cvBadge(sel.cv); return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls}`}>{lbl}（CV {sel.cv}）</span>; })()}
-                {saveData && !sel.stepKey?.includes('lot') && (
-                  templateId
-                    ? <button onClick={() => setObsEditor(true)} className="ml-auto text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{planForSel ? 'じっと見る設定' : 'じっと見る（要素に分ける）'}</button>
-                    : <span className="ml-auto text-[10px] text-slate-400">要素に分けるにはテンプレを選択</span>
-                )}
+                <div className="ml-auto flex items-center gap-1.5">
+                  {saveData && (
+                    <button onClick={() => setFixMode(m => !m)} className={`text-[11px] px-2 py-1 rounded border font-bold flex items-center gap-1 ${fixMode ? 'border-amber-400 bg-amber-100 text-amber-800' : 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'}`} title="グラフを見て生データの異常を感じたら直す">🔧 {fixMode ? '修正モード中' : '生データ修正'}</button>
+                  )}
+                  {saveData && !sel.stepKey?.includes('lot') && (
+                    templateId
+                      ? <button onClick={() => setObsEditor(true)} className="text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{planForSel ? 'じっと見る設定' : 'じっと見る（要素に分ける）'}</button>
+                      : <span className="text-[10px] text-slate-400">要素に分けるにはテンプレを選択</span>
+                  )}
+                </div>
               </div>
               {/* 統計サマリ */}
               <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 text-center">
@@ -15633,6 +15887,36 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                   <div className="text-[10px] text-slate-400 mt-1">中央値は{sel.median > sel.target ? `目標より ${fmt(sel.median - sel.target)} 遅い` : (sel.median < sel.target ? `目標より ${fmt(sel.target - sel.median)} 速い` : '目標どおり')}。{sel.cv >= 0.5 ? '点がかなり散らばっている＝作業のやり方が安定していない可能性。' : (sel.cv < 0.3 ? '点がまとまっている＝安定した作業。' : '')}</div>
                 )}
               </div>
+              {/* 修正モード: 生データ一覧(指図/台/値)→異常を直す */}
+              {fixMode && (
+                <div className="border-2 border-amber-300 bg-amber-50/60 rounded-lg p-2.5">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="text-xs font-bold text-amber-800">🔧 生データ修正 — 「{sel.stepTitle}」の実測値（大きい順 {rawSamples.length}件）</div>
+                    <div className="text-[10px] text-amber-700">🔴=0/5秒未満/4時間超 ・ 🟡=中央値から大きく外れ</div>
+                  </div>
+                  {rawSamples.length === 0 ? (
+                    <div className="text-[11px] text-slate-500 py-2">この工程の実測データがありません。</div>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto rounded border border-amber-200 bg-white">
+                      <table className="w-full text-xs">
+                        <thead className="bg-amber-100 text-amber-900 sticky top-0"><tr><th className="px-2 py-1 text-left">指図</th><th className="px-2 py-1 text-center">台</th><th className="px-2 py-1 text-right">実測</th><th className="px-2 py-1 text-center">完了日</th><th className="px-2 py-1 text-center">修正</th></tr></thead>
+                        <tbody>
+                          {rawSamples.map((sp, i) => { const fl = sampleFlag(sp.value); return (
+                            <tr key={sp.lotId + sp.taskKey + i} className={`border-t border-slate-100 ${fl === 'bad' ? 'bg-rose-50' : fl === 'warn' ? 'bg-amber-50' : ''}`}>
+                              <td className="px-2 py-1 truncate max-w-[10rem]" title={String(sp.workOrder)}>{fl === 'bad' ? '🔴' : fl === 'warn' ? '🟡' : ''} {sp.workOrder}</td>
+                              <td className="px-2 py-1 text-center text-slate-500">{sp.unitIdx + 1}</td>
+                              <td className={`px-2 py-1 text-right font-mono font-bold ${fl === 'bad' ? 'text-rose-600' : fl === 'warn' ? 'text-amber-600' : 'text-slate-700'}`}>{fmt(sp.value)}{sp.manual && <span className="text-[9px] text-slate-400 ml-1">手</span>}</td>
+                              <td className="px-2 py-1 text-center text-[10px] text-slate-400">{sp.completedAt ? pdcaFmtDate(sp.completedAt) : '—'}</td>
+                              <td className="px-2 py-1 text-center"><button onClick={() => setFixEdit({ sample: sp })} className="text-[11px] px-2 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-white font-bold">直す</button></td>
+                            </tr>
+                          ); })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  <div className="text-[10px] text-slate-500 mt-1.5">グラフで「明らかにおかしい点」を見つけたら、ここで実測値を直接修正できます（指図の作業データを書き換えます。修正後は分析・グラフに即反映）。</div>
+                </div>
+              )}
               {/* ③ 推移 */}
               {trend.length > 1 && (
                 <div>
@@ -15691,6 +15975,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
       {obsEditor && sel && templateId && (
         <ObservationPlanEditor plan={planForSel} templateId={templateId} stepKey={sel.stepKey} stepTitle={sel.stepTitle} model={model} models={models} allPlans={observationPlans} saveData={saveData} deleteData={deleteData} onClose={() => setObsEditor(false)} />
       )}
+      {fixEdit && <RawFixModal sample={fixEdit.sample} target={sel?.target || 0} fmt={fmt} onSave={saveFix} onClose={() => setFixEdit(null)} />}
     </div>
   );
 };
