@@ -350,8 +350,17 @@ const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGrou
   const titlePart = stepKey ? (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey) : null;
   (lots || []).forEach(l => {
     if (!l) return;
-    if (l.status !== 'completed' && l.location !== 'completed') return;
     if (model && l.model !== model) return;
+    // 不具合件数: 不具合自身の timestamp で窓を切る。完了/作業中に関係なく数える
+    // (defectStatsと対称=saveDataがupdatedAtを更新する作業中ロットの不具合を落とさない。完了ゲートより前で数える)
+    (l.interruptions || []).filter(i => i.type === 'defect').forEach(dft => {
+      const ms = toMsAny(dft.timestamp);
+      if (ms == null || ms < startMs || ms > endMs) return;
+      if (titlePart && (dft.stepInfo?.title || '') !== titlePart) return;
+      defectCount++;
+    });
+    // 時間統計の標本は完了ロットのみ (作業中の途中durationを混ぜない)
+    if (l.status !== 'completed' && l.location !== 'completed') return;
     const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
     (l.steps || []).forEach((step, idx) => {
       if (stepKey && targetTimeStepKey(step) !== stepKey) return;
@@ -370,13 +379,6 @@ const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGrou
         samples.push({ d, tgt: effTarget });
       });
     });
-    // 不具合件数: 不具合自身の timestamp で窓を切る (ロット updatedAt で丸ごと落とさない=製品の正しいパターン)
-    (l.interruptions || []).filter(i => i.type === 'defect').forEach(dft => {
-      const ms = toMsAny(dft.timestamp);
-      if (ms == null || ms < startMs || ms > endMs) return;
-      if (titlePart && (dft.stepInfo?.title || '') !== titlePart) return;
-      defectCount++;
-    });
   });
   const ds = samples.map(x => x.d).sort((a, b) => a - b);
   const n = ds.length;
@@ -393,7 +395,15 @@ const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGrou
     min: n ? ds[0] : 0, max: n ? ds[n - 1] : 0,
     achievementRate: sum > 0 && sumTgt > 0 ? Math.round((sumTgt / sum) * 1000) / 10 : null,
     within, sumTgt, sumAct: sum, defectCount,
+    startMs, endMs, days: (isFinite(endMs) && startMs > 0) ? Math.max(1, (endMs - startMs) / 86400000) : null,
   };
+};
+// 統計オブジェクトの窓日数 (古いカルテ等で days 欠落時は startMs/endMs から復元)
+const pdcaWindowDays = (stat) => {
+  if (!stat) return 1;
+  if (stat.days) return stat.days;
+  if (stat.startMs != null && stat.endMs != null && isFinite(stat.endMs)) return Math.max(1, (stat.endMs - stat.startMs) / 86400000);
+  return 1;
 };
 // 効果判定: KPIに応じて 改善/悪化/横ばい/標本不足 を返す。時間/σ/不具合=小さいほど良い、達成率=大きいほど良い。
 const PDCA_KPIS = { time: '工程時間(中央値)', sigma: 'ばらつき(σ)', achievement: '達成率', defectRate: '不具合件数' };
@@ -413,6 +423,16 @@ const computeVerdict = (baseline, after, kpi = 'time') => {
   // 件数系(不具合)以外は片側5標本以上を要求
   if (kpi !== 'defectRate' && (nB < PDCA_MIN_N || nA < PDCA_MIN_N)) {
     return { result: 'insufficient', reason: `標本不足(前${nB}/後${nA}件・各${PDCA_MIN_N}件以上必要)`, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
+  }
+  // 不具合件数: 窓長(日数)が違う前後を「1日あたり件数」で比較する(90日 vs 14日 を生比較しない)。ベースライン0件でも増加(0→N)は悪化と判定。
+  if (kpi === 'defectRate') {
+    if (bv == null || av == null) return { result: 'insufficient', reason: '比較値が不足', label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
+    const bRate = bv / pdcaWindowDays(baseline), aRate = av / pdcaWindowDays(after);
+    const deltaPct = bRate > 0 ? Math.round(((aRate - bRate) / bRate) * 1000) / 10 : null;
+    let r;
+    if (deltaPct == null) r = aRate > 0 ? 'worse' : 'flat';
+    else r = deltaPct <= -PDCA_THRESHOLD_PCT ? 'improved' : (deltaPct >= PDCA_THRESHOLD_PCT ? 'worse' : 'flat');
+    return { result: r, deltaPct, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
   }
   if (bv == null || av == null || bv === 0) return { result: 'insufficient', reason: '比較値が不足', label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
   const deltaPct = ((av - bv) / Math.abs(bv)) * 100;
@@ -14300,7 +14320,7 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   const [rstChk, setRstChk] = useState(false);
   const [rstProg, setRstProg] = useState({ done: 0, total: 0 });
   const [rstMsg, setRstMsg] = useState('');
-  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業' };
+  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業', improvements: '改善カルテ' };
   const curIdSet = (arr) => new Set((arr || []).map(x => x && x.id).filter(Boolean));
   const diffOf = (cur, bk) => {
     const cs = curIdSet(cur); let create = 0, over = 0;
@@ -14315,7 +14335,7 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
       const app = parsed && parsed.meta && parsed.meta.app;
       if (app && app !== 'product-inspection') { setRst({ err: `このファイルは「${app}」用のバックアップです。製品検査アプリには取り込めません（データ破損防止のためブロックしました）。`, fileName: f.name }); setRstMsg(''); setRstPhase('error'); return; }
       if (!parsed || (!Array.isArray(parsed.lots) && !parsed.settings)) { setRst({ err: 'バックアップ形式ではないようです（lots / settings が見つかりません）。', fileName: f.name }); setRstMsg(''); setRstPhase('error'); return; }
-      const diff = { lots: diffOf(lots, parsed.lots), templates: diffOf(templates, parsed.templates), workers: diffOf(workers, parsed.workers), indirectWork: diffOf(indirectWork, parsed.indirectWork) };
+      const diff = { lots: diffOf(lots, parsed.lots), templates: diffOf(templates, parsed.templates), workers: diffOf(workers, parsed.workers), indirectWork: diffOf(indirectWork, parsed.indirectWork), improvements: diffOf(improvements, parsed.improvements) };
       setRst({ parsed, diff, fileName: f.name, meta: parsed.meta || {} }); setRstConfirm(''); setRstChk(false); setRstMsg(''); setRstPhase('preview');
     } catch (err) { setRst({ err: 'ファイルの読み込み/解析に失敗しました: ' + (err.message || err), fileName: f.name }); setRstMsg(''); setRstPhase('error'); }
     finally { if (fileRef.current) fileRef.current.value = ''; }
@@ -14540,15 +14560,22 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
   const savePlan = () => patch({ problem: edit.problem, hypothesis: edit.hypothesis, action: edit.action, owner: edit.owner, dueDate: edit.dueDate, kpi: edit.kpi, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew }, { type: 'edit', note: '計画/内容を編集' });
   const markDoing = () => patch({ status: 'doing' }, { type: 'status', note: '実施中に変更' });
   const recordAction = () => {
+    // 既に実施日があるのに再度押すと効果測定がリセットされるため確認 (初回=actionDate無しは確認なし)
+    if (card.actionDate && !confirm('対策実施日を今日に変更すると、これまでの効果測定がリセットされます。よろしいですか？')) return;
     const now = Date.now();
-    patch({ status: 'measuring', actionDate: now, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew }, { type: 'do', note: `対策を実施 (${edit.changeNote || '内容未記入'})` });
+    patch({ status: 'measuring', actionDate: now, kpi: edit.kpi, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew }, { type: 'do', note: `対策を実施 (${edit.changeNote || '内容未記入'})` });
   };
   const closeWith = (status) => {
-    // 実施後統計と判定を凍結して恒久エビデンス化
-    const frozen = afterLive || null;
+    // 「効果あり/悪化」は実施後の標本が一定数たまるまで判定させない (無意味な0台凍結を防ぐ。defectRateは件数ベースなので除外)
+    if (edit.kpi !== 'defectRate' && (status === 'effective' || status === 'worse') && (!afterLive || (afterLive.n || 0) < PDCA_MIN_N)) {
+      alert(`実施後の標本が ${afterLive?.n || 0}台 です。${PDCA_MIN_N}台たまってから「効果あり／悪化」を判定してください。（「効果なし」「元に戻す」での完了は可能です）`);
+      return;
+    }
+    // 実施後統計と判定を凍結して恒久エビデンス化 (窓情報も保存=後で日あたり率の再計算が可能)。kpiも永続化して凍結判定と一致させる。
+    const frozen = afterLive ? { ...afterLive, startMs: card.actionDate, endMs: Date.now() } : null;
     const v = (card.baseline && frozen) ? computeVerdict(card.baseline, frozen, edit.kpi) : null;
     const label = PDCA_STATUS_META[status]?.label || status;
-    patch({ status, afterFrozen: frozen, verdictFrozen: v, closedAt: Date.now(), closedBy: currentUserName || '?' }, { type: 'close', note: `判定: ${label}` });
+    patch({ status, kpi: edit.kpi, afterFrozen: frozen, verdictFrozen: v, closedAt: Date.now(), closedBy: currentUserName || '?' }, { type: 'close', note: `判定: ${label}` });
   };
   const reopen = () => patch({ status: 'measuring', closedAt: null, closedBy: null, afterFrozen: null, verdictFrozen: null }, { type: 'status', note: '再オープン(効果測定中へ)' });
   const doDelete = async () => { if (!deleteData) return; if (!confirm('このカルテを削除しますか？(元に戻せません)')) return; await deleteData('improvements', card.id); onClose(); };
@@ -22767,9 +22794,14 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     let savedSec = 0, defectCut = 0;
     effective.forEach(c => {
       const b = c.baseline, a = c.afterFrozen;
-      if (b && a) {
-        if ((c.kpi || 'time') === 'time' || c.kpi === 'sigma') savedSec += Math.max(0, (b.median || 0) - (a.median || 0)) * (a.n || 0);
-        defectCut += Math.max(0, (b.defectCount || 0) - (a.defectCount || 0));
+      if (!(b && a)) return;
+      // 削減時間: 工程時間(time)を主指標にしたカルテのみ(σ/達成率/不具合は時間削減として計上しない)
+      if ((c.kpi || 'time') === 'time') savedSec += Math.max(0, (b.median || 0) - (a.median || 0)) * (a.n || 0);
+      // 不具合減: 不具合(defectRate)を主指標にしたカルテのみ。窓長が違うので「1日あたり件数」差→30日換算
+      if (c.kpi === 'defectRate') {
+        const bDays = pdcaWindowDays(b), aDays = pdcaWindowDays(a);
+        const cutPerDay = Math.max(0, (b.defectCount || 0) / bDays - (a.defectCount || 0) / aDays);
+        defectCut += Math.round(cutPerDay * 30);
       }
     });
     return { createdN: created.length, actedN: acted.length, judgedN: judged.length, effectiveN: effective.length, noeffectN: noeffect.length, runningN: running.length, savedHours: savedSec / 3600, defectCut, effective, noeffect };
@@ -22967,8 +22999,8 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
       <div class="kpi"><div class="v">${pdcaData.createdN}</div><div class="l">当月 起票</div></div>
       <div class="kpi"><div class="v" style="color:#2563eb">${pdcaData.actedN}</div><div class="l">当月 実施</div></div>
       <div class="kpi"><div class="v" style="color:#059669">${pdcaData.effectiveN}</div><div class="l">定着(効果あり)</div></div>
-      <div class="kpi"><div class="v" style="color:#059669">${pdcaData.savedHours >= 0.1 ? pdcaData.savedHours.toFixed(1) + 'h' : '—'}</div><div class="l">削減時間/月</div></div>
-      <div class="kpi"><div class="v" style="color:#e11d48">${pdcaData.defectCut || 0}</div><div class="l">不具合 減</div></div>
+      <div class="kpi"><div class="v" style="color:#059669">${pdcaData.savedHours >= 0.1 ? pdcaData.savedHours.toFixed(1) + 'h' : '—'}</div><div class="l">削減時間(当月確定分)</div></div>
+      <div class="kpi"><div class="v" style="color:#e11d48">${pdcaData.defectCut || 0}</div><div class="l">不具合減(月換算)</div></div>
     </div>`;
     const pdcaVL = { improved: '改善', worse: '悪化', flat: '横ばい', insufficient: '標本不足' };
     const monthCards = [...pdcaData.effective, ...pdcaData.noeffect];
@@ -23124,7 +23156,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     let R9 = 1;
     R9 = titleRow(s9, R9, `改善PDCA（${monthTitle}）`, 8); R9++;
     R9 = addDataRow(s9, R9, [`起票 ${pdcaData.createdN} / 実施 ${pdcaData.actedN} / 定着 ${pdcaData.effectiveN} / 効果なし ${pdcaData.noeffectN} / 進行中 ${pdcaData.runningN}`, '', '', '', '', '', '', ''], st);
-    R9 = addDataRow(s9, R9, [`削減時間/月: ${pdcaData.savedHours >= 0.1 ? pdcaData.savedHours.toFixed(1) + 'h' : '—'} / 不具合減: ${pdcaData.defectCut || 0}件`, '', '', '', '', '', '', ''], st); R9++;
+    R9 = addDataRow(s9, R9, [`削減時間(当月確定分): ${pdcaData.savedHours >= 0.1 ? pdcaData.savedHours.toFixed(1) + 'h' : '—'} / 不具合減(月換算): ${pdcaData.defectCut || 0}件`, '', '', '', '', '', '', ''], st); R9++;
     R9 = addHeaderRow(s9, R9, ['型式', '工程', '主指標', '改善前', '実施後', '変化%', '判定', '実施日'], st);
     const monthCards9 = [...pdcaData.effective, ...pdcaData.noeffect];
     if (monthCards9.length === 0) R9 = addDataRow(s9, R9, ['当月に判定した改善はありません', '', '', '', '', '', '', ''], st);
@@ -23197,7 +23229,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
 
         {/* 所感 */}
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
-          <label className="block text-sm font-bold text-slate-600 mb-2">所感 (実績報告書 §7 に記載 — 任意)</label>
+          <label className="block text-sm font-bold text-slate-600 mb-2">所感 (実績報告書 §8 に記載 — 任意)</label>
           <textarea value={comment} onChange={e => setComment(e.target.value)} rows={3} placeholder="当月の総括・特記事項・次月への課題などを記入してください。" className="w-full border border-slate-300 rounded p-2.5 text-sm" />
         </div>
 
@@ -23323,8 +23355,8 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
                   <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">起票</div><div className="text-base font-black text-slate-700">{pdcaData.createdN}</div></div>
                   <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">実施</div><div className="text-base font-black text-blue-700">{pdcaData.actedN}</div></div>
                   <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">定着</div><div className="text-base font-black text-emerald-700">{pdcaData.effectiveN}</div></div>
-                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">削減/月</div><div className="text-sm font-black text-emerald-700">{pdcaData.savedHours >= 0.1 ? `${pdcaData.savedHours.toFixed(1)}h` : '—'}</div></div>
-                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">不具合減</div><div className="text-base font-black text-rose-700">{pdcaData.defectCut || 0}</div></div>
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">削減(確定分)</div><div className="text-sm font-black text-emerald-700">{pdcaData.savedHours >= 0.1 ? `${pdcaData.savedHours.toFixed(1)}h` : '—'}</div></div>
+                  <div className="bg-white rounded p-1"><div className="text-[9px] text-slate-500">不具合減(月)</div><div className="text-base font-black text-rose-700">{pdcaData.defectCut || 0}</div></div>
                 </div>
                 <div className="text-[10px] text-slate-500 mt-1">進行中 {pdcaData.runningN}件 ・ 効果なし完了 {pdcaData.noeffectN}件</div>
               </div>
