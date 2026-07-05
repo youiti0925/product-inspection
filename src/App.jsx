@@ -131,6 +131,121 @@ const loadJSZip = async () => {
   return _JSZip;
 };
 
+// ExcelJS のセル値 → 表示テキスト (数式は計算結果, リッチテキストは連結, ハイパーリンクは文字列)
+const xlsxCellText_pi = (v) => {
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    if (v instanceof Date) return v.toString();
+    if (Array.isArray(v.richText)) return v.richText.map(t => t.text).join('');
+    if (v.result != null) return String(v.result);   // 数式セル: 計算結果を使う
+    if (v.text != null) return String(v.text);        // ハイパーリンク等
+    if (v.formula != null) return '';                 // 数式だが結果なし
+    return '';
+  }
+  return String(v);
+};
+
+// 列参照 "B3" → { col:2, row:3 }
+const xlsxRefToRC_pi = (ref) => {
+  const m = /^([A-Z]+)(\d+)$/.exec(ref || '');
+  if (!m) return null;
+  let c = 0;
+  for (const ch of m[1]) c = c * 26 + (ch.charCodeAt(0) - 64);
+  return { col: c, row: parseInt(m[2], 10) };
+};
+
+// ExcelJS が読めない xlsx (Google スプレッドシート由来など) を JSZip + DOMParser で直接読み、
+//   指定シート(無ければ先頭シート)を「1始まり行 × 1始まり列」の文字列グリッドにする。
+//   入荷登録取込のフォールバック用 (load 失敗時)。
+const readXlsxGridWithJSZip_pi = async (buf, preferredSheetName) => {
+  const JSZip = await loadJSZip();
+  const zip = await JSZip.loadAsync(buf);
+  const readXml = async (p) => { const f = zip.file(p); return f ? await f.async('string') : null; };
+  const parser = new DOMParser();
+  const RELNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+  // 共有文字列
+  const shared = [];
+  const sstXml = await readXml('xl/sharedStrings.xml');
+  if (sstXml) {
+    const sdoc = parser.parseFromString(sstXml, 'application/xml');
+    sdoc.querySelectorAll('si').forEach(si => {
+      let text = '';
+      si.querySelectorAll('t').forEach(t => { text += t.textContent || ''; });
+      shared.push(text);
+    });
+  }
+
+  // workbook.xml: シート名 → r:id 、 rels: r:id → ターゲット
+  const wbXml = await readXml('xl/workbook.xml');
+  if (!wbXml) throw new Error('workbook.xml が見つかりません');
+  const wdoc = parser.parseFromString(wbXml, 'application/xml');
+  const relsXml = await readXml('xl/_rels/workbook.xml.rels');
+  const relMap = {};
+  if (relsXml) {
+    const rdoc = parser.parseFromString(relsXml, 'application/xml');
+    rdoc.querySelectorAll('Relationship').forEach(r => { relMap[r.getAttribute('Id')] = r.getAttribute('Target'); });
+  }
+  const sheetEls = [...wdoc.getElementsByTagName('sheet')];
+  const ridOf = (el) => el.getAttributeNS(RELNS, 'id') || el.getAttribute('r:id') || el.getAttribute('id');
+  let chosen = (preferredSheetName && sheetEls.find(s => s.getAttribute('name') === preferredSheetName)) || sheetEls[0];
+  let targetPath = 'xl/worksheets/sheet1.xml';
+  if (chosen) {
+    let tgt = relMap[ridOf(chosen)];
+    if (tgt) {
+      tgt = tgt.replace(/^\.\//, '');
+      targetPath = tgt.startsWith('/') ? tgt.slice(1) : (tgt.startsWith('xl/') ? tgt : 'xl/' + tgt);
+    }
+  }
+  let sheetXml = await readXml(targetPath);
+  if (!sheetXml) sheetXml = await readXml('xl/worksheets/sheet1.xml');
+  if (!sheetXml) throw new Error('シートXMLが見つかりません');
+
+  const doc = parser.parseFromString(sheetXml, 'application/xml');
+  const grid = [];
+  const rowEls = doc.getElementsByTagName('row');
+  for (let ri = 0; ri < rowEls.length; ri++) {
+    const rowEl = rowEls[ri];
+    const rNum = parseInt(rowEl.getAttribute('r'), 10) || (ri + 1);
+    const cells = [];
+    const cEls = rowEl.getElementsByTagName('c');
+    for (let ci = 0; ci < cEls.length; ci++) {
+      const cEl = cEls[ci];
+      const pos = xlsxRefToRC_pi(cEl.getAttribute('r'));
+      const colNum = pos ? pos.col : (ci + 1);
+      const type = cEl.getAttribute('t');
+      let val = '';
+      const vEl = cEl.getElementsByTagName('v')[0];
+      const isEl = cEl.getElementsByTagName('is')[0];
+      if (type === 's') { const idx = parseInt(vEl ? vEl.textContent : '', 10); val = (shared[idx] != null) ? shared[idx] : ''; }
+      else if (type === 'inlineStr' && isEl) { const ts = isEl.getElementsByTagName('t'); for (let k = 0; k < ts.length; k++) val += ts[k].textContent || ''; }
+      else { val = vEl ? (vEl.textContent || '') : ''; } // str(数式結果) / 数値 / 真偽
+      cells[colNum] = val;
+    }
+    grid[rNum] = cells;
+  }
+  return grid;
+};
+
+// 取込用の柔軟な日付パース → "YYYY-MM-DD"(アプリの正規形式) or ''。
+//   対応: "2026/8/15" "2026-8-15"(年先頭) / "7/1/2026" "8/15/2026"(年末尾=Excel/US。M/D優先) /
+//         Excelシリアル値(日付型セル) / その他は new Date フォールバック("Tue Jul 01 2026..." 等)。
+const parseImportDateToYMD_pi = (raw) => {
+  if (raw == null) return '';
+  const s = String(raw).trim();
+  if (!s) return '';
+  let m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/); // 年先頭
+  if (m) return `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+  m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);      // 年末尾(M/D/YYYY 優先, 月>12なら入替)
+  if (m) { let mo = +m[1], da = +m[2]; if (mo > 12 && da <= 12) { const t = mo; mo = da; da = t; } return `${m[3]}-${String(mo).padStart(2, '0')}-${String(da).padStart(2, '0')}`; }
+  if (/^\d+(\.\d+)?$/.test(s)) {                                 // Excelシリアル値
+    const n = parseFloat(s);
+    if (n > 59 && n < 80000) { const d = new Date(Math.round((n - 25569) * 86400000)); if (!isNaN(d.getTime())) return localYMD(d); }
+  }
+  const t = new Date(s).getTime();                              // フォールバック
+  return isNaN(t) ? '' : localYMD(t);
+};
+
 // --- Global Constants & Config ---
 // 修正: IDを固定化して、どの端末からでも同じデータを参照できるようにする
 const APP_DATA_ID = "product-inspection-v1"; 
@@ -337,10 +452,15 @@ const lotOnceCountOf = (tasks, step) => Math.max(1, lotOnceKeysOf(tasks, step).l
 const toMsAny = (raw) => {
   if (raw == null) return null;
   if (typeof raw === 'number') return raw;
-  if (raw.seconds) return raw.seconds * 1000;
+  // Firestore Timestamp: 真のミリ秒 = seconds*1000 + nanoseconds/1e6 (他の toMs 実装と一貫化。
+  //   nanoseconds を落とすと同一秒内の複数完了で微小時刻差が失われ PDCA/年間台数の窓判定がズレる)
+  if (raw.seconds) return raw.seconds * 1000 + Math.floor((raw.nanoseconds || 0) / 1e6);
   const t = new Date(raw).getTime();
   return isNaN(t) ? null : t;
 };
+// CSVセルのエスケープ。カンマ/引用符/改行を含む値(型式名・指図名のユーザー入力や toLocaleString のカンマ)を
+// 正しく引用し、列ずれ・破損を防ぐ。RFC4180準拠(" は "" にエスケープ)。
+const csvCell = (v) => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
 const PDCA_MIN_N = 5;            // 効果判定に必要な片側の最小標本数
 const PDCA_THRESHOLD_PCT = 5;    // 改善/悪化と判定する変化率しきい値(%)
 const PDCA_STALE_DAYS = 14;      // 対策実施から効果が出ない/悪化を「放置」と見なす日数
@@ -401,7 +521,7 @@ const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGrou
 };
 // 儲けどころランキング: 型式×工程ごとに「年間台数 × 実績中央値 × 時給」で年間人件費・年間削減見込(円)を出す純関数。
 // reductionPerUnit = max(0, 実績中央値 − 目標)。年間台数は窓内標本を365日換算。低頻度(年lowFreq台未満)は flag。
-const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, lowFreq = 10 } = {}) => {
+const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, lowFreq = 10, annualUnitsByModel = null } = {}) => {
   const customTargetTimes = settings?.customTargetTimes || {};
   const modelGroups = modelGroupsOf(settings);
   const rate = ratePerHour || settings?.laborCostPerHour || 0;
@@ -410,14 +530,19 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
     const stat = measureWindow(lots, { model: ms.model, stepKey: ms.stepKey, customTargetTimes, modelGroups, startMs, endMs });
     if (stat.n < 1) return;
     const days = pdcaWindowDays(stat) || 365;
-    const annualUnits = Math.round(stat.n * (365 / days));
+    // 年間台数: ユーザーが入力した実際の年間生産台数を優先。無ければ測定台数を365日換算した推定。
+    const measuredAnnual = Math.round(stat.n * (365 / days));
+    const inputAnnual = annualUnitsByModel ? annualUnitsByModel[ms.model] : null;
+    const useActual = typeof inputAnnual === 'number' && inputAnnual > 0;
+    const annualUnits = useActual ? inputAnnual : measuredAnnual;
+    const annualUnitsSource = useActual ? 'actual' : 'estimated';
     const median = stat.median || 0;
     const target = stat.avgTarget || 0;
     const reductionPerUnit = target > 0 ? Math.max(0, median - target) : 0; // 目標未設定は削減見込0(過大評価しない)
     const annualCostYen = Math.round(annualUnits * median / 3600 * rate);
     const annualSaveYen = Math.round(annualUnits * reductionPerUnit / 3600 * rate);
     rows.push({
-      ...ms, n: stat.n, annualUnits, median, target, sigma: stat.sigma, cv: stat.cv,
+      ...ms, n: stat.n, annualUnits, measuredAnnual, annualUnitsSource, median, target, sigma: stat.sigma, cv: stat.cv,
       reductionPerUnit, annualCostSec: annualUnits * median, annualSaveSec: annualUnits * reductionPerUnit,
       annualCostYen, annualSaveYen, hasTarget: target > 0, lowFreq: annualUnits < lowFreq,
     });
@@ -435,6 +560,87 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
     totalSaveSec: rows.reduce((s, r) => s + r.annualSaveSec, 0),
     totalCostYen: rows.reduce((s, r) => s + r.annualCostYen, 0),
     totalCostSec: totalCost,
+  };
+};
+// 共通工程 横断改善: profitRanking の「型式×工程」行を、工程タイトルで型式横断にまとめ直す純関数。
+//   「この工程は何型式に共通か」「全型式合計で年いくらかかっているか」と、3つの改善余地を出す:
+//   ① 最速の型式に揃える(実証済み=現に一番速い型式の中央値まで全型式を揃えたら) ② ◯%短縮の仮定(レイアウト改善等の大改善)
+//   ③ 目標まで詰める(堅実な下限)。狙い=共通ポイントを1つ直すと全型式に効く=大きい、を可視化する。
+const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, reductionPct = 0.5, annualUnitsByModel = null } = {}) => {
+  const base = profitRanking(lots, settings, { startMs, endMs, ratePerHour, lowFreq: 0, annualUnitsByModel });
+  const rate = base.rate;
+  const groups = {};
+  base.rows.forEach(r => {
+    // 工程タイトル(category_title の title 部分)でまとめる。profitDetail の型式横断比較と同じ粒度。
+    const title = r.stepTitle || (r.stepKey && r.stepKey.includes('_') ? r.stepKey.slice(r.stepKey.indexOf('_') + 1) : r.stepKey) || '(不明)';
+    (groups[title] = groups[title] || { title, rows: [] }).rows.push(r);
+  });
+  const out = Object.values(groups).map(g => {
+    const rows = g.rows.slice().sort((a, b) => a.median - b.median); // 速い順(先頭=最速型式)
+    const modelCount = rows.length;
+    const actualModels = rows.filter(r => r.annualUnitsSource === 'actual').length; // 実際の年間台数を入力済の型式数
+    const annualUnits = rows.reduce((s, r) => s + r.annualUnits, 0);
+    const annualCostSec = rows.reduce((s, r) => s + r.annualCostSec, 0);
+    const annualCostYen = rows.reduce((s, r) => s + r.annualCostYen, 0);
+    // ① 最速の型式に揃える: 一番速い型式の中央値まで、それより遅い型式を全部揃えたら浮く分
+    const fastest = rows.reduce((m, r) => (r.median < m ? r.median : m), Infinity);
+    const fastestModel = (rows.find(r => r.median === fastest) || {}).model || '';
+    const slowest = rows.reduce((m, r) => (r.median > m ? r.median : m), 0);
+    const saveToFastestSec = rows.reduce((s, r) => s + r.annualUnits * Math.max(0, r.median - fastest), 0);
+    // ② ◯%短縮の仮定: 全型式合計時間 × 短縮率
+    const saveByPctSec = Math.round(annualCostSec * reductionPct);
+    // ③ 目標まで: 各型式の目標までの削減見込(profitRanking が算出済)の合計。目標未設定型式は0。
+    const saveToTargetSec = rows.reduce((s, r) => s + r.annualSaveSec, 0);
+    const hasTargetAny = rows.some(r => r.hasTarget);
+    const yenOf = (sec) => (rate > 0 ? Math.round(sec / 3600 * rate) : 0);
+    return {
+      title: g.title, modelCount, actualModels, models: rows, annualUnits, annualCostSec, annualCostYen,
+      fastest: isFinite(fastest) ? fastest : 0, fastestModel, slowest,
+      saveToFastestSec, saveToFastestYen: yenOf(saveToFastestSec),
+      saveByPctSec, saveByPctYen: yenOf(saveByPctSec),
+      saveToTargetSec, saveToTargetYen: yenOf(saveToTargetSec), hasTargetAny,
+    };
+  });
+  // 全型式合計の年間コスト(=工数の山)が大きい順 = 横断で直すと効果が大きい順
+  out.sort((a, b) => b.annualCostSec - a.annualCostSec);
+  return { groups: out, rate, reductionPct };
+};
+// 改善スコアボード(SQDC型の見える化): 重点工程の「今月 vs 先月」の中央値トレンド(速/横/遅)と、
+//   今月 実際に浮いた時間/¥ を出す純関数。リサーチの結論=1点集中×結果で評価×正直なお金 を実装。
+//   ※ freed(浮いた時間)は「速くなった分×今月台数」。¥は『余力を別の仕事に回せた場合の価値』で即現金ではない。
+const improvementScoreboard = (lots, settings, { nowMs, topN = 12 } = {}) => {
+  const customTargetTimes = settings?.customTargetTimes || {};
+  const modelGroups = modelGroupsOf(settings);
+  const rate = Number(settings?.laborCostPerHour) || 0;
+  const d = new Date(nowMs);
+  const thisStart = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+  const lastStart = new Date(d.getFullYear(), d.getMonth() - 1, 1).getTime();
+  // 年間コスト(=工数の山)順の上位工程をスコアボード対象にする(重点工程ランキングを土台に流用)。
+  const ranking = profitRanking(lots, settings, { startMs: nowMs - 365 * 86400000, endMs: nowMs, ratePerHour: rate });
+  const rows = ranking.rows.slice(0, topN).map(r => {
+    const tm = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes, modelGroups, startMs: thisStart, endMs: nowMs });
+    const lm = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes, modelGroups, startMs: lastStart, endMs: thisStart });
+    const tmMed = tm.n > 0 ? tm.median : null;
+    const lmMed = lm.n > 0 ? lm.median : null;
+    let trend = 'nodata', deltaSec = 0, freedSec = 0;
+    if (tmMed != null && lmMed != null) {
+      deltaSec = tmMed - lmMed; // <0 = 今月のほうが速い(良い)
+      const pct = lmMed > 0 ? Math.abs(deltaSec) / lmMed * 100 : 0;
+      trend = pct < PDCA_THRESHOLD_PCT ? 'same' : (deltaSec < 0 ? 'faster' : 'slower');
+      freedSec = (lmMed - tmMed) * (tm.n || 0); // 今月: 速くなった分 × 今月台数 (悪化なら負)
+    } else if (tmMed != null) {
+      trend = 'new'; // 今月初データ(比較先なし)
+    }
+    return { ...r, thisMonthMedian: tmMed, lastMonthMedian: lmMed, thisMonthN: tm.n, trend, deltaSec, freedSec };
+  });
+  const freedSecTotal = rows.reduce((s, r) => s + (r.freedSec > 0 ? r.freedSec : 0), 0);
+  const worsenedSecTotal = rows.reduce((s, r) => s + (r.freedSec < 0 ? -r.freedSec : 0), 0);
+  return {
+    rows, rate, thisStart, lastStart,
+    freedSecTotal, freedYenTotal: rate > 0 ? Math.round(freedSecTotal / 3600 * rate) : 0,
+    worsenedSecTotal,
+    improvedCount: rows.filter(r => r.trend === 'faster').length,
+    worsenedCount: rows.filter(r => r.trend === 'slower').length,
   };
 };
 const medianOf = (arr) => { if (!arr || !arr.length) return 0; const s = [...arr].sort((a, b) => a - b); const n = s.length; return n % 2 ? s[(n - 1) / 2] : Math.round((s[n / 2 - 1] + s[n / 2]) / 2); };
@@ -533,7 +739,9 @@ const obsElementStats = (lots, { model, templateId, stepKey, plan }) => {
       if (targetTimeStepKey(step) !== stepKey || step.lotOnce) return; // 段取り(回数ベース)は第1版対象外
       for (let u = 0; u < (l.quantity || 1); u++) {
         const t = (l.tasks || {})[`${step.id}-${u}`] || (l.tasks || {})[`${idx}-${u}`];
-        if (!t || !t.elementDurations) continue;
+        // 該当なし(skipped)/抜取スキップ/未完了の台は時間統計(stepBreakdown/measureWindow)と対称に除外。
+        // 完了→該当なし変換しても elementDurations が残るため、status を見ないと内訳に古い値が居座る。
+        if (!t || t.status !== 'completed' || t.samplingSkipped || !t.elementDurations) continue;
         const entries = Object.entries(t.elementDurations).filter(([, sec]) => sec > 0);
         if (!entries.length) continue;
         observedUnits++; // この台は内訳ありの1観測
@@ -645,11 +853,12 @@ const writeRotaryCommand = async (db, kind, { workId, station, model, machine, m
 
 // ロットの推定総時間。customTargetTimes があれば型式別較正値を使う。
 // ロット1回工程は台数を掛けず1回分のみ加算 (段取りは台数に比例しない)。
-const calculateLotEstimatedTime = (lot, customTargetTimes = null) => {
+const calculateLotEstimatedTime = (lot, customTargetTimes = null, modelGroups = null) => {
   if (!lot?.steps || !Array.isArray(lot.steps)) return 0;
   let perUnitTime = 0, lotOnceTime = 0;
   lot.steps.forEach(step => {
-    const t = getEffectiveTargetTime(step, lot.model, customTargetTimes);
+    // 型式グループ較正(modelGroups)も渡す。較正値を共有している型式で、計画(本関数)と達成率の目標基準が一致する。
+    const t = getEffectiveTargetTime(step, lot.model, customTargetTimes, modelGroups);
     if (step?.lotOnce) lotOnceTime += t; else perUnitTime += t;
   });
   return perUnitTime * (lot.quantity || 1) + lotOnceTime;
@@ -1327,6 +1536,11 @@ const DEFAULT_VOICE_COMMANDS = [
   { id: 'custom', label: 'カスタムモード', keywords: 'カスタム,自由,じゆう', description: 'カスタムモードを選択' },
   { id: 'batch', label: 'まとめて', keywords: 'まとめ,一括,バッチ', description: 'まとめて開始/完了' },
   { id: 'allComplete', label: '全作業完了', keywords: '全部完了,全作業完了,すべて完了', description: '全工程を完了する' },
+  { id: 'skip', label: '該当なし', keywords: '該当なし,該当無し,対象外,スキップ,飛ばす,とばす', description: 'この工程を該当なし(実施しない)に' },
+  { id: 'ng', label: 'NG/不具合', keywords: 'NG,エヌジー,不具合,不良,だめ,ダメ,バツ', description: '不具合を報告する' },
+  { id: 'rework', label: '修正', keywords: '修正,手直し,リワーク,やり直し,直す', description: '修正(リワーク)を開始' },
+  { id: 'reworkDone', label: '修正完了', keywords: '修正完了,手直し完了,直りました,直った', description: '修正を完了する' },
+  { id: 'resume', label: '再開', keywords: '再開,続ける,続き,リスタート', description: '中断から再開する' },
 ];
 
 // Build matcher from voice commands config
@@ -1334,24 +1548,38 @@ const buildVoiceMatcher = (voiceCommands) => {
   const map = {};
   const cmds = voiceCommands || DEFAULT_VOICE_COMMANDS;
   cmds.forEach(cmd => {
-    const words = cmd.keywords.split(',').map(w => w.trim()).filter(Boolean);
+    const words = (cmd.keywords || '').split(',').map(w => w.trim()).filter(Boolean);
+    // ⚠ キーワードが空だと正規表現が /(?:)/ となり全発話に誤マッチ(暴発)する。空のときは「絶対に一致しない」マッチャにする。
+    if (words.length === 0) { map[cmd.id] = () => false; return; }
     const pattern = new RegExp(words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'i');
+    // 生テキストと基本正規化(数字読み変換なし)の両方で判定 → 語が数字化で壊れる事故を回避。
     map[cmd.id] = (text) => {
       if (!text) return false;
-      return pattern.test(text) || pattern.test(normalizeVoiceText(text));
+      return pattern.test(text) || pattern.test(normalizeVoiceTextBasic(text));
     };
   });
   return map;
 };
 
-// Fallback matchers (used when no settings loaded) - normalize input
-const isYesResponse = (text) => { const t = normalizeVoiceText(text); return /はい|うん|OK|オーケー|そう|イエス|yes/i.test(t); };
-const isNoResponse = (text) => { const t = normalizeVoiceText(text); return /いいえ|いや|ダメ|違う|ノー|no/i.test(t); };
-const isCompleteCmd = (text) => { const t = normalizeVoiceText(text); return /完了|かんりょう|終わり|おわり|done/i.test(t); };
-const isInterruptCmd = (text) => { const t = normalizeVoiceText(text); return /中断|ちゅうだん|止め|やめ|ストップ|stop/i.test(t); };
-const isNextCmd = (text) => { const t = normalizeVoiceText(text); if (/次工程|次の工程/i.test(t)) return false; return /^(次|つぎ|next)$/i.test(t?.trim()) || /次へ|つぎへ/i.test(t); };
-const isNextStepCmd = (text) => { const t = normalizeVoiceText(text); return /次工程|次の工程|つぎこうてい|つぎのこうてい/i.test(t); };
-const isCancelCmd = (text) => { const t = normalizeVoiceText(text); return /キャンセル|取り消し|とりけし|cancel/i.test(t); };
+// コマンド一致は「生テキスト」と「基本正規化(数字読み変換なし)」の両方で判定する共通ヘルパー。
+const vt_ = (re, text) => !!text && (re.test(text) || re.test(normalizeVoiceTextBasic(text)));
+// Fallback matchers (used when no settings loaded)
+const isYesResponse = (text) => vt_(/はい|はーい|うん|OK|オーケー|オッケー|そう|了解|りょうかい|イエス|yes/i, text);
+const isNoResponse = (text) => vt_(/いいえ|いや|ダメ|違う|ちがう|ノー|no/i, text);
+const isCompleteCmd = (text) => vt_(/完了|かんりょう|終わり|おわり|できた|done/i, text);
+const isInterruptCmd = (text) => vt_(/中断|ちゅうだん|一時停止|止めて|止め|やめて|ストップ|ポーズ|stop|pause/i, text);
+const isNextCmd = (text) => { if (vt_(/次工程|次の工程/i, text)) return false; const t = normalizeVoiceTextBasic(text).trim(); return /^(次|つぎ|next)$/i.test(t) || vt_(/次へ|つぎへ|次の台|つぎの台|次お願い|次行って/i, text); };
+const isNextStepCmd = (text) => vt_(/次工程|次の工程|つぎこうてい|つぎのこうてい/i, text);
+const isCancelCmd = (text) => vt_(/キャンセル|取り消し|取消|とりけし|cancel/i, text);
+// 「完全に音声で支配」用の追加コマンド (設定が無い時のフォールバック)
+const isSkipCmd = (text) => vt_(/該当なし|該当無し|がいとうなし|対象外|スキップ|とばす|飛ばす|とばして|飛ばして|skip|パス/i, text);
+const isNgCmd = (text) => vt_(/NG|エヌジー|エヌ.?ジー|不具合|不良|バツ|ばつ|×|だめ|ダメ/i, text);
+const isReworkDoneCmd = (text) => vt_(/修正.?(?:完了|終わり|おわり|でき)|手直し.?(?:完了|終わり)|直りました|直った|なおった|治った|リワーク.?完了/i, text);
+const isReworkCmd = (text) => { if (isReworkDoneCmd(text)) return false; return vt_(/修正|手直し|リワーク|やり直し|やりなおし|直す|なおす/i, text); };
+const isResumeCmd = (text) => vt_(/再開|さいかい|続け|つづけ|続き|つづき|再スタート|リスタート|resume/i, text);
+const isStatusCmd = (text) => vt_(/今どこ|いまどこ|今の工程|現在の工程|状況|どこまで|何工程|なん工程|進捗/i, text);
+const isHelpCmd = (text) => vt_(/ヘルプ|help|使い方|コマンド|何て言えば|なんて言えば|何が言える|何が使える/i, text);
+const isVoiceOffCmd = (text) => vt_(/音声.?(?:オフ|終了|切|止|やめ)|アシスタント.?(?:オフ|終了)|もう終わり|おしまい/i, text);
 
 // 同ロット内の他工程の測定結果を1つのオブジェクトにまとめる (cross-step 参照用)
 // 戻り値: { [入力ID または 計算ID]: 値 } — 現在の工程と ID 衝突する場合は現工程優先
@@ -1487,10 +1715,12 @@ const evaluateArrows = (config, values, calcResults, extraValues = {}) => {
 };
 
 // 音声テキスト正規化: 誤変換補正 + 全角→半角 + 漢数字→数字
-const normalizeVoiceText = (text) => {
+// 基本正規化: 同音語補正 + 全角→半角 のみ。数字読み(し→4 等)は変換しない。
+//   ※ コマンド一致(is*Cmd / buildVoiceMatcher)はこの基本正規化で判定する。数字読み変換を混ぜると
+//     「該当なし→該当な4」「取り消し→取り消4」のように語が壊れて該当コマンドが不発になる事故が起きるため。
+const normalizeVoiceTextBasic = (text) => {
   if (!text) return '';
   let t = text;
-  // 音声認識の誤変換補正（同音異字）
   const homophones = {
     '皇帝': '工程', '号艇': '工程', '後程': '工程', '高低': '工程', '肯定': '工程', 'こうてい': '工程',
     '交代': '工程', '好転': '工程', '公定': '工程', '行程': '工程', '校庭': '工程', '口頭': '工程',
@@ -1507,6 +1737,13 @@ const normalizeVoiceText = (text) => {
   t = t.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
   // 全角英字→半角
   t = t.replace(/[Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  return t;
+};
+
+// 音声テキスト正規化: 基本 + 漢数字/ひらがな数字→半角数字。「N工程/N台目」や測定値の解釈に使う。
+const normalizeVoiceText = (text) => {
+  if (!text) return '';
+  let t = normalizeVoiceTextBasic(text);
   // 漢数字→半角 (位取り対応: 百/十)
   const kanjiMap = { '零': 0, '〇': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10, '百': 100 };
   // ひらがな数字→半角
@@ -1643,6 +1880,938 @@ const WorkerBadge = ({ id, workers }) => {
     </span>
   );
 };
+
+// ===== Google Drive 資料フォルダ連動 (方式3: フォルダ自動同期) =====
+// Driveの「検査資料」フォルダに置いた動画・PDF・画像を、Workerプロキシ(読み取り専用サービスアカウント)経由で
+// 型式毎/テンプレ毎/型式xテンプレ毎に自動一覧し、アプリ内で再生・表示する。
+// バイナリはDrive側に置くため Firebase の容量を食わない。リンク共有ONも不要(プロキシが本体を流すため)。
+// 接続先: .env の VITE_DRIVE_PROXY_URL (無ければ localStorage 'driveProxyUrl' → どちらも無ければ設定ガイドを表示)
+const DRIVE_PROXY_URL = String(import.meta.env.VITE_DRIVE_PROXY_URL || (typeof localStorage !== 'undefined' && localStorage.getItem('driveProxyUrl')) || '').replace(/\/+$/, '');
+const driveFileUrl = (id) => `${DRIVE_PROXY_URL}/drive/file?id=${encodeURIComponent(id)}`;
+const driveFmtSize = (n) => { if (!n) return ''; if (n < 1024) return `${n}B`; if (n < 1048576) return `${Math.round(n / 1024)}KB`; if (n < 1073741824) return `${(n / 1048576).toFixed(1)}MB`; return `${(n / 1073741824).toFixed(2)}GB`; };
+const driveKindOf = (mime, name) => {
+  const m = String(mime || '');
+  const ext = String(name || '').split('.').pop().toLowerCase();
+  if (m.startsWith('video/') || ['mp4', 'mov', 'webm', 'm4v'].includes(ext)) return 'video';
+  if (m === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (m.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) return 'image';
+  if (m.startsWith('audio/')) return 'audio';
+  return 'other';
+};
+const DRIVE_KIND_ICON = { video: '🎬', pdf: '📄', image: '🖼️', audio: '🔊', other: '📎' };
+
+// sections = [{ label, path: ['製品','型式','RCV-1000R'] }, ...]
+// steps/model/recipes/onSaveRecipe を渡すと「エース動画」(撮影/レシピ編集/レシピ再生/移動/ゴミ箱/名前変更)が有効になる。
+// Driveのファイルをゴミ箱へ(30日復元可・完全削除はSA制約で不可)。🎬欄の「🗑 Drive削除」から呼ぶ。
+const driveTrashFile = async (id) => {
+  if (!DRIVE_PROXY_URL || !id) return false;
+  try { const res = await fetch(`${DRIVE_PROXY_URL}/drive/trash`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) }); const j = await res.json().catch(() => ({})); return !!j.ok; }
+  catch (e) { return false; }
+};
+
+// 動画を加工: 圧縮(再エンコードで容量削減)/合体(複数動画を1本に)。canvas.captureStream+MediaRecorderで再録画(ffmpeg不要・実時間)。
+const VideoProcessModal = ({ sections = [], driveVideos = [], onDone = null, onClose }) => {
+  const [mode, setMode] = useState('compress'); // 'compress' | 'split' | 'concat'
+  const [files, setFiles] = useState([]);
+  const [quality, setQuality] = useState('mid');
+  const [phase, setPhase] = useState('pick'); // pick|working|done|uploading|error
+  const [prog, setProg] = useState(0);
+  const [upProg, setUpProg] = useState(0);
+  const [err, setErr] = useState('');
+  const [outBlob, setOutBlob] = useState(null);
+  const [outUrl, setOutUrl] = useState(null);
+  const [name, setName] = useState('');
+  const [dest, setDest] = useState(0);
+  const [splitPoints, setSplitPoints] = useState([]); // 分割の区切り位置(秒)
+  const [outSegs, setOutSegs] = useState([]); // 分割結果 [{blob,url,name,dest,saved}]
+  const [busyIdx, setBusyIdx] = useState(-1);
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [curT, setCurT] = useState(0);
+  const [srcDur, setSrcDur] = useState(0);
+  const canvasRef = useRef(null);
+  const previewRef = useRef(null);
+  const QMAP = { high: { w: 1280, vbr: 2500000, label: '高画質(大きめ)' }, mid: { w: 854, vbr: 1200000, label: '標準(おすすめ)' }, low: { w: 640, vbr: 650000, label: '軽量(小さい)' } };
+  const singleMode = mode === 'compress' || mode === 'split';
+  const addFiles = (e) => { const fs = [...(e.target.files || [])]; if (fs.length) setFiles(prev => singleMode ? fs.slice(0, 1) : [...prev, ...fs]); e.target.value = ''; };
+  const addDrive = (v) => { const item = { name: v.name, size: v.size || 0, __driveId: v.id }; setFiles(prev => singleMode ? [item] : [...prev, item]); };
+  const moveFile = (i, dir) => setFiles(prev => { const j = i + dir; if (j < 0 || j >= prev.length) return prev; const n = [...prev]; [n[i], n[j]] = [n[j], n[i]]; return n; });
+  const rmFile = (i) => setFiles(prev => prev.filter((_, j) => j !== i));
+  const pickMime = () => { const c = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4']; return (window.MediaRecorder && c.find(m => MediaRecorder.isTypeSupported(m))) || ''; };
+  const loadVideo = (item) => new Promise((res, rej) => { const v = document.createElement('video'); v.preload = 'auto'; v.muted = true; v.playsInline = true; if (item.__driveId) { v.crossOrigin = 'anonymous'; v.src = driveFileUrl(item.__driveId); } else { v.src = URL.createObjectURL(item); } v.onloadedmetadata = () => res(v); v.onerror = () => rej(new Error('動画を読み込めません: ' + (item.name || '') + (item.__driveId ? '（Drive動画の読込に失敗。端末の動画で試してください）' : ''))); });
+  const run = async () => {
+    if (!files.length) { setErr('動画を選んでください'); return; }
+    if (mode === 'concat' && files.length < 2) { setErr('合体には2本以上選んでください'); return; }
+    setPhase('working'); setProg(0); setErr('');
+    let ac = null; const urls = [];
+    try {
+      const q = QMAP[quality]; const vids = [];
+      for (const f of files) { const v = await loadVideo(f); vids.push(v); urls.push(v.src); }
+      const first = vids[0];
+      const scale = Math.min(1, q.w / (first.videoWidth || q.w));
+      let cw = Math.round((first.videoWidth || q.w) * scale) || q.w;
+      let ch = Math.round((first.videoHeight || Math.round(q.w * 9 / 16)) * scale) || Math.round(q.w * 9 / 16);
+      cw -= cw % 2; ch -= ch % 2;
+      const canvas = canvasRef.current; canvas.width = cw; canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ac = new AC();
+      const audioDest = ac.createMediaStreamDestination();
+      vids.forEach(v => { try { ac.createMediaElementSource(v).connect(audioDest); } catch (e) { /* 音声トラック無し */ } });
+      await ac.resume().catch(() => {});
+      const vstream = canvas.captureStream(30);
+      const mixed = new MediaStream([...vstream.getVideoTracks(), ...audioDest.stream.getAudioTracks()]);
+      const mime = pickMime();
+      const rec = new MediaRecorder(mixed, mime ? { mimeType: mime, videoBitsPerSecond: q.vbr } : undefined);
+      const chunks = [];
+      rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+      const stopped = new Promise(r => { rec.onstop = () => r(new Blob(chunks, { type: rec.mimeType || 'video/webm' })); });
+      rec.start(200);
+      const totalDur = vids.reduce((s, v) => s + (v.duration || 0), 0) || 1;
+      let base = 0; let stop = false;
+      const draw = (v) => { if (stop) return; try { const vr = (v.videoWidth || cw) / (v.videoHeight || ch), cr = cw / ch; let dw = cw, dh = ch, dx = 0, dy = 0; if (vr > cr) { dh = Math.round(cw / vr); dy = Math.round((ch - dh) / 2); } else { dw = Math.round(ch * vr); dx = Math.round((cw - dw) / 2); } ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch); ctx.drawImage(v, dx, dy, dw, dh); } catch (e) { /* noop */ } setProg(Math.min(0.99, (base + (v.currentTime || 0)) / totalDur)); if (!v.paused && !v.ended) requestAnimationFrame(() => draw(v)); };
+      for (const v of vids) { v.currentTime = 0; await v.play().catch(() => {}); requestAnimationFrame(() => draw(v)); await new Promise(r => { v.onended = r; }); base += (v.duration || 0); }
+      stop = true; rec.stop();
+      const blob = await stopped;
+      setOutBlob(blob); setOutUrl(URL.createObjectURL(blob)); setProg(1); setPhase('done');
+      if (!name.trim()) setName(mode === 'concat' ? '合体動画' : '圧縮動画');
+    } catch (e) { setErr(String(e?.message || e)); setPhase('error'); }
+    finally { try { ac && ac.close(); } catch (e) { /* noop */ } urls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) { /* noop */ } }); }
+  };
+  const fmtT = (s) => { s = Math.max(0, s || 0); return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`; };
+  const updateSeg = (i, patch) => setOutSegs(prev => prev.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  const addCut = () => { const t = Math.round(((previewRef.current?.currentTime) || 0) * 100) / 100; if (t <= 0.15) return; setSplitPoints(prev => (prev.some(p => Math.abs(p - t) < 0.3) ? prev : [...prev, t])); };
+  const rmCut = (t) => setSplitPoints(prev => prev.filter(p => p !== t));
+  const segList = () => { const dur = srcDur || 0; const pts = [...new Set(splitPoints)].filter(t => t > 0.15 && (!dur || t < dur - 0.15)).sort((a, b) => a - b); const b = [0, ...pts, ...(dur ? [dur] : [])]; const out = []; for (let i = 0; i < b.length - 1; i++) out.push([b[i], b[i + 1]]); return out; };
+  const onPreviewMeta = (e) => { const v = e.target; setSrcDur(isFinite(v.duration) && v.duration > 0 ? v.duration : 0); };
+  useEffect(() => {
+    if (mode !== 'split' || !files[0]) { setPreviewUrl(''); setCurT(0); setSrcDur(0); return; }
+    const f = files[0];
+    if (f.__driveId) { setPreviewUrl(driveFileUrl(f.__driveId)); return; }
+    const u = URL.createObjectURL(f); setPreviewUrl(u);
+    return () => { try { URL.revokeObjectURL(u); } catch (e) { /* noop */ } };
+  }, [files, mode]);
+  const runSplit = async () => {
+    if (!files.length) { setErr('動画を選んでください'); return; }
+    if (![...new Set(splitPoints)].length) { setErr('区切り位置を1つ以上追加してください（動画を再生して「✂ 今の位置で区切る」を押す）'); return; }
+    setPhase('working'); setProg(0); setErr('');
+    let ac = null; let srcU = null;
+    try {
+      const q = QMAP[quality];
+      const v = await loadVideo(files[0]); srcU = v.src;
+      let dur = v.duration;
+      if (!isFinite(dur) || dur <= 0) {
+        dur = await new Promise(res => { const h = () => { v.removeEventListener('seeked', h); const d = v.currentTime; res(isFinite(d) && d > 0 ? d : 0); }; v.addEventListener('seeked', h); v.currentTime = 1e7; });
+        await new Promise(r => { const h = () => { v.removeEventListener('seeked', h); r(); }; v.addEventListener('seeked', h); v.currentTime = 0; });
+      }
+      if (!dur || dur <= 0) throw new Error('動画の長さを取得できませんでした（別の動画でお試しください）');
+      const pts = [...new Set(splitPoints.map(t => Math.round(t * 100) / 100))].filter(t => t > 0.15 && t < dur - 0.15).sort((a, b) => a - b);
+      if (!pts.length) throw new Error('有効な区切り位置がありません（動画の長さの範囲内で区切ってください）');
+      const bounds = [0, ...pts, dur]; const segs = [];
+      for (let i = 0; i < bounds.length - 1; i++) segs.push([bounds[i], bounds[i + 1]]);
+      const scale = Math.min(1, q.w / (v.videoWidth || q.w));
+      let cw = Math.round((v.videoWidth || q.w) * scale) || q.w;
+      let ch = Math.round((v.videoHeight || Math.round(q.w * 9 / 16)) * scale) || Math.round(q.w * 9 / 16);
+      cw -= cw % 2; ch -= ch % 2;
+      const canvas = canvasRef.current; canvas.width = cw; canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      const AC = window.AudioContext || window.webkitAudioContext; ac = new AC();
+      const audioDest = ac.createMediaStreamDestination();
+      try { ac.createMediaElementSource(v).connect(audioDest); } catch (e) { /* 音声トラック無し */ }
+      await ac.resume().catch(() => {});
+      const vstream = canvas.captureStream(30);
+      const mixed = new MediaStream([...vstream.getVideoTracks(), ...audioDest.stream.getAudioTracks()]);
+      const drawFrame = () => { try { const vr = (v.videoWidth || cw) / (v.videoHeight || ch), cr = cw / ch; let dw = cw, dh = ch, dx = 0, dy = 0; if (vr > cr) { dh = Math.round(cw / vr); dy = Math.round((ch - dh) / 2); } else { dw = Math.round(ch * vr); dx = Math.round((cw - dw) / 2); } ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch); ctx.drawImage(v, dx, dy, dw, dh); } catch (e) { /* noop */ } };
+      const seekTo = (t) => new Promise(res => { if (Math.abs((v.currentTime || 0) - t) < 0.01) { res(); return; } let done2 = false; const h = () => { if (done2) return; done2 = true; v.removeEventListener('seeked', h); res(); }; v.addEventListener('seeked', h); v.currentTime = t; setTimeout(() => h(), 1500); });
+      const totalSpan = segs.reduce((s, seg) => s + (seg[1] - seg[0]), 0) || 1;
+      const baseName = (name.trim() || (files[0].name || '動画').replace(/\.[^.]+$/, '') || '分割');
+      const results = []; let doneSpan = 0;
+      for (let si = 0; si < segs.length; si++) {
+        const start = segs[si][0], end = segs[si][1];
+        v.pause(); await seekTo(start); drawFrame();
+        const mime = pickMime();
+        const rec = new MediaRecorder(mixed, mime ? { mimeType: mime, videoBitsPerSecond: q.vbr } : undefined);
+        const chunks = []; rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+        const stopped = new Promise(r => { rec.onstop = () => r(new Blob(chunks, { type: rec.mimeType || 'video/webm' })); });
+        let stop = false;
+        const tick = () => { if (stop) return; drawFrame(); setProg(Math.min(0.99, (doneSpan + Math.max(0, (v.currentTime || 0) - start)) / totalSpan)); if ((v.currentTime || 0) >= end - 0.03 || v.ended) { stop = true; try { rec.stop(); } catch (e) { /* noop */ } v.pause(); return; } requestAnimationFrame(tick); };
+        rec.start(200); await v.play().catch(() => {}); requestAnimationFrame(tick);
+        const blob = await stopped; doneSpan += (end - start);
+        results.push({ blob, url: URL.createObjectURL(blob), name: `${baseName}_${si + 1}`, dest: 0, saved: false });
+      }
+      setOutSegs(results); setProg(1); setPhase('done');
+    } catch (e) { setErr(String(e?.message || e)); setPhase('error'); }
+    finally { try { ac && ac.close(); } catch (e) { /* noop */ } try { if (srcU) URL.revokeObjectURL(srcU); } catch (e) { /* noop */ } }
+  };
+  const doUploadSeg = async (i) => {
+    const sg = outSegs[i]; if (!sg || !sections[sg.dest]) return;
+    setBusyIdx(i); setErr('');
+    try {
+      const ext = (sg.blob.type || '').includes('mp4') ? 'mp4' : 'webm';
+      const b = (sg.name.trim() || '分割動画').replace(/[\\/:*?"<>|]/g, '_');
+      const d = new Date();
+      const fname = `${b}_${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.${ext}`;
+      await driveUploadFile(new File([sg.blob], fname, { type: sg.blob.type || 'video/webm' }), sections[sg.dest].path, () => {});
+      updateSeg(i, { saved: true });
+    } catch (e) { setErr('保存失敗: ' + (e?.message || e)); }
+    finally { setBusyIdx(-1); }
+  };
+  const resetSplit = () => { outSegs.forEach(s => { try { URL.revokeObjectURL(s.url); } catch (e) { /* noop */ } }); setOutSegs([]); setSplitPoints([]); setPhase('pick'); };
+  const finishSplit = () => { outSegs.forEach(s => { try { URL.revokeObjectURL(s.url); } catch (e) { /* noop */ } }); (onDone ? onDone() : onClose()); };
+  const doUpload = async () => {
+    if (!outBlob || !sections[dest]) return;
+    const ext = (outBlob.type || '').includes('mp4') ? 'mp4' : 'webm';
+    const b = (name.trim() || '加工動画').replace(/[\\/:*?"<>|]/g, '_');
+    const d = new Date();
+    const fname = `${b}_${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.${ext}`;
+    setPhase('uploading'); setUpProg(0);
+    try { const up = await driveUploadFile(new File([outBlob], fname, { type: outBlob.type || 'video/webm' }), sections[dest].path, setUpProg); onDone && onDone(up); }
+    catch (e) { setErr('アップロード失敗: ' + (e?.message || e)); setPhase('error'); }
+  };
+  return (
+    <div className="fixed inset-0 z-[570] bg-black/90 flex flex-col items-center justify-center p-3" onClick={(e) => e.stopPropagation()}>
+      <div className="w-full max-w-lg bg-white rounded-xl p-3 space-y-2 max-h-[92vh] overflow-y-auto">
+        <div className="flex items-center justify-between">
+          <span className="font-bold text-sm text-slate-800">🛠 動画を加工（圧縮・分割・合体）</span>
+          <button onClick={onClose} className="p-1 rounded hover:bg-slate-100"><X className="w-5 h-5 text-slate-500" /></button>
+        </div>
+        <div className="grid grid-cols-3 gap-1.5">
+          <button onClick={() => { setMode('compress'); setFiles([]); setSplitPoints([]); setErr(''); }} className={`py-2 rounded-lg font-bold text-xs ${mode === 'compress' ? 'bg-sky-600 text-white' : 'bg-slate-100 text-slate-600'}`}>📉 圧縮<span className="block text-[9px] font-normal opacity-80">容量を小さく</span></button>
+          <button onClick={() => { setMode('split'); setFiles([]); setSplitPoints([]); setErr(''); }} className={`py-2 rounded-lg font-bold text-xs ${mode === 'split' ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600'}`}>✂ 分割<span className="block text-[9px] font-normal opacity-80">1本→複数に</span></button>
+          <button onClick={() => { setMode('concat'); setFiles([]); setSplitPoints([]); setErr(''); }} className={`py-2 rounded-lg font-bold text-xs ${mode === 'concat' ? 'bg-sky-600 text-white' : 'bg-slate-100 text-slate-600'}`}>🔗 合体<span className="block text-[9px] font-normal opacity-80">複数→1本に</span></button>
+        </div>
+        {phase === 'pick' && (<>
+          <label className="block w-full text-center py-3 border-2 border-dashed border-slate-300 rounded-lg text-sm font-bold text-slate-500 cursor-pointer hover:bg-slate-50">
+            {mode === 'concat' ? '📁 端末の動画から選ぶ（複数可・上から順に繋がります）' : (mode === 'split' ? '📁 分割したい動画を選ぶ（1本）' : '📁 端末の動画から選ぶ')}
+            <input type="file" accept="video/*" multiple={mode === 'concat'} className="hidden" onChange={addFiles} />
+          </label>
+          {driveVideos.length > 0 && (
+            <div>
+              <div className="text-[11px] font-bold text-slate-500 mb-1">☁ Driveの動画から選ぶ（{mode === 'concat' ? '複数タップで追加' : '1本'}）</div>
+              <div className="max-h-32 overflow-y-auto space-y-1 border border-slate-200 rounded p-1">
+                {driveVideos.map(v => (
+                  <button key={v.id} onClick={() => addDrive(v)} className="w-full text-left px-2 py-1.5 rounded bg-sky-50 hover:bg-sky-100 border border-sky-200 text-xs font-bold text-sky-700 truncate">🎬 {v.name} <span className="text-slate-400 font-normal">({driveFmtSize(v.size)})</span></button>
+                ))}
+              </div>
+            </div>
+          )}
+          {files.map((f, i) => (
+            <div key={i} className="flex items-center gap-2 text-xs bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+              <span className="font-bold text-slate-400">{i + 1}</span>
+              <span className="flex-1 min-w-0 truncate">{f.name} <span className="text-slate-400">({driveFmtSize(f.size)})</span></span>
+              {mode === 'concat' && <><button onClick={() => moveFile(i, -1)} className="text-slate-400 px-1">↑</button><button onClick={() => moveFile(i, 1)} className="text-slate-400 px-1">↓</button></>}
+              <button onClick={() => rmFile(i)} className="text-rose-500 px-1">✕</button>
+            </div>
+          ))}
+          {mode === 'split' && files.length > 0 && previewUrl && (
+            <div className="space-y-1.5 border border-indigo-200 bg-indigo-50/60 rounded-lg p-2">
+              <video ref={previewRef} src={previewUrl} crossOrigin="anonymous" controls playsInline onLoadedMetadata={onPreviewMeta} onTimeUpdate={(e) => setCurT(e.target.currentTime || 0)} className="w-full max-h-[34vh] rounded bg-black" />
+              <button onClick={addCut} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg py-2 font-bold text-sm">✂ 今の位置で区切る（{fmtT(curT)}{srcDur > 0 ? ` / ${fmtT(srcDur)}` : ''}）</button>
+              {[...new Set(splitPoints)].length > 0 ? (
+                <div className="space-y-1">
+                  <div className="text-[11px] font-bold text-indigo-700">区切り {[...new Set(splitPoints)].length}個 → {[...new Set(splitPoints)].length + 1}本に分割</div>
+                  <div className="flex flex-wrap gap-1">
+                    {[...new Set(splitPoints)].sort((a, b) => a - b).map((t, i) => (
+                      <span key={i} className="inline-flex items-center gap-1 bg-white border border-indigo-300 rounded-full pl-2 pr-1 py-0.5 text-[11px] font-bold text-indigo-700">✂ {fmtT(t)}<button onClick={() => rmCut(t)} className="text-rose-500 px-0.5">✕</button></span>
+                    ))}
+                  </div>
+                  {srcDur > 0 && (<div className="text-[10px] text-slate-500 space-y-0.5 pt-0.5">{segList().map((s, i) => (<div key={i}>区間{i + 1}: {fmtT(s[0])} 〜 {fmtT(s[1])}（{fmtT(s[1] - s[0])}）</div>))}</div>)}
+                </div>
+              ) : (<div className="text-[11px] text-slate-500">▶ 動画を再生し、切りたい所で「✂ 今の位置で区切る」を押します。区切りの数だけ別々の動画に分かれます。</div>)}
+            </div>
+          )}
+          {(mode === 'compress' || mode === 'split') && (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="font-bold text-slate-500 shrink-0">画質</span>
+              <select value={quality} onChange={(e) => setQuality(e.target.value)} className="flex-1 border border-slate-300 rounded px-2 py-1.5">
+                {Object.entries(QMAP).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              </select>
+            </div>
+          )}
+          {err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded p-2">{err}</div>}
+          <button onClick={() => (mode === 'split' ? runSplit() : run())} disabled={!files.length} className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-200 text-white rounded-lg font-bold text-sm">{mode === 'split' ? '✂ 分割を実行' : '▶ 実行'}</button>
+          <div className="text-[10px] text-slate-400">※ 動画を再生しながら録り直します。<b>動画の長さぶん時間がかかり</b>、その間この画面は開いたままにしてください。</div>
+        </>)}
+        {phase === 'working' && (
+          <div className="py-4 space-y-2">
+            <div className="text-sm font-bold text-slate-700">加工中… {Math.round(prog * 100)}%</div>
+            <div className="h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full bg-emerald-500 transition-all" style={{ width: `${prog * 100}%` }} /></div>
+            <div className="text-[10px] text-slate-400">動画を再生しながら録り直しています。閉じないでください。</div>
+          </div>
+        )}
+        {phase === 'done' && outSegs.length > 0 && (
+          <div className="space-y-2">
+            <div className="text-sm font-bold text-emerald-700">✂ {outSegs.length}本に分割しました。各動画に名前と保存先をつけてDriveへ保存できます。</div>
+            <div className="space-y-2 max-h-[52vh] overflow-y-auto pr-0.5">
+              {outSegs.map((sg, i) => (
+                <div key={i} className="border border-slate-200 rounded-lg p-2 space-y-1.5 bg-slate-50">
+                  <div className="flex gap-2">
+                    <video src={sg.url} controls playsInline className="w-32 h-20 rounded bg-black object-contain shrink-0" />
+                    <div className="flex-1 min-w-0 space-y-1">
+                      <input value={sg.name} onChange={(e) => updateSeg(i, { name: e.target.value })} placeholder={`分割${i + 1}`} className="w-full border border-slate-300 rounded px-2 py-1 text-xs font-bold" />
+                      <div className="text-[10px] text-slate-500">{driveFmtSize(sg.blob.size)}</div>
+                      {sections.length > 0 && <select value={sg.dest} onChange={(e) => updateSeg(i, { dest: Number(e.target.value) })} className="w-full border border-slate-300 rounded px-1 py-1 text-[11px]">{sections.map((s, si) => <option key={si} value={si}>保存先: {s.label}</option>)}</select>}
+                    </div>
+                  </div>
+                  <div className="flex gap-1.5">
+                    <a href={sg.url} download={`${(sg.name || '分割').replace(/[\\/:*?"<>|]/g, '_')}.webm`} className="flex-1 text-center bg-slate-200 hover:bg-slate-300 text-slate-600 rounded py-1.5 font-bold text-[11px]">⬇ 端末に保存</a>
+                    <button onClick={() => doUploadSeg(i)} disabled={!sections.length || sg.saved || busyIdx === i} className="flex-[2] bg-sky-600 hover:bg-sky-500 disabled:bg-slate-200 text-white rounded py-1.5 font-bold text-[11px]">{sg.saved ? '✓ Drive保存済み' : (busyIdx === i ? '保存中…' : '⬆ Driveへ保存')}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {err && <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded p-2">{err}</div>}
+            <div className="flex gap-2">
+              <button onClick={resetSplit} className="flex-1 bg-slate-200 text-slate-600 rounded-lg py-2 font-bold text-sm">やり直す</button>
+              <button onClick={finishSplit} className="flex-[2] bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg py-2 font-bold text-sm">完了して閉じる</button>
+            </div>
+            <div className="text-[10px] text-slate-400">工程への紐づけは、保存後に📁資料一覧で各動画の「＋この工程に使う」から行えます。</div>
+          </div>
+        )}
+        {phase === 'done' && !outSegs.length && outUrl && (
+          <div className="space-y-2">
+            <video src={outUrl} controls playsInline className="w-full max-h-[40vh] rounded-lg bg-black" />
+            <div className="text-xs text-slate-500">できあがり: {driveFmtSize(outBlob.size)}</div>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="動画名" className="w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+            {sections.length > 0 && <select value={dest} onChange={(e) => setDest(Number(e.target.value))} className="w-full border border-slate-300 rounded px-2 py-1.5 text-sm">{sections.map((s, i) => <option key={i} value={i}>保存先: {s.label}</option>)}</select>}
+            <div className="flex gap-2">
+              <button onClick={() => { setPhase('pick'); setOutBlob(null); if (outUrl) URL.revokeObjectURL(outUrl); setOutUrl(null); }} className="flex-1 bg-slate-200 text-slate-600 rounded-lg py-2 font-bold text-sm">やり直す</button>
+              <button onClick={doUpload} disabled={!sections.length} className="flex-[2] bg-sky-600 hover:bg-sky-500 disabled:bg-slate-200 text-white rounded-lg py-2 font-bold text-sm">⬆ Driveへ保存</button>
+            </div>
+          </div>
+        )}
+        {phase === 'uploading' && (
+          <div className="py-4 space-y-2"><div className="text-sm font-bold text-slate-700">アップロード中… {Math.round(upProg * 100)}%</div><div className="h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full bg-sky-500 transition-all" style={{ width: `${upProg * 100}%` }} /></div></div>
+        )}
+        {phase === 'error' && (
+          <div className="space-y-2"><div className="text-sm text-rose-700 bg-rose-50 border border-rose-300 rounded p-2">{err}</div><button onClick={() => setPhase('pick')} className="w-full bg-slate-200 text-slate-600 rounded-lg py-2 font-bold text-sm">戻る</button></div>
+        )}
+        <canvas ref={canvasRef} className="hidden" />
+      </div>
+    </div>
+  );
+};
+
+const DriveDocsModal = ({ title, sections, onClose, steps = [], model = '', recipes = [], onSaveRecipe = null, onDeleteRecipe = null, linkToKey = '', linkToLabel = '' }) => {
+  const [rows, setRows] = useState(() => sections.map(s => ({ ...s, loading: true, error: '', found: false, missing: '', files: [] })));
+  const [viewer, setViewer] = useState(null); // { file, kind }
+  const [studio, setStudio] = useState(null); // { file, recipe, mode } エース動画スタジオ
+  const [recOpen, setRecOpen] = useState(false); // 撮影モーダル
+  const [procOpen, setProcOpen] = useState(false); // 動画を加工(圧縮/合体)
+  const [busy, setBusy] = useState(false);
+  const recipeFor = (fid) => (recipes || []).find(r => r.fileId === fid) || null;
+  // Drive操作(移動/ゴミ箱/名前変更)。失敗はalert、成功は一覧を読み直す。
+  const driveAct = async (path, body) => {
+    if (busy) return false;
+    setBusy(true);
+    try {
+      const res = await fetch(`${DRIVE_PROXY_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const j = await res.json().catch(() => ({}));
+      if (!j.ok) { alert(j.error || '操作に失敗しました'); setBusy(false); return false; }
+      setBusy(false); load(); return true;
+    } catch (e) { alert('通信エラー: ' + (e?.message || e)); setBusy(false); return false; }
+  };
+  const load = () => {
+    setRows(sections.map(s => ({ ...s, loading: true, error: '', found: false, missing: '', files: [] })));
+    sections.forEach(async (s, i) => {
+      try {
+        const res = await fetch(`${DRIVE_PROXY_URL}/drive/list?path=${encodeURIComponent(s.path.join('/'))}`);
+        const j = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+        setRows(prev => prev.map((x, xi) => xi === i ? { ...x, loading: false, error: j.ok ? '' : (j.error || `HTTP ${res.status}`), found: !!j.found, missing: j.missing || '', files: j.files || [] } : x));
+      } catch (e) {
+        setRows(prev => prev.map((x, xi) => xi === i ? { ...x, loading: false, error: (e && e.message) || '通信エラー(プロキシに届きません)' } : x));
+      }
+    });
+  };
+  useEffect(() => { if (DRIVE_PROXY_URL) load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const total = rows.reduce((a, r) => a + r.files.length, 0);
+  return (
+    <div className="fixed inset-0 z-[520] bg-black/60 flex items-center justify-center p-3" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 bg-sky-700 text-white flex items-center justify-between shrink-0">
+          <h2 className="font-bold text-sm flex items-center gap-2">📁 {title} <span className="text-[11px] font-normal opacity-80">(Google Drive資料 {total}件)</span></h2>
+          <div className="flex items-center gap-1.5">
+            {DRIVE_PROXY_URL && sections.length > 0 && <button onClick={() => setRecOpen(true)} className="px-2 py-1 rounded bg-rose-500 hover:bg-rose-400 text-xs font-bold" title="この場で手本動画を撮影してDriveへアップロード">🎥 撮影して追加</button>}
+            {DRIVE_PROXY_URL && sections.length > 0 && <button onClick={() => setProcOpen(true)} className="px-2 py-1 rounded bg-indigo-500 hover:bg-indigo-400 text-xs font-bold" title="動画を圧縮(容量削減)・分割(1本を工程ごとに複数へ)・合体(複数を1本に)してDriveへ保存">🛠 加工</button>}
+            <button onClick={load} className="px-2 py-1 rounded bg-white/15 hover:bg-white/25 text-xs font-bold" title="Driveの最新内容を読み直す(一覧は最大1分キャッシュ)">↻ 更新</button>
+            <button onClick={onClose} className="p-1.5 rounded hover:bg-white/20"><X className="w-5 h-5" /></button>
+          </div>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3 bg-slate-50">
+          {!DRIVE_PROXY_URL && (
+            <div className="bg-amber-50 border border-amber-300 rounded-lg p-3 text-sm text-amber-800 space-y-1">
+              <div className="font-bold">Drive連携が未設定です</div>
+              <div>管理者が worker/README_セットアップ手順.md の「Google Drive 資料フォルダ」の手順(サービスアカウント作成→フォルダ共有→wrangler secret→deploy)を行い、.env の <code className="bg-white px-1 rounded">VITE_DRIVE_PROXY_URL</code> にWorkerのURLを設定して再デプロイしてください。</div>
+            </div>
+          )}
+          {DRIVE_PROXY_URL && rows.map((r, i) => (
+            <div key={i} className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+              <div className="px-3 py-2 bg-slate-100 flex items-center justify-between gap-2">
+                <span className="text-sm font-bold text-slate-700">{r.label}</span>
+                <span className="text-[10px] text-slate-400 font-mono truncate" title={`Driveフォルダ: 資料ルート/${r.path.join('/')}`}>{r.path.join('/')}</span>
+              </div>
+              <div className="p-2">
+                {r.loading && <div className="text-sm text-slate-400 flex items-center gap-2 p-2"><Loader2 className="w-4 h-4 animate-spin" /> 読み込み中…</div>}
+                {!r.loading && r.error && <div className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded p-2">{r.error}</div>}
+                {!r.loading && !r.error && !r.found && (
+                  <div className="text-xs text-slate-400 p-2">フォルダ未作成: Driveの資料フォルダに「<b>{r.path.join('/')}</b>」({r.missing} が見つかりません)を作って動画やPDFを入れると、ここに自動で出ます。</div>
+                )}
+                {!r.loading && !r.error && r.found && r.files.length === 0 && <div className="text-xs text-slate-400 p-2">フォルダはありますが、ファイルがまだ入っていません。</div>}
+                {!r.loading && r.files.map(f => {
+                  const kind = driveKindOf(f.mimeType, f.name);
+                  const rc = kind === 'video' ? recipeFor(f.id) : null;
+                  return (
+                    <div key={f.id} className="w-full flex items-center gap-1 px-1 rounded-lg hover:bg-sky-50 border-b border-slate-100 last:border-b-0">
+                      <button onClick={() => (rc ? setStudio({ file: f, recipe: rc, mode: 'play' }) : setViewer({ file: f, kind }))}
+                        className="flex-1 min-w-0 flex items-center gap-2 px-1 py-2 text-left">
+                        <span className="text-lg shrink-0">{DRIVE_KIND_ICON[kind]}</span>
+                        <span className="text-sm font-bold text-slate-700 truncate flex-1">{rc?.title || f.name}</span>
+                        {rc && <span className="text-[10px] bg-amber-100 text-amber-700 border border-amber-300 rounded px-1 font-bold shrink-0" title="停止ポイント・倍速つきの手本レシピあり">🎬手本</span>}
+                        <span className="text-[10px] text-slate-400 shrink-0">{driveFmtSize(f.size)}</span>
+                        <span className="text-[10px] text-sky-600 font-bold shrink-0">{rc ? '手本再生 ▶' : (kind === 'other' ? '開く' : '表示 ▶')}</span>
+                      </button>
+                      {linkToKey && kind === 'video' && onSaveRecipe && (
+                        (rc && (rc.stepKeys || []).includes(linkToKey))
+                          ? <span className="text-[10px] bg-emerald-100 text-emerald-700 rounded px-1.5 py-1 font-bold shrink-0" title="この工程に紐づけ済み">✓ 紐づけ済</span>
+                          : <button onClick={async (e) => { e.stopPropagation(); const base = rc || { fileId: f.id, fileName: f.name, title: '', model: '', stepKeys: [], events: [] }; await onSaveRecipe(f.id, { ...base, fileId: f.id, fileName: base.fileName || f.name, stepKeys: [...new Set([...(base.stepKeys || []), linkToKey])] }); load(); }} className="text-[10px] bg-sky-600 hover:bg-sky-700 text-white rounded px-2 py-1 font-bold shrink-0" title={linkToLabel ? `「${linkToLabel}」に紐づける` : 'この工程に紐づける'}>＋この工程に使う</button>
+                      )}
+                      <details className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
+                        <summary className="list-none cursor-pointer px-2 py-2 text-slate-400 hover:text-slate-700 font-bold">⋮</summary>
+                        <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-2xl border border-slate-200 w-60 z-50 overflow-hidden p-1.5 space-y-1 text-left">
+                          {kind === 'video' && onSaveRecipe && (
+                            <button onClick={(e) => { e.currentTarget.closest('details')?.removeAttribute('open'); setStudio({ file: f, recipe: rc, mode: 'edit' }); }} className="w-full text-left px-2 py-1.5 rounded hover:bg-amber-50 text-amber-700 text-xs font-bold">✏️ 手本レシピを{rc ? '編集' : '作成'}(停止○/倍速/スキップ)</button>
+                          )}
+                          {rc && <button onClick={(e) => { e.currentTarget.closest('details')?.removeAttribute('open'); setViewer({ file: f, kind }); }} className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-50 text-slate-600 text-xs font-bold">▶ 元の動画をそのまま再生</button>}
+                          <button onClick={async (e) => { e.currentTarget.closest('details')?.removeAttribute('open'); const nn = window.prompt('新しい名前', f.name); if (nn && nn.trim() && nn !== f.name) await driveAct('/drive/rename', { id: f.id, name: nn.trim() }); }} className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-50 text-slate-600 text-xs font-bold">📝 名前を変更</button>
+                          {rows.filter((x, xi) => xi !== i).map((x, xi2) => (
+                            <button key={xi2} onClick={async (e) => { e.currentTarget.closest('details')?.removeAttribute('open'); await driveAct('/drive/move', { id: f.id, toPath: x.path }); }} className="w-full text-left px-2 py-1.5 rounded hover:bg-sky-50 text-sky-700 text-xs font-bold truncate">📦 「{x.label}」へ移動</button>
+                          ))}
+                          <button onClick={async (e) => { e.currentTarget.closest('details')?.removeAttribute('open'); if (!window.confirm(`「${f.name}」をDriveのゴミ箱へ移動しますか？(30日間はDriveのゴミ箱から復元できます)`)) return; const ok = await driveAct('/drive/trash', { id: f.id }); if (ok && rc && onDeleteRecipe) { try { await onDeleteRecipe(f.id); } catch (e2) { /* noop */ } } }} className="w-full text-left px-2 py-1.5 rounded hover:bg-rose-50 text-rose-600 text-xs font-bold">🗑 ゴミ箱へ(復元可)</button>
+                        </div>
+                      </details>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          <div className="text-[10px] text-slate-400 px-1">Driveの該当フォルダにファイルを置くだけで自動で反映されます(反映は最大1分後・「↻ 更新」で即時)。ファイル本体はDriveにあり、このアプリの容量は使いません。</div>
+        </div>
+      </div>
+      {studio && (
+        <VideoRecipeStudio file={studio.file} recipe={studio.recipe} mode={studio.mode} steps={steps} model={model}
+          onSave={onSaveRecipe ? (async (docData) => { await onSaveRecipe(docData.fileId, docData); setStudio(null); load(); }) : null}
+          onClose={() => setStudio(null)} />
+      )}
+      {recOpen && (
+        <VideoRecordModal open sections={sections} defaultName={model ? `${model}_手本` : '手本'} onDone={() => { setRecOpen(false); load(); }} onClose={() => setRecOpen(false)} />
+      )}
+      {procOpen && (
+        <VideoProcessModal sections={sections}
+          driveVideos={rows.flatMap(r => (r.files || []).filter(f => driveKindOf(f.mimeType, f.name) === 'video').map(f => ({ id: f.id, name: f.name, size: f.size })))}
+          onDone={() => { setProcOpen(false); load(); }} onClose={() => setProcOpen(false)} />
+      )}
+      {viewer && (
+        <div className="fixed inset-0 z-[540] bg-black/85 flex flex-col" onClick={() => setViewer(null)}>
+          <div className="flex items-center justify-between px-4 py-2 text-white shrink-0" onClick={e => e.stopPropagation()}>
+            <span className="text-sm font-bold truncate">{DRIVE_KIND_ICON[viewer.kind]} {viewer.file.name}</span>
+            <div className="flex items-center gap-2">
+              {viewer.file.webViewLink && <a href={viewer.file.webViewLink} target="_blank" rel="noopener noreferrer" className="text-xs bg-white/15 hover:bg-white/25 rounded px-2 py-1 font-bold" onClick={e => e.stopPropagation()}>Driveで開く ↗</a>}
+              <button onClick={() => setViewer(null)} className="p-1.5 rounded hover:bg-white/20"><X className="w-5 h-5" /></button>
+            </div>
+          </div>
+          <div className="flex-1 min-h-0 flex items-center justify-center p-2" onClick={e => e.stopPropagation()}>
+            {viewer.kind === 'video' && <video controls autoPlay className="max-w-full max-h-full rounded-lg bg-black" src={driveFileUrl(viewer.file.id)} />}
+            {viewer.kind === 'audio' && <audio controls autoPlay src={driveFileUrl(viewer.file.id)} />}
+            {viewer.kind === 'image' && <img alt={viewer.file.name} className="max-w-full max-h-full object-contain rounded-lg" src={driveFileUrl(viewer.file.id)} />}
+            {viewer.kind === 'pdf' && <iframe title={viewer.file.name} className="w-full h-full bg-white rounded-lg" src={driveFileUrl(viewer.file.id)} />}
+            {viewer.kind === 'other' && (
+              <div className="bg-white rounded-xl p-6 text-center space-y-3 max-w-sm">
+                <div className="text-3xl">📎</div>
+                <div className="text-sm text-slate-600">この形式はアプリ内表示に対応していません。</div>
+                <div className="flex gap-2 justify-center">
+                  <a href={driveFileUrl(viewer.file.id)} download={viewer.file.name} className="px-3 py-2 bg-sky-600 text-white rounded-lg text-sm font-bold">ダウンロード</a>
+                  {viewer.file.webViewLink && <a href={viewer.file.webViewLink} target="_blank" rel="noopener noreferrer" className="px-3 py-2 bg-slate-600 text-white rounded-lg text-sm font-bold">Driveで開く</a>}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ===== エース動画 (再生レシピ = 元動画無傷のメタデータ再生) =====
+// 動画ファイルは一切加工しない。区間倍速/スキップ/自動一時停止(○印+コメント)を「レシピ」(小さなJSON)として
+// Firestore(video_recipes, docId=DriveのfileId)に保存し、再生時にプレイヤーが解釈する(SponsorBlock/Edpuzzle方式)。
+// → 保存は一瞬・何度でも直せる・○やコメントは後から修正可・Firebase容量も食わない。
+// 市場調査の反映: 1動画=1工程(工程タグ)/○×は普遍記号/スキップ直後に「戻す」(誤爆の安全弁)/停止ポイントはシークバーにドット表示。
+const vrFmtT = (s) => { if (!Number.isFinite(s)) return '--:--'; s = Math.max(0, Math.floor(s || 0)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const vrNewId = () => Math.random().toString(36).slice(2, 10);
+
+// Driveアップロード: Workerでresumableセッション開始→ブラウザから直接PUT(進捗つき)。
+// 直接PUTがCORSで失敗する環境ではWorker中継(/drive/upload-chunk, 64MBずつ)に自動フォールバック。
+const drivePutDirect = (sessionUrl, file, onProgress) => new Promise((resolve, reject) => {
+  const xhr = new XMLHttpRequest();
+  xhr.open('PUT', sessionUrl);
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+  xhr.onload = () => { if (xhr.status === 200 || xhr.status === 201) { let f = null; try { f = JSON.parse(xhr.responseText || '{}'); } catch (e2) { f = null; } resolve(f || {}); } else reject(new Error('HTTP ' + xhr.status)); };
+  xhr.onerror = () => reject(new Error('direct-put-failed'));
+  xhr.send(file);
+});
+// 戻り値: アップロードされたDriveファイル情報 {id, name, ...}(工程への自動紐づけに使う)
+const driveUploadFile = async (file, path, onProgress) => {
+  const initRes = await fetch(`${DRIVE_PROXY_URL}/drive/upload-init`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: file.name, mimeType: file.type || 'application/octet-stream', size: file.size, path }) });
+  const init = await initRes.json().catch(() => ({}));
+  if (!init.ok || !init.sessionUrl) throw new Error(init.error || 'アップロード開始に失敗しました');
+  try { return await drivePutDirect(init.sessionUrl, file, onProgress); } catch (e) { /* 直接PUT不可 → Worker中継へ */ }
+  const CH = 64 * 1024 * 1024; // 256KiBの倍数(Google要件) かつ Workers無料枠(100MB/リクエスト)未満
+  let uploaded = null;
+  for (let off = 0; off < file.size; off += CH) {
+    const end = Math.min(off + CH, file.size);
+    const res = await fetch(`${DRIVE_PROXY_URL}/drive/upload-chunk?session=${encodeURIComponent(init.sessionUrl)}`, {
+      method: 'POST',
+      headers: { 'Content-Range': `bytes ${off}-${end - 1}/${file.size}`, 'Content-Type': 'application/octet-stream' },
+      body: file.slice(off, end),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!j.ok) throw new Error(j.error || 'アップロードに失敗しました');
+    if (j.file) uploaded = j.file;
+    if (onProgress) onProgress(end / file.size);
+  }
+  return uploaded || {};
+};
+
+// エース動画スタジオ: mode='play'(作業者: レシピどおり再生) / mode='edit'(だれでも: レシピを打刻編集)
+// events: [{id, type:'pause'|'speed'|'skip', start, end?, speed?, text?, marks?:[{x,y}](0-1)}]
+const VideoRecipeStudio = ({ file, recipe = null, mode: initialMode = 'play', steps = [], model = '', onSave = null, onClose }) => {
+  const [mode, setMode] = useState(initialMode);
+  const videoRef = useRef(null);
+  const boxRef = useRef(null);
+  const lastTRef = useRef(0);
+  const undoneSkipRef = useRef(new Set());
+  const firedPauseRef = useRef(new Set());
+  const fixingRef = useRef(false); // 総時間を測るため末尾へ飛ばしている最中は、停止/スキップ判定を止める(先に消費されるのを防ぐ)
+  const [events, setEvents] = useState(() => (recipe?.events || []).map(e => ({ ...e })));
+  const [stepKeys, setStepKeys] = useState(() => [...(recipe?.stepKeys || [])]);
+  const [title, setTitle] = useState(recipe?.title || '');
+  const [dur, setDur] = useState(0);
+  const [cur, setCur] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [userSpeed, setUserSpeed] = useState(1);
+  const [overlay, setOverlay] = useState(null);
+  const [skipToast, setSkipToast] = useState(null);
+  const [pending, setPending] = useState(null); // {type:'skip'|'speed', speed?, start}
+  const [markTarget, setMarkTarget] = useState(null); // 印配置中の pause イベントid
+  const [markShape, setMarkShape] = useState('circle'); // 'circle'=○ / 'arrow'=→ 置く印の形
+  const [saving, setSaving] = useState(false);
+  const src = driveFileUrl(file.id);
+  const evSorted = [...events].sort((a, b) => (a.start || 0) - (b.start || 0));
+  const patchEvt = (id, patch) => setEvents(prev => prev.map(e => e.id === id ? { ...e, ...patch } : e));
+  // 取り消し(undo): 構造が変わる操作(追加/削除/時刻調整/○配置)の前にスナップショット。テキスト入力は対象外(打ち直せるため)
+  const [undoStack, setUndoStack] = useState([]);
+  const pushUndo = () => setUndoStack(prev => [...prev.slice(-19), events.map(e => ({ ...e }))]);
+  const doUndo = () => setUndoStack(prev => { if (!prev.length) return prev; setEvents(prev[prev.length - 1]); setMarkTarget(null); return prev.slice(0, -1); });
+  const delEvt = (id) => { pushUndo(); setEvents(prev => prev.filter(e => e.id !== id)); if (markTarget === id) setMarkTarget(null); };
+  // 時刻の微調整: ±ボタン/「今ここ」(再生位置に合わせる=タッチで一番正確)。開始<終了は常に保証(0.2秒マージン)
+  const adjTime = (id, field, delta) => { pushUndo(); setEvents(prev => prev.map(ev => { if (ev.id !== id) return ev; let v = Math.round(((field === 'start' ? ev.start : (ev.end ?? ev.start)) + delta) * 10) / 10; v = Math.max(0, Math.min(dur || v, v)); if (field === 'start' && ev.end != null) v = Math.min(v, ev.end - 0.2); if (field === 'end') v = Math.max(v, ev.start + 0.2); return { ...ev, [field]: v }; })); };
+  const setTimeHere = (id, field) => { pushUndo(); const t = Math.round(cur * 10) / 10; setEvents(prev => prev.map(ev => { if (ev.id !== id) return ev; let v = t; if (field === 'start' && ev.end != null) v = Math.min(v, ev.end - 0.2); if (field === 'end') v = Math.max(v, ev.start + 0.2); return { ...ev, [field]: Math.max(0, v) }; })); };
+
+  useEffect(() => { const t = skipToast ? setTimeout(() => setSkipToast(null), 4500) : null; return () => t && clearTimeout(t); }, [skipToast]);
+  // 停止ポイントに hold 秒が設定されていれば自動で再開(tebiki/Teachmeの定番。手袋・両手がふさがる検査現場向け)
+  useEffect(() => {
+    if (!overlay || !(overlay.hold > 0)) return;
+    const t = setTimeout(() => { setOverlay(null); const v = videoRef.current; if (v) v.play().catch(() => {}); }, overlay.hold * 1000);
+    return () => clearTimeout(t);
+  }, [overlay]);
+
+  const onTime = () => {
+    const v = videoRef.current; if (!v) return;
+    if (fixingRef.current) return; // 総時間測定中は無視
+    const t = v.currentTime; setCur(t);
+    const prev = lastTRef.current;
+    if (t < prev - 0.5) firedPauseRef.current = new Set(); // 巻き戻したら停止ポイントは再発火してよい
+    if (!overlay && !pending) { // 打刻中(pending)だけ素の再生。それ以外は編集中も保存後と同じにスキップ/停止を適用(その場で効きを確認できる)
+      const sk = events.find(e => e.type === 'skip' && t >= e.start && t < (e.end || e.start) - 0.05 && !undoneSkipRef.current.has(e.id));
+      if (sk) { v.currentTime = (sk.end || sk.start) + 0.01; lastTRef.current = sk.end || sk.start; setSkipToast(sk); return; }
+      const p = events.find(e => e.type === 'pause' && prev < e.start && t >= e.start && !firedPauseRef.current.has(e.id));
+      if (p) { firedPauseRef.current.add(p.id); v.pause(); setOverlay(p); }
+    }
+    const sp = events.find(e => e.type === 'speed' && t >= e.start && t < (e.end || e.start));
+    const want = (sp ? (sp.speed || 1) : 1) * userSpeed;
+    if (Math.abs(v.playbackRate - want) > 0.01) v.playbackRate = want;
+    lastTRef.current = t;
+  };
+  const seekTo = (t) => { const v = videoRef.current; if (!v) return; v.currentTime = Math.max(0, Math.min(dur || 0, t)); lastTRef.current = v.currentTime; setCur(v.currentTime); setOverlay(null); };
+  const togglePlay = () => { const v = videoRef.current; if (!v) return; if (v.paused) { setOverlay(null); v.play(); } else v.pause(); };
+  // シークバー: タップだけでなく指でなぞって(ドラッグ)シークできる(タッチの定番)。setPointerCaptureでバー外に指が出ても追従
+  const scrubRef = useRef(false);
+  const barSeek = (e) => { const r = e.currentTarget.getBoundingClientRect(); if (!r.width || !dur) return; seekTo(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * dur); };
+  const barDown = (e) => { scrubRef.current = true; try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* noop */ } barSeek(e); };
+  const barMove = (e) => { if (scrubRef.current) barSeek(e); };
+  const barUp = () => { scrubRef.current = false; };
+  // 打刻した区間/停止点を「試す」: 少し手前から再生して効き具合を確認(SponsorBlock等の保存前プレビュー相当)
+  const previewEvt = (e) => { if (e.type === 'pause') firedPauseRef.current.delete(e.id); if (e.type === 'skip') undoneSkipRef.current.delete(e.id); const lead = e.end ? 1.5 : 2.5; seekTo(Math.max(0, e.start - lead)); setOverlay(null); const v = videoRef.current; if (v) v.play().catch(() => {}); };
+  // 次の停止ポイント(要点)へスキップ。重要ポイントだけ拾い見できる。無ければ末尾へ
+  const goNextPoint = () => { const np = evSorted.find(x => x.type === 'pause' && x.start > cur + 0.3); if (np) { seekTo(np.start); firedPauseRef.current.add(np.id); videoRef.current?.pause(); setOverlay(np); } else { seekTo(dur || cur); } };
+  const videoClick = (e) => {
+    if (mode === 'edit' && markTarget) {
+      const r = boxRef.current?.getBoundingClientRect(); if (!r) return;
+      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      pushUndo();
+      setEvents(prev => prev.map(ev => ev.id === markTarget ? { ...ev, marks: [...(ev.marks || []), { x: Math.round(x * 1000) / 1000, y: Math.round(y * 1000) / 1000, shape: markShape }].slice(0, 6) } : ev));
+      return;
+    }
+    togglePlay();
+  };
+  const addPause = () => { const v = videoRef.current; if (!v) return; v.pause(); pushUndo(); const ev = { id: vrNewId(), type: 'pause', start: Math.round(cur * 10) / 10, text: '', marks: [] }; setEvents(prev => [...prev, ev]); setMarkTarget(ev.id); };
+  const startRange = (type, speed) => setPending({ type, speed, start: Math.round(cur * 10) / 10 });
+  const endRange = () => { if (!pending) return; const end = Math.round(cur * 10) / 10; if (end <= pending.start + 0.2) { alert('終了位置は開始より後にしてください(再生を進めてからもう一度)'); return; } pushUndo(); setEvents(prev => [...prev, { id: vrNewId(), ...pending, end }]); setPending(null); };
+  const doSave = async () => {
+    if (!onSave) return;
+    setSaving(true);
+    try { await onSave({ fileId: file.id, fileName: file.name || '', title: title.trim(), model, stepKeys, events }); }
+    catch (e) { alert('保存に失敗しました: ' + (e?.message || e)); }
+    setSaving(false);
+  };
+  const markEvt = mode === 'edit' && markTarget ? events.find(e => e.id === markTarget) : null;
+  const EVT_META = { pause: { icon: '⏸', label: '停止+コメント', c: '#f59e0b' }, skip: { icon: '⏭', label: 'スキップ', c: '#64748b' }, speed: { icon: '⚡', label: '倍速', c: '#0284c7' } };
+
+  return (
+    <div className="fixed inset-0 z-[560] bg-black/90 flex flex-col" onClick={(e) => e.stopPropagation()}>
+      <div className="flex items-center justify-between px-3 py-2 text-white shrink-0 gap-2">
+        <span className="text-sm font-bold truncate">🎬 {title || file.name}{mode === 'edit' && <span className="ml-2 text-[11px] bg-amber-500 text-black rounded px-1.5 py-0.5">レシピ編集中</span>}</span>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {mode === 'play' && onSave && <button onClick={() => setMode('edit')} className="text-xs bg-white/15 hover:bg-white/25 rounded px-2 py-1 font-bold">✏️ レシピ編集</button>}
+          {mode === 'edit' && <button onClick={doSave} disabled={saving} className="text-xs bg-emerald-600 hover:bg-emerald-500 rounded px-3 py-1 font-bold disabled:opacity-50">{saving ? '保存中…' : '💾 保存'}</button>}
+          <button onClick={onClose} className="p-1.5 rounded hover:bg-white/20"><X className="w-5 h-5" /></button>
+        </div>
+      </div>
+      <div className="flex-1 min-h-0 flex flex-col md:flex-row gap-2 px-2 pb-2 overflow-hidden">
+        <div className="flex-1 min-h-0 flex flex-col items-center justify-center relative">
+          <div ref={boxRef} className="relative max-h-full max-w-full" style={{ cursor: markTarget ? 'crosshair' : 'pointer' }}>
+            <video ref={videoRef} src={src} className="max-h-[62vh] md:max-h-[78vh] max-w-full rounded-lg bg-black" playsInline
+              onTimeUpdate={onTime}
+              onLoadedMetadata={(e) => { const v = e.currentTarget; if (Number.isFinite(v.duration) && v.duration > 0) { setDur(v.duration); } else { fixingRef.current = true; const fix = () => { if (Number.isFinite(v.duration) && v.duration > 0) { v.removeEventListener('timeupdate', fix); setDur(v.duration); try { v.currentTime = 0; } catch { /* noop */ } lastTRef.current = 0; firedPauseRef.current = new Set(); fixingRef.current = false; } }; v.addEventListener('timeupdate', fix); try { v.currentTime = 1e7; } catch { /* noop */ } } }}
+              onDurationChange={(e) => { const d = e.currentTarget.duration; if (Number.isFinite(d) && d > 0) setDur(d); }}
+              onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onClick={videoClick} />
+            {/* ○印: 再生中は発火中の停止ポイントの分、編集中は配置対象の分を重ねる */}
+            {(overlay?.marks || markEvt?.marks || []).map((m, i) => (m.shape === 'arrow' ? (
+              <span key={i} className="absolute pointer-events-none animate-bounce" style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, transform: 'translate(-50%,-100%)' }}>
+                <span className="text-red-500 text-5xl font-black leading-none block" style={{ filter: 'drop-shadow(0 1px 2px rgba(0,0,0,.7))' }}>⬇</span>
+                {m.text ? <span className="absolute left-1/2 top-full -translate-x-1/2 whitespace-nowrap bg-red-600 text-white text-[11px] font-bold px-1.5 py-0.5 rounded shadow">{m.text}</span> : null}
+              </span>
+            ) : (
+              <span key={i} className="absolute border-4 border-red-500 rounded-full pointer-events-none animate-pulse" style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: '3.5rem', height: '3.5rem', transform: 'translate(-50%,-50%)' }}>
+                {m.text ? <span className="absolute left-1/2 top-full mt-1 -translate-x-1/2 whitespace-nowrap bg-red-600 text-white text-[11px] font-bold px-1.5 py-0.5 rounded shadow">{m.text}</span> : null}
+              </span>
+            )))}
+            {overlay && (
+              <div className="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-black/85 to-transparent rounded-b-lg" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-stretch gap-2">
+                  <div className="flex flex-col gap-1.5 shrink-0 w-32 sm:w-40">
+                    {overlay.hold > 0 && <div className="text-[10px] text-amber-200 font-bold text-center leading-tight">⏱ {overlay.hold}秒後に自動</div>}
+                    <button onClick={() => { seekTo(Math.max(0, overlay.start - 5)); videoRef.current?.play(); }} className="bg-white/20 hover:bg-white/30 text-white rounded-lg py-2 text-xs font-bold">⏪ 5秒戻る</button>
+                    <button onClick={() => { setOverlay(null); videoRef.current?.play(); }} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg py-2 text-sm font-bold">▶ 続きを見る</button>
+                  </div>
+                  <div className="flex-1 min-w-0 bg-amber-400/95 text-black rounded-lg px-3 py-2 flex flex-col justify-center">
+                    <div className="text-[10px] font-bold text-amber-800 leading-none mb-0.5">⏸ 要点ポイント</div>
+                    <div className="text-base font-black leading-tight break-words">{overlay.label || overlay.text || '重要ポイント'}</div>
+                    {overlay.label && overlay.text && <div className="text-xs font-bold mt-1 leading-snug break-words">{overlay.text}</div>}
+                  </div>
+                </div>
+              </div>
+            )}
+            {skipToast && !overlay && (
+              <button onClick={() => { undoneSkipRef.current.add(skipToast.id); seekTo(skipToast.start); videoRef.current?.play(); setSkipToast(null); }}
+                className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-slate-800/90 text-white text-xs font-bold rounded-full px-3 py-1.5 hover:bg-slate-700">
+                ⏭ {vrFmtT(skipToast.start)}〜{vrFmtT(skipToast.end)} を飛ばしました — タップで戻って見る
+              </button>
+            )}
+            {markTarget && <div className="absolute top-1 left-1/2 -translate-x-1/2 bg-red-600 text-white text-[11px] font-bold rounded px-2 py-0.5 pointer-events-none">映像をタップして○を置く(複数可)</div>}
+          </div>
+          {/* シークバー(イベント可視化: スキップ=灰帯 / 倍速=青帯 / 停止=黄ドット) */}
+          <div className="w-full max-w-3xl mt-2 px-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+            <div className="relative h-5 bg-white/15 rounded-full cursor-pointer" style={{ touchAction: 'none' }}
+              onPointerDown={barDown} onPointerMove={barMove} onPointerUp={barUp} onPointerCancel={barUp}>
+              {dur > 0 && evSorted.filter(e => e.type !== 'pause' && e.end).map(e => (
+                <span key={e.id} className="absolute top-0 h-full rounded-full opacity-70 pointer-events-none" style={{ left: `${(e.start / dur) * 100}%`, width: `${Math.max(0.5, ((e.end - e.start) / dur) * 100)}%`, background: EVT_META[e.type].c }} />
+              ))}
+              {/* 打刻中(ここから〜)の区間をライブ表示: どこまで選んでいるか見える */}
+              {pending && dur > 0 && (
+                <span className="absolute top-0 h-full rounded-full opacity-50 animate-pulse pointer-events-none" style={{ left: `${(pending.start / dur) * 100}%`, width: `${Math.max(0.5, ((Math.max(cur, pending.start) - pending.start) / dur) * 100)}%`, background: EVT_META[pending.type].c }} />
+              )}
+              {dur > 0 && evSorted.filter(e => e.type === 'pause').map(e => (
+                <span key={e.id} className="absolute w-3.5 h-3.5 bg-amber-400 border-2 border-white rounded-full top-0.5 pointer-events-none" style={{ left: `calc(${(e.start / dur) * 100}% - 7px)` }} />
+              ))}
+              {dur > 0 && <span className="absolute w-1.5 h-7 -top-1 bg-white rounded pointer-events-none" style={{ left: `${(cur / (dur || 1)) * 100}%` }} />}
+            </div>
+            <div className="flex items-center gap-1.5 mt-1.5 text-white flex-wrap">
+              <button onClick={togglePlay} className="bg-white/15 hover:bg-white/25 rounded-lg px-3 py-1.5 text-sm font-bold">{playing ? '⏸ 一時停止' : '▶ 再生'}</button>
+              {evSorted.some(e => e.type === 'pause') && <button onClick={goNextPoint} className="bg-amber-500/80 hover:bg-amber-500 text-black rounded-lg px-3 py-1.5 text-sm font-bold" title="次の停止ポイント(要点)へ飛ぶ">⏭ 次の要点</button>}
+              <span className="flex gap-1">
+                <button onClick={() => seekTo(cur - 5)} className="bg-white/10 hover:bg-white/20 rounded px-2 py-1.5 text-xs font-bold">−5秒</button>
+                <button onClick={() => seekTo(cur - 1)} className="bg-white/10 hover:bg-white/20 rounded px-2 py-1.5 text-xs font-bold">−1</button>
+                <button onClick={() => seekTo(cur - 0.1)} className="bg-white/10 hover:bg-white/20 rounded px-2 py-1.5 text-xs font-bold" title="コマ送り(0.1秒)">−0.1</button>
+                <button onClick={() => seekTo(cur + 0.1)} className="bg-white/10 hover:bg-white/20 rounded px-2 py-1.5 text-xs font-bold" title="コマ送り(0.1秒)">+0.1</button>
+                <button onClick={() => seekTo(cur + 1)} className="bg-white/10 hover:bg-white/20 rounded px-2 py-1.5 text-xs font-bold">+1</button>
+                <button onClick={() => seekTo(cur + 5)} className="bg-white/10 hover:bg-white/20 rounded px-2 py-1.5 text-xs font-bold">+5秒</button>
+              </span>
+              <span className="text-xs font-mono whitespace-nowrap tabular-nums shrink-0">{vrFmtT(cur)} / {vrFmtT(dur)}</span>
+              <label className="ml-auto text-[11px] flex items-center gap-1">自分の速度
+                <select value={userSpeed} onChange={(e) => setUserSpeed(Number(e.target.value))} className="bg-white/15 rounded px-1 py-0.5 text-xs">
+                  {[0.5, 0.75, 1, 1.25, 1.5, 2].map(s => <option key={s} value={s} className="text-slate-800">{s}×</option>)}
+                </select>
+              </label>
+            </div>
+          </div>
+        </div>
+        {mode === 'edit' && (
+          <div className="w-full md:w-80 shrink-0 max-h-[45vh] md:max-h-none bg-white rounded-xl p-2.5 overflow-y-auto space-y-2.5 text-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="text-[11px] text-slate-500 leading-snug bg-sky-50 border border-sky-200 rounded p-2">再生しながら要点で打刻するだけ。<b>目安1〜3分/1工程</b>。重要ポイントは⏸で止めて○とひと言、それ以外は⚡倍速か⏭スキップで短く。</div>
+            <div className="grid grid-cols-1 gap-1.5">
+              <button onClick={addPause} className="bg-amber-500 hover:bg-amber-600 text-white rounded-lg py-2 font-bold">⏸ ここで停止ポイント(○+コメント)</button>
+              {!pending ? (
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button onClick={() => startRange('skip')} className="bg-slate-600 hover:bg-slate-700 text-white rounded-lg py-2 font-bold text-xs">⏭ ここからスキップ</button>
+                  <div className="flex gap-1">
+                    {[2, 1.5, 0.5].map(s => <button key={s} onClick={() => startRange('speed', s)} className="flex-1 bg-sky-600 hover:bg-sky-700 text-white rounded-lg py-2 font-bold text-xs">⚡{s}×</button>)}
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-1.5">
+                  <button onClick={endRange} className="flex-[2] bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg py-2 font-bold text-xs animate-pulse">✅ ここまで({EVT_META[pending.type].icon}{pending.speed ? pending.speed + '×' : ''} {vrFmtT(pending.start)}〜)</button>
+                  <button onClick={() => setPending(null)} className="flex-1 bg-slate-200 text-slate-600 rounded-lg py-2 font-bold text-xs">やめる</button>
+                </div>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center text-xs font-bold text-slate-500">
+                <span>打刻したポイント({evSorted.length})</span>
+                <button onClick={doUndo} disabled={!undoStack.length} className={`ml-auto px-2 py-0.5 rounded border text-[11px] font-bold ${undoStack.length ? 'border-slate-300 bg-white text-slate-600 hover:bg-slate-50' : 'border-slate-200 bg-slate-50 text-slate-300'}`} title="直前の追加/削除/調整を取り消す">↩ 取り消し</button>
+              </div>
+              {evSorted.length === 0 && <div className="text-[11px] text-slate-400">まだありません。動画を再生して要点で上のボタンを押してください。</div>}
+              {evSorted.map(e => (
+                <div key={e.id} className={`border rounded-lg p-1.5 space-y-1 ${markTarget === e.id ? 'border-red-400 ring-1 ring-red-300' : 'border-slate-200'}`}>
+                  <div className="flex items-center gap-1 text-xs font-bold" style={{ color: EVT_META[e.type].c }}>
+                    <button onClick={() => seekTo(e.start)} className="hover:underline">{EVT_META[e.type].icon} {vrFmtT(e.start)}{e.end ? `〜${vrFmtT(e.end)}` : ''}</button>
+                    <span className="text-slate-400 font-normal">{EVT_META[e.type].label}</span>
+                    {e.type === 'speed' && (
+                      <select value={e.speed || 1.5} onChange={(ev) => { pushUndo(); patchEvt(e.id, { speed: Number(ev.target.value) }); }} className="text-[10px] border border-slate-200 rounded px-0.5 py-0 text-slate-700" title="倍速を後から変更">
+                        {[0.5, 0.75, 1.5, 2, 3].map(s => <option key={s} value={s}>{s}×</option>)}
+                      </select>
+                    )}
+                    <button onClick={() => previewEvt(e)} className="ml-auto px-1.5 bg-emerald-100 text-emerald-700 rounded font-bold" title="手前から再生して、この打刻の効き具合を試す">▶試す</button>
+                    <button onClick={() => delEvt(e.id)} className="px-1 bg-rose-100 text-rose-600 rounded font-bold">🗑</button>
+                  </div>
+                  {/* 時刻調整: ±0.5 と「今ここ」(動画をその位置にしてから押すと再生位置に合う=タッチで一番正確) */}
+                  <div className="flex flex-wrap items-center gap-1 text-[10px]">
+                    <span className="text-slate-400 font-bold">開始</span>
+                    <button onClick={() => adjTime(e.id, 'start', -0.5)} className="px-1.5 py-0.5 bg-slate-100 rounded text-slate-600 font-bold">−0.5</button>
+                    <button onClick={() => adjTime(e.id, 'start', 0.5)} className="px-1.5 py-0.5 bg-slate-100 rounded text-slate-600 font-bold">+0.5</button>
+                    <button onClick={() => setTimeHere(e.id, 'start')} className="px-1.5 py-0.5 bg-sky-100 text-sky-700 rounded font-bold" title="再生位置を開始にする">⇤今ここ</button>
+                    {e.end != null && (
+                      <>
+                        <span className="text-slate-400 font-bold ml-1">終了</span>
+                        <button onClick={() => adjTime(e.id, 'end', -0.5)} className="px-1.5 py-0.5 bg-slate-100 rounded text-slate-600 font-bold">−0.5</button>
+                        <button onClick={() => adjTime(e.id, 'end', 0.5)} className="px-1.5 py-0.5 bg-slate-100 rounded text-slate-600 font-bold">+0.5</button>
+                        <button onClick={() => setTimeHere(e.id, 'end')} className="px-1.5 py-0.5 bg-sky-100 text-sky-700 rounded font-bold" title="再生位置を終了にする">今ここ⇥</button>
+                      </>
+                    )}
+                  </div>
+                  {e.type === 'pause' && (
+                    <>
+                      <input value={e.label || ''} onChange={(ev) => patchEvt(e.id, { label: ev.target.value })} placeholder="この要点のタイトル(例: 端子の締付け)" className="w-full border border-amber-300 bg-amber-50 rounded px-1.5 py-1 text-xs font-bold" />
+                      <input value={e.text || ''} onChange={(ev) => patchEvt(e.id, { text: ev.target.value })} placeholder="何をする所か・コツ(例: 左手で押さえながら)" className="w-full border border-slate-200 rounded px-1.5 py-1 text-xs" />
+                      <div className="flex items-center gap-1 text-[11px]">
+                        <button onClick={() => { seekTo(e.start); setMarkTarget(markTarget === e.id ? null : e.id); }} className={`px-2 py-0.5 rounded font-bold ${markTarget === e.id ? 'bg-red-600 text-white' : 'bg-red-50 text-red-600 border border-red-200'}`}>{markTarget === e.id ? '配置を終了' : '印を置く'}</button>
+                        {markTarget === e.id && (
+                          <span className="flex gap-0.5">
+                            <button onClick={() => setMarkShape('circle')} className={`px-1.5 py-0.5 rounded font-bold ${markShape === 'circle' ? 'bg-red-600 text-white' : 'bg-white text-red-600 border border-red-300'}`} title="丸(○)を置く">○</button>
+                            <button onClick={() => setMarkShape('arrow')} className={`px-1.5 py-0.5 rounded font-bold ${markShape === 'arrow' ? 'bg-red-600 text-white' : 'bg-white text-red-600 border border-red-300'}`} title="矢印(→)を置く">↓</button>
+                          </span>
+                        )}
+                        <span className="text-slate-400">印 {e.marks?.length || 0}個</span>
+                        {(e.marks?.length || 0) > 0 && <button onClick={() => { pushUndo(); patchEvt(e.id, { marks: [] }); }} className="text-slate-400 underline">全消し</button>}
+                      </div>
+                      {(e.marks || []).length > 0 && (
+                        <div className="space-y-1 pl-2 border-l-2 border-red-200">
+                          {(e.marks || []).map((m, mi) => (
+                            <div key={mi} className="flex items-center gap-1">
+                              <span className="text-red-500 font-bold text-[11px] shrink-0">○{mi + 1}</span>
+                              <input value={m.text || ''} onChange={(ev) => patchEvt(e.id, { marks: e.marks.map((mm, j) => j === mi ? { ...mm, text: ev.target.value } : mm) })} placeholder="この○のひと言(任意)" className="flex-1 min-w-0 border border-slate-200 rounded px-1.5 py-0.5 text-[11px]" />
+                              <button onClick={() => { pushUndo(); patchEvt(e.id, { marks: e.marks.filter((_, j) => j !== mi) }); }} className="px-1 bg-rose-100 text-rose-600 rounded font-bold shrink-0" title="この○を削除">✕</button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-1 text-[10px]">
+                        <span className="text-slate-400 font-bold">再開</span>
+                        <select value={e.hold || 0} onChange={(ev) => { pushUndo(); patchEvt(e.id, { hold: Number(ev.target.value) }); }} className="border border-slate-200 rounded px-1 py-0.5 text-slate-700" title="停止したあと、自動で続きへ進むまでの時間">
+                          <option value={0}>タップで再開(既定)</option>
+                          <option value={2}>2秒後に自動</option>
+                          <option value={3}>3秒後に自動</option>
+                          <option value={5}>5秒後に自動</option>
+                          <option value={8}>8秒後に自動</option>
+                        </select>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs font-bold text-slate-500">この動画を出す工程(タップで選択)</div>
+              <div className="flex flex-wrap gap-1">
+                {steps.length === 0 && <span className="text-[11px] text-slate-400">工程情報なし(作業画面から開くと選べます)</span>}
+                {steps.map(s => (
+                  <button key={s.key} onClick={() => setStepKeys(prev => prev.includes(s.key) ? prev.filter(k => k !== s.key) : [...prev, s.key])}
+                    className={`text-[11px] px-1.5 py-0.5 rounded border font-bold ${stepKeys.includes(s.key) ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-slate-500 border-slate-300'}`}>{s.label}</button>
+                ))}
+              </div>
+            </div>
+            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="タイトル(例: 面板取付のコツ)" className="w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// アプリ内で動画撮影(映像+音声)→Driveへアップロード。目安1〜3分(超えたら警告色)。
+// aceTarget/withPhotoTool(統合フロー「動画で資料を作る」用): プレビューで「この動画で作る物」をチェックで選ぶ。
+//   aceTarget=工程名 → 「手本として登録」チェックを出す / withPhotoTool → 「写真・説明を作る」チェックを出す。
+//   手本のチェックを外すと動画はDriveに保存されない(写真づくりにだけ使う)。両方未指定なら従来どおりの撮影→アップロードのみ。
+const VideoRecordModal = ({ open, sections = [], defaultName = '', onDone = null, onClose, aceTarget = null, withPhotoTool = false }) => {
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const recRef = useRef(null);
+  const chunksRef = useRef([]);
+  const [phase, setPhase] = useState('live'); // live|rec|preview|uploading|error
+  const [err, setErr] = useState('');
+  const [blob, setBlob] = useState(null);
+  const [name, setName] = useState(defaultName);
+  const [dest, setDest] = useState(0);
+  const [prog, setProg] = useState(0);
+  const [sec, setSec] = useState(0);
+  const [makeAce, setMakeAce] = useState(!!aceTarget);                       // 🎬 手本として登録(Drive保存+工程紐づけ)
+  const [makePhotos, setMakePhotos] = useState(!aceTarget && withPhotoTool); // 📸 写真切り出し+説明文(工程未保存の時は写真づくりが既定)
+  useEffect(() => {
+    if (!open || blob) return;
+    let on = true;
+    (async () => {
+      try {
+        const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true });
+        if (!on) { st.getTracks().forEach(tr => tr.stop()); return; }
+        streamRef.current = st;
+        if (videoRef.current) { videoRef.current.srcObject = st; videoRef.current.muted = true; videoRef.current.play().catch(() => {}); }
+      } catch (e) { setErr('カメラ/マイクを起動できません: ' + (e?.message || e)); setPhase('error'); }
+    })();
+    return () => { on = false; try { streamRef.current?.getTracks().forEach(tr => tr.stop()); } catch (e) { /* noop */ } streamRef.current = null; };
+  }, [open, blob]);
+  useEffect(() => { if (phase !== 'rec') return; const t = setInterval(() => setSec(s => s + 1), 1000); return () => clearInterval(t); }, [phase]);
+  if (!open) return null;
+  const startRec = () => {
+    const st = streamRef.current; if (!st) return;
+    const cands = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+    const mt = (window.MediaRecorder && cands.find(c => MediaRecorder.isTypeSupported(c))) || '';
+    let mr;
+    try { mr = new MediaRecorder(st, mt ? { mimeType: mt, videoBitsPerSecond: 5000000 } : undefined); }
+    catch (e) { setErr('この端末は動画録画に対応していません: ' + (e?.message || e)); setPhase('error'); return; }
+    chunksRef.current = [];
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) chunksRef.current.push(e.data); };
+    mr.onstop = () => { setBlob(new Blob(chunksRef.current, { type: mr.mimeType || 'video/webm' })); setPhase('preview'); try { streamRef.current?.getTracks().forEach(tr => tr.stop()); } catch (e2) { /* noop */ } };
+    mr.start(1000); recRef.current = mr; setSec(0); setPhase('rec');
+  };
+  const stopRec = () => { try { if (recRef.current && recRef.current.state !== 'inactive') recRef.current.stop(); } catch (e) { /* noop */ } };
+  const doUpload = async () => {
+    if (!blob || !sections[dest]) return;
+    const ext = (() => { const t = blob.type || ''; if (t.includes('mp4')) return 'mp4'; if (t.includes('quicktime')) return 'mov'; if (t.includes('webm')) return 'webm'; const m = String(blob.name || '').match(/\.([A-Za-z0-9]+)$/); return m ? m[1].toLowerCase() : 'webm'; })();
+    const base = (name.trim() || defaultName || '作業動画').replace(/[\\/:*?"<>|]/g, '_');
+    const d = new Date();
+    const fname = `${base}_${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.${ext}`;
+    setPhase('uploading'); setProg(0);
+    try {
+      const uploaded = await driveUploadFile(new File([blob], fname, { type: blob.type || 'video/webm' }), sections[dest].path, setProg);
+      onDone && onDone(uploaded, blob, { makePhotos }); // uploaded={id,name}(工程への自動紐づけ用) / blob=元動画 / makePhotos=続けて写真・説明づくりへ
+    } catch (e) { setErr('アップロード失敗: ' + (e?.message || e)); setPhase('error'); }
+  };
+  return (
+    <div className="fixed inset-0 z-[560] bg-black/90 flex flex-col items-center justify-center p-3" onClick={(e) => e.stopPropagation()}>
+      <div className="w-full max-w-2xl space-y-2">
+        <div className="flex items-center justify-between text-white">
+          <span className="font-bold text-sm">{withPhotoTool ? '🎥 動画で資料を作る' : '🎥 手本動画を撮影'} {phase === 'rec' && <span className={`ml-2 font-mono ${sec > 180 ? 'text-rose-400' : 'text-emerald-300'}`}>● {vrFmtT(sec)}{sec > 180 ? '(目安1〜3分を超えています)' : ''}</span>}</span>
+          <button onClick={onClose} className="p-1.5 rounded hover:bg-white/20"><X className="w-5 h-5" /></button>
+        </div>
+        {phase === 'error' ? (
+          <div className="bg-rose-50 border border-rose-300 rounded-lg p-3 text-sm text-rose-700">{err}</div>
+        ) : blob ? (
+          <video src={URL.createObjectURL(blob)} controls playsInline className="w-full max-h-[55vh] rounded-lg bg-black" />
+        ) : (
+          <video ref={videoRef} playsInline muted className="w-full max-h-[55vh] rounded-lg bg-black" />
+        )}
+        {phase === 'live' && (
+          <div className="space-y-2">
+            <button onClick={startRec} className="w-full bg-rose-600 hover:bg-rose-500 text-white rounded-lg py-3 font-bold">● 録画開始(音声も入ります)</button>
+            <label className="w-full block bg-white/10 hover:bg-white/20 text-white rounded-lg py-2.5 font-bold text-center text-sm cursor-pointer">
+              📁 端末にある動画を選ぶ(撮影済みの動画をそのまま使う)
+              <input type="file" accept="video/*" className="hidden" onChange={(e) => { const f = e.target.files && e.target.files[0]; if (!f) return; setBlob(f); if (!name.trim() && f.name) setName(f.name.replace(/\.[^.]+$/, '')); setPhase('preview'); try { streamRef.current?.getTracks().forEach(tr => tr.stop()); } catch (e2) { /* noop */ } e.target.value = ''; }} />
+            </label>
+          </div>
+        )}
+        {phase === 'rec' && <button onClick={stopRec} className="w-full bg-slate-100 hover:bg-white text-slate-900 rounded-lg py-3 font-bold">■ 録画終了</button>}
+        {phase === 'preview' && blob && (
+          <div className="bg-white rounded-xl p-3 space-y-2">
+            <div className="text-xs text-slate-500">サイズ: {driveFmtSize(blob.size)} / 確認して問題なければ次へ</div>
+            {(aceTarget || withPhotoTool) && (
+              <div className="border border-slate-200 bg-slate-50 rounded-lg p-2 space-y-1.5">
+                <div className="text-[11px] font-bold text-slate-500">この動画で作る物(チェックした物だけ)</div>
+                {aceTarget && (
+                  <label className="flex items-start gap-2 text-xs font-bold text-slate-700 cursor-pointer">
+                    <input type="checkbox" checked={makeAce} onChange={(e) => setMakeAce(e.target.checked)} className="mt-0.5" />
+                    <span>🎬 工程「{aceTarget}」の手本として登録<span className="block font-normal text-[10px] text-slate-500">Driveに保存され、作業画面のこの工程の場所に自動で出ます</span></span>
+                  </label>
+                )}
+                {withPhotoTool && (
+                  <label className="flex items-start gap-2 text-xs font-bold text-slate-700 cursor-pointer">
+                    <input type="checkbox" checked={makePhotos} onChange={(e) => setMakePhotos(e.target.checked)} className="mt-0.5" />
+                    <span>📸 写真を切り出して説明文を作る<span className="block font-normal text-[10px] text-slate-500">コマ取り+AI下書き(この後の画面で作ります)</span></span>
+                  </label>
+                )}
+                {aceTarget && !makeAce && <div className="text-[10px] text-amber-600 font-bold">⚠ 手本登録しないため、動画はDriveに保存されません(写真づくりに使うだけ)</div>}
+              </div>
+            )}
+            {((aceTarget || withPhotoTool) ? makeAce : true) && (<>
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="動画名(例: 面板取付_エース手本)" className="w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+              <select value={dest} onChange={(e) => setDest(Number(e.target.value))} className="w-full border border-slate-300 rounded px-2 py-1.5 text-sm">
+                {sections.map((s, i) => <option key={i} value={i}>保存先: {s.label}</option>)}
+              </select>
+            </>)}
+            <div className="flex gap-2">
+              <button onClick={() => { setBlob(null); setPhase('live'); }} className="flex-1 bg-slate-200 text-slate-600 rounded-lg py-2 font-bold text-sm">撮り直す</button>
+              {(aceTarget || withPhotoTool) && !makeAce ? (
+                <button disabled={!makePhotos} onClick={() => onDone && onDone(null, blob, { makePhotos: true })} className={`flex-[2] rounded-lg py-2 font-bold text-sm ${makePhotos ? 'bg-indigo-600 hover:bg-indigo-500 text-white' : 'bg-slate-100 text-slate-300'}`}>📸 写真づくりへ進む(動画は保存しない)</button>
+              ) : (
+                <button onClick={doUpload} className="flex-[2] bg-sky-600 hover:bg-sky-500 text-white rounded-lg py-2 font-bold text-sm">⬆ Driveへアップロード{makePhotos ? '→写真づくりへ' : ''}</button>
+              )}
+            </div>
+          </div>
+        )}
+        {phase === 'uploading' && (
+          <div className="bg-white rounded-xl p-4 space-y-2">
+            <div className="text-sm font-bold text-slate-700">アップロード中… {Math.round(prog * 100)}%</div>
+            <div className="h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full bg-sky-500 rounded-full transition-all" style={{ width: `${prog * 100}%` }} /></div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// 埋め込みモード(?embed=map): ③司令塔の「工場別」が、このアプリの現場マップ画面【そのもの】をiframeで表示するために使う。
+// ヘッダーを隠すだけ(初期タブは元々 main=現場マップ)。画面の中身・見た目・動きは通常と完全に同一で、
+// 通常アクセス(パラメータ無し)には一切影響しない。
+const EMBED_MAP = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('embed') === 'map';
 
 // ロットカード表示項目のデフォルト (全てON)
 // settings.lotCardDisplay にユーザ設定を保存し、必要なら個別にOFFできる
@@ -2052,10 +3221,19 @@ const isUnassignedLot = (l) => {
 };
 
 // 予定(残): 未着手分 + 進行中の残り見込み
-// 実績(済): 完了分 + 進行中の経過時間
+// 実績(済): 「本日」完了した分 + 進行中の経過時間
+//   完了ロットは completedAt(無ければ updatedAt)が今日のものだけを実績に数える。
+//   全期間の完了を積むと、予定が空の作業者でも昔の完了分が実績に出続けて
+//   「予定なしなのに実績だけ数字」になる(=ユーザー指摘)。当日分に限定して整合させる。
 const computeWorkerTimes = (lots, workerId) => {
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const todayStartMs = todayStart.getTime();
+  const completedTodayMs = (l) => {
+    const ms = toMsAny(l.completedAt) || toMsAny(l.updatedAt) || 0;
+    return ms >= todayStartMs;
+  };
   const plannedLots = lots.filter(l => l.location === 'planned' && l.workerId === workerId);
-  const completedLots = lots.filter(l => l.location === 'completed' && l.workerId === workerId);
+  const completedLots = lots.filter(l => l.location === 'completed' && l.workerId === workerId && completedTodayMs(l));
 
   let notStartedSec = 0;
   let inProgressRemainingSec = 0;
@@ -2141,14 +3319,19 @@ const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
   // 工程をタイトルで突き合わせるヘルパー。実データは同じテンプレでもロットごとに step.id・工程順が違うため、
   //   id 直引きだと別ロットを取りこぼす。→ タイトルで一致させて全ロットを正しく拾う。
   const lotMaps = completedLots.map(lot => {
-    const idByTitle = {};
-    (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) idByTitle[t] = s?.id || `idx-${i}`; });
-    return { lot, idByTitle, qty: lot.quantity || 1 };
+    const idByTitle = {}, idxByTitle = {};
+    (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) { idByTitle[t] = s?.id || null; idxByTitle[t] = i; } });
+    return { lot, idByTitle, idxByTitle, qty: lot.quantity || 1 };
   });
+  // タスクキーは3形式(id系 / 旧式数値 ${idx}-${u} / lotOnce)。id直引きだけだと、id無し工程や
+  //   旧式数値キーで保存された完了ロットの実績を取りこぼす(他集計は両キー対応)。→ 数値indexにフォールバック。
   const taskOfTitle = (entry, title, u) => {
-    const id = entry.idByTitle[(title || '').trim()];
-    if (id == null) return undefined;
-    return entry.lot.tasks?.[`${id}-${u}`];
+    const t = (title || '').trim();
+    if (!(t in entry.idxByTitle)) return undefined;
+    const id = entry.idByTitle[t];
+    const i = entry.idxByTitle[t];
+    const tasks = entry.lot.tasks || {};
+    return (id != null && tasks[`${id}-${u}`] !== undefined) ? tasks[`${id}-${u}`] : tasks[`${i}-${u}`];
   };
   // 時刻(firstStartTime)があるロットだけを「時間・並列・まとめ」解析の対象にする。無いロットは件数だけ残す(隠さない)。
   const timedEntries = lotMaps.filter(entry => {
@@ -2526,10 +3709,11 @@ const computeEnforcedSchedule = (steps, quantity, analysis, opts = {}) => {
 const analyzeLotsForReview = (steps = [], completedLots = []) => {
   const isAuto = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const lotMaps = completedLots.map(lot => {
-    const idByTitle = {}; (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) idByTitle[t] = s?.id || `idx-${i}`; });
-    return { lot, idByTitle, qty: lot.quantity || 1 };
+    const idByTitle = {}, idxByTitle = {}; (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) { idByTitle[t] = s?.id || null; idxByTitle[t] = i; } });
+    return { lot, idByTitle, idxByTitle, qty: lot.quantity || 1 };
   });
-  const taskOf = (e, title, u) => { const id = e.idByTitle[(title || '').trim()]; return id != null ? e.lot.tasks?.[`${id}-${u}`] : undefined; };
+  // id系→旧式数値キーへフォールバック(id無し工程・旧フォーマット保存ロットを取りこぼさない)。
+  const taskOf = (e, title, u) => { const t = (title || '').trim(); if (!(t in e.idxByTitle)) return undefined; const id = e.idByTitle[t]; const i = e.idxByTitle[t]; const tasks = e.lot.tasks || {}; return (id != null && tasks[`${id}-${u}`] !== undefined) ? tasks[`${id}-${u}`] : tasks[`${i}-${u}`]; };
   const tmplTitles = steps.map(s => (s.title || '').trim());
   const autoTitles = new Set(steps.filter(isAuto).map(s => (s.title || '').trim()));
 
@@ -2723,21 +3907,37 @@ JSON で次の形式で返してください:
 
 // 動画から資料を作るツール: 動画を選び、好きな場面を静止画(コマ)として切り出して参考写真に。AIで説明下書きも作れる。
 //   動画本体は保存しない(オブジェクトURLのみ)。切り出したコマだけ Cloud Storage にアップして onApply で返す。
-const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApply, onClose }) => {
+// initialFile: 撮影登録フローから動画を直接受け取る(写真・説明づくりへ一気通貫)。
+// onRegisterVideo: 「この動画を工程の手本にも登録」(Driveアップロード+工程紐づけ)。1本の動画で写真も手本も作れる連携の本体。
+const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApply, onClose, initialFile = null, onRegisterVideo = null }) => {
   const [videoUrl, setVideoUrl] = useState(null);
+  const [videoFile, setVideoFile] = useState(null); // 手本登録用に選択中のFileを保持
   const videoRef = useRef(null);
   const [frames, setFrames] = useState([]); // [{ id, dataUrl, t }]
   const [desc, setDesc] = useState(existingDescription || '');
   const [aiBusy, setAiBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const [applying, setApplying] = useState(false);
+  const [regBusy, setRegBusy] = useState(false);
+  const [regDone, setRegDone] = useState(false);
   const hasAiKey = !!(import.meta.env.VITE_GEMINI_API_KEY);
+
+  useEffect(() => {
+    if (initialFile) { setVideoFile(initialFile); setVideoUrl(URL.createObjectURL(initialFile)); }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const pickVideo = (e) => {
     const f = e.target.files?.[0]; if (!f) { return; }
     if (videoUrl) URL.revokeObjectURL(videoUrl);
-    setVideoUrl(URL.createObjectURL(f)); setFrames([]); setMsg('');
+    setVideoUrl(URL.createObjectURL(f)); setVideoFile(f); setFrames([]); setMsg(''); setRegDone(false);
     e.target.value = '';
+  };
+  const registerAsAce = async () => {
+    if (!onRegisterVideo || !videoFile || regBusy || regDone) return;
+    setRegBusy(true); setMsg('動画をDriveへアップロードして工程に紐づけ中…');
+    try { await onRegisterVideo(videoFile); setRegDone(true); setMsg('✓ この工程の手本動画として登録しました（作業画面の工程詳細に自動で出ます。停止○や倍速は🎬欄の「✏ レシピ」から）'); }
+    catch (e) { setMsg('手本登録に失敗: ' + (e?.message || e)); }
+    setRegBusy(false);
   };
   const frameFromVideo = () => {
     const v = videoRef.current; if (!v || !v.videoWidth) return null;
@@ -2807,7 +4007,7 @@ const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApp
             <label className="block border-2 border-dashed border-indigo-300 rounded-xl p-8 text-center cursor-pointer hover:bg-indigo-50">
               <Camera className="w-10 h-10 mx-auto text-indigo-400 mb-2" />
               <div className="font-bold text-indigo-700">動画を撮影 / 選択</div>
-              <div className="text-xs text-slate-500 mt-1">作業の動画から、必要な場面を写真として切り出します（動画自体は保存しません）</div>
+              <div className="text-xs text-slate-500 mt-1">作業の動画から、必要な場面を写真として切り出します{onRegisterVideo ? '（同じ動画を「🎬 手本にも登録」ボタンでDriveに保存し、作業画面に出すこともできます）' : '（動画自体は保存しません）'}</div>
               <input type="file" accept="video/*" className="hidden" onChange={pickVideo} />
             </label>
           ) : (
@@ -2817,6 +4017,13 @@ const VideoToPhotosModal = ({ contextLabel = '', existingDescription = '', onApp
                 <button onClick={grabFrame} className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-sm flex items-center gap-1.5"><Camera className="w-4 h-4" /> この場面を写真に</button>
                 <button onClick={() => autoSample(6)} className="px-3 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg font-bold text-sm">⚡ 自動で6コマ取得</button>
                 <label className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg font-bold text-sm cursor-pointer">別の動画<input type="file" accept="video/*" className="hidden" onChange={pickVideo} /></label>
+                {onRegisterVideo && videoFile && (
+                  <button onClick={registerAsAce} disabled={regBusy}
+                    className={`px-3 py-2 rounded-lg font-bold text-sm flex items-center gap-1.5 ${regDone ? 'bg-emerald-100 text-emerald-700 border border-emerald-300' : 'bg-sky-600 hover:bg-sky-700 text-white'} disabled:opacity-60`}
+                    title="同じ動画を、作業画面に出る「エースの手本動画」としてもDriveに登録します(写真切り出しと二度手間なし)">
+                    {regDone ? '✓ 手本として登録済み' : (regBusy ? '登録中…' : '🎬 この動画を工程の手本にも登録')}
+                  </button>
+                )}
               </div>
             </>
           )}
@@ -2891,7 +4098,7 @@ const WorkerSummaryCard = ({ worker, lots }) => {
          </div>
          <div className={`rounded p-2 ${processingCount > 0 ? 'bg-emerald-100 ring-1 ring-emerald-300' : 'bg-emerald-50'}`}>
             <div className="text-[10px] text-emerald-500 font-bold mb-1 flex items-center justify-center gap-1">
-              実績(済)
+              本日実績
               {processingCount > 0 && <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"/>}
             </div>
             <div className="text-base font-black text-emerald-700 font-mono">{formatTime(actualDoneSec)}</div>
@@ -3080,7 +4287,7 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
   return (
     // 外枠: dashboard モードは飾り枠あり (ダッシュボード内の1パネルなので)、map-only モードは枠なし (画面いっぱい)
     <div className={`h-full relative bg-white overflow-hidden flex flex-col ${isDashboard ? 'rounded-xl border-2 border-blue-400 shadow-lg cursor-pointer' : ''}`}>
-       {!isDashboard && headerContent}
+       {!isDashboard && !EMBED_MAP && headerContent} {/* 埋め込み(③)はマップだけ: 操作バー非表示 */}
        {isDashboard && (
          <div className="absolute top-2 left-2 z-30 bg-white/80 backdrop-blur px-3 py-1 rounded-full border shadow-sm pointer-events-none">
            <span className="text-xs font-bold text-blue-800 flex items-center gap-1"><MapIcon className="w-3 h-3"/> 作業エリア (Clickで拡大)</span>
@@ -3179,7 +4386,7 @@ const InteractiveMap = ({ lots, workers, templates, handleMoveLot, saveData, set
                          variant={useCompact ? 'dashboard-map' : 'full'}
                        />
                      ))}
-                     {zoneLots.length === 0 && !isLayoutMode && !isDashboard && (<div className="h-full flex items-center justify-center text-black/10 text-[10px]">Drop Here</div>)}
+                     {zoneLots.length === 0 && !isLayoutMode && !isDashboard && !EMBED_MAP && (<div className="h-full flex items-center justify-center text-black/10 text-[10px]">Drop Here</div>)}
                    </>
                  );
                })()}
@@ -3266,145 +4473,6 @@ const IndirectWorkModal = ({ categories, activeIndirect, onStart, onStop, onClos
 // シフト引継ぎモーダル
 // 終業時に呼び出し、当日の作業サマリー + 引継ぎメモ入力 → ノートとして共有
 // ===========================
-const ShiftHandoverModal = ({ lots, indirectWork, currentUserName, workers, saveData, onClose }) => {
-  const today = new Date();
-  const todayStr = localYMD(today);
-  const todayMs = today.setHours(0,0,0,0);
-  const [memo, setMemo] = useState('');
-  const myWorkerId = workers.find(w => w.name === currentUserName)?.id;
-
-  // 自分が今日触ったロット
-  const myLots = useMemo(() => {
-    return lots.filter(lot => {
-      // 自分が担当 OR tasks に自分のworkerNameがある
-      if (lot.workerId === myWorkerId) return true;
-      const tasks = Object.values(lot.tasks || {});
-      if (tasks.some(t => t.workerName === currentUserName || t.workerId === myWorkerId)) return true;
-      return false;
-    });
-  }, [lots, myWorkerId, currentUserName]);
-
-  // 完了/進行中/未完了の分類
-  const todayCompleted = myLots.filter(l => {
-    if (!(l.status === 'completed' || l.location === 'completed')) return false;
-    const t = (typeof l.updatedAt === 'number') ? l.updatedAt : (l.updatedAt?.seconds ? l.updatedAt.seconds * 1000 : 0);
-    return t >= todayMs;
-  });
-  const inProgress = myLots.filter(l => l.status === 'processing' || l.status === 'paused');
-  const incomplete = myLots.filter(l => !(l.status === 'completed' || l.location === 'completed') && l.status !== 'processing' && l.status !== 'paused');
-
-  // 自分の今日の合計作業時間
-  const totalMyWork = useMemo(() => {
-    let sec = 0;
-    lots.forEach(lot => {
-      Object.values(lot.tasks || {}).forEach(t => {
-        if (!t || t.status !== 'completed') return;
-        if (t.workerName !== currentUserName && t.workerId !== myWorkerId) return;
-        sec += (t.duration || 0);
-      });
-    });
-    return sec;
-  }, [lots, currentUserName, myWorkerId]);
-
-  const indirectToday = (indirectWork || []).filter(w => {
-    if (w.workerName !== currentUserName) return false;
-    return (w.startTime || 0) >= todayMs;
-  });
-  const indirectSec = indirectToday.reduce((s, w) => s + (w.duration || 0), 0);
-
-  const handleSave = () => {
-    if (!memo.trim() && inProgress.length === 0 && incomplete.length === 0) {
-      if (!confirm('引継ぎ事項が空です。このまま登録しますか？')) return;
-    }
-    // ノートとして共有 (isPersonal: false で全員に見える)
-    const noteId = `handover_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
-    const inProgressList = inProgress.map(l => `・${l.model} (${l.orderNo}) ${l.status === 'paused' ? '⏸️一時停止' : '▶️作業中'}`).join('\n');
-    const content = [
-      `📋 ${currentUserName} の引継ぎ (${todayStr})`,
-      `本日の実績: 完了 ${todayCompleted.length}件 / 進行中 ${inProgress.length}件 / 未着手 ${incomplete.length}件`,
-      `合計作業時間: 直接 ${(totalMyWork/3600).toFixed(1)}時間 + 間接 ${(indirectSec/3600).toFixed(1)}時間`,
-      inProgressList ? `\n■ 引継ぎ対象 (進行中・一時停止):\n${inProgressList}` : '',
-      memo.trim() ? `\n■ 引継ぎメモ:\n${memo.trim()}` : '',
-    ].filter(Boolean).join('\n');
-    saveData('notes', noteId, {
-      content,
-      author: currentUserName,
-      isPersonal: false,
-      isHandover: true,
-      handoverDate: todayStr,
-      createdAt: Date.now(),
-    });
-    alert('引継ぎを保存しました。次のシフトの担当者がノートで確認できます。');
-    onClose();
-  };
-
-  return (
-    <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-        <div className="bg-blue-700 text-white p-4 flex justify-between items-center shrink-0">
-          <h2 className="font-bold flex items-center gap-2 text-lg"><FileText className="w-5 h-5"/> シフト引継ぎ</h2>
-          <button onClick={onClose} className="hover:bg-white/20 rounded p-1"><X className="w-5 h-5"/></button>
-        </div>
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {/* 本日のサマリー */}
-          <div>
-            <div className="text-xs font-bold text-slate-500 mb-2">本日の実績 ({currentUserName})</div>
-            <div className="grid grid-cols-3 gap-2">
-              <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
-                <div className="text-[10px] text-emerald-600 font-bold">完了</div>
-                <div className="text-2xl font-black text-emerald-700">{todayCompleted.length}</div>
-              </div>
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-center">
-                <div className="text-[10px] text-blue-600 font-bold">進行中・一時停止</div>
-                <div className="text-2xl font-black text-blue-700">{inProgress.length}</div>
-              </div>
-              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-center">
-                <div className="text-[10px] text-slate-500 font-bold">合計時間</div>
-                <div className="text-2xl font-black text-slate-700 font-mono">{((totalMyWork + indirectSec)/3600).toFixed(1)}h</div>
-              </div>
-            </div>
-          </div>
-
-          {/* 引継ぎ対象 */}
-          {inProgress.length > 0 && (
-            <div>
-              <div className="text-xs font-bold text-slate-500 mb-2">引継ぎ対象 (進行中・一時停止のロット)</div>
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-1">
-                {inProgress.map(l => (
-                  <div key={l.id} className="flex items-center gap-2 text-sm">
-                    {l.status === 'paused' ? <Pause className="w-4 h-4 text-amber-600"/> : <PlayCircle className="w-4 h-4 text-blue-600"/>}
-                    <span className="font-bold">{l.model}</span>
-                    <span className="text-slate-500 text-xs">({l.orderNo})</span>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${l.status === 'paused' ? 'bg-amber-200 text-amber-800' : 'bg-blue-200 text-blue-800'}`}>
-                      {l.status === 'paused' ? '一時停止' : '作業中'}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* 引継ぎメモ */}
-          <div>
-            <label className="block text-xs font-bold text-slate-500 mb-1">引継ぎメモ (任意)</label>
-            <textarea
-              value={memo}
-              onChange={e => setMemo(e.target.value)}
-              className="w-full border rounded-lg p-3 h-32 text-sm"
-              placeholder="例: ロット123 の Step3 で気になる点あり、明日確認お願いします"
-            />
-            <p className="text-[10px] text-slate-400 mt-1">保存すると共有ノートに登録され、次のシフトの担当者が「ノート」タブで確認できます。</p>
-          </div>
-        </div>
-        <div className="border-t p-4 flex justify-end gap-2 shrink-0">
-          <button onClick={onClose} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg font-bold">キャンセル</button>
-          <button onClick={handleSave} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-black flex items-center gap-2 shadow-md"><Save className="w-4 h-4"/> 保存して引継ぎ</button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
 const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, settings, saveData, onClose }) => {
   const today = localYMD(new Date());
   const [tab, setTab] = useState('daily'); // 'daily' | 'analysis'
@@ -3416,7 +4484,7 @@ const DailySummaryModal = ({ lots, indirectWork, currentUserName, workers, setti
   const [addDuration, setAddDuration] = useState('');
   const [addNote, setAddNote] = useState('');
   const [expandedLots, setExpandedLots] = useState({}); // { lotKey: true } で詳細展開
-  const categories = settings?.indirectCategories || DEFAULT_INDIRECT_CATEGORIES;
+  const categories = [...new Set(settings?.indirectCategories || DEFAULT_INDIRECT_CATEGORIES)];
   const allWorkerNames = [...new Set([...workers.map(w => w.name), ...indirectWork.map(w => w.workerName).filter(Boolean)])];
 
   const toggleWorker = (name) => setSelectedWorkers(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]);
@@ -3886,7 +4954,7 @@ const WorkStandardEditModal = ({ editingItem, onClose, onSave, onDelete, current
           <h2 className="text-lg font-bold flex items-center gap-2"><BookOpen className="w-5 h-5"/> {editingItem ? '作業標準 編集' : '作業標準 新規登録'}</h2>
           <button onClick={onClose} className="hover:bg-white/20 rounded p-1"><X className="w-5 h-5"/></button>
         </div>
-        <div className="p-4 space-y-3 overflow-y-auto">
+        <div className="flex-1 min-h-0 p-4 space-y-3 overflow-y-auto">
           <div>
             <label className="block text-xs font-bold text-slate-600 mb-1">名称 *</label>
             <input value={name} onChange={e => setName(e.target.value)} placeholder="例: 円テーブル組立作業標準書" className="w-full border rounded p-2 text-sm"/>
@@ -4357,7 +5425,7 @@ const MeasurementPreviewBox = ({ config, variant = 'tiny', maxHeight = 200 }) =>
   );
 };
 
-const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSaveLayouts, comboPresets = [], builtInOverrides = {}, hiddenBuiltIns = [] }) => {
+const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSaveLayouts, comboPresets = [], builtInOverrides = {}, hiddenBuiltIns = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null }) => {
   const [name, setName] = useState(template?.name || '');
   const [steps, setSteps] = useState(template?.steps || []);
   const [title, setTitle] = useState('');
@@ -4385,6 +5453,21 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const [images, setImages] = useState([]);
   const [activeImgIdx, setActiveImgIdx] = useState(0);
   const [showVideoTool, setShowVideoTool] = useState(false); // 動画から写真・説明を作るツール
+  // 工程の動画(エース手本): 用意はテンプレで行い、作業画面ではその工程の場所に自動で出る(本来の形)
+  const [stepVideoStudio, setStepVideoStudio] = useState(null); // { recipe, mode }
+  const [stepVideoRec, setStepVideoRec] = useState(false);      // 撮影して登録
+  const [showStepDrivePick, setShowStepDrivePick] = useState(false); // Driveから紐づけ
+  const [videoToolFile, setVideoToolFile] = useState(null);     // 統合フローで切り出しツールへ渡す動画
+  const [videoToolFromAce, setVideoToolFromAce] = useState(false); // true=手本登録済みの動画→ツール内の「手本にも登録」を隠す(二重登録防止)
+  // 統合フローの手本登録本体: 同じ1本をDriveへ上げて工程に紐づけ(二度手間・二度撮影なし)
+  const handleRegisterStepVideo = async (file) => {
+    if (!onSaveVideoRecipe || !editingStepId) throw new Error('工程を保存してから登録してください');
+    const base = (title || '工程').replace(/[\\/:*?"<>|]/g, '_');
+    const named = (file && file.name) ? file : new File([file], `${base}_手本.webm`, { type: file?.type || 'video/webm' });
+    const up = await driveUploadFile(named, ['製品', 'テンプレ', name || template?.name || 'テンプレ'], null);
+    if (!up?.id) throw new Error('アップロード結果を取得できませんでした');
+    await onSaveVideoRecipe(up.id, { fileId: up.id, fileName: up.name || named.name, title: title || '', model: '', stepKeys: [editingStepId], events: [] });
+  };
   const [pdfData, setPdfData] = useState(null);
   const [editingStepId, setEditingStepId] = useState(null);
   const [measurementConfig, setMeasurementConfig] = useState(null);
@@ -4624,7 +5707,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
             <div className="bg-indigo-50/50 border-2 border-indigo-200 rounded-lg p-3 space-y-2.5">
               <div className="text-xs font-bold text-indigo-800 flex items-center gap-1.5">
                 <Bot className="w-3.5 h-3.5"/> 実行モードと占有リソース
-                <span className="text-[10px] font-normal text-indigo-600 ml-1">(オススメ順機能で「並行可能か」を判定するための情報)</span>
+                <span className="text-[10px] font-normal text-indigo-600 ml-1">(作業順の並行判定・厳密モードで使う情報)</span>
               </div>
 
               {/* 実行モード: 手動 / 自動測定 */}
@@ -5384,17 +6467,83 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleImageUpload}/>
              </div>
              {images.length > 0 && (<div className="flex gap-2 overflow-x-auto pb-1 mb-2">{images.map((img, i) => (<div key={i} className={`relative w-12 h-12 flex-none border rounded overflow-hidden cursor-pointer group ${activeImgIdx===i?'ring-2 ring-blue-500':''}`}><img src={img} onClick={()=>setActiveImgIdx(i)} className="w-full h-full object-cover"/><button onClick={(e)=>{e.stopPropagation(); setImages(prev=>prev.filter((_,j)=>j!==i)); setActiveImgIdx(p=>{ const n = i < p ? p-1 : p; return Math.max(0, Math.min(n, images.length-2)); });}} className="absolute top-0 right-0 bg-rose-600 text-white rounded-bl px-0.5 opacity-0 group-hover:opacity-100" title="削除"><X className="w-3 h-3"/></button></div>))}</div>)}
-             {/* 動画から写真・説明を作る (動画は保存せずコマだけ参考写真に。AI下書きも可) */}
-             <button type="button" onClick={()=>setShowVideoTool(true)} className="w-full mb-2 py-2 border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-xs font-bold flex items-center justify-center gap-1.5"><Camera className="w-4 h-4"/> 🎥 動画から写真・説明を作る</button>
+             {/* 旧「🎥動画から写真・説明を作る」単独ボタンは下の🎬欄「動画で資料を作る」に統合(入口1本化、2026-07-05ユーザー合意) */}
              <div className="mt-2 border-t pt-2"><label className="block text-xs font-bold text-slate-500 mb-1">PDF資料</label><button onClick={()=>pdfInputRef.current?.click()} className={`w-full py-2 border rounded text-xs flex items-center justify-center gap-2 ${pdfData ? 'bg-orange-50 text-orange-600 border-orange-200' : 'bg-slate-50 text-slate-500'}`}><FileText className="w-4 h-4"/> {pdfData ? '添付済' : '選択'}</button><input type="file" ref={pdfInputRef} className="hidden" accept="application/pdf" onChange={handlePdfUpload}/></div>
+             {/* 工程の動画(エース手本): ここで用意→作業画面のこの工程の場所に自動で出て、押すと拡大再生 */}
+             <div className="mt-2 border-t pt-2">
+               <label className="block text-xs font-bold text-slate-500 mb-1">🎬 工程の動画(エース手本)</label>
+               <div className="space-y-1">
+                 {editingStepId && (videoRecipes || []).filter(r => (r.stepKeys || []).includes(editingStepId)).map(r => (
+                   <div key={r.fileId} className="flex items-center gap-1 border border-sky-200 bg-sky-50 rounded px-1.5 py-1">
+                     <button type="button" onClick={() => setStepVideoStudio({ recipe: r, mode: 'play' })} className="flex-1 min-w-0 text-left text-xs font-bold text-sky-700 truncate" title="確認再生">🎬 {r.title || r.fileName || '動画'}</button>
+                     <button type="button" onClick={() => setStepVideoStudio({ recipe: r, mode: 'edit' })} className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 font-bold border border-amber-300" title="停止○・倍速・スキップの編集">✏ レシピ</button>
+                     <button type="button" onClick={() => { if (onSaveVideoRecipe && window.confirm('この工程との紐づけを外しますか？(動画本体はDriveに残ります)')) onSaveVideoRecipe(r.fileId, { ...r, stepKeys: (r.stepKeys || []).filter(k => k !== editingStepId) }); }} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-500 font-bold" title="紐づけ解除">解除</button>
+                     <button type="button" onClick={async () => { if (!window.confirm(`「${r.title || r.fileName || '動画'}」をDriveのゴミ箱へ移動しますか？\n(30日間はDriveのゴミ箱から復元可・この工程からも外れます)`)) return; const ok = await driveTrashFile(r.fileId); if (ok) { if (onDeleteVideoRecipe) await onDeleteVideoRecipe(r.fileId); } else { alert('Drive削除に失敗しました(通信/権限をご確認ください)'); } }} className="text-[10px] px-1.5 py-0.5 rounded bg-rose-100 text-rose-600 font-bold border border-rose-200" title="Driveのゴミ箱へ(30日復元可)">🗑 Drive削除</button>
+                   </div>
+                 ))}
+                 {/* 統合入口(1ボタン): 撮影/端末の動画→「作る物」をチェックで選ぶ(手本登録・写真切り出し・AI説明) */}
+                 <button type="button" onClick={() => setStepVideoRec(true)} className="w-full py-2 border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded text-[11px] font-bold">🎥 動画で資料を作る(手本・写真・説明)</button>
+                 {editingStepId && <button type="button" onClick={() => setShowStepDrivePick(true)} className="w-full py-1.5 border border-sky-200 bg-sky-50 hover:bg-sky-100 text-sky-700 rounded text-[11px] font-bold">📁 Driveの既存動画から紐づけ</button>}
+                 {editingStepId
+                   ? <div className="text-[10px] text-slate-400">手本は作業画面の工程詳細(右側)に自動で出ます。目安1〜3分。</div>
+                   : <div className="text-[10px] text-slate-400 bg-slate-50 border border-slate-200 rounded p-1.5">工程が未保存のため、今は写真・説明づくりのみ。一度保存(追加)すると手本の登録・紐づけもできます</div>}
+               </div>
+             </div>
           </div>
         </div>
         {showVideoTool && (
           <VideoToPhotosModal
             contextLabel={title || ''}
             existingDescription={description || ''}
+            initialFile={videoToolFile}
+            onRegisterVideo={(!videoToolFromAce && editingStepId && onSaveVideoRecipe) ? handleRegisterStepVideo : null}
             onApply={({ images: imgs, description: d }) => { if (imgs && imgs.length) setImages(prev => [...prev, ...imgs]); if (d != null) setDescription(d); }}
-            onClose={() => setShowVideoTool(false)}
+            onClose={() => { setShowVideoTool(false); setVideoToolFile(null); setVideoToolFromAce(false); }}
+          />
+        )}
+        {/* 工程の動画: 確認再生/レシピ編集 */}
+        {stepVideoStudio && (
+          <VideoRecipeStudio file={{ id: stepVideoStudio.recipe.fileId, name: stepVideoStudio.recipe.fileName || '' }} recipe={stepVideoStudio.recipe} mode={stepVideoStudio.mode}
+            steps={(steps || []).filter(s => s.id).map(s => ({ key: s.id, label: s.title }))} model=""
+            onSave={onSaveVideoRecipe ? (async (docData) => { await onSaveVideoRecipe(docData.fileId, { ...docData, model: stepVideoStudio.recipe.model || '' }); setStepVideoStudio(null); }) : null}
+            onClose={() => setStepVideoStudio(null)} />
+        )}
+        {/* 動画で資料を作る(統合フロー): 撮影/端末の動画→「作る物」チェックで分岐。
+            手本のみ→登録後そのまま打刻式編集(停止○・倍速・スキップ)へ案内 / 写真あり→切り出しツールへ / 手本なし→動画はDriveに保存されない */}
+        {stepVideoRec && (
+          <VideoRecordModal open sections={[{ label: `テンプレ「${name || template?.name || ''}」の動画`, path: ['製品', 'テンプレ', name || template?.name || 'テンプレ'] }]}
+            defaultName={`${title || '工程'}_手本`}
+            aceTarget={editingStepId ? (title || '工程') : null}
+            withPhotoTool
+            onDone={async (up, localBlob, opts = {}) => {
+              setStepVideoRec(false);
+              let newRecipe = null;
+              if (up?.id && onSaveVideoRecipe && editingStepId) {
+                newRecipe = { fileId: up.id, fileName: up.name || '', title: title || '', model: '', stepKeys: [editingStepId], events: [] };
+                await onSaveVideoRecipe(up.id, newRecipe);
+              }
+              if (opts.makePhotos && localBlob) {
+                const f = localBlob instanceof File ? localBlob : new File([localBlob], (up && up.name) || 'video.webm', { type: localBlob.type || 'video/webm' });
+                setVideoToolFromAce(!!newRecipe); setVideoToolFile(f); setShowVideoTool(true);
+              } else if (newRecipe && window.confirm('手本として登録しました。\n\n続けて動画編集(⏸停止○コメント・⚡区間倍速・✂スキップの打刻)をしますか？\n※後からでも🎬欄の「✏ レシピ」でいつでも編集できます')) {
+                setStepVideoStudio({ recipe: newRecipe, mode: 'edit' });
+              }
+            }}
+            onClose={() => setStepVideoRec(false)} />
+        )}
+        {/* 工程の動画: Driveの既存動画から紐づけ(動画の⋮→レシピ編集→工程タグで選択) */}
+        {showStepDrivePick && (
+          <DriveDocsModal
+            title={`Driveの動画を工程に紐づけ（動画の⋮→レシピ${'作成'}→下の工程タグで選ぶ）`}
+            sections={[{ label: `テンプレの資料（${name || template?.name || ''}）`, path: ['製品', 'テンプレ', name || template?.name || 'テンプレ'] }]}
+            steps={(steps || []).filter(s => s.id).map(s => ({ key: s.id, label: s.title }))}
+            model=""
+            recipes={videoRecipes || []}
+            onSaveRecipe={onSaveVideoRecipe}
+            onDeleteRecipe={onDeleteVideoRecipe}
+            linkToKey={editingStepId || ''}
+            linkToLabel={title || ''}
+            onClose={() => setShowStepDrivePick(false)}
           />
         )}
         {/* === テンプレ全体の総合資料エディタ (手順書PDF・概要写真・全体説明) === */}
@@ -5975,7 +7124,7 @@ const playOverrunBeep = (kind = 'warn') => {
   } catch { /* 音はベストエフォート (初回はユーザー操作後でないと鳴らないブラウザあり) */ }
 };
 
-const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNextTask, getTaskStatusColor, formatTime, activeCustomTaskKey, onCellClick, onBatchClick, onSkipRow, dense = false, effTargets = [], oa = { enabled: true, warnPct: 80, overPct: 100, warnColor: '#F59E0B', overColor: '#E11D48', warnBlink: 'none', overBlink: 'slow' }, onEditReworks = null }) => {
+const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNextTask, getTaskStatusColor, formatTime, activeCustomTaskKey, onCellClick, onBatchClick, onSkipRow, dense = false, effTargets = [], oa = { enabled: true, warnPct: 80, overPct: 100, warnColor: '#F59E0B', overColor: '#E11D48', warnBlink: 'none', overBlink: 'slow' }, onEditReworks = null, aceCountFor = null, onOpenVideo = null }) => {
   const qty = lot.quantity || 1;
   // 密表示(無理やり表示)モード: 工程欄・セル・余白を縮めて多くの台(10台等)を画面に収める
   const D = dense ? {
@@ -6045,6 +7194,7 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
                   <div className="flex items-center gap-1.5">
                     {isAuto && <span className="bg-purple-500 text-white text-[10px] font-bold px-1 py-0.5 rounded shrink-0">自</span>}
                     <span className={`font-bold text-slate-800 ${D.stepTitle} leading-tight`}>{step.title}</span>
+                    {aceCountFor && aceCountFor(step.id) > 0 && <span role="button" onClick={(e) => { e.stopPropagation(); onOpenVideo && onOpenVideo(step.id); }} className="shrink-0 text-[10px] bg-sky-100 text-sky-700 border border-sky-200 rounded px-1 font-bold cursor-pointer hover:bg-sky-200" title="エースの手本動画を見る">🎬</span>}
                   </div>
                   <div className={`items-center gap-1.5 mt-1 ${D.stepMeta}`}>
                     <span className="text-[11px] text-slate-400">Step {sIdx + 1}</span>
@@ -6294,7 +7444,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [] }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -6312,8 +7462,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 検査中に途中経過の成績表をプレビューする (データ未入力部分は空白)
   const [showInProgressReport, setShowInProgressReport] = useState(false);
   const [showOverview, setShowOverview] = useState(false); // テンプレ全体の総合資料ビューア
-  // 作業順最適化モーダル
-  const [showWorkOrderOptimizer, setShowWorkOrderOptimizer] = useState(false);
+  // showDriveDocs(作業画面のDrive資料モーダル)は撤去済み: 入口はテンプレ編集に移設(2026-07-05)
+  const [aceStudio, setAceStudio] = useState(null); // エース手本動画の再生(レシピ)
+  const [acePick, setAcePick] = useState(null); // 同一工程に手本が複数ある時の選択リスト
+  // この工程に紐づく手本レシピ(工程タグ=step.id。型式が付いたレシピは同型式のみ)
+  const aceFor = (sid) => (videoRecipes || []).filter(r => (r.stepKeys || []).includes(sid) && (!r.model || r.model === lot.model));
+  const openAce = (sid) => { const rs = aceFor(sid); if (!rs.length) return; if (rs.length === 1) setAceStudio(rs[0]); else setAcePick(rs); };
   // 推奨順ガイダンス: カスタムモードで「1台目から順番に」のルールを視覚化
   // 厳密モード = 「1台目から順番」を強制し、飛ばし(順序外タップ)を防ぐモード。
   //   OFF (順番ガイド) = 警告のみで飛ばしも可。状況に応じて作業者が現場判断できるよう、
@@ -6546,6 +7700,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   }, []);
   const [voiceStatus, setVoiceStatus] = useState('');
   const [voiceBarOpen, setVoiceBarOpen] = useState(false);
+  const [showVoiceHelp, setShowVoiceHelp] = useState(false); // 音声コマンド早見表(すぐ出せるヘルプ)
   const voiceActiveRef = useRef(false);
   const voiceRunningRef = useRef(false);
 
@@ -6577,6 +7732,15 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   const matchCustom = (t) => (vcm.custom || ((x) => /カスタム|自由|じゆう/i.test(x || '')))(t);
   const matchBatch = (t) => (vcm.batch || ((x) => /まとめ|一括|バッチ/i.test(x || '')))(t);
   const matchAllComplete = (t) => (vcm.allComplete || ((x) => /全部完了|全作業完了|すべて完了/i.test(x || '')))(t);
+  // 「完全に音声で支配」用の追加コマンド (設定があれば vcm を、無ければフォールバックを使う)
+  const matchSkip = (t) => (vcm.skip || isSkipCmd)(t);
+  const matchNg = (t) => (vcm.ng || isNgCmd)(t);
+  const matchReworkDone = (t) => (vcm.reworkDone || isReworkDoneCmd)(t);
+  const matchRework = (t) => { if (matchReworkDone(t)) return false; return (vcm.rework || isReworkCmd)(t); };
+  const matchResume = (t) => (vcm.resume || isResumeCmd)(t);
+  const matchStatus = (t) => isStatusCmd(t);
+  const matchHelp = (t) => isHelpCmd(t);
+  const matchVoiceOff = (t) => isVoiceOffCmd(t);
 
   // Wrapped speak that logs and applies settings
   const speakWithLog = (text, onEnd) => {
@@ -6767,6 +7931,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // カスタム実行モードでも進行中の個別タスクをまとめて一時停止/再開できるように対応
   const [customPaused, setCustomPaused] = useState(false);
   const isOnBreak = executionType === 'sequential' ? !isTimerRunning : customPaused;
+  // 音声フロー(長寿命async)から stale 無しで現在状態を読むための ref
+  const isOnBreakRef = useRef(false);
+  const showDefectModalRef = useRef(false);
+  useEffect(() => { isOnBreakRef.current = isOnBreak; }, [isOnBreak]);
+  useEffect(() => { showDefectModalRef.current = showDefectModal; }, [showDefectModal]);
   const toggleBreak = () => {
     if (executionType === 'sequential') {
       if (isTimerRunning) {
@@ -6788,9 +7957,15 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const newTasks = {};
       Object.entries(tasks).forEach(([k, t]) => {
         if (t?.status === 'processing' && t.startTime) {
-          const sec = Math.floor((now - t.startTime) / 1000);
-          // firstStartTime は維持 (最初に着手した時刻を覚えておく)
-          newTasks[k] = { ...t, status: 'paused', duration: (t.duration || 0) + sec, startTime: null, pausedAt: now, firstStartTime: t.firstStartTime || t.startTime };
+          if (t.batchOwner != null) {
+            // バッチ(並列計測)は完了時に「壁時計÷台数」で算出するため、ここで duration を積むと二重計上になる。
+            //   積まずに凍結し、再開時に batchStartTimes を休憩分ずらして休憩を除外する。
+            newTasks[k] = { ...t, status: 'paused', startTime: null, pausedAt: now, firstStartTime: t.firstStartTime || t.startTime };
+          } else {
+            const sec = Math.floor((now - t.startTime) / 1000);
+            // firstStartTime は維持 (最初に着手した時刻を覚えておく)
+            newTasks[k] = { ...t, status: 'paused', duration: (t.duration || 0) + sec, startTime: null, pausedAt: now, firstStartTime: t.firstStartTime || t.startTime };
+          }
         } else if (t?.status === 'reworking' && t.reworkStartTime) {
           // 修正(リワーク)中の経過も一時停止で凍結する: 現セッション分を reworks[last].duration に確定し reworkStartTime をクリア。
           //   これをしないと休憩・中断中も壁時計差分が進み続け、修正完了時に休憩・中断分が修正時間へ混入する(ユーザー報告のバグ)。
@@ -6811,8 +7986,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       // ※ firstStartTime は維持 (再開しても「最初の着手時刻」は変わらない)
       const now = Date.now();
       const newTasks = {};
+      let breakMs = 0;
       Object.entries(tasks).forEach(([k, t]) => {
         if (t?.status === 'paused' && t.pausedAt) {
+          if (!breakMs) breakMs = Math.max(0, now - t.pausedAt); // 休憩時間(全タスク共通の停止→再開幅)
           newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null, firstStartTime: t.firstStartTime || now };
         } else if (t?.status === 'reworking' && t.reworkPausedAt) {
           // 一時停止していた修正(リワーク)を再開: reworkStartTime を再セット (積み上げ分は reworks[last].duration に確定済み)。
@@ -6821,6 +7998,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           newTasks[k] = t;
         }
       });
+      // バッチ(並列計測)の壁時計起点を休憩分だけ後ろへずらす → batch完了時の totalDuration から休憩が除外される。
+      if (breakMs > 0 && Object.keys(batchStartTimes).length) {
+        const shifted = {};
+        Object.entries(batchStartTimes).forEach(([si, ts]) => { shifted[si] = ts + breakMs; });
+        setBatchStartTimes(shifted);
+      }
       setTasks(newTasks);
       tasksRef.current = newTasks;
       onSave({ tasks: newTasks });
@@ -6902,8 +8085,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           // この工程に関連するかフラグ
           isThisStep: itr.stepInfo?.title === currentStep?.title || itr.stepInfo?.id === currentStep?.id,
         };
+        // 種別ごとに正しく振り分ける。以前は complaint 以外を全部 defects に入れていたため、
+        //   improvement(気づき・改善)や monitoring が「不具合」側に混入していた(ユーザー報告のバグ)。
         if (itr.type === 'complaint') complaints.push(entry);
-        else defects.push(entry);
+        else if (itr.type === 'defect') defects.push(entry);
+        // improvement(気づき・改善=工程提案)/monitoring は品質情報パネルには出さない(改善は分析画面で見る)。
       });
       // NG タスク
       Object.entries(l.tasks || {}).forEach(([k, t]) => {
@@ -6948,6 +8134,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   };
   const handlePause = () => {
     const now = Date.now();
+    // 現在の工程×台に費やした経過秒を退避。再開時 handleStart が stepUnitStartRef を now にリセットするため、
+    //   退避しないと休憩前の作業時間が「次へ」の per-unit 時間から丸ごと欠落する。
+    stepUnitAccumRef.current += Math.max(0, Math.floor((now - stepUnitStartRef.current) / 1000));
     const computed = (lot.totalWorkTime || 0) + (startTime ? (now - startTime) : 0);
     setIsTimerRunning(false);
     setElapsed(computed);
@@ -6961,6 +8150,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // stepUnitTimes: { "stepId-unitIdx": seconds } 各工程×各台の個別時間
   const [stepUnitTimes, setStepUnitTimes] = useState(lot.stepUnitTimes || {});
   const stepUnitStartRef = useRef(Date.now());
+  // 現在の工程×台に費やした秒の累積。一時停止で stepUnitStartRef がリセットされても、
+  //   休憩前の作業時間がここに退避されるので「次へ」での per-unit 時間が欠落しない。
+  const stepUnitAccumRef = useRef(0);
 
   // カスタムで完了済みかチェック (id ベース・index 両対応)
   const isTaskCompleted = (sIdx, uIdx) => {
@@ -6999,13 +8191,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         }
       }
     }
-    // 現在の工程×台の作業時間を記録
+    // 現在の工程×台の作業時間を記録 (退避済みの休憩前経過 + 現セッション経過)
     const now = Date.now();
-    const unitDuration = Math.floor((now - stepUnitStartRef.current) / 1000);
+    const unitDuration = stepUnitAccumRef.current + Math.floor((now - stepUnitStartRef.current) / 1000);
     const unitKey = `${currentStep.id}-${currentUnitIdx}`;
     const newStepUnitTimes = { ...stepUnitTimes, [unitKey]: unitDuration };
     setStepUnitTimes(newStepUnitTimes);
     stepUnitStartRef.current = now;
+    stepUnitAccumRef.current = 0; // 次の工程×台に向けてリセット
 
     // カスタムモードのtasksにも完了を記録（モード切替時に整合性を保つ）
     // step.id ベースのキーを正準とする (テンプレ並び替え時の不整合防止)
@@ -7154,6 +8347,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         const rawCmd = await listenOnceWithLog({ timeout: 15000 });
         if (!voiceActiveRef.current) return;
         if (!rawCmd) continue;
+        // 全モード共通コマンド(NG/該当なし/修正/修正完了/再開/状況/ヘルプ/音声オフ)を先に処理
+        if (await handleUniversalVoiceCmd(rawCmd)) { if (!voiceActiveRef.current) return; continue; }
         const cmd = normalizeVoiceText(rawCmd);
 
         // Check for completion command
@@ -7183,7 +8378,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           // ロット1回(段取り)工程は音声「次工程」の着地点にしない (台indexを回数と取り違えるため。準備/片付けは画面タップで)
           while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) nextS++;
           if (nextS < localSteps.length) {
-            voiceToggleTask(nextS, uI); // 次工程の同じ台数を開始
+            const rNext = voiceToggleTask(nextS, uI); // 次工程の同じ台数を開始(連動/厳密ゲートあり)
+            if (!rNext.ok) { await speakAsyncWithLog(rNext.hint || 'この工程は画面から開始してください'); continue; }
             setActiveCustomTaskKey(`${nextS}-${uI}`);
             await speakAsyncWithLog(`${nextS+1}工程、${uI+1}台目を開始しました`);
             await runVoiceCustomTaskFlow(nextS, uI);
@@ -7231,13 +8427,17 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           const sIdx = stepNum - 1;
           const uIdx = unitNum - 1;
           if (sIdx >= 0 && sIdx < localSteps.length && uIdx >= 0 && uIdx < lot.quantity) {
-            const taskKey = `${sIdx}-${uIdx}`;
+            const taskKey = getTaskKey(sIdx, uIdx);
             const curTask = tasksRef.current[taskKey] || { status: 'waiting', duration: 0 };
             if (curTask.status === 'waiting' || curTask.status === 'paused') {
-              voiceToggleTask(sIdx, uIdx);
-              await speakAsyncWithLog(`${stepNum}工程、${unitNum}台目を開始しました`);
-              setActiveCustomTaskKey(taskKey);
-              await runVoiceCustomTaskFlow(sIdx, uIdx);
+              const rStart = voiceToggleTask(sIdx, uIdx);
+              if (!rStart.ok) {
+                await speakAsyncWithLog(rStart.hint || 'この工程は画面から開始してください');
+              } else {
+                await speakAsyncWithLog(`${stepNum}工程、${unitNum}台目を開始しました`);
+                setActiveCustomTaskKey(taskKey);
+                await runVoiceCustomTaskFlow(sIdx, uIdx);
+              }
             } else if (curTask.status === 'processing') {
               await speakAsyncWithLog(`${stepNum}工程${unitNum}台目を完了しますか？`);
               const confirm = await listenOnceWithLog({ timeout: 5000, defaultValue: 'はい' });
@@ -7280,7 +8480,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           // ロット1回(段取り)工程は音声「次」の着地点にしない (台indexを回数と取り違えるため。準備/片付けは画面タップで)
           while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) { nextS++; nextU = 0; }
           if (nextS < localSteps.length) {
-            voiceToggleTask(nextS, nextU); // 次を開始
+            const rNx = voiceToggleTask(nextS, nextU); // 次を開始(連動/厳密ゲートあり)
+            if (!rNx.ok) { await speakAsyncWithLog(rNx.hint || 'この工程は画面から開始してください'); continue; }
             setActiveCustomTaskKey(`${nextS}-${nextU}`);
             await speakAsyncWithLog(`${nextS+1}工程、${nextU+1}台目を開始しました`);
             await runVoiceCustomTaskFlow(nextS, nextU);
@@ -7304,6 +8505,26 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // ※ キーは getTaskKey で step.id ベース優先 (UI 側と統一しないと画面が更新されない)
   const voiceToggleTask = (sIdx, uIdx) => {
     const key = getTaskKey(sIdx, uIdx);
+    // 開始時は画面タップと同じゲートを通す(音声だけが連動工程・厳密モードの抜け道にならないように)。完了はそのまま通す。
+    const curNow = tasksRef.current[key] || { status: 'waiting' };
+    if (curNow.status === 'waiting' || curNow.status === 'paused') {
+      const stepObj = (localSteps || [])[sIdx];
+      // 分割測定の連動工程: ステーション選択+指令送信が必要(素通りすると指令も自動停止も無言で不発)
+      if (rotaryConfig?.enabled && stepObj?.rotaryLink && !stepObj?.lotOnce && db) {
+        return { ok: false, reason: 'rotary', hint: `${sIdx + 1}工程は分割測定アプリと連動しています。画面からステーションを選んで開始してください` };
+      }
+      // 厳密モード: 承認済みの順序をクリック側(順序ゲート)と同じ条件で強制
+      if (strictOrderMode) {
+        if (optimalNextMove) {
+          const og = optimalGate(sIdx, uIdx);
+          if (og) return { ok: false, reason: 'strict', hint: `厳密モードです。${String(og.hint || '').replace(/^🔒\s*/, '').replace(/^厳密モード:\s*/, '')}` };
+        } else if (globalNextTask) {
+          const isNext = globalNextTask.sIdx === sIdx && globalNextTask.unitIdx === uIdx;
+          const isOOO = curNow.status === 'waiting' && !isNext && ((globalNextTask.sIdx === sIdx && uIdx > globalNextTask.unitIdx) || (sIdx > globalNextTask.sIdx));
+          if (isOOO) return { ok: false, reason: 'strict', hint: `厳密モードです。先に${globalNextTask.sIdx + 1}工程の${globalNextTask.unitIdx + 1}台目を完了してください` };
+        }
+      }
+    }
     setTasks(prev => {
       const cur = prev[key] || { status: 'waiting', duration: 0, startTime: null };
       if (cur.status === 'waiting' || cur.status === 'paused') {
@@ -7315,13 +8536,213 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       } else if (cur.status === 'processing') {
         const now = Date.now();
         const dur = cur.startTime ? Math.floor((now - cur.startTime) / 1000) : 0;
-        const updated = { ...prev, [key]: { ...cur, status: 'completed', duration: cur.duration + dur, startTime: null, endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now, workerName: inspectorName } };
+        // batchOwner/batchStartedAt は完了時に必ず外す(残すと後日の同工程バッチ完了に巻き込まれ実測が上書きされる)
+        const updated = { ...prev, [key]: { ...cur, status: 'completed', duration: cur.duration + dur, startTime: null, endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now, workerName: inspectorName, batchOwner: null, batchStartedAt: null } };
         onSave({ tasks: updated, status: 'processing' });
         startUndoTimer({ key, type: 'task', previousTasks: prev });
         return updated;
       }
       return prev;
     });
+    return { ok: true };
+  };
+
+  // ===== 音声「完全支配」用の確実な書き込み (functional setState で stale 回避・既存の時間記録ルール踏襲) =====
+  const voiceSkipTask = (sIdx, uIdx) => {
+    const key = getTaskKey(sIdx, uIdx);
+    setTasks(prev => {
+      const cur = prev[key] || { status: 'waiting', duration: 0 };
+      if (cur.status === 'skipped') return prev;
+      const now = Date.now();
+      const updated = { ...prev, [key]: { status: 'skipped', duration: 0, skipAt: now, firstStartTime: cur.firstStartTime || now, endTime: now, workerName: cur.workerName || inspectorName || '' } };
+      onSave({ tasks: updated, status: 'processing' });
+      startUndoTimer({ key, type: 'task', previousTasks: prev });
+      return updated;
+    });
+    return true;
+  };
+  const voiceStartRework = (sIdx, uIdx) => {
+    const key = getTaskKey(sIdx, uIdx);
+    let ok = false;
+    setTasks(prev => {
+      const cur = prev[key];
+      if (!cur || cur.status === 'reworking') return prev;
+      const now = Date.now();
+      const reworks = [...(cur.reworks || []), { startTime: now, duration: 0, round: (cur.reworks?.length || 0) + 1 }];
+      ok = true;
+      const updated = { ...prev, [key]: { ...cur, status: 'reworking', reworkStartTime: now, reworkPausedAt: null, firstStartTime: cur.firstStartTime || cur.startTime || now, reworks, workerName: inspectorName || cur.workerName } };
+      onSave({ tasks: updated, status: 'processing' });
+      startUndoTimer({ key, type: 'task', previousTasks: prev });
+      return updated;
+    });
+    return ok;
+  };
+  const voiceCompleteRework = (sIdx, uIdx) => {
+    const key = getTaskKey(sIdx, uIdx);
+    let ok = false;
+    setTasks(prev => {
+      const cur = prev[key];
+      if (!cur || cur.status !== 'reworking') return prev;
+      const now = Date.now();
+      const dur = cur.reworkStartTime ? Math.floor((now - cur.reworkStartTime) / 1000) : 0;
+      const reworks = [...(cur.reworks || [])];
+      if (reworks.length) reworks[reworks.length - 1] = { ...reworks[reworks.length - 1], duration: (reworks[reworks.length - 1]?.duration || 0) + dur, endTime: now };
+      ok = true;
+      const updated = { ...prev, [key]: { ...cur, status: 'completed', reworkStartTime: null, reworkPausedAt: null, reworks, endTime: now, firstStartTime: cur.firstStartTime || cur.startTime || now, workerName: inspectorName || cur.workerName } };
+      onSave({ tasks: updated, status: 'processing' });
+      startUndoTimer({ key, type: 'task', previousTasks: prev });
+      return updated;
+    });
+    return ok;
+  };
+
+  // まとめて(一括)開始/完了。全台 or 範囲(from..to, 0始まり)。batchOwnerマーカーで所属管理(UIのtoggleBatchと同方式・perUnit=合計/台数)。
+  //   tasksRef.current(最新)を基点 + functional setBatchStartTimes で stale 回避。
+  const voiceBatchStart = (sIdx, fromU, toU) => {
+    if (!localSteps[sIdx] || localSteps[sIdx].lotOnce) return { ok: false, reason: 'lotOnce' };
+    // 画面の「まとめて開始」と同じゲート(handleBatchClick相当): 連動工程は台ごとに指令が要る/厳密モードは推奨バッチのみ
+    if (rotaryConfig?.enabled && localSteps[sIdx]?.rotaryLink && db) return { ok: false, reason: 'rotary' };
+    if (optimalNextMove && strictOrderMode) {
+      const gnt = globalNextTask;
+      if (!(gnt && gnt.isBatch && gnt.sIdx === sIdx)) {
+        const t = gnt ? (localSteps[gnt.sIdx]?.title || `${gnt.sIdx + 1}工程`) : '';
+        return { ok: false, reason: 'strict', hint: gnt ? (gnt.isBatch ? `次は${t}をまとめて開始してください` : `次は${t}の${gnt.unitIdx + 1}台目です`) : '' };
+      }
+    }
+    const base = tasksRef.current; const now = Date.now();
+    let lo = 0, hi = lot.quantity - 1;
+    if (Number.isInteger(fromU) && Number.isInteger(toU)) { lo = Math.max(0, Math.min(fromU, toU)); hi = Math.min(lot.quantity - 1, Math.max(fromU, toU)); }
+    const nt = { ...base }; let started = 0, firstUnit = lo;
+    for (let u = lo; u <= hi; u++) {
+      const key = getTaskKey(sIdx, u);
+      const cur = base[key] || { status: 'waiting', duration: 0, startTime: null };
+      if (['completed', 'skipped', 'processing', 'ng', 'reworking'].includes(cur.status)) continue;
+      nt[key] = { ...cur, status: 'processing', startTime: now, firstStartTime: cur.firstStartTime || now, batchOwner: sIdx, batchStartedAt: now };
+      if (started === 0) firstUnit = u;
+      started++;
+    }
+    if (started === 0) return { ok: false, reason: 'none' };
+    setTasks(nt);
+    setBatchStartTimes(prev => ({ ...prev, [sIdx]: now }));
+    onSave({ tasks: nt, status: 'processing' });
+    return { ok: true, started, firstUnit };
+  };
+  const voiceBatchComplete = (sIdx) => {
+    const base = tasksRef.current; const now = Date.now();
+    const bs = batchStartTimes[sIdx] || null; // いま走っているバッチの開始時刻(=世代)
+    const members = [];
+    for (let u = 0; u < lot.quantity; u++) {
+      const key = getTaskKey(sIdx, u); const t = base[key];
+      // batchStartedAt の世代一致で「過去バッチの残留マーカー」を巻き込まない(旧データの未設定は互換で許容)
+      if (t && t.status === 'processing' && t.batchOwner === sIdx && (bs == null || t.batchStartedAt == null || t.batchStartedAt === bs)) members.push({ key, t });
+    }
+    if (members.length === 0) return { ok: false };
+    const startAt = bs || Math.min(...members.map(m => m.t.batchStartedAt || m.t.startTime || now));
+    const per = Math.floor(Math.max(0, (now - startAt) / 1000) / members.length); // 合計壁時計÷台数
+    const nt = { ...base };
+    members.forEach(({ key, t }) => { nt[key] = { ...t, status: 'completed', duration: (t.duration || 0) + per, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, batchOwner: null, batchStartedAt: null, workerName: inspectorName || t.workerName }; });
+    setTasks(nt);
+    setBatchStartTimes(prev => { const c = { ...prev }; delete c[sIdx]; return c; });
+    onSave({ tasks: nt, status: 'processing' });
+    return { ok: true, count: members.length };
+  };
+
+  // 現在の対象タスクを解決 (custom=activeCustomTaskKey / sequential=currentStepIdx,currentUnitIdx)。
+  //   custom で対象未確定なら null(誤った台に作用しないよう案内する)。
+  const voiceCurrentTarget = () => {
+    if (executionType === 'custom') {
+      if (!activeCustomTaskKey) return null;
+      const { stepIdx, unitIdx } = parseActiveTaskKey(activeCustomTaskKey);
+      if (stepIdx == null || unitIdx == null || Number.isNaN(stepIdx) || Number.isNaN(unitIdx)) return null;
+      return { sIdx: stepIdx, uIdx: unitIdx };
+    }
+    return { sIdx: currentStepIdx, uIdx: currentUnitIdx };
+  };
+
+  // 全モード共通の音声コマンド割り込み。処理したら true を返す(各ループは true なら continue)。
+  const handleUniversalVoiceCmd = async (rawCmd) => {
+    if (!rawCmd) return false;
+    // 不具合モーダル表示中は工程コマンドを抑止(誤認識で別操作しない)。「閉じる/キャンセル」のみ。
+    if (showDefectModalRef.current) {
+      if (/閉じ|とじ|キャンセル|やめ|終わ/.test(rawCmd)) { setShowDefectModal(false); await speakAsyncWithLog('閉じました'); }
+      else setVoiceStatus('📝 不具合を入力中… 入力できたら「閉じる」と言ってください');
+      return true;
+    }
+    if (matchVoiceOff(rawCmd)) {
+      await speakAsyncWithLog('音声アシスタントを終了します');
+      voiceActiveRef.current = false; setVoiceEnabled(false);
+      window.speechSynthesis?.cancel(); stopIOSResumeFix();
+      return true;
+    }
+    // --- まとめて / 一括 開始・完了 (同一工程の複数台を一括計測。カスタムモード専用) ---
+    if (matchBatch(rawCmd)) {
+      if (executionType !== 'custom') { await speakAsyncWithLog('まとめて開始はカスタムモードで使えます。「カスタム」と言って切り替えてください'); return true; }
+      const norm = normalizeVoiceText(rawCmd);
+      const sm = norm.match(/(\d+)\s*工程/) || norm.match(/工程\s*(\d+)/) || norm.match(/^\D*(\d+)\D*まとめ/);
+      const tgt0 = voiceCurrentTarget();
+      let sIdx = sm ? parseInt(sm[1]) - 1 : (tgt0 ? tgt0.sIdx : null);
+      if (sIdx == null || Number.isNaN(sIdx) || sIdx < 0 || sIdx >= localSteps.length) { await speakAsyncWithLog('どの工程をまとめますか？「1工程まとめて開始」のように言ってください'); return true; }
+      if (localSteps[sIdx]?.lotOnce) { await speakAsyncWithLog('段取り工程はまとめて開始できません'); return true; }
+      const isComplete = /完了|おわり|終わ|かんりょう/.test(norm);
+      if (isComplete) {
+        const r = voiceBatchComplete(sIdx);
+        await speakAsyncWithLog(r.ok ? `${sIdx + 1}工程を${r.count}台、まとめて完了しました。次はどうしますか？` : 'まとめて開始中の台がありません');
+      } else {
+        const rng = norm.match(/(\d+)\s*(?:台目?|番)?\s*から\s*(\d+)/);
+        const fromU = rng ? parseInt(rng[1]) - 1 : undefined;
+        const toU = rng ? parseInt(rng[2]) - 1 : undefined;
+        const r = voiceBatchStart(sIdx, fromU, toU);
+        if (r.ok) { setActiveCustomTaskKey(`${sIdx}-${r.firstUnit}`); await speakAsyncWithLog(`${sIdx + 1}工程を${r.started}台、まとめて開始しました。終わったら「まとめて完了」と言ってください`); }
+        else if (r.reason === 'rotary') await speakAsyncWithLog('この工程は分割測定アプリと連動しているため、まとめて開始できません。画面から台ごとに開始してください');
+        else if (r.reason === 'strict') await speakAsyncWithLog(`厳密モードです。${r.hint || 'その工程のまとめて開始はまだできません'}`);
+        else await speakAsyncWithLog('まとめて開始できる台がありません(全台、作業済みか進行中です)');
+      }
+      return true;
+    }
+    if (matchHelp(rawCmd)) {
+      setShowVoiceHelp(true);
+      await speakAsyncWithLog('使い方を表示します。完了、次、次工程、まとめて開始、まとめて完了、該当なし、NG、修正、修正完了、中断、再開、取り消し、状況、測定入力、全作業完了、音声オフ、と言えます');
+      return true;
+    }
+    if (matchStatus(rawCmd)) {
+      const tgt = voiceCurrentTarget();
+      if (!tgt) { await speakAsyncWithLog('まだ工程を選んでいません。工程と台数を言ってください'); return true; }
+      const st = localSteps[tgt.sIdx];
+      await speakAsyncWithLog(`今は${tgt.sIdx + 1}工程${st ? '、' + st.title : ''}、${tgt.uIdx + 1}台目です`);
+      return true;
+    }
+    if (matchResume(rawCmd)) {
+      if (isOnBreakRef.current) { toggleBreak(); await speakAsyncWithLog('再開します'); }
+      else await speakAsyncWithLog('止まっていません');
+      return true;
+    }
+    if (matchSkip(rawCmd)) {
+      const tgt = voiceCurrentTarget();
+      if (!tgt) { await speakAsyncWithLog('どの工程を該当なしにしますか？先に工程と台数を言ってください'); return true; }
+      voiceSkipTask(tgt.sIdx, tgt.uIdx);
+      await speakAsyncWithLog(`${tgt.sIdx + 1}工程、${tgt.uIdx + 1}台目を該当なしにしました`);
+      return true;
+    }
+    if (matchReworkDone(rawCmd)) {
+      const tgt = voiceCurrentTarget();
+      if (!tgt) { await speakAsyncWithLog('修正中の台がありません'); return true; }
+      const ok = voiceCompleteRework(tgt.sIdx, tgt.uIdx);
+      await speakAsyncWithLog(ok ? `${tgt.sIdx + 1}工程、${tgt.uIdx + 1}台目の修正完了` : '修正中の台がありません');
+      return true;
+    }
+    if (matchRework(rawCmd)) {
+      const tgt = voiceCurrentTarget();
+      if (!tgt) { await speakAsyncWithLog('どの台を修正しますか？先に工程と台数を言ってください'); return true; }
+      const ok = voiceStartRework(tgt.sIdx, tgt.uIdx);
+      await speakAsyncWithLog(ok ? `${tgt.sIdx + 1}工程、${tgt.uIdx + 1}台目の修正を開始します` : 'この台は修正を開始できません');
+      return true;
+    }
+    if (matchNg(rawCmd)) {
+      await speakAsyncWithLog('不具合報告を開きます。入力できたら「閉じる」と言ってください');
+      setShowDefectModal(true);
+      return true;
+    }
+    return false;
   };
 
   const runVoiceCustomTaskFlow = async (sIdx, uIdx) => {
@@ -7341,6 +8762,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const cmd = await listenOnceWithLog({ timeout: 15000 });
       if (!voiceActiveRef.current) return;
       if (!cmd) continue;
+      if (await handleUniversalVoiceCmd(cmd)) { if (!voiceActiveRef.current) return; continue; }
       const norm = normalizeVoiceText(cmd);
 
       // キャンセル（取り消し）
@@ -7360,7 +8782,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         let nextS = sIdx + 1;
         while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) nextS++; // ロット1回工程は着地点にしない(準備/片付けはタップで)
         if (nextS < localSteps.length) {
-          voiceToggleTask(nextS, uIdx); // 次工程の同じ台数
+          const rNs = voiceToggleTask(nextS, uIdx); // 次工程の同じ台数(連動/厳密ゲートあり)
+          if (!rNs.ok) { await speakAsyncWithLog(rNs.hint || 'この工程は画面から開始してください'); return; }
           // activeCustomTaskKey は数値index 形式で統一 (他の voice ハンドラと一致させる、parse 時 NaN を避ける)
           setActiveCustomTaskKey(`${nextS}-${uIdx}`);
           await speakAsyncWithLog(`${nextS+1}工程、${uIdx+1}台目を開始しました`);
@@ -7379,7 +8802,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         if (nextU >= lot.quantity) { nextS++; nextU = 0; }
         while (nextS < localSteps.length && localSteps[nextS]?.lotOnce) { nextS++; nextU = 0; } // ロット1回工程は着地点にしない
         if (nextS < localSteps.length) {
-          voiceToggleTask(nextS, nextU); // 次を開始
+          const rNu = voiceToggleTask(nextS, nextU); // 次を開始(連動/厳密ゲートあり)
+          if (!rNu.ok) { await speakAsyncWithLog(rNu.hint || 'この工程は画面から開始してください'); return; }
           setActiveCustomTaskKey(`${nextS}-${nextU}`);
           await speakAsyncWithLog(`${nextS+1}工程、${nextU+1}台目を開始しました`);
           await runVoiceCustomTaskFlow(nextS, nextU);
@@ -7427,14 +8851,22 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         while (voiceActiveRef.current) {
           const cmd = await listenOnceWithLog({ timeout: 15000 });
           if (!voiceActiveRef.current) return;
-          if (matchComplete(cmd) || matchNext(cmd)) {
+          if (!cmd) continue;
+          if (await handleUniversalVoiceCmd(cmd)) { if (!voiceActiveRef.current) return; continue; }
+          if (matchAllComplete(cmd)) {
+            await speakAsyncWithLog('全作業を完了しますか？');
+            const c = await listenOnceWithLog({ timeout: 5000, defaultValue: 'はい' });
+            if (matchYes(c) || c === null) { handleCompleteTrigger(); return; }
+          } else if (matchNextStep(cmd) || matchComplete(cmd) || matchNext(cmd)) {
+            // 通常モードは「完了/次/次工程」いずれも次へ進める
             handleNext(); return;
           } else if (matchInterrupt(cmd)) {
             await speakAsyncWithLog('中断します');
             handlePause(); return;
           } else if (isCancelCmd && isCancelCmd(cmd)) {
-            // 取り消し
-            if (undoItem) { handleUndo(); await speakAsyncWithLog('取り消しました'); }
+            // 取り消し (直近操作のundo窓内のみ実効)
+            if (pendingUndo) { handleUndo(); await speakAsyncWithLog('取り消しました'); }
+            else await speakAsyncWithLog('取り消せる操作がありません');
           }
         }
       }
@@ -7473,16 +8905,29 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           handlePause(); return;
         }
 
-        const num = parseJapaneseNumber(response);
+        let num = parseJapaneseNumber(response);
         if (num !== null) {
           setVoiceStatus(`🎤 ${inp.label}: ${num} — 確認中 (5秒で自動確定)`);
           await speakAsyncWithLog(`${num}ですね`);
-          const confirm = await listenOnceWithLog({ timeout: 5000, defaultValue: 'はい' });
+          let confirm = await listenOnceWithLog({ timeout: 5000, defaultValue: 'はい' });
 
           if (matchNo(confirm)) {
             await speakAsyncWithLog('もう一度お願いします');
             retry = 0; continue;
           }
+          // 確認中に別の数値を言い直したら「訂正」として取り込み、再確認する(自然な言い直しを許容)
+          let cguard = 0;
+          while (confirm && !matchYes(confirm) && cguard < 3) {
+            const corrected = parseJapaneseNumber(confirm);
+            if (corrected === null || corrected === num) break;
+            num = corrected;
+            setVoiceStatus(`🎤 ${inp.label}: ${num} — 確認中 (5秒で自動確定)`);
+            await speakAsyncWithLog(`${num}に直しました。よろしいですか？`);
+            confirm = await listenOnceWithLog({ timeout: 5000, defaultValue: 'はい' });
+            if (matchNo(confirm)) { await speakAsyncWithLog('もう一度お願いします'); num = null; break; }
+            cguard++;
+          }
+          if (num === null) { retry = 0; continue; }
           // Confirmed (explicit yes or 5s timeout auto-confirm)
           currentValues[inp.id] = num;
           // 統一キー方針: ${stepId}-${unitIdx}-values + ${stepId}-${unitIdx}
@@ -7518,8 +8963,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const finalResults = calculateMeasurementResults(currentValues, config, collectCrossStepValues(lot, step.id));
     if (finalResults.length > 0) {
       const announcements = finalResults.map(r => {
-        const okng = r.isOk ? 'OK' : 'NG';
-        return `${r.label}、${r.result?.toFixed(r.precision ?? 3)}${r.unit}、判定${okng}`;
+        if (r.result == null || isNaN(r.result)) return `${r.label}、計算未設定`;
+        const okng = (r.isOk == null) ? '対象外' : (r.isOk ? 'OK' : 'NG');
+        return `${r.label}、${r.result.toFixed(r.precision ?? 3)}${r.unit}、判定${okng}`;
       }).join('。');
       setVoiceStatus(`🎤 結果発表中...`);
       await speakAsyncWithLog(`計算結果。${announcements}。次工程に進みますか？`);
@@ -8103,7 +9549,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const newTasks = { ...tasks };
     keys.forEach(key => {
       const t = newTasks[key] || {};
-      newTasks[key] = { ...t, status: 'completed', duration: Math.round(totalSec), startTime: null, endTime: now, firstStartTime: t.firstStartTime || now, manualTime: true, workerName: inspectorName || t.workerName };
+      // endTime は firstStartTime+duration で再構成(LotTimeTable.apply と同じ)。
+      // endTime=now のままだと壁時計幅が duration と無関係になり、ガント/並列分析の窓が手入力値とずれる。
+      const fst = Number(t.firstStartTime) || now;
+      const dur = Math.round(totalSec);
+      newTasks[key] = { ...t, status: 'completed', duration: dur, startTime: null, firstStartTime: fst, endTime: fst + dur * 1000, manualTime: true, workerName: inspectorName || t.workerName };
     });
     setTasks(newTasks);
     onSave({ tasks: newTasks, status: 'processing' });
@@ -8200,6 +9650,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         endTime: now,
         firstStartTime: currentTask.firstStartTime || (currentTask.startTime || now),
         workerName: inspectorName, // 台ごとの作業者を記録 (担当切替に追従)
+        // バッチ所属マーカーは完了で必ず外す(残すと後日の同工程バッチ完了に巻き込まれ実測が上書きされる)
+        batchOwner: null, batchStartedAt: null,
       };
       // じっと見る: ラップがあれば要素別時間を添付 (クリーン&完結のみ Σ要素=工程時間。歪む場合は内訳を付けない)。
       const elData = buildElementData(key, completed, now);
@@ -8324,7 +9776,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 分割測定アプリ連携: done イベントで測定タスクを自動停止 (processing のときだけ)。tasksRef で最新を読む。
   const autoCompleteRotaryTask = (key, judgement) => {
     const cur = (tasksRef.current || {})[key];
-    if (!cur || cur.status !== 'processing') return;
+    if (!cur || cur.status !== 'processing') return false; // 一時停止中など処理中でなければ停止できない(追跡は呼び出し側で残す)
     const now = Date.now();
     const sessionDuration = cur.startTime ? Math.floor((now - cur.startTime) / 1000) : 0;
     const nt = {
@@ -8339,6 +9791,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     tasksRef.current = nt;
     setTasks(nt);
     onSave({ tasks: nt, status: 'processing' });
+    return true;
   };
 
   // 分割測定アプリ連携: rotaryEvents の done を購読し、このセッションで start_capture を送った台の測定タイマーを自動停止する。
@@ -8356,8 +9809,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         if (!key) return; // 自分が送った台でなければ無視 (他端末/過去データの done を踏まない)
         const ts = e.createdAt?.toMillis ? e.createdAt.toMillis() : null;
         if (ts != null && ts < rotarySessionStartRef.current - 5000) return; // 購読開始より前の done(replay)は無視
-        autoCompleteRotaryTask(key, e.judgement);
-        delete rotaryTrackRef.current[wid];
+        // 停止できた時だけ追跡を解除する。一時停止中など停止できなかった場合は追跡を残し、手動完了を促す
+        //   (旧実装は無条件 delete で、停止できないのに追跡を消し『連動なのに止まらない』状態になっていた)。
+        if (autoCompleteRotaryTask(key, e.judgement)) {
+          delete rotaryTrackRef.current[wid];
+        } else {
+          setOrderHint('🔗 測定完了を受信しましたが、その台が一時停止中のため自動停止できませんでした。再開してから手動で完了してください。');
+        }
       });
     }, (err) => console.error('rotaryEvents subscribe failed', err));
     return () => unsub();
@@ -8408,7 +9866,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       //   autoEnded を false に戻して再発動できるようにする。判定はインターバル側(セッション基準)。
       const contStep = localSteps[completedTaskMenu?.stepIdx];
       const isAutoCont = autoEndSecForStep(contStep) > 0;
-      newTasks[key] = { ...currentTask, status: 'processing', startTime: nowTs, firstStartTime: currentTask.firstStartTime || nowTs, ...(isAutoCont ? { autoEnded: false } : {}) };
+      newTasks[key] = { ...currentTask, status: 'processing', startTime: nowTs, firstStartTime: currentTask.firstStartTime || nowTs, batchOwner: null, batchStartedAt: null, ...(isAutoCont ? { autoEnded: false } : {}) };
       setActiveCustomTaskKey(key);
       clearElementLaps(key); // じっと見る: 続きは別セッション。前回ラップを残さない(続きは壁時計ギャップで内訳対象外になる)
 
@@ -8600,7 +10058,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             const currentTask = newTasks[key] || { status: 'waiting', duration: 0, startTime: null };
             if (currentTask.status !== 'completed') {
                 // firstStartTime: 一度設定したら維持 (中断・再開で変わらない)
-                newTasks[key] = { ...currentTask, status: 'processing', startTime: now, firstStartTime: currentTask.firstStartTime || now };
+                // batchOwner: このバッチに属する安定マーカー。休憩(toggleBreak)で startTime が書き換わっても所属が壊れないようにする
+                //   (旧実装は startTime===batchStart で所属判定→休憩再開で除外され、再開した台が未完了で取り残された)。
+                newTasks[key] = { ...currentTask, status: 'processing', startTime: now, firstStartTime: currentTask.firstStartTime || now, batchOwner: stepIdx, batchStartedAt: now };
             }
         }
         setBatchStartTimes({ ...batchStartTimes, [stepIdx]: now });
@@ -8613,19 +10073,21 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         const batchStart = batchStartTimes[stepIdx];
         const totalDuration = Math.floor((now - batchStart) / 1000);
         let processedCount = 0;
+        // バッチ所属判定: batchOwner マーカー優先。旧データ(マーカー無し)は従来の startTime===batchStart にフォールバック。
+        const belongsToBatch = (t) => t && t.status === 'processing' && ((t.batchOwner === stepIdx && (t.batchStartedAt == null || t.batchStartedAt === batchStart)) || (t.batchOwner == null && t.startTime === batchStart));
         Array.from({ length: lot.quantity }).forEach((_, uIdx) => {
             const key = getTaskKey(stepIdx, uIdx);  // ← 統一キー
-            if (newTasks[key]?.status === 'processing' && newTasks[key]?.startTime === batchStart) {
+            if (belongsToBatch(newTasks[key])) {
                 processedCount++;
             }
         });
         const perUnitTime = processedCount > 0 ? Math.floor(totalDuration / processedCount) : 0;
 
-        // このバッチで開始した台 (startTime === batchStart) のみ完了。範囲外で個別開始した台は壊さない。
+        // このバッチで開始した台のみ完了。範囲外で個別開始した台は壊さない。
         Array.from({ length: lot.quantity }).forEach((_, uIdx) => {
             const key = getTaskKey(stepIdx, uIdx);  // ← 統一キー
             const currentTask = newTasks[key];
-            if (currentTask && currentTask.status === 'processing' && currentTask.startTime === batchStart) {
+            if (belongsToBatch(currentTask)) {
                 newTasks[key] = {
                     ...currentTask,
                     status: 'completed',
@@ -8634,6 +10096,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                     endTime: now,
                     firstStartTime: currentTask.firstStartTime || currentTask.startTime || batchStart,
                     workerName: inspectorName,
+                    batchOwner: null, batchStartedAt: null,
                 };
             }
         });
@@ -9090,17 +10553,96 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     );
   }
 
+  // === 音声コマンド早見表 (すぐ出せるヘルプ) — どのモードからでも表示できるよう共通定義 ===
+  const voiceHelpModal = showVoiceHelp ? (
+    <div className="fixed inset-0 z-[300] bg-black/70 backdrop-blur-sm flex items-center justify-center p-3" onClick={() => setShowVoiceHelp(false)}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[88vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="bg-blue-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+          <h2 className="text-base font-black flex items-center gap-2"><Mic className="w-5 h-5"/> 音声でできること（早見表）</h2>
+          <button onClick={() => setShowVoiceHelp(false)} className="p-1.5 hover:bg-white/20 rounded-full"><X className="w-5 h-5"/></button>
+        </div>
+        <div className="p-4 overflow-y-auto text-sm text-slate-700 space-y-3">
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-2.5 text-xs text-blue-800">
+            音声をオンにして話しかけてください。<b>工程は番号（「1の1」）で言うのが一番確実</b>です。
+          </div>
+          <div>
+            <div className="font-black text-slate-800 mb-1">▶ 工程を始める</div>
+            <ul className="space-y-0.5 text-[13px] pl-1">
+              <li>「<b>1の1</b>」「<b>5-1</b>」… 1工程の1台目を開始（数字-数字）</li>
+              <li>「<b>1工程1台目</b>」「第1工程 1番」… 同じ意味</li>
+              <li>「<b>1工程</b>」… 工程だけ言うと「何台目ですか?」と聞き返します</li>
+            </ul>
+          </div>
+          <div>
+            <div className="font-black text-slate-800 mb-1">▶ まとめて始める／終える（同じ工程の複数台を一気に）<span className="text-[10px] font-bold text-emerald-700 ml-1">※カスタムモード専用</span></div>
+            <ul className="space-y-0.5 text-[13px] pl-1">
+              <li>「<b>1工程まとめて開始</b>」「<b>一括開始</b>」「<b>バッチ</b>」… その工程の未着手の台を全部いっぺんに開始</li>
+              <li>「<b>2台目から4台目までまとめて</b>」… 範囲を指定して開始</li>
+              <li>「<b>まとめて完了</b>」「<b>一括完了</b>」… まとめて始めた台を全部いっぺんに完了</li>
+            </ul>
+          </div>
+          <div>
+            <div className="font-black text-slate-800 mb-1">▶ 進める／終える</div>
+            <ul className="space-y-0.5 text-[13px] pl-1">
+              <li>「<b>完了</b>」「<b>終わり</b>」「<b>できた</b>」… いまの台を完了</li>
+              <li>「<b>次</b>」… この台を完了して次の台へ（なければ次工程へ）</li>
+              <li>「<b>次工程</b>」… この台を完了して、同じ台数のまま次の工程へ</li>
+              <li>「<b>全作業完了</b>」「<b>全部完了</b>」… ロット全体を完了（確認します）</li>
+            </ul>
+          </div>
+          <div>
+            <div className="font-black text-slate-800 mb-1">▶ 不具合・修正</div>
+            <ul className="space-y-0.5 text-[13px] pl-1">
+              <li>「<b>NG</b>」「<b>不具合</b>」「<b>不良</b>」… 不具合報告を開く（内容は画面で入力 → できたら「閉じる」）</li>
+              <li>「<b>該当なし</b>」「<b>対象外</b>」「<b>飛ばす</b>」… いまの台を対象外（集計から除外）</li>
+              <li>「<b>修正</b>」「<b>手直し</b>」「<b>リワーク</b>」… いまの台の修正を開始</li>
+              <li>「<b>修正完了</b>」「<b>直った</b>」… 修正を終えて完了</li>
+            </ul>
+          </div>
+          <div>
+            <div className="font-black text-slate-800 mb-1">▶ 止める／戻す／確認</div>
+            <ul className="space-y-0.5 text-[13px] pl-1">
+              <li>「<b>中断</b>」「<b>一時停止</b>」「<b>ストップ</b>」… 作業を止める</li>
+              <li>「<b>再開</b>」「<b>続け</b>」… 止めた作業を再開</li>
+              <li>「<b>キャンセル</b>」「<b>取り消し</b>」… 直前の操作を取り消す</li>
+              <li>「<b>今どこ</b>」「<b>状況</b>」「<b>進捗</b>」… いまの工程・台数を読み上げ</li>
+              <li>「<b>ヘルプ</b>」「<b>使い方</b>」… この早見表を表示</li>
+              <li>「<b>音声オフ</b>」「<b>終了</b>」… 音声アシスタントを止める</li>
+            </ul>
+          </div>
+          <div>
+            <div className="font-black text-slate-800 mb-1">▶ 測定（数値入力の工程）</div>
+            <ul className="space-y-0.5 text-[13px] pl-1">
+              <li>「<b>測定入力</b>」… 測定フローを開始</li>
+              <li>「<b>プラス12てん5</b>」「<b>マイナス3</b>」「<b>12.5</b>」… 数値を入力（「○ですね」と確認 → 5秒で自動確定）</li>
+              <li>確認中に<b>別の数値を言い直すと訂正</b>できます</li>
+            </ul>
+          </div>
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-800 space-y-1">
+            <div className="font-bold">⚠️ コツ・注意（正直なところ）</div>
+            <div>・工程は番号（「1の1」）が一番確実。工程名は似ていると取り違えることがあります。</div>
+            <div>・<b>段取り・片付け（ロット1回）の工程は、いまのところ画面タップ</b>で操作してください（台数と回数を音声で取り違えやすいため）。</div>
+            <div>・「はい/いいえ」の確認は、無言だと数秒で「はい」に進みます。</div>
+            <div>・騒がしい場所では聞き間違いが起こることがあります。違ったら「キャンセル」で直近の操作を取り消せます。</div>
+            <div>・不具合の<b>内容</b>（種別・コメント）は画面入力です。音声では報告画面を開くところまで。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   if (executionType === 'initial') {
     return (
       <div data-fs="execution" className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
         <div className="bg-white rounded-xl shadow-2xl p-8 max-w-md w-full text-center">
            <h2 className="text-xl font-bold mb-6">作業モードを選択してください</h2>
            {/* Voice Assistant Toggle */}
-           <div className="flex items-center justify-center mb-5">
+           <div className="flex items-center justify-center gap-2 mb-5">
              <button onClick={toggleVoice} className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-bold text-sm transition-all shadow-sm ${voiceEnabled ? 'bg-blue-600 text-white ring-2 ring-blue-300 shadow-blue-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
                {voiceEnabled ? <Mic className="w-4 h-4 animate-pulse"/> : <MicOff className="w-4 h-4"/>}
                音声アシスタント {voiceEnabled ? 'ON' : 'OFF'}
              </button>
+             <button onClick={()=>setShowVoiceHelp(true)} className="flex items-center gap-1 px-3 py-2.5 rounded-full font-bold text-sm bg-slate-100 text-slate-600 hover:bg-slate-200 transition-all" title="音声コマンドの使い方"><HelpCircle className="w-4 h-4"/> 使い方</button>
            </div>
            {voiceEnabled && (
              <div className="mb-4 bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-700">
@@ -9120,18 +10662,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
            </div>
            <button onClick={onClose} className="mt-6 text-slate-400 hover:text-slate-600">キャンセル</button>
         </div>
-        {/* オススメ作業順モーダル (初期モード選択画面からもアクセス可) */}
-        {/* ※ onApply 系は撤去 — 順序を勝手に書き換える破壊的操作だったため (2026-05-30) */}
-        {showWorkOrderOptimizer && (
-          <WorkOrderOptimizerModal
-            lot={lot}
-            lots={lots}
-            templates={templates}
-            currentExecutionType="initial"
-            onSwitchToCustom={() => { setExecutionType('custom'); onSave({ executionType: 'custom' }); }}
-            onClose={() => setShowWorkOrderOptimizer(false)}
-          />
-        )}
+        {voiceHelpModal}
       </div>
     );
   }
@@ -9272,6 +10803,67 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             </div>
         )}
 
+        {/* テンプレ総合資料ビューア (カスタムモード側。従来は通常モード側にしか無く、カスタムの「資料」ボタンが無反応だった) */}
+        {showOverview && lotTemplate?.overview && (
+          <div className="fixed inset-0 z-[130] bg-black/60 flex items-center justify-center p-4" onClick={() => setShowOverview(false)}>
+            <div className="bg-white w-full max-w-3xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="bg-cyan-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
+                <h3 className="font-bold flex items-center gap-2"><FileText className="w-5 h-5"/> 総合資料 — {lotTemplate.name}</h3>
+                <button onClick={() => setShowOverview(false)} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
+              </div>
+              <div className="p-4 overflow-y-auto space-y-4">
+                {(lotTemplate.overview.description || '').trim() && (
+                  <div>
+                    <div className="text-xs font-bold text-slate-500 mb-1">全体説明 / 申し送り</div>
+                    <div className="text-sm text-slate-800 whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-lg p-3">{lotTemplate.overview.description}</div>
+                  </div>
+                )}
+                {Array.isArray(lotTemplate.overview.pdfs) && lotTemplate.overview.pdfs.length > 0 && (
+                  <div>
+                    <div className="text-xs font-bold text-slate-500 mb-1">PDF資料</div>
+                    <div className="space-y-1.5">
+                      {lotTemplate.overview.pdfs.map((p, i) => (
+                        <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 border rounded-lg px-3 py-2 bg-orange-50/60 hover:bg-orange-100 transition">
+                          <FileText className="w-5 h-5 text-orange-600 shrink-0"/>
+                          <span className="flex-1 min-w-0 text-sm font-bold text-slate-700 truncate">{p.name || 'document.pdf'}</span>
+                          <span className="text-[11px] text-orange-700 shrink-0">タップで開く ↗</span>
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {Array.isArray(lotTemplate.overview.images) && lotTemplate.overview.images.length > 0 && (
+                  <div>
+                    <div className="text-xs font-bold text-slate-500 mb-1">概要写真 ({lotTemplate.overview.images.length}枚) — タップで拡大</div>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {lotTemplate.overview.images.map((img, i) => (
+                        <a key={i} href={img} target="_blank" rel="noopener noreferrer" className="block aspect-square border rounded-lg overflow-hidden bg-slate-50 hover:ring-2 hover:ring-cyan-400">
+                          <img src={img} className="w-full h-full object-cover"/>
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {aceStudio && (
+          <VideoRecipeStudio file={{ id: aceStudio.fileId, name: aceStudio.fileName || '' }} recipe={aceStudio} mode="play"
+            steps={(localSteps || []).map(s => ({ key: s.id, label: s.title }))} model={lot.model || ''}
+            onSave={onSaveVideoRecipe ? (async (docData) => { await onSaveVideoRecipe(docData.fileId, docData); setAceStudio(null); }) : null}
+            onClose={() => setAceStudio(null)} />
+        )}
+        {acePick && (
+          <div className="fixed inset-0 z-[550] bg-black/60 flex items-center justify-center p-4" onClick={() => setAcePick(null)}>
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-3 space-y-1.5" onClick={(e) => e.stopPropagation()}>
+              <div className="text-sm font-bold text-slate-700 mb-1">🎬 手本動画を選ぶ</div>
+              {acePick.map(r => (
+                <button key={r.fileId} onClick={() => { setAcePick(null); setAceStudio(r); }} className="w-full text-left px-3 py-2 rounded-lg border border-slate-200 hover:bg-sky-50 text-sm font-bold text-slate-700 truncate">🎬 {r.title || r.fileName || r.fileId}</button>
+              ))}
+            </div>
+          </div>
+        )}
         {showComplaintModal && (
             <div className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
                 <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
@@ -9551,6 +11143,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  {(() => { const ov = lotTemplate?.overview; const has = ov && (((ov.images?.length) || 0) + ((ov.pdfs?.length) || 0) + ((ov.description || '').trim() ? 1 : 0) > 0); return has ? (
                    <button onClick={()=>setShowOverview(true)} className="px-3 py-2 bg-cyan-600 hover:bg-cyan-700 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap" title="このテンプレの総合資料(手順書・概要)を見る"><FileText className="w-4 h-4"/> 資料</button>
                  ) : null; })()}
+                 {/* 📁Drive資料ボタンは撤去(2026-07-05 ユーザー指摘: 作業者は「探しに行かない」。動画の用意=テンプレ編集、閲覧=工程詳細パネルに自動表示が本来の形) */}
                  {/* 報告ボタン統合: 1ボタンから 軽微不良 / 気づき・改善 / 不具合 を選ぶ (ボタン数削減) */}
                  <details className="relative" onClick={e => e.stopPropagation()}>
                    <summary className="px-3 py-2 rounded font-bold text-xs flex items-center gap-1 whitespace-nowrap list-none cursor-pointer bg-purple-600 hover:bg-purple-700"><Megaphone className="w-4 h-4"/> 報告 ▾</summary>
@@ -9931,6 +11524,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                    effTargets={effTargetsBySIdx}
                    oa={oaCfg}
                    onEditReworks={(sIdx, uIdx) => openReworkEditor(getTaskKey(sIdx, uIdx), `#${uIdx + 1}`)}
+                   aceCountFor={(sid) => aceFor(sid).length}
+                   onOpenVideo={openAce}
                  />
                  </>
                )}
@@ -9951,6 +11546,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                              <span className="bg-slate-100 text-slate-500 font-bold px-2 py-1 rounded text-xs">Step {sIdx+1}</span>
                              <span className="font-bold text-lg text-slate-800">{step.title}</span>
                              {isAuto && <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded text-xs font-bold flex items-center gap-1"><Bot className="w-3 h-3"/> 自動</span>}
+                             {aceFor(step.id).length > 0 && <button onClick={() => openAce(step.id)} className="bg-sky-100 text-sky-700 px-2 py-0.5 rounded text-xs font-bold hover:bg-sky-200 border border-sky-200" title="エースの手本動画を見る(要点で自動停止・不要部分は倍速)">🎬 手本</button>}
                              {effTargetsBySIdx[sIdx] > 0 && <span className="bg-slate-100 text-slate-500 px-2 py-0.5 rounded text-xs font-bold font-mono" title="目標時間 (1台あたり・較正済み)">🎯 目標 {formatTime(effTargetsBySIdx[sIdx])}/台</span>}
                            </div>
                            <div className="flex gap-2">
@@ -10266,6 +11862,20 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                    {lot.unitSerialNumbers?.[displayUnitIdx] && <span className="text-slate-400 ml-1">({lot.unitSerialNumbers[displayUnitIdx]})</span>}
                  </div>
                </div>
+               {/* この工程のエース手本動画: テンプレで紐づけた物がここに自動で出る。押したら拡大再生 */}
+               {displayStep?.id && aceFor(displayStep.id).length > 0 && (
+                 <button onClick={() => openAce(displayStep.id)} className="mb-3 w-full bg-slate-900 hover:bg-slate-800 text-white rounded-xl p-3 text-left shadow-lg group shrink-0">
+                   <div className="flex items-center gap-2.5">
+                     <span className="text-3xl">🎬</span>
+                     <div className="flex-1 min-w-0">
+                       <div className="text-[11px] text-sky-300 font-bold">エースの手本動画{aceFor(displayStep.id).length > 1 ? `（${aceFor(displayStep.id).length}本）` : ''}</div>
+                       <div className="text-sm font-bold truncate">{aceFor(displayStep.id)[0].title || aceFor(displayStep.id)[0].fileName || '手本動画'}</div>
+                       <div className="text-[10px] text-slate-400 mt-0.5">要点で自動停止・不要部分は倍速</div>
+                     </div>
+                     <span className="text-[10px] bg-white/15 rounded-full px-2 py-1 group-hover:bg-white/25 shrink-0 font-bold">タップで拡大 ▶</span>
+                   </div>
+                 </button>
+               )}
                {Array.isArray(displayStep.checklistItems) && displayStep.checklistItems.length > 0 && displayStep.type !== 'measurement' ? (() => {
                  // チェックリスト単独工程 (測定なし)
                  const chkKey = `${displayStep.id}-${displayUnitIdx}-checklist`;
@@ -10829,10 +12439,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
               {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
             </button>
+            <button onClick={()=>setShowVoiceHelp(true)} className="p-2 rounded-full bg-white/10 text-white/70 hover:bg-white/20 transition-all" title="音声コマンドの使い方"><HelpCircle className="w-5 h-5"/></button>
             <button onClick={()=>setShowInProgressReport(true)} className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 rounded font-bold text-sm flex items-center gap-1" title="途中経過の成績表を表示 (未入力は空白)"><Printer className="w-4 h-4"/> 成績表</button>
             <button onClick={handleSafeClose} title="閉じる（作業中なら一時停止・保存）" className="p-2 hover:bg-white/10 rounded-full"><X className="w-6 h-6"/></button>
           </div>
         </div>
+        {voiceHelpModal}
         <div className="flex-1 flex overflow-hidden">
           <div className="flex-1 bg-slate-100 p-4 flex flex-col relative overflow-y-auto">
              {/* === 品質情報共有: この型式・この工程で直近こんな気づき/不良が出てます === */}
@@ -10917,6 +12529,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                          {currentStep.type === 'danger' && <span className="bg-red-100 text-red-700 text-[10px] font-bold px-1.5 py-0.5 rounded flex items-center gap-0.5"><AlertOctagon className="w-2.5 h-2.5"/> 危険</span>}
                          {currentStep.type === 'important' && <span className="bg-amber-100 text-amber-700 text-[10px] font-bold px-1.5 py-0.5 rounded flex items-center gap-0.5"><AlertTriangle className="w-2.5 h-2.5"/> 重要</span>}
                          {currentStep.pdfData && <button onClick={() => setShowPdf(true)} className="bg-orange-100 text-orange-700 text-[10px] font-bold px-1.5 py-0.5 rounded hover:bg-orange-200 flex items-center gap-0.5"><FileText className="w-2.5 h-2.5"/> PDF</button>}
+                         {aceFor(currentStep.id).length > 0 && <button onClick={() => openAce(currentStep.id)} className="bg-sky-100 text-sky-700 text-[10px] font-bold px-1.5 py-0.5 rounded hover:bg-sky-200 flex items-center gap-0.5">🎬 手本</button>}
                        </div>
                        <div className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">{currentStep.description || <span className="text-slate-400 italic">（詳細・注意事項なし）</span>}</div>
                      </div>
@@ -10993,6 +12606,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                     {currentStep.type === 'important' && ( <div className="absolute top-4 right-4 bg-amber-500 text-white px-4 py-2 rounded-full font-bold shadow-lg flex items-center gap-2"><AlertTriangle className="w-5 h-5"/> 重要</div> )}
                  </div>
                  {currentStep.pdfData && ( <button onClick={() => setShowPdf(true)} className="mt-2 w-full bg-orange-50 text-orange-700 border border-orange-200 py-2 rounded-lg font-bold flex items-center justify-center gap-2 hover:bg-orange-100"><FileText className="w-4 h-4"/> PDF資料を開く</button> )}
+                 {aceFor(currentStep.id).length > 0 && ( <button onClick={() => openAce(currentStep.id)} className="mt-2 w-full bg-sky-50 text-sky-700 border border-sky-200 py-2 rounded-lg font-bold flex items-center justify-center gap-2 hover:bg-sky-100">🎬 エースの手本動画を見る</button> )}
                  <div className="mt-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                    <h3 className="text-sm font-bold text-slate-500 mb-1 flex items-center justify-between">作業内容 / 注意事項 <button onClick={() => { const el = document.getElementById('seq-desc-edit'); if(el) el.style.display = el.style.display === 'none' ? '' : 'none'; }} className="text-xs text-blue-500 hover:text-blue-700"><Pencil className="w-3 h-3 inline"/> 編集</button></h3>
                    <p className="text-lg text-slate-800 whitespace-pre-wrap">{currentStep.description}</p>
@@ -11137,7 +12751,22 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         />
       )}
 
-      {/* テンプレ全体の総合資料ビューア (作業中に参照、読み取り専用) */}
+      {aceStudio && (
+        <VideoRecipeStudio file={{ id: aceStudio.fileId, name: aceStudio.fileName || '' }} recipe={aceStudio} mode="play"
+          steps={(localSteps || []).map(s => ({ key: s.id, label: s.title }))} model={lot.model || ''}
+          onSave={onSaveVideoRecipe ? (async (docData) => { await onSaveVideoRecipe(docData.fileId, docData); setAceStudio(null); }) : null}
+          onClose={() => setAceStudio(null)} />
+      )}
+      {acePick && (
+        <div className="fixed inset-0 z-[550] bg-black/60 flex items-center justify-center p-4" onClick={() => setAcePick(null)}>
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-3 space-y-1.5" onClick={(e) => e.stopPropagation()}>
+            <div className="text-sm font-bold text-slate-700 mb-1">🎬 手本動画を選ぶ</div>
+            {acePick.map(r => (
+              <button key={r.fileId} onClick={() => { setAcePick(null); setAceStudio(r); }} className="w-full text-left px-3 py-2 rounded-lg border border-slate-200 hover:bg-sky-50 text-sm font-bold text-slate-700 truncate">🎬 {r.title || r.fileName || r.fileId}</button>
+            ))}
+          </div>
+        </div>
+      )}
       {showOverview && lotTemplate?.overview && (
         <div className="fixed inset-0 z-[130] bg-black/60 flex items-center justify-center p-4" onClick={() => setShowOverview(false)}>
           <div className="bg-white w-full max-w-3xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
@@ -11181,19 +12810,6 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             </div>
           </div>
         </div>
-      )}
-
-      {/* 作業順最適化 (ルールベース + AI + シミュレーション) */}
-      {/* ※ onApply 系は撤去 — 順序を勝手に書き換える破壊的操作だったため (2026-05-30) */}
-      {showWorkOrderOptimizer && (
-        <WorkOrderOptimizerModal
-          lot={lot}
-          lots={lots}
-          templates={templates}
-          currentExecutionType={executionType}
-          onSwitchToCustom={() => { setExecutionType('custom'); onSave({ executionType: 'custom' }); }}
-          onClose={() => setShowWorkOrderOptimizer(false)}
-        />
       )}
 
       {/* 厳密モードの順序外通知 (非ブロッキング・自動消滅・クリックを妨げない) */}
@@ -11443,8 +13059,8 @@ const ArrivalPlanningView = ({ onBack, lots, workers, templates, handleMoveLot, 
                   </div>
                 </div>
                 <div className="flex gap-3 text-sm mb-2 border-b pb-1 shrink-0">
-                  <span className="text-blue-600">予定: <span className="font-black font-mono text-base">{formatTime(wPlannedTime)}</span></span>
-                  <span className="text-emerald-600">実績: <span className="font-black font-mono text-base">{formatTime(wCompletedTime)}</span></span>
+                  <span className="text-blue-600">予定(残): <span className="font-black font-mono text-base">{formatTime(wPlannedTime)}</span></span>
+                  <span className="text-emerald-600">本日実績: <span className="font-black font-mono text-base">{formatTime(wCompletedTime)}</span></span>
                 </div>
                 <div className="flex-1 overflow-y-auto space-y-2 min-h-0">{lots.filter(l => l.location === 'planned' && l.workerId === w.id).map(lot => <LotCard key={lot.id} lot={lot} workers={workers} templates={templates} mapZones={mapZones} onOpenExecution={()=>{}} saveData={saveData} setDraggedLotId={setDraggedLotId} draggedLotId={draggedLotId} onEdit={onEditLot} onDelete={onDeleteLot} minimal={false}/>)}</div>
               </div>
@@ -11495,8 +13111,8 @@ const PlanningExecutionView = ({ onBack, workers, lots, templates, handleMoveLot
                        </div>
                      </div>
                      <div className="flex gap-3 text-[10px] font-normal mt-0.5">
-                       <span className="text-blue-600">予定: <span className="font-bold font-mono">{formatTime(wPlanTime)}</span></span>
-                       <span className="text-emerald-600">実績: <span className="font-bold font-mono">{formatTime(wDoneTime)}</span></span>
+                       <span className="text-blue-600">予定(残): <span className="font-bold font-mono">{formatTime(wPlanTime)}</span></span>
+                       <span className="text-emerald-600">本日実績: <span className="font-bold font-mono">{formatTime(wDoneTime)}</span></span>
                      </div>
                    </div>
                    <div className="p-1.5 space-y-0.5 min-h-[40px] bg-slate-50/50">
@@ -11567,7 +13183,13 @@ const PlanningExecutionView = ({ onBack, workers, lots, templates, handleMoveLot
 // 画面全体を使うため fixed inset-0 で親レイアウトの padding/header を回避
 const MapOnlyView = ({ onBack, lots, workers, templates, handleMoveLot, saveData, setDraggedLotId, draggedLotId, setExecutionLotId, settings, handleImageUpload, saveSettings, mapZones, onEditLot, onDeleteLot }) => (
     <div data-fs="dashboard" className="fixed inset-0 z-40 bg-slate-100 flex flex-col">
-       {/* 戻る/タイトル は上部の細いバーに集約してマップに最大限のスペースを与える */}
+       {/* 埋め込み(③司令塔)は閲覧専用: マップだけを表示し、クリック/ドラッグを遮断(ホイールは下へ転送) */}
+       {EMBED_MAP && (
+         <div className="fixed inset-0 z-[900]" style={{ cursor: 'default' }}
+           onWheel={(e) => { const sh = e.currentTarget; sh.style.pointerEvents = 'none'; let el = document.elementFromPoint(e.clientX, e.clientY); sh.style.pointerEvents = ''; while (el && el !== document.body) { const s = window.getComputedStyle(el); if (/(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 1) { el.scrollTop += e.deltaY; break; } el = el.parentElement; } }} />
+       )}
+       {/* 戻る/タイトル は上部の細いバーに集約してマップに最大限のスペースを与える (埋め込みではバーも出さない=マップだけ) */}
+       {!EMBED_MAP && (
        <div className="bg-white border-b border-slate-200 px-3 py-1.5 flex items-center justify-between shrink-0 shadow-sm">
           <button onClick={onBack} className="text-slate-500 hover:text-slate-800 flex items-center gap-1 text-sm font-bold">
             <ArrowRight className="w-4 h-4 rotate-180"/> 戻る
@@ -11575,6 +13197,7 @@ const MapOnlyView = ({ onBack, lots, workers, templates, handleMoveLot, saveData
           <h2 className="font-bold text-blue-800 flex items-center gap-2 text-sm"><MapIcon className="w-4 h-4"/> 作業エリア全体図</h2>
           <div className="w-16"/> {/* 中央揃え用スペーサ */}
        </div>
+       )}
        {/* 余白を完全に排除してマップに最大限のスペースを */}
        <div className="flex-1 overflow-hidden">
          <InteractiveMap
@@ -13195,8 +14818,8 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
         const targetLots = lots.filter(l => {
             if (l.status !== 'completed' && l.location !== 'completed') return false;
             if (l.model !== targetValue) return false;
-            const completedAt = l.updatedAt || l.createdAt || 0;
-            const ts = typeof completedAt === 'number' ? completedAt : new Date(completedAt).getTime();
+            // 完了時刻を最優先(updatedAtは編集の度に動き標本が揺れる, Timestampは数値化)。
+            const ts = toMsAny(l.completedAt) || toMsAny(l.updatedAt) || toMsAny(l.createdAt) || 0;
             if (ts < startDate || ts > endDate) return false;
             return true;
         });
@@ -13301,7 +14924,7 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
         const byModelStep = {}; // `${model}||${stepKey}` → { model, title, category, target, times[] }
         lots.forEach(l => {
             if (l.status !== 'completed' && l.location !== 'completed') return;
-            const ts0 = l.updatedAt || l.createdAt || 0;
+            const ts0 = toMsAny(l.completedAt) || toMsAny(l.updatedAt) || toMsAny(l.createdAt) || 0;
             const ts = typeof ts0 === 'number' ? ts0 : new Date(ts0).getTime();
             if (ts < startDate || ts > endDate) return;
             const model = l.model;
@@ -13389,7 +15012,7 @@ const ProcessInsightsTab = ({ lots, workers, customTargetTimes, onSaveSettings, 
                         <h3 className="font-bold text-slate-800">工程改善・目標時間最適化</h3>
                         <p className="text-xs text-slate-500">実績データからエビデンスを算出し、状況に応じた最適な目標時間を提案します。</p>
                         <p className="text-[11px] text-emerald-700 font-bold mt-0.5 flex items-center gap-1">
-                          <CheckCircle2 className="w-3 h-3"/> 適用先: 較正した目標時間は<b>新規ロット作成時に自動反映</b>され、ETA・進捗・オススメ順・ガントすべてに使われます
+                          <CheckCircle2 className="w-3 h-3"/> 適用先: 較正した目標時間は<b>新規ロット作成時に自動反映</b>され、ETA・進捗・データ最適順・ガントすべてに使われます
                         </p>
                     </div>
                 </div>
@@ -13834,9 +15457,14 @@ const DataExportCenter = ({ lots = [], workers = [], indirectWork = [], settings
         rows.push({ date: fmtDate(ms), worker: w, category: iw.category || '', min: Math.round((iw.duration || 0) / 60), _ts: ms, _model: '', _worker: w, _order: '' });
       });
     } else if (s === 'targettime') {
+      // 実スキーマ: {timestamp, by, targetValue(型式/外観図), updates:[{category,title,oldTime,newTime,strategyName,evidence}]}
+      // (旧実装は e.model/e.from 等 存在しないフィールドを読み全列空欄+複数updatesを1行に潰していた。MonthlyReportView と同じ展開に統一)
       (settings.targetTimeHistory || []).forEach(e => {
-        const ms = toMs(e.timestamp ?? e.at ?? e.changedAt);
-        rows.push({ date: fmtDateTime(ms), model: e.model || '', step: e.step || e.title || e.stepTitle || '', oldSec: e.from ?? e.old ?? e.before ?? '', newSec: e.to ?? e.new ?? e.after ?? '', reason: e.reason || e.note || e.evidence || '', user: e.user || e.changedBy || '', _ts: ms, _model: e.model || '', _worker: '', _order: '' });
+        const ms = toMs(e.timestamp);
+        const model = e.targetValue || '';
+        (e.updates || []).forEach(u => {
+          rows.push({ date: fmtDateTime(ms), model, step: (u.category ? `[${u.category}] ` : '') + (u.title || ''), oldSec: u.oldTime ?? '', newSec: u.newTime ?? '', reason: u.strategyName || (u.evidence?.periodLabel || ''), user: e.by || '', _ts: ms, _model: model, _worker: '', _order: '' });
+        });
       });
     }
     return rows;
@@ -14417,6 +16045,80 @@ const KpiDetailView = ({ lots = [], settings = {}, saveSettings = null, currentU
   useEffect(() => { setRate(settings.laborCostPerHour || 0); }, [settings.laborCostPerHour]);
   const isAdmin = currentUserName === '管理者';
 
+  // 年間生産台数(金額計算の台数)の入力。settings.annualProduction[年][型式]=実際の年間生産台数。
+  const [editYear, setEditYear] = useState(new Date().getFullYear());
+  const [prodDraft, setProdDraft] = useState({});
+  useEffect(() => { setProdDraft({ ...((settings.annualProduction || {})[editYear] || {}) }); }, [editYear, settings.annualProduction]);
+  // 記録上の台数(参考): 直近365日に完了したロットの quantity 合計を型式別に。実生産台数の目安。
+  const measuredByModel = useMemo(() => {
+    const m = {}; const cutoff = Date.now() - 365 * 86400000;
+    (lots || []).forEach(l => { if (!isCompleted(l)) return; const cm = compMs(l); if (cm == null || cm < cutoff) return; const k = l.model || '不明'; m[k] = (m[k] || 0) + (l.quantity || 1); });
+    return m;
+  }, [lots]);
+  const prodModels = useMemo(() => { const s = new Set(Object.keys(measuredByModel)); Object.keys(prodDraft).forEach(k => s.add(k)); return [...s].filter(Boolean).sort(); }, [measuredByModel, prodDraft]);
+  const prodYearOpts = useMemo(() => { const y0 = new Date().getFullYear(); const ys = new Set([y0, y0 - 1, y0 - 2]); Object.keys(settings.annualProduction || {}).forEach(y => ys.add(Number(y))); return [...ys].filter(Boolean).sort((a, b) => b - a); }, [settings.annualProduction]);
+  const saveProd = () => { const clean = {}; Object.entries(prodDraft).forEach(([k, v]) => { const n = Number(v); if (n > 0) clean[k] = Math.round(n); }); saveSettings && saveSettings({ annualProduction: { ...(settings.annualProduction || {}), [editYear]: clean } }); };
+  // 年間生産台数をExcelで一括(全型式×全年のマトリクス): ダウンロードで現状が丸見え→各年の列を編集→取込で該当年を一括更新(取込は確認後すぐ保存)。
+  const exportProdExcel = async () => {
+    try {
+      const ExcelJS = await loadExcelJS();
+      const ap = settings.annualProduction || {};
+      const years = [...new Set([Number(editYear), ...prodYearOpts.map(Number), ...Object.keys(ap).map(Number)])].filter(Boolean).sort((a, b) => a - b);
+      const modelSet = new Set(prodModels);
+      Object.values(ap).forEach(obj => Object.keys(obj || {}).forEach(m => modelSet.add(m)));
+      const models = [...modelSet].filter(Boolean).sort();
+      const wb = new ExcelJS.Workbook(); const ws = wb.addWorksheet('年間生産台数');
+      ws.addRow(['年間生産台数（各年の列に台数を入れてアップロード＝その年を更新。空欄はそのまま・記録上の台数列は編集不要）']); ws.mergeCells(1, 1, 1, 2 + years.length); ws.getRow(1).font = { bold: true };
+      const head = ws.addRow(['型式', '記録上の台数(参考・編集不要)', ...years.map(y => `${y}年`)]); head.font = { bold: true };
+      models.forEach(m => ws.addRow([m, measuredByModel[m] || 0, ...years.map(y => { const v = Number((ap[y] || {})[m]); return v > 0 ? v : ''; })]));
+      ws.columns = [{ width: 26 }, { width: 22 }, ...years.map(() => ({ width: 12 }))];
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `年間生産台数_全型式全年.xlsx`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { alert('Excel書き出しに失敗しました: ' + (e.message || e)); }
+  };
+  const importProdExcel = async (file) => {
+    if (!file) return;
+    try {
+      const ExcelJS = await loadExcelJS();
+      const wb = new ExcelJS.Workbook(); await wb.xlsx.load(await file.arrayBuffer());
+      const ws = wb.worksheets[0]; if (!ws) { alert('シートが読めませんでした。'); return; }
+      // ヘッダ行から「型式」列と「◯◯◯◯年」列(複数可)を特定。各年の列を全部読み、その年に反映する。
+      let modelCol = 0, dataStart = 0; const yearCols = [];
+      ws.eachRow((row, idx) => {
+        if (dataStart) return;
+        const cells = row.values || [];
+        let mi = 0; const ycs = [];
+        for (let c = 1; c < cells.length; c++) {
+          const s = String(cells[c] == null ? '' : (cells[c].text || cells[c])).trim();
+          if (s === '型式' || s === '品目コード') mi = c;
+          const my = s.match(/(20\d{2})\s*年?/); if (my && !s.includes('記録')) ycs.push({ col: c, year: Number(my[1]) });
+        }
+        if (mi && ycs.length) { modelCol = mi; ycs.forEach(y => yearCols.push(y)); dataStart = idx + 1; }
+      });
+      if (!modelCol || !yearCols.length) { alert('「型式」列と「◯◯◯◯年」の列が見つかりませんでした。ダウンロードしたExcelの形式（1行目に型式・各年の列）でお願いします。'); return; }
+      const ap = { ...(settings.annualProduction || {}) };
+      yearCols.forEach(yc => { ap[yc.year] = { ...(ap[yc.year] || {}) }; });
+      let applied = 0; const touched = new Set();
+      ws.eachRow((row, idx) => {
+        if (idx < dataStart) return;
+        const model = String(row.getCell(modelCol).value == null ? '' : (row.getCell(modelCol).value.text || row.getCell(modelCol).value)).trim();
+        if (!model) return;
+        yearCols.forEach(yc => {
+          const raw = row.getCell(yc.col).value; const v = Number(raw && raw.result != null ? raw.result : raw);
+          if (Number.isFinite(v) && v > 0) { ap[yc.year][model] = Math.round(v); applied++; touched.add(yc.year); }
+        });
+      });
+      if (applied === 0) { alert('取り込める台数がありませんでした（型式の行と各年の列に数字が入っているかご確認ください）。'); return; }
+      const yrs = [...touched].sort((a, b) => a - b).join('・');
+      if (!window.confirm(`${yrs}年 の台数を ${applied}件 取り込んで保存します。よろしいですか？（Excelで空欄の型式・年は変更しません）`)) return;
+      saveSettings && saveSettings({ annualProduction: ap });
+      setProdDraft(d => ({ ...d, ...(ap[Number(editYear)] || {}) }));
+      alert(`保存しました（${yrs}年 / 合計${applied}件）。`);
+    } catch (e) { alert('Excel取込に失敗しました: ' + (e.message || e)); }
+  };
+  const prodDirty = useMemo(() => { const saved = (settings.annualProduction || {})[editYear] || {}; const keys = new Set([...Object.keys(saved), ...Object.keys(prodDraft)]); for (const k of keys) { const a = Math.round(Number(prodDraft[k]) || 0); const b = Math.round(Number(saved[k]) || 0); if (a !== b) return true; } return false; }, [prodDraft, settings.annualProduction, editYear]);
+
   const range = () => { const t = new Date(); if (period === 'thisMonth') return [new Date(t.getFullYear(), t.getMonth(), 1).getTime(), new Date(t.getFullYear(), t.getMonth() + 1, 1).getTime()]; if (period === 'lastMonth') return [new Date(t.getFullYear(), t.getMonth() - 1, 1).getTime(), new Date(t.getFullYear(), t.getMonth(), 1).getTime()]; if (period === 'thisYear') return [new Date(t.getFullYear(), 0, 1).getTime(), new Date(t.getFullYear() + 1, 0, 1).getTime()]; return [-Infinity, Infinity]; };
 
   const D = useMemo(() => {
@@ -14510,6 +16212,51 @@ const KpiDetailView = ({ lots = [], settings = {}, saveSettings = null, currentU
         </div>
         <div className="text-[10px] text-slate-400 mt-2">※ 工数=当該期間に完了したロットの検査タスク実時間の合計。間接作業・残業割増は含みません（残業/土曜のコストは全体進捗で別途）。</div>
       </div>
+
+      {/* 年間生産台数（重点工程の金額計算に使う台数） */}
+      <div className="bg-white rounded-xl border border-indigo-200 p-4">
+        <div className="text-sm font-bold text-indigo-700 mb-1">年間生産台数（重点工程の「年◯円」を実態に合わせる）</div>
+        <div className="text-[11px] text-slate-500 mb-2 leading-relaxed">改善の金額は「<b>年間台数 × 1台の時間 × 時給</b>」で出ます。台数を入れないと<b>測定した台数ベースの推定</b>になり、抜取や未測定の分だけ実態とズレます。型式ごとに<b>実際の年間生産台数</b>を年別で入れてください（1台の時間は測定データのまま使います）。</div>
+        <div className="flex items-center gap-2 mb-2 flex-wrap">
+          <span className="text-[11px] font-bold text-slate-500">年:</span>
+          <select value={editYear} onChange={e => setEditYear(Number(e.target.value))} className="border border-indigo-200 rounded px-2 py-1 text-xs font-bold bg-white">
+            {prodYearOpts.map(y => <option key={y} value={y}>{y}年</option>)}
+          </select>
+          {isAdmin && <button onClick={() => setProdDraft(d => { const n = { ...d }; prodModels.forEach(m => { if (!(Number(n[m]) > 0)) n[m] = measuredByModel[m] || 0; }); return n; })} className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[11px] font-bold rounded border" title="空欄に記録上の台数を入れて、あとは手で直す">記録台数を初期値に入れる</button>}
+          {isAdmin && <button onClick={saveProd} disabled={!prodDirty} className={`px-3 py-1 text-white text-xs font-bold rounded ${prodDirty ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-300 cursor-not-allowed'}`}>{editYear}年の台数を保存</button>}
+          <span className="text-slate-300">|</span>
+          <button onClick={exportProdExcel} className="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[11px] font-bold rounded border border-emerald-200" title="登録済みの全型式・全年の台数を1枚のExcelで出力（現状が丸見え）。各年の列を編集して取込むと更新できます">⬇ 現状をExcelでDL（全型式×全年）</button>
+          {isAdmin && <label className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold rounded cursor-pointer" title="ダウンロードしたExcelの各年の列を編集して取込むと、その年の台数を一括更新（確認後すぐ保存）">⬆ Excelで取込んで更新<input type="file" accept=".xlsx,.xls" className="hidden" onChange={e => { importProdExcel(e.target.files && e.target.files[0]); e.target.value = ''; }} /></label>}
+          {!isAdmin && <span className="text-[11px] text-slate-400">入力は管理者のみ</span>}
+          {prodDirty && <span className="text-[11px] text-amber-600 font-bold">未保存の変更があります</span>}
+        </div>
+        {prodModels.length === 0 ? <div className="text-xs text-slate-400 py-4 text-center">完了データのある型式がまだありません</div> : (
+          <div className="max-h-72 overflow-auto border border-slate-200 rounded">
+            <table className="w-full text-xs border-collapse">
+              <thead className="sticky top-0 bg-slate-100 text-slate-500"><tr>
+                <th className="px-2 py-1.5 text-left font-bold">型式</th>
+                <th className="px-2 py-1.5 text-right font-bold" title="直近365日に完了したロットの台数合計(目安)">記録上の台数<div className="text-[9px] font-normal text-slate-400">参考</div></th>
+                <th className="px-2 py-1.5 text-right font-bold">実際の年間生産台数<div className="text-[9px] font-normal text-slate-400">{editYear}年</div></th>
+              </tr></thead>
+              <tbody>
+                {prodModels.map(m => {
+                  const has = Number(prodDraft[m]) > 0;
+                  return (
+                    <tr key={m} className={`border-b border-slate-50 ${has ? 'bg-indigo-50/30' : ''}`}>
+                      <td className="px-2 py-1 font-mono font-bold text-slate-700">{m}</td>
+                      <td className="px-2 py-1 text-right font-mono text-slate-400">{(measuredByModel[m] || 0).toLocaleString()}</td>
+                      <td className="px-2 py-1 text-right">
+                        <input type="number" min="0" value={prodDraft[m] ?? ''} disabled={!isAdmin} onChange={e => setProdDraft(d => ({ ...d, [m]: e.target.value }))} placeholder={`推定 ${(measuredByModel[m] || 0).toLocaleString()}`} className="border border-slate-300 rounded px-2 py-0.5 text-xs w-24 text-right font-mono disabled:bg-slate-100" />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div className="text-[10px] text-slate-400 mt-2">※ 入力した型式は「重点工程」で<b className="text-indigo-600">実数</b>として、未入力の型式は<b>推定</b>として金額計算されます。年を切り替えると過去年の台数も入れられます（重点工程の「生産台数の年」で使う年を選択）。保存はこの画面の型式のみ更新（他は保持）。</div>
+      </div>
     </div>
   );
 };
@@ -14541,7 +16288,17 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
   // ロット1回工程の実施回数 (列数)
   const colsOf = (si) => { const st = steps[si]; if (!st?.lotOnce) return qty; return Math.max(1, Object.keys(tasks).filter(k => k.startsWith(`${st.id}-lot-`)).length); };
   // 手入力で時間を確定。全キーに反映。endTime = firstStartTime + duration にして時刻の逆転(終了<開始)も同時に解消し時刻を実時間と整合させる。
-  const apply = (keys, sec) => { const d = Math.round(sec); const nt = { ...tasks }; keys.forEach(key => { const cur = tasks[key] || {}; const fst = Number(cur.firstStartTime) || Date.now(); nt[key] = { ...cur, status: 'completed', duration: d, startTime: null, firstStartTime: fst, endTime: fst + d * 1000, manualTime: true }; }); onSaveTasks(nt); setTi(null); };
+  const apply = (keys, sec) => {
+    const d = Math.round(sec);
+    // 一部だけ skipped(レガシー重複: id系=該当なし + 数値系=異常completed 等)なら、該当なしキーは巻き込まず
+    //   completed キーだけ直す(意図的な該当なしを無言で復活させない)。全キーが skipped の純粋な該当なしセルで
+    //   時間確定した場合のみ、ユーザーの明示操作として全キーを completed に戻す。
+    const nonSkipped = keys.filter(key => tasks[key]?.status !== 'skipped');
+    const targetKeys = nonSkipped.length > 0 ? nonSkipped : keys;
+    const nt = { ...tasks };
+    targetKeys.forEach(key => { const cur = tasks[key] || {}; const fst = Number(cur.firstStartTime) || Date.now(); nt[key] = { ...cur, status: 'completed', duration: d, startTime: null, firstStartTime: fst, endTime: fst + d * 1000, manualTime: true }; });
+    onSaveTasks(nt); setTi(null);
+  };
   // 該当なし(対象外)= この台はこの工程に該当しない。集計・異常から除外。全キーに反映。
   const markSkip = (keys) => { const nt = { ...tasks }; keys.forEach(key => { const cur = tasks[key] || {}; nt[key] = { ...cur, status: 'skipped', skipReason: cur.skipReason || '該当なし(対象外)', skipAt: cur.skipAt || Date.now(), endTime: cur.endTime || Date.now() }; }); onSaveTasks(nt); setTi(null); };
   // 該当なしを解除 = 測定値(完了)に戻す。
@@ -14583,13 +16340,13 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden" onClick={e => e.stopPropagation()}>
             <div className="bg-indigo-600 text-white p-3 text-center font-bold text-sm">{ti.label} を直す</div>
             <div className="p-4 space-y-3">
-              {ti.keys.some(k => tasks[k]?.status === 'skipped') && <div className="text-center text-[11px] text-slate-500 bg-slate-50 border rounded py-1">現在「該当なし(対象外)」です</div>}
+              {ti.keys.length > 0 && ti.keys.every(k => tasks[k]?.status === 'skipped') && <div className="text-center text-[11px] text-slate-500 bg-slate-50 border rounded py-1">現在「該当なし(対象外)」です</div>}
               <div className="flex items-center justify-center gap-1.5"><input type="number" min="0" value={ti.min} onChange={e => setTi(p => ({ ...p, min: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" /><span className="font-bold text-sm">分</span><input type="number" min="0" max="59" value={ti.sec} onChange={e => setTi(p => ({ ...p, sec: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" /><span className="font-bold text-sm">秒</span></div>
               <div className="text-center text-xs text-slate-400">= {tiTotal} 秒</div>
               {ti.targetSec > 0 && <button onClick={() => setTi(p => ({ ...p, min: String(Math.floor(ti.targetSec / 60)), sec: String(ti.targetSec % 60) }))} className="w-full py-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg text-blue-700 font-bold text-xs">目標 {ti.targetSec}秒 を入れる</button>}
               <div className="flex gap-2"><button onClick={() => setTi(null)} className="flex-1 py-2.5 border rounded-xl font-bold text-slate-600 hover:bg-slate-50">そのまま（変更しない）</button><button disabled={tiTotal <= 0} onClick={() => apply(ti.keys, tiTotal)} className={`flex-1 py-2.5 rounded-xl font-bold text-white ${tiTotal > 0 ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-slate-300 cursor-not-allowed'}`}>この時間で確定</button></div>
               {/* 該当なし(対象外): ロットで1回だけの工程の2台目以降など、本来やらない台。集計・異常から除外。 */}
-              {ti.keys.some(k => tasks[k]?.status === 'skipped')
+              {ti.keys.length > 0 && ti.keys.every(k => tasks[k]?.status === 'skipped')
                 ? <button onClick={() => unskip(ti.keys)} className="w-full py-2 border border-slate-300 rounded-xl font-bold text-slate-600 hover:bg-slate-50 text-sm">該当なしを解除（測定値に戻す）</button>
                 : <button onClick={() => markSkip(ti.keys)} className="w-full py-2 border-2 border-amber-300 bg-amber-50 rounded-xl font-bold text-amber-700 hover:bg-amber-100 text-sm">📦 該当なし（対象外）にする<div className="text-[10px] font-normal text-amber-600">この台はこの工程をやらない／ロットで1回だけ等。集計・異常から外します</div></button>}
             </div>
@@ -14600,7 +16357,7 @@ const LotTimeTable = ({ lot, onSaveTasks }) => {
   );
 };
 
-const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], improvements = [], observationPlans = [], currentUserName = '', onRestore = null }) => {
+const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = {}, indirectWork = [], improvements = [], observationPlans = [], notes = [], announcements = [], logs = [], strictModeHistory = [], currentUserName = '', onRestore = null, db = null }) => {
   const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
   const isCompleted = (l) => l.status === 'completed' || l.location === 'completed';
   const ord = (l) => l.orderNo || l.id;
@@ -14636,12 +16393,48 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   const errCount = issues.filter(i => i.sev === 'err').length;
   const warnCount = issues.filter(i => i.sev === 'warn').length;
 
-  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length, 改善カルテ: (improvements || []).length, 観測プラン: (observationPlans || []).length };
+  const counts = { lots: lots.length, templates: templates.length, workers: workers.length, 間接作業: (indirectWork || []).length, 改善カルテ: (improvements || []).length, 観測プラン: (observationPlans || []).length, メモ: (notes || []).length, お知らせ: (announcements || []).length, ログ: (logs || []).length };
   const doBackup = () => {
-    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, improvements, observationPlans, lots };
+    const data = { meta: { app: 'product-inspection', exportedAt: new Date().toISOString(), by: currentUserName || '', counts }, settings, templates, workers, indirectWork, improvements, observationPlans, lots, notes, announcements, logs };
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url;
     a.download = `バックアップ_製品検査_${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // PocketBase移行用エクスポート: 全コレクションを「PocketBaseに取り込みやすい per-collection 配列」でダンプ。
+  //   将来 Firebase → PocketBase へ移したくなった時の“お守り”。今は何も起きない読み取り専用エクスポート。取込はリポジトリの pb_import.mjs で行う。
+  //   strict_mode_history / help_images は遅延購読のため、移行時は Firestore から直接読み直して取りこぼしを防ぐ。
+  const exportForPocketBase = async () => {
+    let strictHist = strictModeHistory || [], helpImgs = [];
+    try { const sh = await getDocs(collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'strict_mode_history')); strictHist = sh.docs.map(d => ({ id: d.id, ...d.data() })); } catch (e) { /* state フォールバック */ }
+    try { const hi = await getDocs(collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'help_images')); helpImgs = hi.docs.map(d => ({ id: d.id, ...d.data() })); } catch (e) { /* 空フォールバック */ }
+    const data = {
+      forPocketBase: true,
+      schemaVersion: 1,
+      app: 'product-inspection',
+      appDataId: 'product-inspection-v1',
+      exportedAt: new Date().toISOString(),
+      by: currentUserName || '',
+      counts,
+      collections: {
+        settings: settings ? [{ id: 'config', ...settings }] : [],
+        lots: lots || [],
+        templates: templates || [],
+        workers: workers || [],
+        indirectWork: indirectWork || [],
+        improvements: improvements || [],
+        observationPlans: observationPlans || [],
+        notes: notes || [],
+        announcements: announcements || [],
+        logs: logs || [],
+        strict_mode_history: strictHist,
+        help_images: helpImgs,
+      },
+      note: 'PocketBase移行用。各 collections[<名前>] を PocketBase の同名コレクション(キー=実Firestore名)へ取り込む。settings は id="config" の1レコード。取込はリポジトリの pb_import.mjs（README_pocketbase移行.md 参照）。',
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url;
+    a.download = `pocketbase移行_製品検査_${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   // --- 復元(取り込み) UI ---
@@ -14652,7 +16445,7 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
   const [rstChk, setRstChk] = useState(false);
   const [rstProg, setRstProg] = useState({ done: 0, total: 0 });
   const [rstMsg, setRstMsg] = useState('');
-  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業', improvements: '改善カルテ', observationPlans: '観測プラン' };
+  const RST_LABELS = { lots: '検査ロット', templates: 'テンプレート', workers: '作業者', indirectWork: '間接作業', improvements: '改善カルテ', observationPlans: '観測プラン', notes: 'メモ', announcements: 'お知らせ', logs: 'ログ' };
   const curIdSet = (arr) => new Set((arr || []).map(x => x && x.id).filter(Boolean));
   const diffOf = (cur, bk) => {
     const cs = curIdSet(cur); let create = 0, over = 0;
@@ -14697,8 +16490,9 @@ const AuditBackupPanel = ({ lots = [], templates = [], workers = [], settings = 
             </div>
           </div>
           <button onClick={doBackup} className="px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm bg-emerald-600 hover:bg-emerald-700 text-white"><DownloadCloud className="w-4 h-4" /> JSONで保存</button>
+          <button onClick={exportForPocketBase} title="将来 Firebase から PocketBase へ移したくなった時のための、全コレクションのエクスポート（PocketBaseに取り込みやすい形）。いつでも逃げられる“お守り”。今は何も起きません。" className="px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-1.5 shadow-sm bg-slate-700 hover:bg-slate-800 text-white"><DownloadCloud className="w-4 h-4" /> PocketBase移行用</button>
         </div>
-        <div className="text-[10px] text-slate-400 mt-2">※ 読み取りのみ（現在のデータには一切変更しません）。不良/軽微/気づきの報告はロット内に含まれます。復元(取り込み)は下の「データ復元」から、プレビュー＋確認の上で行えます。</div>
+        <div className="text-[10px] text-slate-400 mt-2">※ 読み取りのみ（現在のデータには一切変更しません）。不良/軽微/気づきの報告はロット内に含まれます。復元(取り込み)は下の「データ復元」から、プレビュー＋確認の上で行えます。<br/>「PocketBase移行用」= 全データを PocketBase に取り込みやすい形で書き出す“お守り”（いつでも Firebase から移れる備え。今すぐ使うものではありません）。</div>
       </div>
 
       {/* 復元(取り込み) */}
@@ -14946,7 +16740,7 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
             <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
           </div>
         </div>
-        <div className="p-4 overflow-y-auto space-y-4 text-sm">
+        <div className="flex-1 min-h-0 p-4 overflow-y-auto space-y-4 text-sm">
           {/* タイムライン */}
           <div className="flex items-center gap-1 text-[11px] flex-wrap bg-slate-50 border rounded-lg p-2">
             {[['検知', card.createdAt], ['計画', card.createdAt], ['実施', card.actionDate], ['効果測定', card.actionDate], ['判定', card.closedAt]].map((s, i) => (
@@ -15064,7 +16858,9 @@ const ProfitDetailModal = ({ row, lots = [], settings = {}, rate = 0, onClose, o
   const gap = Math.abs(row.median - row.target);
   const overUnder = row.median > row.target ? '遅い' : (row.median < row.target ? '速い' : '同じ');
   const myCompIdx = detail.compares.findIndex(c => c.model === row.model);
-  const slowerThan = detail.compares.length > 1 ? detail.compares.length - 1 - myCompIdx : 0; // 自分より速い型式の数
+  // compares は median 昇順(index 0 = 最速)。自分より速い型式の数 = 自分の位置 myCompIdx。
+  // (旧: length-1-myCompIdx は「自分より遅い型式の数」を数えており速い/遅いが反転していた)
+  const slowerThan = detail.compares.length > 1 ? Math.max(0, myCompIdx) : 0; // 自分より速い(=自分が遅れている)型式の数
   return (
     <div className="fixed inset-0 z-[210] bg-black/50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="bg-white w-full max-w-2xl max-h-[92vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
@@ -15072,7 +16868,7 @@ const ProfitDetailModal = ({ row, lots = [], settings = {}, rate = 0, onClose, o
           <h3 className="font-bold flex items-center gap-2 min-w-0"><TrendingUp className="w-5 h-5 shrink-0" /><span className="truncate">{row.model} ／ {row.stepTitle}</span></h3>
           <button onClick={onClose} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold shrink-0">閉じる</button>
         </div>
-        <div className="p-4 overflow-y-auto space-y-4 text-sm text-slate-700">
+        <div className="flex-1 min-h-0 p-4 overflow-y-auto space-y-4 text-sm text-slate-700">
           {/* なぜ上位か(一言) */}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
             <div className="font-bold text-slate-800 mb-1">なぜこの工程が上位なのか</div>
@@ -15087,7 +16883,8 @@ const ProfitDetailModal = ({ row, lots = [], settings = {}, rate = 0, onClose, o
             <div className="font-bold text-slate-800 mb-1">計算の内訳（実際の数字）</div>
             <table className="w-full text-xs border-collapse">
               <tbody>
-                <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500 w-1/2">① 年間台数（直近1年の完了数）</td><td className="py-1.5 text-right font-mono font-bold">{row.annualUnits.toLocaleString()} 台/年</td></tr>
+                <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500 w-1/2">① 年間台数{row.annualUnitsSource === 'actual' ? '（経営分析で登録した実台数）' : '（実績からの推定）'}</td><td className="py-1.5 text-right font-mono font-bold">{row.annualUnits.toLocaleString()} 台/年 <span className={`text-[9px] font-bold px-1 rounded ${row.annualUnitsSource === 'actual' ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-500'}`}>{row.annualUnitsSource === 'actual' ? '登録値' : '推定'}</span></td></tr>
+                {row.annualUnitsSource !== 'actual' && <tr className="border-b border-slate-100"><td className="py-1 text-slate-400 text-[11px]" colSpan={2}>　└ 台数の出し方: 直近1年で完了した <b>{(row.n || 0).toLocaleString()}台</b> の実績ペースを365日換算した概算です。経営分析タブで実際の年間生産台数を登録すると、この値が登録値に置き換わり金額が正確になります。</td></tr>}
                 <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">② 1台あたりの時間（実績の中央値・{detail.srcLots.reduce((s, x) => s + x.count, 0)}台ぶん）</td><td className="py-1.5 text-right font-mono font-bold">{pdcaFmtSec(row.median)}</td></tr>
                 <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">③ 年間の合計時間 ＝ ① × ②</td><td className="py-1.5 text-right font-mono font-bold">{hrs(row.annualCostSec)}</td></tr>
                 {rate > 0 && <tr className="border-b border-slate-100"><td className="py-1.5 text-slate-500">④ 年間人件費 ＝ ③ × 時給{yen(rate)}/時</td><td className="py-1.5 text-right font-mono font-bold">{yen(row.annualCostYen)}</td></tr>}
@@ -15096,7 +16893,7 @@ const ProfitDetailModal = ({ row, lots = [], settings = {}, rate = 0, onClose, o
                 {row.hasTarget && row.reductionPerUnit > 0 && <tr><td className="py-1.5 text-emerald-700 font-bold">⑦ 年間削減見込 ＝ ① × ⑥{rate > 0 ? ' × 時給' : ''}</td><td className="py-1.5 text-right font-mono font-bold text-emerald-700">{hrs(row.annualSaveSec)}{rate > 0 ? ` ＝ ${yen(row.annualSaveYen)}` : ''}</td></tr>}
               </tbody>
             </table>
-            <div className="text-[10px] text-slate-400 mt-1">※ 中央値＝実績の真ん中の値（極端に速い/遅い台に引っぱられないため平均でなく中央値）。年間台数は直近1年の完了数。</div>
+            <div className="text-[10px] text-slate-400 mt-1">※ 中央値＝実績の真ん中の値（極端に速い/遅い台に引っぱられないため平均でなく中央値）。年間台数は①のとおり（登録値があれば登録値、無ければ実績ペースの推定）。</div>
           </div>
 
           {/* 類似比較 */}
@@ -15157,11 +16954,41 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
     return s;
   }, [improvements]);
 
+  // 金額計算に使う「実際の年間生産台数」: settings.annualProduction[年][型式] を優先。無ければ測定台数ベースの推定。
+  const curYear = new Date(nowMs).getFullYear();
+  const [prodYear, setProdYear] = useState(curYear);
+  const annualUnitsByModel = useMemo(() => (settings?.annualProduction && settings.annualProduction[prodYear]) || {}, [settings, prodYear]);
+  const prodYears = useMemo(() => { const ys = new Set([curYear, curYear - 1]); Object.keys(settings?.annualProduction || {}).forEach(y => ys.add(Number(y))); return [...ys].filter(Boolean).sort((a, b) => b - a); }, [settings, curYear]);
+  const prodInputCount = useMemo(() => Object.values(annualUnitsByModel).filter(v => Number(v) > 0).length, [annualUnitsByModel]);
   // 儲けどころランキング: 直近1年で「年間台数×実績×時給」=年間削減見込(円)が大きい順
-  const ranking = useMemo(() => profitRanking(lots, settings, { startMs: nowMs - 365 * 86400000, endMs: nowMs, lowFreq: 10 }), [lots, settings]);
+  const ranking = useMemo(() => profitRanking(lots, settings, { startMs: nowMs - 365 * 86400000, endMs: nowMs, lowFreq: 10, annualUnitsByModel }), [lots, settings, annualUnitsByModel]);
   const rankingRows = useMemo(() => (hideLowFreq ? ranking.rows.filter(r => !r.lowFreq) : ranking.rows).slice(0, 20), [ranking, hideLowFreq]);
   const maxCost = useMemo(() => Math.max(1, ...rankingRows.map(r => r.annualCostSec)), [rankingRows]);
   const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
+  // 重点工程の見方: 'model'=型式×工程(どの型式のどこ) / 'cross'=工程横断(共通ポイント1つを直すと全型式に効く)
+  const [rankingView, setRankingView] = useState('model');
+  const [crossPct, setCrossPct] = useState(50); // ◯%短縮の仮定(レイアウト改善等の大改善)の率
+  const [crossExpanded, setCrossExpanded] = useState(null); // 工程横断: 行展開で型式別内訳
+  // 工程横断の絞り込み(複数選択可): 'tpl:<テンプレID>'(同じテンプレ内=中間分割等) / 'grp:<型式グループID>'(ファナック等) を任意個。
+  //   空配列=全部まとめて。選んだタグに「いずれか一致」するロットを集めてから crossStepRanking に渡す(選んだ分だけまとめて横断集計)。
+  const [crossScopes, setCrossScopes] = useState([]);
+  const toggleCrossScope = (tok) => { setCrossScopes(prev => prev.includes(tok) ? prev.filter(x => x !== tok) : [...prev, tok]); setCrossExpanded(null); };
+  const crossScopedLots = useMemo(() => {
+    if (!crossScopes || crossScopes.length === 0) return lots;
+    const tplIds = new Set(crossScopes.filter(s => s.startsWith('tpl:')).map(s => s.slice(4)));
+    const grpModels = new Set();
+    crossScopes.filter(s => s.startsWith('grp:')).forEach(s => {
+      const g = (modelGroups || []).find(x => x.id === s.slice(4));
+      ((g && g.models) || []).forEach(m => grpModels.add(m));
+    });
+    return (lots || []).filter(l => tplIds.has(l.templateId) || grpModels.has(l.model));
+  }, [lots, crossScopes, modelGroups]);
+  // 防御: 万一データ起因で集計が落ちても、パネル全体(改善PDCA)を白画面にしない。空表示に退避する。
+  const crossRanking = useMemo(() => { try { return crossStepRanking(crossScopedLots, settings, { startMs: nowMs - 365 * 86400000, endMs: nowMs, reductionPct: crossPct / 100, annualUnitsByModel }); } catch (e) { console.error('crossStepRanking failed:', e); return { groups: [], rate: 0, reductionPct: crossPct / 100 }; } }, [crossScopedLots, settings, crossPct, annualUnitsByModel]);
+  const crossRows = useMemo(() => crossRanking.groups.filter(g => g.annualCostSec > 0).slice(0, 20), [crossRanking]);
+  const crossMaxCost = useMemo(() => Math.max(1, ...crossRows.map(g => g.annualCostSec)), [crossRows]);
+  // 改善スコアボード(今月 vs 先月のトレンド + 浮いた時間)。改善ループの主役。
+  const scoreboard = useMemo(() => improvementScoreboard(lots, settings, { nowMs, topN: 12 }), [lots, settings]);
 
   const modelOptions = useMemo(() => [...new Set(enumerateModelSteps(lots).map(m => m.model))].filter(Boolean).sort(), [lots]);
   const stepOptions = useMemo(() => enumerateModelSteps(lots).filter(m => m.model === newModel), [lots, newModel]);
@@ -15175,7 +17002,9 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
       id, createdAt: nowMs, createdBy: currentUserName || '?', status: 'plan',
       model, stepKey, stepTitle: stepTitle || (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey), category: category || '',
       kpi: 'time', source: source || { kind: 'manual', label: '手動作成' }, baseline,
-      problem: source?.problem || '', hypothesis: '', action: '', owner: '', dueDate: '',
+      // 問題文は「実際に保存される baseline(90日窓)」から組み立てる。ユーザーが見た数字=効果判定の証拠 を一致させる
+      //   (buildProblem があればそれを優先。ランキング由来の年間値は問題文内で『参考(直近1年)』として併記する)。
+      problem: source?.buildProblem ? source.buildProblem(baseline) : (source?.problem || ''), hypothesis: '', action: '', owner: '', dueDate: '',
       log: [{ ts: nowMs, by: currentUserName || '?', type: 'create', note: `カルテ作成 (由来: ${source?.label || '手動'})` }],
     };
     saveData('improvements', id, card);
@@ -15185,7 +17014,12 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
     const saving = ranking.rate > 0 ? `約 ${yen(r.annualSaveYen)}/年` : `年間 約${Math.round(r.annualSaveSec / 3600)}時間`;
     createCard(r.model, r.stepKey, r.stepTitle, r.category, {
       kind: 'profit', label: `重点工程 ${saving}`,
-      problem: `${r.stepTitle}: 年間${r.annualUnits}台・実績中央値${pdcaFmtSec(r.median)}${r.hasTarget ? ` / 目標${pdcaFmtSec(r.target)}（1台${pdcaFmtSec(r.reductionPerUnit)}の短縮余地）` : '（目標未設定）'}。目標まで詰めると ${saving} の削減見込。`,
+      // 問題文は 90日 baseline(=保存される証拠)から組み立て、年間削減見込(365日由来)は「参考」として併記する。
+      buildProblem: (b) => {
+        const tgt = (b.avgTarget != null && b.avgTarget > 0) ? b.avgTarget : (r.hasTarget ? r.target : 0);
+        const reduce = tgt > 0 ? Math.max(0, (b.median || 0) - tgt) : 0;
+        return `${r.stepTitle}: 実績中央値 ${pdcaFmtSec(b.median)}（直近90日・${b.n || 0}台）${tgt > 0 ? ` / 目標 ${pdcaFmtSec(tgt)}（${reduce > 0 ? `1台${pdcaFmtSec(reduce)}遅い` : '目標内'}）` : '（目標未設定）'}。参考: 直近1年で ${saving} の削減見込（年間${r.annualUnits}台）。`;
+      },
     });
   };
 
@@ -15237,20 +17071,199 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
         </div>
       </div>
 
+      {/* === 改善スコアボード(SQDC型・改善ループの主役): 今月 vs 先月のトレンド + 浮いた時間。毎月見て1つ選ぶ。 === */}
+      <div className="border-2 border-indigo-200 rounded-xl overflow-hidden mb-4">
+        <div className="px-3 py-2 bg-indigo-600 text-white text-sm font-black flex items-center gap-2"><Activity className="w-4 h-4" /> 改善スコアボード — 今月のうごき（先月と比べて）</div>
+        {/* サマリ: 浮いた時間 + ¥ + 正直な注記 */}
+        <div className="px-3 py-2.5 bg-indigo-50 border-b border-indigo-100 flex items-center gap-4 flex-wrap">
+          <div className="shrink-0">
+            <div className="text-[10px] text-indigo-500 font-bold">今月 浮いた時間（先月より速くなった分）</div>
+            <div className="text-2xl font-black text-indigo-700 font-mono">{formatTime(scoreboard.freedSecTotal)}
+              {scoreboard.rate > 0 && <span className="text-sm font-bold text-emerald-600 ml-2">≒ {yen(scoreboard.freedYenTotal)}</span>}
+            </div>
+          </div>
+          <div className="text-[11px] text-slate-600 flex-1 min-w-[220px] leading-relaxed">
+            改善 <b className="text-emerald-600">{scoreboard.improvedCount}</b> 工程 / 悪化 <b className="text-rose-600">{scoreboard.worsenedCount}</b> 工程。<br />
+            ※ ¥は「<b>浮いた余力（時間）</b>を別の仕事に回せた場合の価値」です。すぐ現金が減るわけではなく、<b>増産・多能工化・内製化・改善活動</b>などに回して初めて利益になります。
+          </div>
+        </div>
+        <div className="overflow-auto max-h-72">
+          <table className="w-full text-xs border-collapse">
+            <thead className="sticky top-0 bg-slate-100 text-slate-500">
+              <tr>
+                <th className="px-2 py-1.5 text-left font-bold">型式 × 工程</th>
+                <th className="px-2 py-1.5 text-right font-bold">今の中央値→目標</th>
+                <th className="px-2 py-1.5 text-center font-bold">先月比（今月の動き）</th>
+                <th className="px-2 py-1.5 text-right font-bold">年間の山</th>
+              </tr>
+            </thead>
+            <tbody>
+              {scoreboard.rows.length === 0 && <tr><td colSpan={4} className="px-2 py-6 text-center text-slate-400">データがまだありません。時間取りが貯まると表示されます。</td></tr>}
+              {scoreboard.rows.map((r, i) => {
+                const tu = r.trend === 'faster' ? { c: 'text-emerald-700 bg-emerald-100', a: '▼ 速くなった' }
+                  : r.trend === 'slower' ? { c: 'text-rose-700 bg-rose-100', a: '▲ 遅くなった' }
+                  : r.trend === 'same' ? { c: 'text-slate-500 bg-slate-100', a: '→ 横ばい' }
+                  : r.trend === 'new' ? { c: 'text-blue-600 bg-blue-50', a: '新規' }
+                  : { c: 'text-slate-300 bg-slate-50', a: '今月なし' };
+                return (
+                  <tr key={i} onClick={() => setDetailRow(r)} className="border-t border-slate-100 hover:bg-indigo-50 cursor-pointer">
+                    <td className="px-2 py-1.5"><div className="font-bold text-slate-700 truncate max-w-[14rem]">{r.model}</div><div className="text-slate-500 truncate max-w-[14rem]">{r.stepTitle}</div></td>
+                    <td className="px-2 py-1.5 text-right font-mono whitespace-nowrap">{formatTime(r.median)}{r.hasTarget && <span className="text-slate-400"> → {formatTime(r.target)}</span>}</td>
+                    <td className="px-2 py-1.5 text-center whitespace-nowrap"><span className={`inline-block px-2 py-0.5 rounded font-bold ${tu.c}`}>{tu.a}{(r.trend === 'faster' || r.trend === 'slower') && <span className="ml-1 font-mono">{formatTime(Math.abs(r.deltaSec))}</span>}</span></td>
+                    <td className="px-2 py-1.5 text-right font-mono text-slate-500 whitespace-nowrap">{ranking.rate > 0 ? yen(r.annualCostYen) : `${Math.round(r.annualCostSec / 3600)}h`}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="px-3 py-1.5 bg-white text-[11px] text-slate-500 border-t leading-relaxed">
+          <b className="text-slate-700">毎月の使い方：</b>この表を見て <b className="text-rose-600">▲遅くなった</b>／年間の山が大きい工程を<b>1つ</b>選んでクリック → 計算の内訳と根拠データを確認 →「カルテ化」で対策を決めて実施。来月この表で<b className="text-emerald-600">▼速くなった</b>か<u>自動で</u>分かります（人は“やる”だけ）。
+        </div>
+      </div>
+
       {/* 重点工程ランキング: 年間でかかっている時間・コストが大きい順。行クリックで詳細(計算の内訳+根拠データ) */}
       <div className="border border-emerald-200 rounded-xl overflow-hidden">
         <div className="px-3 py-2 bg-emerald-50 text-emerald-900 text-sm font-bold flex items-center justify-between gap-2 flex-wrap">
-          <span className="flex items-center gap-2"><TrendingUp className="w-4 h-4" /> 重点工程 — 年間でかかっている時間が大きい順</span>
+          <span className="flex items-center gap-2"><TrendingUp className="w-4 h-4" /> 重点工程 — {rankingView === 'cross' ? '工程横断（共通ポイントを1つ直すと全型式に効く）' : '年間でかかっている時間が大きい順（詳しく見る）'}</span>
           <div className="flex items-center gap-3 text-[11px] font-normal">
-            {ranking.rate > 0
+            <div className="flex rounded-lg overflow-hidden border border-emerald-300 shrink-0">
+              <button onClick={() => setRankingView('model')} className={`px-2.5 py-0.5 font-bold ${rankingView === 'model' ? 'bg-emerald-600 text-white' : 'bg-white text-emerald-700 hover:bg-emerald-100'}`} title="どの型式のどの工程か">型式別</button>
+              <button onClick={() => setRankingView('cross')} className={`px-2.5 py-0.5 font-bold ${rankingView === 'cross' ? 'bg-emerald-600 text-white' : 'bg-white text-emerald-700 hover:bg-emerald-100'}`} title="工程ごとに型式をまとめ、共通ポイントを横断改善">工程横断</button>
+            </div>
+            {rankingView === 'model' && (ranking.rate > 0
               ? <span>年間人件費 計 <b className="text-slate-700 text-sm">{yen(ranking.totalCostYen)}</b> ・ 短縮できれば <b className="text-emerald-700 text-sm">{yen(ranking.totalSaveYen)}</b></span>
-              : <span className="text-amber-600">時給未設定（経営分析タブで設定すると円換算）</span>}
-            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={hideLowFreq} onChange={e => setHideLowFreq(e.target.checked)} className="accent-emerald-600" />年10台未満を隠す</label>
+              : <span className="text-amber-600">時給未設定（経営分析タブで設定すると円換算）</span>)}
+            {rankingView === 'model' && <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={hideLowFreq} onChange={e => setHideLowFreq(e.target.checked)} className="accent-emerald-600" />年10台未満を隠す</label>}
           </div>
         </div>
         <div className="px-3 py-1.5 bg-white text-[11px] text-slate-500 border-b">
-          <b className="text-slate-700">読み方：</b>1年でその工程に合計どれだけ時間がかかっているかの大きい順です。<b>行をクリック</b>すると「年間◯台 × 1台◯分 = 年◯時間」の計算の内訳と、集計に使った指図一覧（確認用）が見られます。
+          {rankingView === 'cross'
+            ? <><b className="text-slate-700">読み方：</b>同じ工程（例: 測定準備）を<b>型式をまたいで合計</b>しています。「N型式に共通・年◯時間」の大きい所ほど、<b>その1工程を直すと全型式に効いて大きい</b>。行クリックで型式別の内訳が見られます。</>
+            : <><b className="text-slate-700">読み方：</b>1年でその工程に合計どれだけ時間がかかっているかの大きい順です。<b>行をクリック</b>すると「年間◯台 × 1台◯分 = 年◯時間」の計算の内訳と、集計に使った指図一覧（確認用）が見られます。</>}
         </div>
+        {/* 生産台数の年: 金額計算の台数をどの年の実生産台数で出すか。未入力型式は測定台数ベースの推定にフォールバック。 */}
+        <div className="px-3 py-1.5 bg-indigo-50/40 border-b border-indigo-100 flex items-center gap-2 flex-wrap text-[11px]">
+          <span className="font-bold text-indigo-800">金額の元にする 生産台数の年:</span>
+          <select value={prodYear} onChange={e => setProdYear(Number(e.target.value))} className="border border-indigo-200 rounded px-2 py-0.5 text-xs font-bold bg-white">
+            {prodYears.map(y => <option key={y} value={y}>{y}年</option>)}
+          </select>
+          <span className="text-slate-500">{prodInputCount > 0
+            ? <>この年は <b className="text-indigo-700">{prodInputCount}型式</b> に実際の生産台数を入力済（青=実数 / 灰=測定台数ベースの推定）。</>
+            : <>まだ生産台数の入力がありません＝<b className="text-amber-600">測定した台数ベースの推定</b>で計算中。<b>経営分析</b>タブで実際の年間生産台数を入れると金額の精度が上がります。</>}</span>
+        </div>
+
+        {/* === 工程横断（共通ポイント）=== */}
+        {rankingView === 'cross' && (() => {
+          const cr = ranking.rate > 0;
+          const cVal = (sec, yenv) => cr ? yen(yenv) : `${Math.round(sec / 3600)}h`;
+          return (
+            <>
+              {/* 絞り込み(複数選択可): テンプレ/型式グループのタグを任意個選ぶと「選んだ分だけ」まとめて横断集計(例: 中間分割を数種まとめて・ファナックだけ等) */}
+              <div className="px-3 py-1.5 bg-white border-b text-[11px]">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-slate-700">絞り込み:</span>
+                  <button onClick={() => { setCrossScopes([]); setCrossExpanded(null); }} className={`px-2 py-0.5 rounded-full border font-bold ${crossScopes.length === 0 ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>全部（まとめて）</button>
+                  {crossScopes.length > 0 && <span className="text-emerald-700 font-bold">選択中 {crossScopes.length}件 をまとめて集計</span>}
+                  {crossScopes.length > 0 && <button onClick={() => { setCrossScopes([]); setCrossExpanded(null); }} className="text-slate-400 underline hover:text-slate-600">クリア</button>}
+                </div>
+                {((templates || []).length > 0 || (modelGroups || []).length > 0) && (
+                  <div className="mt-1 max-h-24 overflow-auto flex flex-wrap gap-1 pr-1">
+                    {(templates || []).map(t => { const tok = `tpl:${t.id}`; const on = crossScopes.includes(tok); return (
+                      <button key={tok} onClick={() => toggleCrossScope(tok)} className={`px-2 py-0.5 rounded border ${on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-indigo-700 border-indigo-200 hover:bg-indigo-50'}`} title="同じテンプレ内だけで横断（中間分割など）。複数選べます">{on ? '✓ ' : ''}{t.name}</button>
+                    ); })}
+                    {(modelGroups || []).map(g => { const tok = `grp:${g.id}`; const on = crossScopes.includes(tok); return (
+                      <button key={tok} onClick={() => toggleCrossScope(tok)} className={`px-2 py-0.5 rounded border ${on ? 'bg-amber-600 text-white border-amber-600' : 'bg-white text-amber-700 border-amber-200 hover:bg-amber-50'}`} title="型式グループ（ファナック等）。複数選べます">{on ? '✓ ' : ''}{g.name}</button>
+                    ); })}
+                  </div>
+                )}
+                <div className="mt-1 text-slate-400">{crossScopes.length === 0 ? '全部を横断集計中。同じと言えない工程が混ざる時は下のタグで絞り込み（複数選べます／青=テンプレ・橙=型式グループ）。' : '選んだタグの分だけ「まとめて」横断集計しています。タグを足すと対象が広がります。'}</div>
+              </div>
+              <div className="px-3 py-2 bg-indigo-50/60 border-b border-indigo-100 flex items-center gap-2 flex-wrap text-[11px]">
+                <span className="font-bold text-indigo-800">「もし◯%短縮できたら」の仮定：</span>
+                <input type="range" min="10" max="70" step="5" value={crossPct} onChange={e => setCrossPct(Number(e.target.value))} className="accent-indigo-600 w-36" />
+                <span className="font-mono font-bold text-indigo-700 w-10">{crossPct}%</span>
+                <span className="text-slate-500">← レイアウト改善・治具・自動化など「大きい改善」の効果を仮置きで試算（下の②列）</span>
+              </div>
+              <div className="overflow-auto max-h-80">
+                <table className="w-full text-xs border-collapse">
+                  <thead className="sticky top-0 bg-slate-100 text-slate-500">
+                    <tr>
+                      <th className="px-2 py-1.5 text-left font-bold">共通工程</th>
+                      <th className="px-2 py-1.5 text-right font-bold" title="この工程を持つ型式の数">型式数</th>
+                      <th className="px-2 py-1.5 text-right font-bold" title="全型式合計の年間時間（×時給）">年間合計<div className="text-[9px] font-normal text-slate-400">{cr ? '円/年' : '時間/年'}</div></th>
+                      <th className="px-2 py-1.5 text-right font-bold text-emerald-700" title="一番速い型式の中央値まで、遅い型式を全部揃えたら浮く分（現に出来てる型式があるので実証済み）">①最速に揃える<div className="text-[9px] font-normal text-emerald-500">{cr ? '円/年' : '時間/年'}</div></th>
+                      <th className="px-2 py-1.5 text-right font-bold text-indigo-700" title={`全型式合計を${crossPct}%短縮できたらの仮定`}>②{crossPct}%短縮<div className="text-[9px] font-normal text-indigo-400">{cr ? '円/年' : '時間/年'}</div></th>
+                      <th className="px-2 py-1.5 text-right font-bold text-slate-600" title="各型式を目標時間まで詰めたら浮く分（堅実な下限）">③目標まで<div className="text-[9px] font-normal text-slate-400">{cr ? '円/年' : '時間/年'}</div></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {crossRows.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-4">完了データがまだありません</td></tr>}
+                    {crossRows.map((g, i) => {
+                      const barPct = Math.max(2, Math.round(g.annualCostSec / crossMaxCost * 100));
+                      const open = crossExpanded === g.title;
+                      return (
+                        <React.Fragment key={g.title}>
+                          <tr onClick={() => setCrossExpanded(open ? null : g.title)} className={`border-b border-slate-50 cursor-pointer hover:bg-indigo-50/50 ${open ? 'bg-indigo-50/60' : ''}`}>
+                            <td className="px-2 py-1.5"><div className="font-bold text-slate-800 truncate max-w-[13rem] flex items-center gap-1" title={`${g.title}（クリックで型式別内訳）`}><span className="text-slate-300">{open ? '▼' : '▶'}</span><span className="text-slate-300">{i + 1}.</span>{g.title}</div></td>
+                            <td className="px-2 py-1.5 text-right font-mono">{g.modelCount}<span className="text-[9px] text-slate-400">型式</span>{g.actualModels > 0 && <div className="text-[8px] font-bold text-indigo-600">{g.actualModels}実数</div>}</td>
+                            <td className="px-2 py-1.5 text-right">
+                              <div className="flex items-center gap-1.5 justify-end">
+                                <div className="h-2 w-12 bg-slate-100 rounded overflow-hidden"><div className="h-full bg-slate-400" style={{ width: `${barPct}%` }} /></div>
+                                <span className="font-mono text-slate-600 whitespace-nowrap">{cVal(g.annualCostSec, g.annualCostYen)}</span>
+                              </div>
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-mono font-bold whitespace-nowrap">{g.saveToFastestSec > 0 ? <span className="text-emerald-700">{cVal(g.saveToFastestSec, g.saveToFastestYen)}</span> : <span className="text-slate-300">—</span>}</td>
+                            <td className="px-2 py-1.5 text-right font-mono font-bold whitespace-nowrap text-indigo-700">{cVal(g.saveByPctSec, g.saveByPctYen)}</td>
+                            <td className="px-2 py-1.5 text-right font-mono whitespace-nowrap">{g.saveToTargetSec > 0 ? cVal(g.saveToTargetSec, g.saveToTargetYen) : <span className="text-slate-300">{g.hasTargetAny ? '—' : '目標未設定'}</span>}</td>
+                          </tr>
+                          {open && (
+                            <tr className="bg-indigo-50/30 border-b border-indigo-100"><td colSpan={6} className="px-3 py-2">
+                              <div className="text-[11px] text-slate-600 mb-1.5"><b className="text-indigo-700">「{g.title}」の型式別内訳</b> — 一番速いのは <b>{g.fastestModel}（{pdcaFmtSec(g.fastest)}）</b>。これに全型式を揃えれば <b className="text-emerald-700">{cVal(g.saveToFastestSec, g.saveToFastestYen)}/年</b> 浮く。さらにレイアウト等で{crossPct}%短縮できれば <b className="text-indigo-700">{cVal(g.saveByPctSec, g.saveByPctYen)}/年</b>。</div>
+                              <table className="w-full text-[11px] border-collapse">
+                                <thead><tr className="text-slate-400 border-b border-indigo-100"><th className="px-2 py-0.5 text-left">型式</th><th className="px-2 py-0.5 text-right">年間台数</th><th className="px-2 py-0.5 text-right">1台の中央値</th><th className="px-2 py-0.5 text-right">目標</th><th className="px-2 py-0.5 text-right">年間コスト</th></tr></thead>
+                                <tbody>
+                                  {g.models.map((m, j) => (
+                                    <tr key={j} onClick={(e) => { e.stopPropagation(); setDetailRow(m); }} className={`border-b border-indigo-50 cursor-pointer hover:bg-amber-50 ${m.median === g.fastest ? 'bg-emerald-50/50' : ''}`} title={`${m.model} の計算の内訳（台数の出し方・根拠データ）を見る`}>
+                                      <td className="px-2 py-0.5 font-bold text-slate-700">{m.median === g.fastest && <span className="text-emerald-600">🏆 </span>}{m.model}<span className="text-[9px] text-indigo-400 ml-1">詳細▸</span></td>
+                                      <td className="px-2 py-0.5 text-right font-mono">{m.annualUnits.toLocaleString()}<span className="text-[8px] text-slate-400 ml-0.5">{m.annualUnitsSource === 'actual' ? '登録' : '推定'}</span></td>
+                                      <td className="px-2 py-0.5 text-right font-mono">{pdcaFmtSec(m.median)}</td>
+                                      <td className="px-2 py-0.5 text-right font-mono text-slate-400">{m.hasTarget ? pdcaFmtSec(m.target) : '—'}</td>
+                                      <td className="px-2 py-0.5 text-right font-mono">{cVal(m.annualCostSec, m.annualCostYen)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              <div className="text-[10px] text-slate-400 mt-1">🏆=この工程で一番速い型式（実証済みの到達点）。年間コスト = 年間台数 × 中央値{cr ? ' × 時給' : ''}。<b>型式をクリック</b>すると台数の計算方法・根拠データが見られます（台数: 登録=経営分析の入力値 / 推定=実績ペースを1年換算）。</div>
+                            </td></tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <div className="px-3 py-1.5 bg-slate-50 text-[10px] text-slate-500 border-t">
+                ①最速に揃える＝現に一番速い型式の中央値まで他を揃えた場合（実証済みの堅い目標）。②{crossPct}%短縮＝レイアウト/治具/自動化など大きい改善の仮置き試算（上のスライダーで率を変更）。③目標まで＝設定目標までの堅実な下限。全型式合計で効くので「共通工程を1つ直す」インパクトが見えます。
+              </div>
+            </>
+          );
+        })()}
+
+        {/* まず直すなら: 削減見込が一番大きい(=目標より遅い)工程を1つ名指し。コスト×達成の優先象限を1行で示す。 */}
+        {rankingView === 'model' && (<>
+        {/* model-view-start */}
+        {(() => {
+          const top = rankingRows.find(r => r.hasTarget && r.median > r.target && r.annualSaveSec > 0);
+          if (!top) return null;
+          const save = ranking.rate > 0 ? yen(top.annualSaveYen) : `約${Math.round(top.annualSaveSec / 3600)}時間`;
+          return (
+            <div onClick={() => setDetailRow(top)} className="px-3 py-2 bg-rose-50 border-b border-rose-200 text-[12px] text-rose-800 flex items-center gap-2 cursor-pointer hover:bg-rose-100">
+              <span className="shrink-0">🎯</span>
+              <span><b>まず直すなら：{top.model} / {top.stepTitle}</b> — 年間{top.annualUnits}台・目標より遅く、詰めれば <b>{save}/年</b> の削減見込（クリックで計算の内訳）</span>
+            </div>
+          );
+        })()}
         <div className="overflow-auto max-h-80">
           <table className="w-full text-xs border-collapse">
             <thead className="sticky top-0 bg-slate-100 text-slate-500">
@@ -15271,7 +17284,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
                 return (
                   <tr key={i} onClick={() => setDetailRow(r)} className={`border-b border-slate-50 cursor-pointer hover:bg-emerald-50/50 ${r.lowFreq ? 'opacity-50' : ''}`}>
                     <td className="px-2 py-1.5"><div className="font-bold text-slate-800 truncate max-w-[12rem] flex items-center gap-1" title={`${r.model} / ${r.stepTitle}（クリックで詳細）`}><span className="text-slate-300">{i + 1}.</span>{r.model} ／ {r.stepTitle}</div>{r.lowFreq && <span className="text-[10px] text-amber-600">年{r.annualUnits}台・後回し</span>}{!r.hasTarget && <span className="text-[10px] text-slate-400">目標未設定</span>}</td>
-                    <td className="px-2 py-1.5 text-right font-mono">{r.annualUnits.toLocaleString()}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{r.annualUnits.toLocaleString()}<div className={`text-[8px] font-bold ${r.annualUnitsSource === 'actual' ? 'text-indigo-600' : 'text-slate-400'}`}>{r.annualUnitsSource === 'actual' ? '実数' : '推定'}</div></td>
                     <td className="px-2 py-1.5 text-right font-mono whitespace-nowrap">{pdcaFmtSec(r.median)}<span className="text-slate-400"> → {r.hasTarget ? pdcaFmtSec(r.target) : '—'}</span></td>
                     <td className="px-2 py-1.5 text-right">
                       <div className="flex items-center gap-1.5 justify-end">
@@ -15297,6 +17310,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
           年間人件費 = 年間台数 × 実績中央値 × 時給（＝コストの山＝割合が多い所）。年間削減見込 = 年間台数 × 短縮余地(実績中央値−目標) × 時給。
           {ranking.totalSaveSec <= 60 && rankingRows.length > 0 && <span className="text-amber-600"> ／ 今は目標まで詰める余地が小さい（多くが目標より速い）＝目標が緩い可能性。人件費の山(左の棒)で重点を選ぶか、目標の見直し・自動化を検討。</span>}
         </div>
+        </>)}
       </div>
 
       {/* 手動でカルテ作成 */}
@@ -15354,7 +17368,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
               <h3 className="font-bold flex items-center gap-2"><ClipboardList className="w-5 h-5" /> 改善PDCA の使い方</h3>
               <button onClick={() => setShowHelp(false)} className="px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-bold">閉じる</button>
             </div>
-            <div className="p-4 overflow-y-auto space-y-4 text-sm text-slate-700">
+            <div className="flex-1 min-h-0 p-4 overflow-y-auto space-y-4 text-sm text-slate-700">
               <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
                 <div className="font-bold text-emerald-800 mb-1">この画面は「どの工程に時間とお金がかかっているか」から始めます</div>
                 上の<b>重点工程</b>表は <b>年間台数 × 1台の時間</b>（＝1年でその工程に合計どれだけ時間がかかっているか）が大きい順です。台数が多くて時間がかかる工程ほど上に来ます。<b>行をクリック</b>すると、その数字がどう計算されたか（実数つき）と、集計に使った指図一覧（確認用）が見られます。年10台未満の工程は金額が小さく自動で下位＝「年1回しか来ないから後回し」が分かります。
@@ -15702,14 +17716,19 @@ const processRawSamples = (lots, { model, templateId, stepKey }) => {
     if (model && l.model !== model) return;
     if (templateId && l.templateId !== templateId) return;
     (l.steps || []).forEach((step, idx) => {
-      if (targetTimeStepKey(step) !== stepKey || step.lotOnce) return;
-      for (let u = 0; u < (l.quantity || 1); u++) {
-        const tk = step.id ? `${step.id}-${u}` : `${idx}-${u}`;
-        const t = (l.tasks || {})[tk] || (l.tasks || {})[`${idx}-${u}`];
-        if (!t || (t.status !== 'completed' && t.status !== 'ng')) continue;
+      if (targetTimeStepKey(step) !== stepKey) return;
+      // 段取り(lotOnce)は回数キー(-lot-k)、通常工程は台キー(id系優先, 旧式数値にフォールバック)。
+      // stepBreakdown と同じキー解決にして、段取り工程でも生データ修正できるようにする。
+      const keys = step.lotOnce
+        ? lotOnceKeysOf(l.tasks || {}, step)
+        : Array.from({ length: l.quantity || 1 }, (_, u) => ((l.tasks || {})[`${step.id}-${u}`] !== undefined ? `${step.id}-${u}` : `${idx}-${u}`));
+      keys.forEach((tk, ki) => {
+        const t = (l.tasks || {})[tk];
+        if (!t || (t.status !== 'completed' && t.status !== 'ng')) return;
         const dur = t.duration || 0;
-        out.push({ lotId: l.id, taskKey: (l.tasks || {})[tk] ? tk : `${idx}-${u}`, workOrder: l.workOrderNumber || l.orderNumber || l.id, unitIdx: u, value: dur, manual: !!t.manualTime, completedAt: toMsAny(t.endTime) || toMsAny(l.completedAt) || toMsAny(l.updatedAt) || 0 });
-      }
+        const u = step.lotOnce ? (parseInt((tk.match(/-lot-(\d+)$/) || [])[1]) || ki) : ki;
+        out.push({ lotId: l.id, taskKey: tk, workOrder: l.workOrderNumber || l.orderNumber || l.id, unitIdx: u, isLot: !!step.lotOnce, value: dur, manual: !!t.manualTime, completedAt: toMsAny(t.endTime) || toMsAny(l.completedAt) || toMsAny(l.updatedAt) || 0 });
+      });
     });
   });
   return out.sort((a, b) => b.value - a.value);
@@ -15726,7 +17745,7 @@ const RawFixModal = ({ sample, target, fmt, onSave, onClose }) => {
       <div className="bg-white w-full max-w-xs rounded-2xl shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className="bg-amber-500 text-white px-4 py-3 font-bold flex items-center gap-2">🔧 実測値を修正</div>
         <div className="p-4 space-y-3">
-          <div className="text-xs text-slate-500">指図 {sample.workOrder} ／ {sample.unitIdx + 1}台目<br />現在: <b className="font-mono text-slate-700">{fmt(sample.value)}</b></div>
+          <div className="text-xs text-slate-500">指図 {sample.workOrder} ／ {sample.unitIdx + 1}{sample.isLot ? '回目' : '台目'}<br />現在: <b className="font-mono text-slate-700">{fmt(sample.value)}</b></div>
           <div className="flex items-center justify-center gap-2">
             <input type="number" value={mm} onChange={e => setMm(e.target.value)} className="w-16 border rounded p-2 text-center text-lg font-mono" /><span className="text-sm">分</span>
             <input type="number" value={ss} onChange={e => setSs(e.target.value)} className="w-16 border rounded p-2 text-center text-lg font-mono" /><span className="text-sm">秒</span>
@@ -15830,7 +17849,11 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
     if ((v <= 0 || v > 14400) && !confirm(v <= 0 ? '0秒は集計から除外され、グラフから消えます。このまま保存しますか？' : '4時間を超える値は異常値（外れ値）のままになります。このまま保存しますか？')) return;
     const lot = (lots || []).find(l => l.id === fixEdit.sample.lotId); if (!lot) { setFixEdit(null); return; }
     const tk = fixEdit.sample.taskKey; const cur = (lot.tasks || {})[tk]; if (!cur) { setFixEdit(null); return; }
-    const tasks = { ...(lot.tasks || {}), [tk]: { ...cur, duration: v, manualTime: true } };
+    // 手編集で壁時計の連続ラップ前提が崩れるため、じっと見るの内訳(elementDurations/elementMarks)は破棄して
+    // 内訳対象外にする(「歪むなら内訳を出さない」設計と整合)。残すと Σ要素=工程時間 の整合が崩れる。
+    const { elementDurations, elementMarks, ...keep } = cur;
+    const fst = Number(keep.firstStartTime) || Number(keep.startTime) || null;
+    const tasks = { ...(lot.tasks || {}), [tk]: { ...keep, duration: v, manualTime: true, ...(fst ? { firstStartTime: fst, endTime: fst + v * 1000, startTime: null } : {}) } };
     saveData('lots', lot.id, { tasks });
     setFixEdit(null);
   };
@@ -16020,12 +18043,12 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                   ) : (
                     <div className="max-h-72 overflow-y-auto rounded border border-amber-200 bg-white">
                       <table className="w-full text-xs">
-                        <thead className="bg-amber-100 text-amber-900 sticky top-0"><tr><th className="px-2 py-1 text-left">指図</th><th className="px-2 py-1 text-center">台</th><th className="px-2 py-1 text-right">実測</th><th className="px-2 py-1 text-center">完了日</th><th className="px-2 py-1 text-center">修正</th></tr></thead>
+                        <thead className="bg-amber-100 text-amber-900 sticky top-0"><tr><th className="px-2 py-1 text-left">指図</th><th className="px-2 py-1 text-center">台/回</th><th className="px-2 py-1 text-right">実測</th><th className="px-2 py-1 text-center">完了日</th><th className="px-2 py-1 text-center">修正</th></tr></thead>
                         <tbody>
                           {rawSamples.map((sp, i) => { const fl = sampleFlag(sp.value); return (
                             <tr key={sp.lotId + sp.taskKey + i} className={`border-t border-slate-100 ${fl === 'bad' ? 'bg-rose-50' : fl === 'warn' ? 'bg-amber-50' : ''}`}>
                               <td className="px-2 py-1 truncate max-w-[10rem]" title={String(sp.workOrder)}>{fl === 'bad' ? '🔴' : fl === 'warn' ? '🟡' : ''} {sp.workOrder}</td>
-                              <td className="px-2 py-1 text-center text-slate-500">{sp.unitIdx + 1}</td>
+                              <td className="px-2 py-1 text-center text-slate-500">{sp.unitIdx + 1}{sp.isLot ? '回' : ''}</td>
                               <td className={`px-2 py-1 text-right font-mono font-bold ${fl === 'bad' ? 'text-rose-600' : fl === 'warn' ? 'text-amber-600' : 'text-slate-700'}`}>{fmt(sp.value)}{sp.manual && <span className="text-[9px] text-slate-400 ml-1">手</span>}</td>
                               <td className="px-2 py-1 text-center text-[10px] text-slate-400">{sp.completedAt ? pdcaFmtDate(sp.completedAt) : '—'}</td>
                               <td className="px-2 py-1 text-center"><button onClick={() => setFixEdit({ sample: sp })} className="text-[11px] px-2 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-white font-bold">直す</button></td>
@@ -16057,12 +18080,25 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
               {workerRows.length > 1 && (
                 <div>
                   <div className="text-xs text-slate-500 mb-1">④ 作業者別の中央値（速い順）</div>
+                  {/* 最速作業者に全員が揃った場合の機会サイズ(教育・手順統一のレバー)。各作業者の(中央値−最速)×担当台数の合計。 */}
+                  {(() => {
+                    const fastest = workerRows[0].median;
+                    const gapSec = workerRows.reduce((s, w) => s + Math.max(0, w.median - fastest) * w.n, 0);
+                    if (gapSec < 60) return null;
+                    const rate = Number(settings?.laborCostPerHour) || 0;
+                    const yenTxt = rate > 0 ? ` ≒ ¥${Math.round(gapSec / 3600 * rate).toLocaleString()}` : '';
+                    return (
+                      <div className="mb-1.5 text-[11px] bg-amber-50 border border-amber-200 rounded px-2 py-1 text-amber-800">
+                        💡 最速「{workerRows[0].name}」に全員が揃えば <b className="font-mono">合計 {(gapSec / 3600).toFixed(1)}時間{yenTxt}</b> 短縮の余地（測定対象期間内・教育/手順統一のレバー）
+                      </div>
+                    );
+                  })()}
                   <div className="space-y-1">
                     {workerRows.map((w, i) => (
                       <div key={i} className="flex items-center gap-2 text-xs">
                         <span className="w-24 truncate shrink-0 text-slate-700">{w.name}</span>
                         <div className="flex-1 h-2.5 bg-slate-100 rounded overflow-hidden"><div className="h-full bg-teal-500" style={{ width: `${Math.max(2, Math.round(w.median / maxWorker * 100))}%` }} /></div>
-                        <span className="font-mono text-slate-600 w-20 text-right shrink-0">{fmt(w.median)}・{w.n}台</span>
+                        <span className="font-mono text-slate-600 w-20 text-right shrink-0">{fmt(w.median)}・{w.n}台{i > 0 && <span className="text-amber-500">（+{fmt(w.median - workerRows[0].median)}）</span>}</span>
                       </div>
                     ))}
                   </div>
@@ -16134,7 +18170,7 @@ const ANALYSIS_GROUPS = [
     { k: 'rotary', l: '分割測定', color: 'text-cyan-600' },
   ] },
 ];
-const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null }) => {
+const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], notes = [], announcements = [], strictModeHistory = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null }) => {
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('process-analysis'); // 既定=工程分析(データを見る土台)。グループは activeMode から導出
   const activeGroup = ANALYSIS_GROUPS.find(g => g.tabs.some(t => t.k === activeMode)) || ANALYSIS_GROUPS[0];
@@ -16190,7 +18226,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
 
   const analysisData = useMemo(() => {
     // Basic filtering
-    let filtered = lots.filter(l => (l.status === 'completed' || l.location === 'completed') && isInFilterPeriod(l.updatedAt || l.createdAt));
+    let filtered = lots.filter(l => (l.status === 'completed' || l.location === 'completed') && isInFilterPeriod(toMsAny(l.completedAt) || toMsAny(l.updatedAt) || l.createdAt));
     if (selectedModel !== 'all') {
         filtered = filtered.filter(l => l.model === selectedModel);
     }
@@ -16309,7 +18345,8 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
     const isInPrev = getPrevPeriodChecker();
 
     lots.forEach(lot => {
-      const lotTime = lot.updatedAt || lot.entryAt || lot.createdAt;
+      // 完了時刻を最優先(updatedAtはserverTimestampで編集の度に動く+Firestore Timestampは要数値化)。
+      const lotTime = toMsAny(lot.completedAt) || toMsAny(lot.updatedAt) || toMsAny(lot.entryAt) || toMsAny(lot.createdAt);
       // 前期間カウント (件数比較用) + 月別推移用の全期間カウント (期間フィルタに依存しない)
       const lotDefectsAll = (lot.interruptions || []).filter(i => i.type === 'defect');
       lotDefectsAll.forEach(d => {
@@ -16434,6 +18471,34 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
       prevCount,
       diff,
       diffRate,
+    };
+  }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
+
+  // 気づき・改善(type='improvement') の集計。タブ名「軽微不良・改善提案」の“改善”側。
+  //   軽微不良(complaint)とは別概念(工程の提案)なので complaintStats とは分けて集計し、同タブ内に別セクションで出す。
+  const improvementStats = useMemo(() => {
+    const IMPROVE_LABELS = { split: '細分化', add: '追加', change: '変更', remove: '削除', order: '順番変更', other: 'その他' };
+    const items = [];
+    const kindCounts = {}, stepCounts = {}, modelCounts = {}, workerCounts = {};
+    lots.forEach(lot => {
+      (lot.interruptions || []).filter(i => i.type === 'improvement').forEach(im => {
+        if (!isInDefectPeriod(im.timestamp)) return;
+        const wname = (workers.find(x => x.id === im.workerName)?.name) || im.workerName || '不明';
+        const kindLabel = IMPROVE_LABELS[im.improvementKind] || 'その他';
+        const st = im.stepInfo?.title || im.targetStepTitle || '全体';
+        const m = lot.model || '不明';
+        items.push({ ...im, lot, workerName: wname, kindLabel, stepTitle: st });
+        kindCounts[kindLabel] = (kindCounts[kindLabel] || 0) + 1;
+        stepCounts[st] = (stepCounts[st] || 0) + 1;
+        modelCounts[m] = (modelCounts[m] || 0) + 1;
+        workerCounts[wname] = (workerCounts[wname] || 0) + 1;
+      });
+    });
+    const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
+    return {
+      total: items.length,
+      items: items.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
+      kinds: sortObj(kindCounts), steps: sortObj(stepCounts), models: sortObj(modelCounts), workers: sortObj(workerCounts),
     };
   }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
@@ -16979,6 +19044,33 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                  </div>
                </div>
 
+               {/* 気づき・改善(工程の提案) ― 軽微不良(品質)とは別概念。タブ名「軽微不良・改善提案」の“改善”側をここに出す。 */}
+               <div className="bg-white rounded-xl shadow-sm border-2 border-indigo-200 p-4">
+                 <h3 className="font-bold text-indigo-700 mb-2 flex items-center gap-2"><Lightbulb className="w-4 h-4"/> 気づき・改善（工程の提案） <span className="text-indigo-500">{improvementStats.total}件</span></h3>
+                 <div className="text-[11px] text-slate-500 mb-2">作業画面の「気づき・改善」で残した工程の提案（細分化/追加/変更/削除/順番）。軽微不良（品質の不良）とは別物です。</div>
+                 {improvementStats.total === 0 ? (
+                   <div className="text-slate-400 text-sm py-3">この期間の気づき・改善はありません。</div>
+                 ) : (
+                   <div className="space-y-3">
+                     <div className="flex flex-wrap gap-1.5">
+                       {improvementStats.kinds.map((k, i) => (<span key={i} className="text-[11px] bg-indigo-50 border border-indigo-200 text-indigo-700 rounded px-2 py-0.5 font-bold">{k.name} {k.count}</span>))}
+                     </div>
+                     <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 border-t border-slate-100">
+                       {improvementStats.items.map((im, i) => (
+                         <div key={im.id || i} className="py-2 flex items-start gap-2 text-xs">
+                           <span className="bg-indigo-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0">{im.kindLabel}</span>
+                           <div className="flex-1 min-w-0">
+                             <div className="text-slate-800 whitespace-pre-wrap break-words">{im.label || '内容未記載'}</div>
+                             <div className="text-[10px] text-slate-400 mt-0.5">{im.stepTitle} · {im.lot?.model || ''} · {im.lot?.orderNo || ''} · {im.workerName} · {im.timestamp ? new Date(im.timestamp).toLocaleDateString('ja-JP') : ''}</div>
+                           </div>
+                           <button onClick={() => triggerDeleteInterruption(im.id, im.lot?.id, '気づき・改善')} className="text-slate-300 hover:text-rose-500 shrink-0" title="削除"><Trash2 className="w-3.5 h-3.5"/></button>
+                         </div>
+                       ))}
+                     </div>
+                   </div>
+                 )}
+               </div>
+
                {/* 月別推移バー */}
                <div className="bg-white rounded-xl shadow-sm border p-4">
                  <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2"><Activity className="w-4 h-4 text-purple-600"/> 月別推移 (直近12ヶ月)</h3>
@@ -17226,7 +19318,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'worker-eval' && (() => {
              // 作業者別の評価データ生成 (エビデンスベース)
              // 期間フィルタを反映: 完了が isInDefectPeriod に該当するロットのみ
-             const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(l.completedAt || l.updatedAt));
+             const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(toMsAny(l.completedAt) || toMsAny(l.updatedAt)));
 
              // 自動工程の判定: executionMode='batch' or title に '自動' を含む
              const isAutoStep = (step) => step?.executionMode === 'batch' || step?.title?.includes('自動');
@@ -17311,6 +19403,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    const tListE = step.lotOnce
                      ? lotOnceKeysOf(tasks, step).map(k => tasks[k])
                      : Array.from({ length: qty }, (_, uIdx) => getTask(step, sIdx, uIdx));
+                   const effTgtE = getEffectiveTargetTime(step, lot.model, settings.customTargetTimes || {}, modelGroupsOf(settings));
                    tListE.forEach(task => {
                      if (!task) return;
                      totalTasks++;
@@ -17318,9 +19411,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                      const dur = task.duration || 0;
                      totalDuration += dur;
                      if (dur > 0) stepTimes[stepKey].push(dur);
-                     if (step.targetTime && step.targetTime > 0 && dur > 0) {
+                     if (effTgtE > 0 && dur > 0) {
                        onTargetOpportunities++;
-                       if (dur <= step.targetTime) onTargetCount++;
+                       if (dur <= effTgtE) onTargetCount++;
                      }
                      if (task.reworks?.length > 0) {
                        ngCount += 1;
@@ -17532,7 +19625,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            })()}
 
            {activeMode === 'improvement' && (() => {
-             const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(l.completedAt || l.updatedAt));
+             const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(toMsAny(l.completedAt) || toMsAny(l.updatedAt)));
              const isAutoStep = (step) => step?.executionMode === 'batch' || step?.title?.includes('自動');
 
              // === 1) 不要工程あぶり出し ===
@@ -17975,7 +20068,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                          );
                        })}
                        <div className="text-[11px] text-slate-500 mt-2 bg-slate-50 rounded p-2 leading-relaxed">
-                         💡 上位3つ(赤)が改善の最優先。<b>自動工程</b>がボトルネックなら → オススメ順で並列吸収。<b>手動工程</b>なら → 標準化・教育・治具改善。
+                         💡 上位3つ(赤)が改善の最優先。<b>自動工程</b>がボトルネックなら → 並行作業で吸収。<b>手動工程</b>なら → 標準化・教育・治具改善。
                        </div>
                      </div>
                    )}
@@ -17992,7 +20085,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
            {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} improvements={improvements} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onGoToPdca={() => setActiveMode('pdca')} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
-           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} currentUserName={currentUserName} onRestore={onRestore} />}
+           {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} notes={notes} announcements={announcements} logs={logs} strictModeHistory={strictModeHistory} currentUserName={currentUserName} onRestore={onRestore} db={db} />}
            {/* ① データを正す: 要確認(異常値・該当なし)。ヘッダーの浮いたバッジと同じ中身を流れの先頭に置く。 */}
            {activeMode === 'anomaly' && (
              <div className="space-y-3">
@@ -18118,7 +20211,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
          }
      });
  
-     const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+     const csvContent = [headers.map(csvCell).join(','), ...rows.map(r => r.map(csvCell).join(','))].join('\n');
      const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: 'text/csv;charset=utf-8;' });
      const link = document.createElement('a');
      link.href = URL.createObjectURL(blob);
@@ -19312,7 +21405,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
              <button onClick={() => {
                const input = document.getElementById('indirectCatInput');
                if (input?.value?.trim()) {
-                 const cats = [...(settings.indirectCategories || DEFAULT_INDIRECT_CATEGORIES), input.value.trim()];
+                 const cats = [...new Set([...(settings.indirectCategories || DEFAULT_INDIRECT_CATEGORIES), input.value.trim()])];
                  saveSettings({ indirectCategories: cats });
                  input.value = '';
                }
@@ -19979,336 +22072,6 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
 
 // --- Completed History View ---
 // =====================================================================
-// 作業順最適化モーダル
-// - ルールベース: 自動工程の所要時間内に手動工程を詰める
-// - AI モード: Gemini に最適順を生成させる (VITE_GEMINI_API_KEY 必須)
-// - シミュレーション: シーケンシャル vs 最適化 のバー比較
-// =====================================================================
-const WorkOrderOptimizerModal = ({ lot, lots, templates = [], currentExecutionType = 'custom', onSwitchToCustom = null, onApplyToTemplate = null, onApplyToLot = null, onClose }) => {
-  const [mode, setMode] = useState('rule'); // 'rule' | 'ai' | 'sim'
-  const [aiResult, setAiResult] = useState(null);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState(null);
-  const [applyStatus, setApplyStatus] = useState(null); // 'applying' | 'applied' | 'error:...'
-  // 現在のモードに応じた表示制御
-  const isSequential = currentExecutionType === 'sequential';
-  const isInitial = currentExecutionType === 'initial';
-  // テンプレ情報
-  const lotTemplate = (templates || []).find(t => t.id === lot?.templateId);
-
-  // 同テンプレートの完了ロットを実績データソースに
-  const sameTemplateLots = useMemo(() => {
-    if (!lot) return [];
-    return (lots || []).filter(l =>
-      l.id !== lot.id &&
-      l.status === 'completed' &&
-      l.templateId === lot.templateId
-    );
-  }, [lot, lots]);
-
-  const analysis = useMemo(() => {
-    if (!lot?.steps) return null;
-    return analyzeWorkOrder(lot.steps, sameTemplateLots, { quantity: lot.quantity || 1 });
-  }, [lot, sameTemplateLots]);
-
-  const handleRunAi = async () => {
-    if (!analysis) return;
-    setAiLoading(true);
-    setAiError(null);
-    try {
-      const result = await requestGeminiWorkOrder(analysis);
-      setAiResult(result);
-    } catch (e) {
-      setAiError(e.message || String(e));
-    } finally {
-      setAiLoading(false);
-    }
-  };
-
-  if (!lot) return null;
-
-  const fmtSec = (sec) => {
-    const m = Math.floor(sec / 60);
-    const s = Math.round(sec % 60);
-    return m > 0 ? `${m}分${s > 0 ? s + '秒' : ''}` : `${s}秒`;
-  };
-
-  // バー描画用最大値
-  const maxBarSec = analysis ? Math.max(analysis.serialTotalSec, analysis.optimalTotalSec, 1) : 1;
-  const barW = (sec) => `${Math.round((sec / maxBarSec) * 100)}%`;
-
-  return (
-    <div className="fixed inset-0 bg-black/50 z-[140] flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-        <div className="px-5 py-4 border-b flex items-center justify-between bg-gradient-to-r from-indigo-50 to-purple-50">
-          <div>
-            <div className="text-xs text-indigo-700 font-bold">作業順最適化</div>
-            <div className="text-lg font-black text-slate-800">{lot.orderNo} {lot.model} <span className="text-sm font-normal text-slate-500">/ {lot.quantity || 1}台</span></div>
-          </div>
-          <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-lg"><X className="w-5 h-5"/></button>
-        </div>
-
-        <div className="px-5 pt-3 flex gap-2 border-b">
-          {[
-            { id: 'rule', label: '🧮 ルールベース', desc: '実績データから自動算出' },
-            { id: 'ai', label: '🤖 AI生成', desc: 'Gemini に提案させる' },
-            { id: 'sim', label: '📊 シミュレーション', desc: '時短効果を可視化' },
-          ].map(t => (
-            <button key={t.id} onClick={() => setMode(t.id)}
-              className={`px-4 py-2 -mb-px border-b-2 text-sm font-bold transition-colors ${mode === t.id ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-slate-500 hover:text-slate-700'}`}
-              title={t.desc}>{t.label}</button>
-          ))}
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-5">
-          {!analysis && <div className="text-center text-slate-400 py-12">テンプレートデータがありません</div>}
-
-          {analysis && (
-            <>
-              {/* モード警告: 順序実行モードでは並列化できない (モード仕様上) */}
-              {isSequential && (
-                <div className="mb-4 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg p-3 flex items-start gap-3">
-                  <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5"/>
-                  <div className="flex-1">
-                    <div className="font-bold text-amber-900 text-sm">⚠ 現在「順序実行モード」です</div>
-                    <div className="text-xs text-amber-800 mt-1 leading-relaxed">
-                      順序実行モードは <b>Step 1 → 2 → 3 と固定順</b>で進める仕様なので <b>並列作業はできません</b>。
-                      でも下の「<b>適用</b>」を押せばテンプレ自体の<b>工程順が最適順に書き換わる</b>ので、順序実行モードのままでも効率UPに使えます。
-                      並列化までやるなら <b>カスタムモード</b>を選んでください。
-                    </div>
-                    {onSwitchToCustom && (
-                      <button onClick={() => { onSwitchToCustom(); onClose(); }}
-                        className="mt-2 inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-3 py-1.5 rounded shadow">
-                        <Zap className="w-3 h-3"/> カスタムモードに切替えて並列活用
-                      </button>
-                    )}
-                  </div>
-                </div>
-              )}
-              {/* モード選択画面で開いた場合: カスタム推奨 */}
-              {isInitial && (
-                <div className="mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3 flex items-start gap-3">
-                  <Zap className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5"/>
-                  <div className="flex-1">
-                    <div className="font-bold text-emerald-900 text-sm">💡 並列活用するなら「カスタムモード」推奨</div>
-                    <div className="text-xs text-emerald-800 mt-1 leading-relaxed">
-                      下のオススメ順は <b>自動測定中に手動工程を並行する</b>前提です。
-                      順序実行モードでは並列化できないので、<b>カスタムモード</b>を選んでください。
-                    </div>
-                  </div>
-                </div>
-              )}
-              {/* 共通: データ量サマリ */}
-              <div className="mb-4 flex flex-wrap gap-3 text-sm">
-                <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
-                  <div className="text-[10px] text-indigo-600 font-bold">サンプルロット</div>
-                  <div className="text-lg font-black text-indigo-900">{analysis.sampleLotCount}件</div>
-                  {!analysis.hasEnoughData && <div className="text-[10px] text-amber-600">⚠ データが少ないため精度は限定的</div>}
-                </div>
-                <div className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
-                  <div className="text-[10px] text-purple-600 font-bold">自動工程</div>
-                  <div className="text-lg font-black text-purple-900">{analysis.autoCount}件</div>
-                </div>
-                <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
-                  <div className="text-[10px] text-blue-600 font-bold">手動工程</div>
-                  <div className="text-lg font-black text-blue-900">{analysis.manualCount}件</div>
-                </div>
-                <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
-                  <div className="text-[10px] text-emerald-600 font-bold">想定時短</div>
-                  <div className="text-lg font-black text-emerald-900">{fmtSec(analysis.timeSavedSec)} ({analysis.timeSavedPercent}%)</div>
-                </div>
-              </div>
-
-              {/* ルールベース表示 (現実的モデル: 「他の台」での並行作業) */}
-              {mode === 'rule' && (
-                <div className="space-y-4">
-                  <div className="text-xs text-slate-700 leading-relaxed bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
-                    💡 <b>物理ルール</b>: テンプレ順は変えません。1台目が自動測定中はその台に触れないため、その間は <b>他の台 (2台目以降) の機械独立な作業</b> を進めます。<br/>
-                    候補に入る条件: ①過去ロットで実際に並列された実績あり ②テンプレで <b>「機械独立」</b>タグが付いている ③別リソースを使う工程。<br/>
-                    ⚠ タグが未設定の工程は「機械占有の可能性アリ」とみなして候補から除外。<b>テンプレ編集で工程ごとに「機械独立 / 測定機を占有」をタグ付け</b>してください。
-                  </div>
-                  {(analysis.opportunities || []).length === 0 && (
-                    <div className="text-center py-8 text-slate-400 text-sm">自動工程が無いので並行機会がありません</div>
-                  )}
-                  {(analysis.opportunities || []).map((op, i) => (
-                    <div key={i} className="border-2 border-purple-300 rounded-lg overflow-hidden">
-                      <div className="bg-purple-100 px-3 py-2 flex items-center gap-2">
-                        <span className="bg-purple-700 text-white text-xs font-bold px-2 py-0.5 rounded">機会 {i+1}</span>
-                        <span className="text-sm font-black text-purple-900">⏱ #{op.autoUnitIdx + 1}台目「{op.autoStep.title}」 (自動 / 約{fmtSec(op.autoDurationSec)})</span>
-                        <span className="ml-auto text-xs bg-white px-2 py-0.5 rounded-full font-bold text-purple-700">時間利用 {op.utilizationPct}%</span>
-                      </div>
-                      <div className="p-3 bg-blue-50/30">
-                        <div className="text-xs text-slate-600 mb-2 font-bold">→ #{op.autoUnitIdx + 1}台目が機械占有中、この時間でやれる他の台の作業:</div>
-                        {op.parallelTasks.length === 0 ? (
-                          <div className="text-xs text-amber-700 italic bg-amber-50 px-2 py-2 rounded border border-amber-200">
-                            並行候補なし。<br/>
-                            原因 (考えられる順): ①過去に並行実績がない ②テンプレで「機械独立」とタグ付けされた工程がない ③全工程が同じ機械を占有する設定。<br/>
-                            <b>テンプレ編集</b>で「機械独立」タグを付けてください。
-                          </div>
-                        ) : (
-                          <div className="space-y-1">
-                            {op.parallelTasks.map((t, j) => {
-                              const evLabel = t.evidence === 'observed' ? `実績${t.observedCount}回` :
-                                              t.evidence === 'machine-independent' ? '機械独立' :
-                                              t.evidence === 'different-resource' ? '別リソース' : '並行可フラグ';
-                              const evColor = t.evidence === 'observed' ? 'bg-emerald-100 text-emerald-700' :
-                                              t.evidence === 'machine-independent' ? 'bg-blue-100 text-blue-700' :
-                                              t.evidence === 'different-resource' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600';
-                              return (
-                                <div key={j} className="bg-white border border-blue-200 rounded px-2 py-1 flex items-center gap-2 text-sm">
-                                  <span className="text-blue-600 text-xs font-bold w-6">{j+1}.</span>
-                                  <span className="bg-blue-600 text-white text-[10px] font-black px-1.5 py-0.5 rounded shrink-0">#{t.unitIdx + 1}台目</span>
-                                  <span className="font-bold text-slate-800 flex-1">{t.step.title}</span>
-                                  <span className="text-xs text-slate-500 font-mono">{fmtSec(t.durationSec)}</span>
-                                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${evColor}`} title="この候補が認められた根拠">{evLabel}</span>
-                                </div>
-                              );
-                            })}
-                            <div className="text-[10px] text-emerald-700 mt-2 bg-emerald-50 px-2 py-1 rounded border border-emerald-200 font-bold">
-                              合計 {fmtSec(op.filledSec)} を並行 → 自動測定 {fmtSec(op.autoDurationSec)} の間に他の台の作業がここまで進む
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* AI モード */}
-              {mode === 'ai' && (
-                <div className="space-y-4">
-                  <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 border rounded-lg px-3 py-2">
-                    💡 ルールベースの結果と実績データを Gemini に投げて、より高度な提案を取得します。VITE_GEMINI_API_KEY が必要。
-                  </div>
-                  {!aiResult && !aiLoading && !aiError && (
-                    <div className="text-center py-8">
-                      <button onClick={handleRunAi} className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold px-6 py-3 rounded-lg shadow hover:shadow-lg transition">
-                        🤖 Gemini に最適順を生成させる
-                      </button>
-                      <div className="text-xs text-slate-400 mt-2">サンプル {analysis.sampleLotCount}件 / 工程 {analysis.autoCount + analysis.manualCount}件 を送信</div>
-                    </div>
-                  )}
-                  {aiLoading && (
-                    <div className="text-center py-8">
-                      <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
-                      <div className="text-sm text-slate-600 mt-2">Gemini が思考中…</div>
-                    </div>
-                  )}
-                  {aiError && (
-                    <div className="bg-rose-50 border border-rose-200 rounded-lg p-4 text-rose-800 text-sm">
-                      <div className="font-bold">❌ AI 生成失敗</div>
-                      <div className="mt-1 text-xs">{aiError}</div>
-                      <button onClick={handleRunAi} className="mt-2 text-xs bg-white border border-rose-300 px-3 py-1 rounded hover:bg-rose-50">再試行</button>
-                    </div>
-                  )}
-                  {aiResult && (
-                    <div className="space-y-3">
-                      {aiResult.summary && (
-                        <div className="bg-indigo-50 border-l-4 border-indigo-500 px-3 py-2 text-sm text-indigo-900">
-                          <div className="font-bold text-xs text-indigo-600 mb-1">🤖 Gemini の所見</div>
-                          {aiResult.summary}
-                        </div>
-                      )}
-                      {aiResult.expectedTotalSec && (
-                        <div className="text-xs text-slate-600">想定合計時間: <span className="font-bold">{fmtSec(aiResult.expectedTotalSec)}</span></div>
-                      )}
-                      {(aiResult.suggestions || []).map((sug, i) => {
-                        const autoStep = sug.autoKey ? analysis.stepStats[sug.autoKey]?.step : null;
-                        const manuals = (sug.manualKeys || (sug.manualKey ? [sug.manualKey] : [])).map(k => analysis.stepStats[k]?.step).filter(Boolean);
-                        return (
-                          <div key={i} className="border rounded-lg overflow-hidden">
-                            <div className={`px-3 py-2 ${sug.kind === 'parallel' ? 'bg-purple-100 border-b border-purple-300' : 'bg-slate-100 border-b border-slate-300'}`}>
-                              <span className={`text-white text-xs font-bold px-2 py-0.5 rounded ${sug.kind === 'parallel' ? 'bg-purple-700' : 'bg-slate-600'}`}>STEP {i+1}</span>
-                              <span className="ml-2 text-sm font-black">
-                                {sug.kind === 'parallel' ? `🔧 ${autoStep?.title || sug.autoKey} (自動)` : `📝 ${manuals[0]?.title || sug.manualKey}`}
-                              </span>
-                            </div>
-                            <div className="p-3 text-sm">
-                              {sug.kind === 'parallel' && manuals.length > 0 && (
-                                <ul className="list-disc list-inside text-slate-700 space-y-0.5">
-                                  {manuals.map((m, j) => <li key={j}>{m.title}</li>)}
-                                </ul>
-                              )}
-                              {sug.reason && <div className="text-xs text-slate-500 mt-2 italic">💬 {sug.reason}</div>}
-                            </div>
-                          </div>
-                        );
-                      })}
-                      <button onClick={handleRunAi} className="text-xs text-indigo-600 hover:underline">↻ もう一度生成する</button>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* シミュレーション */}
-              {mode === 'sim' && (
-                <div className="space-y-4">
-                  <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 border rounded-lg px-3 py-2">
-                    💡 全部シーケンシャル vs 並列化した場合の合計時間を比較します。
-                  </div>
-                  <div className="space-y-3">
-                    <div>
-                      <div className="text-xs font-bold text-slate-600 mb-1">シーケンシャル (全部順番に)</div>
-                      <div className="bg-slate-100 rounded h-8 overflow-hidden relative">
-                        <div className="bg-rose-500 h-full flex items-center px-2 text-white font-bold text-xs" style={{ width: barW(analysis.serialTotalSec) }}>
-                          {fmtSec(analysis.serialTotalSec)}
-                        </div>
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-xs font-bold text-slate-600 mb-1">最適化 (並列活用)</div>
-                      <div className="bg-slate-100 rounded h-8 overflow-hidden relative">
-                        <div className="bg-emerald-500 h-full flex items-center px-2 text-white font-bold text-xs" style={{ width: barW(analysis.optimalTotalSec) }}>
-                          {fmtSec(analysis.optimalTotalSec)}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
-                      <div className="text-xs text-emerald-600 font-bold">⏱ 時短効果</div>
-                      <div className="text-2xl font-black text-emerald-700">{fmtSec(analysis.timeSavedSec)}</div>
-                      <div className="text-sm text-emerald-600">全体の {analysis.timeSavedPercent}% 短縮</div>
-                    </div>
-                  </div>
-                  <div className="mt-4">
-                    <div className="text-xs font-bold text-slate-600 mb-2">工程ごとの平均時間 (実績ベース)</div>
-                    <div className="space-y-1">
-                      {Object.values(analysis.stepStats).map(s => (
-                        <div key={s.key} className="flex items-center gap-2 text-xs">
-                          <span className={`w-1.5 h-4 ${s.isAuto ? 'bg-purple-500' : 'bg-blue-500'}`}></span>
-                          <span className="flex-1 truncate">{s.step.title}</span>
-                          <span className="font-mono text-slate-600">{fmtSec(s.avgSec)}</span>
-                          <span className="text-[10px] text-slate-400 w-12 text-right">n={s.sampleCount}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-
-        {/* === 「適用」ボタン撤去 (2026-05-30) ===
-            理由: 「テンプレ全体に適用」「このロットに適用」はテンプレ/ロットの正規工程順を物理的に書き換える破壊的操作だった。
-            ユーザー指示により、オススメ順は「自動測定中の並列作業の参考表示」のみに留め、データには触らない方針に変更。
-            撤去前の被害: lot 1001456619 の optimizedStepOrder フィールドが残存していたが、steps 配列自体は元のまま (=復旧可能)。 */}
-        {analysis && analysis.timeSavedSec > 0 && (
-          <div className="px-5 py-3 border-t bg-slate-50/60">
-            <div className="text-xs text-slate-500 leading-relaxed">
-              💡 上記は<b>自動測定中に並行できる手動工程の提案</b>です。テンプレや工程の順序は<b>変更しません</b>。<br/>
-              作業者が自動測定中に画面を確認して、提案された手動工程を進めることで時短になります。
-            </div>
-          </div>
-        )}
-
-        <div className="px-5 py-3 border-t bg-slate-50 flex justify-end">
-          <button onClick={onClose} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded font-bold text-sm">閉じる</button>
-        </div>
-      </div>
-    </div>
-  );
-};
 
 // 検査リストからロットを選択 → 担当者/エリア指定 → 作業開始 の多段フロー
 // - 使用者選択 = 特定の作業者 (管理者/フリー以外): 「自分で作業しますか?」確認 → 自分に割当 → エリア選択 → 作業開始確認
@@ -20478,6 +22241,8 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
   const [searchOrderNo, setSearchOrderNo] = useState('');
   const [searchModel, setSearchModel] = useState('');
   const [searchTemplate, setSearchTemplate] = useState('');
+  // 司令塔(工場統合管理アプリ)からの深掘りリンク ?q=指図番号 で来たら、指図検索に反映してその指図に絞り込む。
+  useEffect(() => { try { const q = new URLSearchParams(window.location.search).get('q'); if (q) setSearchOrderNo(q); } catch (e) { /* noop */ } }, []);
   const [selectedZoneFilter, setSelectedZoneFilter] = useState('all');
   const [sortOrder, setSortOrder] = useState('entry_asc');
   const [onlyMine, setOnlyMine] = useState(false);
@@ -20895,10 +22660,10 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                       </div>
                       <span className="text-xs font-bold bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 shrink-0">{lot.quantity}台</span>
                     </div>
-                    {/* テンプレート名 */}
+                    {/* テンプレート名 (何の検査か = 目立たせる) */}
                     {templateName && (
-                      <div className="text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1 truncate w-fit max-w-full" title={templateName}>
-                        <ClipboardList className="w-3 h-3 shrink-0"/> <span className="truncate">{templateName}</span>
+                      <div className="text-[11px] font-bold text-indigo-800 bg-indigo-100 border border-indigo-300 rounded px-2 py-0.5 inline-flex items-center gap-1 truncate w-fit max-w-full shadow-sm" title={templateName}>
+                        <ClipboardList className="w-3.5 h-3.5 shrink-0"/> <span className="truncate">{templateName}</span>
                       </div>
                     )}
                     {/* 停止理由バッジ */}
@@ -21010,8 +22775,8 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                         </td>
                         <td className="p-3">
                           {templateName !== '-' ? (
-                            <span className="text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1 max-w-[160px]" title={templateName}>
-                              <ClipboardList className="w-3 h-3 shrink-0"/>
+                            <span className="text-[11px] font-bold text-indigo-800 bg-indigo-100 border border-indigo-300 rounded px-2 py-0.5 inline-flex items-center gap-1 max-w-[180px] shadow-sm" title={templateName}>
+                              <ClipboardList className="w-3.5 h-3.5 shrink-0"/>
                               <span className="truncate">{templateName}</span>
                             </span>
                           ) : <span className="text-slate-300">-</span>}
@@ -21326,7 +23091,23 @@ const EditMeasurementModal = ({ lot, onClose, onSave }) => {
   };
 
   const handleSave = () => {
-    onSave({ measurementResults: localMR });
+    // 保存前に全工程×全台を依存順(steps順=上流が先)で一巡再計算する。
+    //   updateValue は編集中工程の calcResults だけ直すため、上流値を参照する下流工程(cross-step)の calcResults/isOk が
+    //   古いまま残り、成績表・達成率の合否がずれる。多段依存に備えて2巡し陳腐化を解消する。
+    const finalMR = JSON.parse(JSON.stringify(localMR));
+    for (let pass = 0; pass < 2; pass++) {
+      measSteps.forEach(step => {
+        for (let u = 0; u < (lot.quantity || 1); u++) {
+          const key = `${step.id}-${u}`;
+          const values = finalMR[`${key}-values`] || finalMR[key]?.values;
+          if (!values) continue; // 未入力の台は触らない
+          const crossVals = collectCrossStepValues({ ...lot, measurementResults: finalMR }, step.id);
+          const calcResults = calculateMeasurementResults(values, step.measurementConfig, crossVals);
+          finalMR[key] = { ...(finalMR[key] || {}), values, calcResults, timestamp: finalMR[key]?.timestamp || Date.now() };
+        }
+      });
+    }
+    onSave({ measurementResults: finalMR });
     onClose();
   };
 
@@ -21746,7 +23527,7 @@ const ReportPreview = ({ lot: _originalLot, workers, onClose }) => {
     titleCell.alignment = { horizontal: 'center' };
     R += 2;
 
-    const infoItems = [['指図番号', lot.orderNo || ''], ['型式', lot.model || ''], ['台数', `${lot.quantity || 1} 台`], ['作業者', worker], ['完了日時', toDateTimeJp(lot.updatedAt)]];
+    const infoItems = [['指図番号', lot.orderNo || ''], ['型式', lot.model || ''], ['台数', `${lot.quantity || 1} 台`], ['作業者', worker], ['完了日時', toDateTimeJp(lot.completedAt || lot.updatedAt)]];
     // 適用品質規格 (ロット作成時のスナップショット) を情報行に追加
     if (lot.appliedStandard?.standardNo && lot.appliedStandard.source === 'qualityStandard') {
       const rev = lot.appliedStandard.revision ? ` Rev.${lot.appliedStandard.revision}` : '';
@@ -21941,7 +23722,7 @@ const ReportPreview = ({ lot: _originalLot, workers, onClose }) => {
                   <h1 className="text-xl font-serif font-bold">製品検査チェックシート (多台用)</h1>
                 </div>
                 <div className="text-right text-[10px]">
-                  <div>完了: {toDateTimeJp(lot.updatedAt)}</div>
+                  <div>完了: {toDateTimeJp(lot.completedAt || lot.updatedAt)}</div>
                   <div>帳票: <span className="font-bold">{customReportNo}</span></div>
                 </div>
               </div>
@@ -22106,7 +23887,7 @@ const ReportPreview = ({ lot: _originalLot, workers, onClose }) => {
                   <h2 className="text-2xl font-bold text-slate-800">製品検査チェックシート</h2>
                 </div>
                 <div className="text-right text-sm text-slate-500">
-                  <div>完了: {toDateTimeJp(lot.updatedAt)}</div>
+                  <div>完了: {toDateTimeJp(lot.completedAt || lot.updatedAt)}</div>
                   <div>帳票番号: <span className="font-bold">{customReportNo}</span></div>
                 </div>
               </div>
@@ -22369,7 +24150,7 @@ const ReportPreview = ({ lot: _originalLot, workers, onClose }) => {
               </div>
               <div className="flex gap-4">
                 <div className="text-[10px] border border-black p-1 min-w-[100px]">
-                  <div>完了: {toDateTimeJp(lot.updatedAt)}</div>
+                  <div>完了: {toDateTimeJp(lot.completedAt || lot.updatedAt)}</div>
                 </div>
                 <div className="flex border border-black text-center text-xs h-14 items-stretch divide-x divide-black">
                   <div className="w-12 flex flex-col"><div className="bg-gray-100 border-b border-black px-1 py-0.5 text-[10px]">承認</div><div className="flex-1"></div></div>
@@ -22966,6 +24747,76 @@ const overflowPlan = (reqH, headcount, factor, hoursPerWeek, hoursPerDay, daysPe
   return { over:true, excessH, otClockH, otPerPersonH: headcount? otClockH/headcount : 0, otMaxedClockH: otDirectMaxWeek*f, satDays };
 };
 
+// === 作業者ロスター(日次の在席) — 統合管理アプリ「人」ビューの土台。capの作業者数を実在席で出す ===
+// settings.workerRoster[YYYY-MM-DD][作業者名] = 'off'(休み) | 'other'(他工場)。既定(エントリ無し)=出勤。
+const rymd = (ms) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const rosterStatusOf = (settings, ymd, worker) => ((settings?.workerRoster || {})[ymd] || {})[worker] || 'present';
+const rosterDayStats = (settings, names, ymd) => { let present = 0, off = 0, other = 0; (names || []).forEach(w => { const s = rosterStatusOf(settings, ymd, w); if (s === 'off') off++; else if (s === 'other') other++; else present++; }); return { present, off, other, total: (names || []).length }; };
+// 期間[fromMs,toMs]の平日について、基準人数(baseline=上書き or 登録)から その日の休み/他工場の人数を引いた平均。
+// 記録の無い日は baseline のまま=ロスター未入力なら従来挙動と一致。anyEntry=その期間に休/他の記録があるか。
+const rosterAdjustedAvailable = (settings, names, fromMs, toMs, baseline) => {
+  let sum = 0, days = 0, anyEntry = false;
+  for (let t = fromMs; t <= toMs + 1; t += 86400000) {
+    const d = new Date(t); const dow = d.getDay(); if (dow === 0 || dow === 6) continue;
+    const ymd = rymd(t); const st = rosterDayStats(settings, names, ymd);
+    if (st.off + st.other > 0) anyEntry = true;
+    sum += Math.max(0, baseline - st.off - st.other); days++;
+  }
+  return days > 0 ? { avg: sum / days, days, anyEntry } : { avg: baseline, days: 0, anyEntry: false };
+};
+const WorkerRosterPanel = ({ workers = [], settings = {}, saveSettings = null, days = 7 }) => {
+  const names = useMemo(() => [...new Set((workers || []).map(w => w.name).filter(Boolean))], [workers]);
+  const today0 = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }, []);
+  const cols = useMemo(() => Array.from({ length: days }, (_, i) => today0 + i * 86400000), [today0, days]);
+  const cycle = (ymd, worker) => {
+    const cur = rosterStatusOf(settings, ymd, worker);
+    const next = cur === 'present' ? 'off' : cur === 'off' ? 'other' : 'present';
+    const roster = { ...(settings?.workerRoster || {}) };
+    const day = { ...(roster[ymd] || {}) };
+    if (next === 'present') delete day[worker]; else day[worker] = next;
+    if (Object.keys(day).length === 0) delete roster[ymd]; else roster[ymd] = day;
+    saveSettings && saveSettings({ workerRoster: roster });
+  };
+  const DOW = ['日', '月', '火', '水', '木', '金', '土'];
+  const cellOf = (s) => s === 'off' ? { t: '休', c: 'bg-slate-200 text-slate-500' } : s === 'other' ? { t: '他', c: 'bg-amber-100 text-amber-700' } : { t: '出', c: 'bg-emerald-100 text-emerald-700' };
+  if (names.length === 0) return null;
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 p-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap mb-1">
+        <div className="text-sm font-bold text-slate-700 flex items-center gap-2"><Users className="w-4 h-4 text-indigo-600" /> 作業者ロスター（今日からの在席）</div>
+        <div className="text-[11px] text-slate-400">セルをタップで 出勤→休み→他工場 を切替</div>
+      </div>
+      <div className="text-[11px] text-slate-500 mb-2">休み・他工場（製品/最終を掛け持つ人が今日は別工場）の人を外して、<b>その日に本当にこの工場で使える人数</b>を出します。下のキャパ計算もこの在席人数を使います。</div>
+      <div className="overflow-x-auto">
+        <table className="text-xs border-collapse">
+          <thead><tr className="text-slate-400">
+            <th className="px-2 py-1 text-left font-bold sticky left-0 bg-white z-10">作業者</th>
+            {cols.map(ms => { const d = new Date(ms); const wend = d.getDay() === 0 || d.getDay() === 6; return <th key={ms} className={`px-1 py-1 text-center font-bold min-w-[2.4rem] ${wend ? 'text-slate-300' : ''}`}>{d.getMonth() + 1}/{d.getDate()}<div className="text-[9px] font-normal">{DOW[d.getDay()]}</div></th>; })}
+          </tr></thead>
+          <tbody>
+            {names.map(w => (
+              <tr key={w} className="border-t border-slate-50">
+                <td className="px-2 py-1 font-bold text-slate-700 sticky left-0 bg-white whitespace-nowrap z-10">{w}</td>
+                {cols.map(ms => { const ymd = rymd(ms); const cd = cellOf(rosterStatusOf(settings, ymd, w)); return <td key={ms} className="px-1 py-1 text-center"><button onClick={() => cycle(ymd, w)} className={`w-7 h-6 rounded font-bold ${cd.c} hover:opacity-80`}>{cd.t}</button></td>; })}
+              </tr>
+            ))}
+            <tr className="border-t-2 border-slate-200 font-bold">
+              <td className="px-2 py-1 text-slate-500 sticky left-0 bg-white z-10">在席</td>
+              {cols.map(ms => { const st = rosterDayStats(settings, names, rymd(ms)); return <td key={ms} className="px-1 py-1 text-center"><span className="text-emerald-700">{st.present}</span>{(st.off + st.other) > 0 && <span className="text-[9px] text-slate-400">/{st.total}</span>}</td>; })}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="flex items-center gap-3 mt-2 text-[10px] text-slate-500 flex-wrap">
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-emerald-100" />出勤</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-slate-200" />休み</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-amber-100" />他工場（共有作業者が今日は別工場）</span>
+        <span className="text-slate-400">※ 将来の統合管理アプリでは、この配置がそのまま「今日 誰がどの工場」になります。</span>
+      </div>
+    </div>
+  );
+};
+
 const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSettings, indirectWork = [] }) => {
   const [tickN, setTickN] = useState(0);
   // 週次仕事量で展開中の週 (null = なし)
@@ -23144,8 +24995,13 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
   //   未設定なら workers.length にフォールバック
   const registeredWorkers = workers.length || 1;
   const overrideWorkers = settings?.workloadEffectiveWorkers;
-  const totalWorkers = (overrideWorkers && Number(overrideWorkers) > 0) ? Number(overrideWorkers) : registeredWorkers;
+  // 基準人数 = 手動上書き(あれば) or 登録作業者数。ロスターはこの基準から「その日 休み/他工場」を引いて日次の欠員を反映する。
+  const baselineWorkers = (overrideWorkers && Number(overrideWorkers) > 0) ? Number(overrideWorkers) : registeredWorkers;
+  const rosterWeek = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); const t0 = d.getTime(); return rosterAdjustedAvailable(settings, (workers || []).map(w => w.name).filter(Boolean), t0, t0 + 6 * 86400000, baselineWorkers); }, [settings, workers, baselineWorkers]);
+  // ロスターに今週の休/他の記録があればそれで補正、無ければ基準のまま。
+  const totalWorkers = rosterWeek.anyEntry ? Math.max(1, Math.round(rosterWeek.avg * 10) / 10) : baselineWorkers;
   const isWorkerOverride = (overrideWorkers && Number(overrideWorkers) > 0 && Number(overrideWorkers) !== registeredWorkers);
+  const isRosterDriven = rosterWeek.anyEntry;
 
   // 実測間接込み係数 (参考値): 直近90日の完了ロット
   //   directSec  = 完了ロットの完了タスク duration 合計
@@ -23368,6 +25224,9 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
         workSchedule={settings?.workSchedule}
       />
 
+      {/* 作業者ロスター（日次の在席）— 下のキャパ計算の作業者数に反映 */}
+      <WorkerRosterPanel workers={workers} settings={settings} saveSettings={saveSettings} days={7} />
+
       {/* セクション 2: 週次仕事量 (納期ベース) */}
       <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
         <div className="p-3 border-b flex flex-wrap items-center justify-between gap-2">
@@ -23391,7 +25250,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
             </div>
           </div>
           <div className="text-[11px] text-slate-500">
-            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_WEEK}日</span> = {HOURS_PER_WEEK.toFixed(1)}h/週 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : '登録作業者数'}>{isWorkerOverride ? '想定' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}</span> → 実効直工キャパ <span className="font-bold">{teamCapacityWeekH.toFixed(1)}h/週</span>{factor !== 1 && <span className="text-indigo-600 ml-0.5">(間接込み係数{factor.toFixed(2)})</span>}
+            想定: <span className="font-bold">{HOURS_PER_DAY.toFixed(2)}h/日 ({includeOT ? '残業込' : '定時'}) × {DAYS_PER_WEEK}日</span> = {HOURS_PER_WEEK.toFixed(1)}h/週 ・<span title={isWorkerOverride ? `マスタ設定で上書き (登録${registeredWorkers}人)` : isRosterDriven ? `作業者ロスターの今週平均在席 (登録${registeredWorkers}人・休/他工場を除く)` : '登録作業者数'}>{isWorkerOverride ? '想定' : isRosterDriven ? '在席' : '在籍'} <span className="font-bold">{totalWorkers}</span>人{isWorkerOverride && <span className="text-amber-600 text-[10px] ml-0.5">(設定値)</span>}{isRosterDriven && <span className="text-indigo-600 text-[10px] ml-0.5">(ロスター)</span>}</span> → 実効直工キャパ <span className="font-bold">{teamCapacityWeekH.toFixed(1)}h/週</span>{factor !== 1 && <span className="text-indigo-600 ml-0.5">(間接込み係数{factor.toFixed(2)})</span>}
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -23852,6 +25711,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
   // PLAN: 当月予定 (lot.dueDate が当月のロット)。完了済みは「予定」から除外する。
   // =====================================================================================
   const planData = useMemo(() => {
+    const mg = modelGroupsOf(settings); // 型式グループ較正を見積もりにも適用(達成率の目標基準と一致させる)
     const activeLots = lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
     const monthLots = activeLots.filter(l => l.dueDate && inMonth(new Date(l.dueDate).getTime()));
     let totalSec = 0, totalQty = 0;
@@ -23866,7 +25726,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     // 型式別予定
     const modelMap = {}; // model -> { qty, sec, lots }
     monthLots.forEach(lot => {
-      const sec = calculateLotEstimatedTime(lot, customTargetTimes);
+      const sec = calculateLotEstimatedTime(lot, customTargetTimes, mg);
       const qty = lot.quantity || 1;
       totalSec += sec; totalQty += qty;
       const dueMs = new Date(lot.dueDate).setHours(0, 0, 0, 0);
@@ -23885,7 +25745,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     // 納期未設定で進行中のロット (当月の計画に乗らない注意喚起)
     const noDueLots = activeLots.filter(l => !l.dueDate);
     noDueInfo = noDueLots.length;
-    const noDueSec = noDueLots.reduce((a, l) => a + calculateLotEstimatedTime(l, customTargetTimes), 0);
+    const noDueSec = noDueLots.reduce((a, l) => a + calculateLotEstimatedTime(l, customTargetTimes, mg), 0);
 
     const byModel = Object.values(modelMap).sort((a, b) => b.sec - a.sec);
     const totalHours = totalSec / 3600;
@@ -23915,7 +25775,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
       overdueCount, overdueSec, noDueInfo, noDueSec,
       capacityLabel: capLevel(avgReqWorkers, capacityWorkers),
     };
-  }, [lots, customTargetTimes, monthWeeks, monthRange, templates, HOURS_PER_WEEK, DAYS_PER_WEEK, capacityWorkers, factor, capLevels, maxOtPerDay]);
+  }, [lots, customTargetTimes, settings, monthWeeks, monthRange, templates, HOURS_PER_WEEK, DAYS_PER_WEEK, capacityWorkers, factor, capLevels, maxOtPerDay]);
 
   // =====================================================================================
   // ACTUAL: 当月実績 (lot.completedAt が当月の完了ロット)
@@ -24363,6 +26223,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
     const summaryRows = [['完了ロット数', a.lotCount], ['完了台数', a.totalQty], ['実作業総工数(h)', Number(a.totalHours.toFixed(1))], ['稼働作業者数', a.activeWorkerCount], ['1人当たり工数(h)', a.activeWorkerCount ? Number(a.perWorkerHours.toFixed(1)) : '—']];
     if (directIndirect.hasData) { summaryRows.push(['直工比率(%)', Number(directIndirect.directPct.toFixed(1))]); summaryRows.push(['直工工数(h)', Number((directIndirect.directSec / 3600).toFixed(1))]); summaryRows.push(['間接工数(h)', Number((directIndirect.indirectSec / 3600).toFixed(1))]); }
     summaryRows.forEach(row => { R = addDataRow(s1, R, row, st, [1]); });
+    const r1End = R; // s1(実績サマリー)の末尾(次の空き行)。所感はここ基準で書く(R は以降 s2..s8 で使い回されるため)。
     s1.getColumn(1).width = 22; s1.getColumn(2).width = 18; s1.getColumn(3).width = 16; s1.getColumn(4).width = 18;
     // 週次実績
     const s2 = wb.addWorksheet('週次実績');
@@ -24430,8 +26291,8 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
       R9 = addDataRow(s9, R9, [c.model || '—', c.stepTitle || c.stepKey || '—', PDCA_KPIS[c.kpi] || PDCA_KPIS.time, pdcaKpiDisplay(c.baseline, c.kpi || 'time'), pdcaKpiDisplay(c.afterFrozen, c.kpi || 'time'), v && v.deltaPct != null ? `${v.deltaPct > 0 ? '+' : ''}${v.deltaPct}%` : '—', PDCA_STATUS_META[c.status]?.label || '', fmtDate(c.actionDate)], st);
     });
     [16, 22, 14, 12, 12, 10, 16, 12].forEach((w, i) => { s9.getColumn(i + 1).width = w; });
-    // 所感
-    if (comment) { const cell = s1.getRow(R + 2).getCell(1); s1.mergeCells(R + 2, 1, R + 2, 4); cell.value = `所感: ${comment}`; cell.alignment = { wrapText: true, vertical: 'top' }; cell.font = { italic: true }; }
+    // 所感(s1 実績サマリーの末尾直下に置く。R は s8 構築後の値なので使うと指標表を破壊する=r1End基準にする)
+    if (comment) { const cr = r1End + 1; const cell = s1.getRow(cr).getCell(1); s1.mergeCells(cr, 1, cr, 4); cell.value = `所感: ${comment}`; cell.alignment = { wrapText: true, vertical: 'top' }; cell.font = { italic: true }; }
     await downloadWb(wb, `月次業務実績_${selectedMonth}.xlsx`);
   };
 
@@ -24651,10 +26512,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
   const [filterStartDate, setFilterStartDate] = useState(() => { const d = new Date(); d.setMonth(d.getMonth() - 1); return localYMD(d); });
   const [filterEndDate, setFilterEndDate] = useState(getTodayStr());
   const [searchQuery, setSearchQuery] = useState('');
+  // 司令塔(工場統合管理アプリ)からの深掘りリンク: ?q=指図番号 で起動したら検索欄に反映し、その指図に絞り込んで開く。
+  useEffect(() => { try { const q = new URLSearchParams(window.location.search).get('q'); if (q) setSearchQuery(q); } catch (e) { /* noop */ } }, []);
   const [filterWorker, setFilterWorker] = useState('');
   const [filterDefect, setFilterDefect] = useState('all'); // 'all' | 'with' | 'without'
 
   const toMs = (val) => { if (!val) return 0; if (typeof val === 'number') return val; if (val.seconds) return val.seconds * 1000 + (val.nanoseconds || 0) / 1e6; if (val.toMillis) return val.toMillis(); const t = new Date(val).getTime(); return isNaN(t) ? 0 : t; };
+  // 完了日時は completedAt(完了時に焼き付け)を最優先。updatedAt は保存の度に動くため、完了後の編集で別月へ消える/最新側へ飛ぶのを防ぐ。
+  const compMs = (lot) => toMs(lot.completedAt) || toMs(lot.updatedAt) || toMs(lot.createdAt);
 
   const triggerDelete = (id) => { setConfirmModal({ isOpen: true, title: '削除確認', message: '履歴を削除しますか？この操作は元に戻せません。', action: () => { onDeleteLot(id); setConfirmModal(p => ({ ...p, isOpen: false })); } }); };
 
@@ -24664,7 +26529,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
     if (filterEndDate) { const endDate = new Date(filterEndDate); endDate.setHours(23, 59, 59, 999); end = endDate.getTime(); }
     const lowerQuery = searchQuery.toLowerCase();
     return completedLots.filter(lot => {
-      const ts = toMs(lot.updatedAt || lot.createdAt);
+      const ts = compMs(lot);
       if (ts < start || ts > end) return false;
       if (searchQuery && !((lot.orderNo && lot.orderNo.toLowerCase().includes(lowerQuery)) || (lot.model && lot.model.toLowerCase().includes(lowerQuery)))) return false;
       if (filterWorker && lot.workerId !== filterWorker) return false;
@@ -24677,7 +26542,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
     });
   }, [completedLots, filterStartDate, filterEndDate, searchQuery, filterWorker, filterDefect]);
 
-  const allSortedCompletedLots = useMemo(() => [...filteredCompletedLots].sort((a, b) => toMs(b.updatedAt || b.createdAt) - toMs(a.updatedAt || a.createdAt)), [filteredCompletedLots]);
+  const allSortedCompletedLots = useMemo(() => [...filteredCompletedLots].sort((a, b) => compMs(b) - compMs(a)), [filteredCompletedLots]);
   // 表示上限 (パフォーマンス対策、ユーザは「もっと見る」で拡張可能)
   const [displayLimit, setDisplayLimit] = useState(100);
   const sortedCompletedLots = useMemo(() => allSortedCompletedLots.slice(0, displayLimit), [allSortedCompletedLots, displayLimit]);
@@ -24687,7 +26552,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
     const headers = ['完了日時', '型式', '指図番号', 'ユニットNo', 'カテゴリ', '検査項目', '結果', '作業者', '実績時間(秒)', '目標時間(秒)', '達成率(%)'];
     const rows = [];
     sortedCompletedLots.forEach(lot => {
-      const d = new Date(toMs(lot.updatedAt || lot.createdAt) || Date.now());
+      const d = new Date(compMs(lot) || Date.now());
       const dateStr = isNaN(d.getTime()) ? '-' : d.toLocaleString();
       (lot.steps || []).forEach((step, sIdx) => {
         // ロット1回(段取り)工程: 台ではなく回数(lot-k)。ユニットNoは「回N」で台(#N)と区別 (取込側も対応)
@@ -24697,7 +26562,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
             if (task?.status === 'completed' || task?.status === 'skipped') {
               const eff = task.duration > 0 ? Math.round(((step.targetTime || 60) / task.duration) * 100) : 0;
               const wName = workers.find(w => w.id === task.workerId)?.name || task.workerName || '-';
-              rows.push([dateStr, lot.model, lot.orderNo, `回${k + 1}`, step.category || '', step.title, task.status === 'completed' ? 'OK' : 'N/A', wName, task.duration || 0, step.targetTime || 60, eff].join(','));
+              rows.push([dateStr, lot.model, lot.orderNo, `回${k + 1}`, step.category || '', step.title, task.status === 'completed' ? 'OK' : 'N/A', wName, task.duration || 0, step.targetTime || 60, eff]);
             }
           });
           return;
@@ -24707,12 +26572,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
           if (task?.status === 'completed' || task?.status === 'skipped') {
             const eff = task.duration > 0 ? Math.round(((step.targetTime || 60) / task.duration) * 100) : 0;
             const wName = workers.find(w => w.id === task.workerId)?.name || task.workerName || '-';
-            rows.push([dateStr, lot.model, lot.orderNo, `#${i + 1}`, step.category || '', step.title, task.status === 'completed' ? 'OK' : 'N/A', wName, task.duration || 0, step.targetTime || 60, eff].join(','));
+            rows.push([dateStr, lot.model, lot.orderNo, `#${i + 1}`, step.category || '', step.title, task.status === 'completed' ? 'OK' : 'N/A', wName, task.duration || 0, step.targetTime || 60, eff]);
           }
         }
       });
     });
-    const blob = new Blob(["\uFEFF" + headers.join(',') + '\n' + rows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob(["\uFEFF" + headers.map(csvCell).join(',') + '\n' + rows.map(r => r.map(csvCell).join(',')).join('\n')], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `history_${Date.now()}.csv`; link.click();
   };
 
@@ -24725,13 +26590,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
       if (csvRows.length < 2) { alert("CSVのデータがありません。"); return; }
       const hdrs = csvRows[0].map(h => h.replace(/^"|"$/g, '').trim());
       if (hdrs[0] && hdrs[0].charCodeAt(0) === 0xFEFF) hdrs[0] = hdrs[0].substring(1);
-      const idxOrderNo = hdrs.indexOf('指図番号'), idxUnitNo = hdrs.indexOf('ユニットNo'), idxTitle = hdrs.indexOf('検査項目'), idxCategory = hdrs.indexOf('カテゴリ'), idxDuration = hdrs.indexOf('実績時間(秒)'), idxWorker = hdrs.indexOf('作業者');
+      const idxOrderNo = hdrs.indexOf('指図番号'), idxUnitNo = hdrs.indexOf('ユニットNo'), idxTitle = hdrs.indexOf('検査項目'), idxCategory = hdrs.indexOf('カテゴリ'), idxDuration = hdrs.indexOf('実績時間(秒)'), idxWorker = hdrs.indexOf('作業者'), idxResult = hdrs.indexOf('結果');
       if (idxOrderNo === -1 || idxUnitNo === -1 || idxTitle === -1) { alert("CSV形式が正しくありません。必須列（指図番号、ユニットNo、検査項目）が見つかりません。"); return; }
       const updates = {};
       for (let i = 1; i < csvRows.length; i++) {
         const row = csvRows[i]; if (row.length < hdrs.length) continue;
         const getVal = (idx) => idx !== -1 && row[idx] ? row[idx].replace(/^"|"$/g, '').trim() : '';
         const orderNo = getVal(idxOrderNo), unitNo = getVal(idxUnitNo), title = getVal(idxTitle), category = getVal(idxCategory), duration = parseInt(getVal(idxDuration), 10) || 0, workerName = getVal(idxWorker);
+        const isSkip = getVal(idxResult) === 'N/A'; // 結果=N/A は『該当なし(対象外)』由来 → completed に戻さない
         if (!orderNo || !unitNo || !title) continue;
         const matchLot = completedLots.find(l => l.orderNo === orderNo); if (!matchLot) continue;
         if (!updates[matchLot.id]) updates[matchLot.id] = { tasks: JSON.parse(JSON.stringify(matchLot.tasks || {})) };
@@ -24745,8 +26611,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
           if (isNaN(occ) || occ < 0) continue;
           const loKey = `${step.id}-lot-${occ}`;
           const ex = updates[matchLot.id].tasks[loKey];
+          const loSkip = isSkip || ex?.status === 'skipped';
           updates[matchLot.id].tasks[loKey] = {
-            ...(ex || { startTime: null }), status: 'completed', duration,
+            ...(ex || { startTime: null }), status: loSkip ? 'skipped' : 'completed', duration,
+            ...(loSkip ? { skipReason: ex?.skipReason || '該当なし(対象外)', skipAt: ex?.skipAt || importEndTs } : {}),
             workerName: workerName !== '-' ? workerName : (ex?.workerName || ''),
             firstStartTime: ex?.firstStartTime || ex?.startTime || (duration > 0 ? importEndTs - duration * 1000 : importEndTs),
             endTime: ex?.endTime || importEndTs,
@@ -24760,10 +26628,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
         const actualKey = updates[matchLot.id].tasks[taskKey1] ? taskKey1 : taskKey2;
         // CSV取込で時刻情報がない場合は、ロットの completedAt or updatedAt を流用
         const importEnd = (typeof matchLot.completedAt === 'number' ? matchLot.completedAt : null) || Date.now();
+        const nSkip = isSkip || existingTask?.status === 'skipped';
         updates[matchLot.id].tasks[actualKey] = {
           ...(existingTask || { startTime: null }),
-          status: 'completed',
+          status: nSkip ? 'skipped' : 'completed',
           duration,
+          ...(nSkip ? { skipReason: existingTask?.skipReason || '該当なし(対象外)', skipAt: existingTask?.skipAt || importEnd } : {}),
           workerName: workerName !== '-' ? workerName : (existingTask?.workerName || ''),
           // CSV から復元したタスクには時刻が無い → 既存値があれば優先、無ければ ロット完了時刻ベースで埋める
           firstStartTime: existingTask?.firstStartTime || existingTask?.startTime || (duration > 0 ? importEnd - duration * 1000 : importEnd),
@@ -24867,12 +26737,16 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                   </div>
                 </div>
                 <div className="text-sm text-slate-600">指図: <span className="font-bold">{lot.orderNo}</span> | <span className="bg-slate-100 px-1.5 rounded">{lot.quantity}台</span></div>
+                <div className="flex items-center gap-1 text-xs font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-1 w-fit max-w-full" title={templates?.find(t => t.id === lot.templateId)?.name || ''}>
+                  <ClipboardList className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">{templates?.find(t => t.id === lot.templateId)?.name || '(テンプレ不明)'}</span>
+                </div>
                 <div className="text-xs text-slate-500 flex items-center gap-1"><User className="w-3 h-3" /> {workers.find(w => w.id === lot.workerId)?.name || '未割当'}</div>
                 <div className="text-xs font-mono text-slate-600 flex items-center gap-1">
                   <Clock className="w-3 h-3" /> {formatTime(lot.tasks ? Object.values(lot.tasks).reduce((s, t) => s + (t.status === 'completed' ? (t.duration || 0) : 0), 0) : Math.floor((lot.totalWorkTime || 0) / 1000))}
                 </div>
                 <div className="text-xs text-slate-400 mt-auto pt-3 border-t flex items-center justify-between gap-2">
-                  <span>{lot.updatedAt ? new Date(toMs(lot.updatedAt)).toLocaleString() : '-'}</span>
+                  <span>{compMs(lot) ? new Date(compMs(lot)).toLocaleString() : '-'}</span>
                   <button onClick={(e) => {
                     e.stopPropagation();
                     if (!confirm(`このロット（${lot.model} / ${lot.orderNo}）を検査リストへ復帰しますか？\n完了を取り消し、再度作業ができるようになります（実績は残ります）。`)) return;
@@ -24894,16 +26768,17 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
           <div className="bg-white rounded-lg shadow border overflow-hidden">
             <table className="w-full text-left border-collapse">
               <thead className="bg-slate-50 sticky top-0 z-10 shadow-sm text-xs text-slate-500 uppercase">
-                <tr><th className="p-3 font-bold border-b">完了日時</th><th className="p-3 font-bold border-b">指図番号</th><th className="p-3 font-bold border-b">型式</th><th className="p-3 font-bold border-b text-center">台数</th><th className="p-3 font-bold border-b">作業者</th><th className="p-3 font-bold border-b">実績時間</th><th className="p-3 font-bold border-b text-right">操作</th></tr>
+                <tr><th className="p-3 font-bold border-b">完了日時</th><th className="p-3 font-bold border-b">指図番号</th><th className="p-3 font-bold border-b">型式</th><th className="p-3 font-bold border-b">テンプレート</th><th className="p-3 font-bold border-b text-center">台数</th><th className="p-3 font-bold border-b">作業者</th><th className="p-3 font-bold border-b">実績時間</th><th className="p-3 font-bold border-b text-right">操作</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
                 {sortedCompletedLots.map(lot => {
                   const totalActual = lot.tasks ? Object.values(lot.tasks).reduce((s, t) => s + (t.status === 'completed' ? (t.duration || 0) : 0), 0) : Math.floor((lot.totalWorkTime || 0) / 1000);
                   return (
                   <tr key={lot.id} className="hover:bg-slate-50 transition-colors">
-                    <td className="p-3 text-slate-500 text-xs whitespace-nowrap">{lot.updatedAt ? new Date(toMs(lot.updatedAt)).toLocaleString() : '-'}</td>
+                    <td className="p-3 text-slate-500 text-xs whitespace-nowrap">{compMs(lot) ? new Date(compMs(lot)).toLocaleString() : '-'}</td>
                     <td className="p-3 font-bold text-slate-800">{lot.orderNo}</td>
                     <td className="p-3 font-bold text-slate-700">{lot.model}</td>
+                    <td className="p-3"><span className="inline-flex items-center gap-1 text-xs font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5" title={templates?.find(t => t.id === lot.templateId)?.name || ''}><ClipboardList className="w-3 h-3 shrink-0" />{templates?.find(t => t.id === lot.templateId)?.name || '(不明)'}</span></td>
                     <td className="p-3 text-center"><span className="bg-slate-100 border border-slate-200 px-2 py-0.5 rounded text-xs">{lot.quantity}台</span></td>
                     <td className="p-3 text-xs text-slate-600">{workers.find(w => w.id === lot.workerId)?.name || '未割当'}</td>
                     <td className="p-3 font-mono text-sm">{formatTime(totalActual)}</td>
@@ -24921,7 +26796,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                   </tr>
                   );
                 })}
-                {sortedCompletedLots.length === 0 && <tr><td colSpan="7" className="p-8 text-center text-slate-400">表示するデータがありません</td></tr>}
+                {sortedCompletedLots.length === 0 && <tr><td colSpan="8" className="p-8 text-center text-slate-400">表示するデータがありません</td></tr>}
               </tbody>
             </table>
           </div>
@@ -25099,8 +26974,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    }, [lots, defectNotifyEnabled, currentUserName]);
 
    // State: UI
-   const [viewMode, setViewMode] = useState('dashboard');
+   const [viewMode, setViewMode] = useState(EMBED_MAP ? 'map-only' : 'dashboard'); // 埋め込みは「マップだけ」画面(現場マップの地図そのもの)
    const [activeTab, setActiveTab] = useState('main');
+   // 司令塔からの深掘りリンク(?q=指図)で来たら、検査リストタブを開く(検索欄への反映は上の searchQuery effect)。
+   useEffect(() => { try { if (new URLSearchParams(window.location.search).get('q')) setActiveTab('inspection'); } catch (e) { /* noop */ } }, []);
    // タブ集約: 親タブの下にサブタブをぶら下げる。activeTab は子の値('history'等)も取りうる。
    const TAB_GROUPS = {
      inspection: [
@@ -25142,6 +27019,18 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    // State: Execution Modal
    const [executionLotId, setExecutionLotId] = useState(null);
 
+   // 司令塔(工場統合管理)の作業者マップから ?lot=ロットID で来たら、そのロットの作業画面を自動で開く(指図絞り込みに加えて実画面を直接開く)。
+   const deepOpenRef = useRef(false);
+   useEffect(() => {
+     if (deepOpenRef.current) return;
+     try {
+       const lid = new URLSearchParams(window.location.search).get('lot');
+       if (!lid || !lots || lots.length === 0) return;
+       const lot = lots.find((l) => l.id === lid);
+       if (lot && lot.status !== 'completed') { deepOpenRef.current = true; setActiveTab('inspection'); setExecutionLotId(lot.id); }
+     } catch (e) { /* noop */ }
+   }, [lots]);
+
    // State: Notes & Announcements (disabled for debug)
    const [notes, setNotes] = useState([]);
    const [announcements, setAnnouncements] = useState([]);
@@ -25150,9 +27039,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const [indirectWork, setIndirectWork] = useState([]);
    const [improvementCards, setImprovementCards] = useState([]); // 改善PDCAカルテ (improvements コレクション)
    const [observationPlans, setObservationPlans] = useState([]); // じっと見るモード=要素作業分割の観測プラン (observationPlans コレクション)
+   const [videoRecipes, setVideoRecipes] = useState([]); // エース動画の再生レシピ (video_recipes コレクション, docId=DriveのfileId)
    const [showIndirectModal, setShowIndirectModal] = useState(false);
    const [showDailySummary, setShowDailySummary] = useState(false);
-   const [showShiftHandover, setShowShiftHandover] = useState(false);
    const [activeIndirect, setActiveIndirect] = useState(null); // { id, category, startTime }
 
    // お知らせ通知タイマー
@@ -25277,6 +27166,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        onSnapshot(getPath('indirectWork'), (snap) => setIndirectWork(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.startTime || 0) - (a.startTime || 0)))),
        onSnapshot(getPath('improvements'), (snap) => setImprovementCards(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(getPath('observationPlans'), (snap) => setObservationPlans(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('video_recipes'), (snap) => setVideoRecipes(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), (snap) => {
          if (snap.exists()) {
             const data = snap.data();
@@ -25417,6 +27307,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        ['indirectWork', parsed.indirectWork],
        ['improvements', parsed.improvements],
        ['observationPlans', parsed.observationPlans],
+       ['notes', parsed.notes],
+       ['announcements', parsed.announcements],
+       ['logs', parsed.logs],
      ];
      const total = cols.reduce((n, [, a]) => n + (Array.isArray(a) ? a.length : 0), 0) + 1; // +1: settings/config
      let done = 0;
@@ -25552,16 +27445,20 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
          ws.eachRow((row, rowNumber) => {
              if (rowNumber < startRow) return;
-             let title, desc, targetTime, type;
+             let title, desc, targetTime, type, lotOnce, executionMode;
 
              if (isNewFormat) {
-               // Download format: B=工程名, C=作業内容, D=目標時間, E=種別
+               // Download format: B=工程名, C=作業内容, D=目標時間, E=種別, F=段取り(ロット1回), G=実行モード
                title = row.getCell(2).value?.toString();
                desc = row.getCell(3).value?.toString() || '';
                const rawTime = row.getCell(4).value;
                targetTime = typeof rawTime === 'number' ? rawTime : parseInt(rawTime) || 0;
-               type = row.getCell(5).value?.toString() || 'normal';
-               if (!['normal','important','danger'].includes(type)) type = 'normal';
+               type = (row.getCell(5).value?.toString() || 'normal').trim();
+               if (!['normal', 'important', 'danger', 'measurement'].includes(type)) type = 'normal';
+               const f = (row.getCell(6).value?.toString() || '').trim();
+               lotOnce = /^(○|◯|✓|はい|yes|true|1|y)$/i.test(f);
+               const g = (row.getCell(7).value?.toString() || '').trim();
+               executionMode = /自動|batch/i.test(g) ? 'batch' : 'manual';
              } else {
                // Legacy format: E=title, F=description
                title = row.getCell(5).value?.toString();
@@ -25571,14 +27468,16 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              }
 
              if (title && title.trim()) {
-                 newSteps.push({
+                 const st = {
                      id: generateId(),
                      title: title.trim(),
                      description: desc,
                      type,
                      targetTime,
                      images: imageMap.get(rowNumber) || []
-                 });
+                 };
+                 if (isNewFormat) { st.lotOnce = lotOnce; st.executionMode = executionMode; }
+                 newSteps.push(st);
              }
          });
 
@@ -25590,13 +27489,18 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  '「' + importedTitle + '」は既に存在します。\n上書き更新しますか？\n（キャンセルで新規コピー作成）'
                );
                if (overwrite) {
-                 // Preserve original images when uploaded file has no images for that step
+                 // 既存工程の高度な設定(機械占有/測定詳細/チェック項目/PDF/rotary等)と画像を保持し、Excelで編集した項目だけ上書き。
+                 //   行の並べ替えに強いよう、まず同名の既存工程を母体に、無ければ同じ位置の既存工程を使う。
                  const mergedSteps = newSteps.map((ns, i) => {
-                   const origStep = existing.steps?.[i];
-                   if (ns.images.length === 0 && origStep?.images?.length > 0) {
-                     return { ...ns, images: origStep.images };
-                   }
-                   return ns;
+                   const orig = (existing.steps || []).find(s => s.title === ns.title) || (existing.steps || [])[i] || {};
+                   return {
+                     ...orig,
+                     id: orig.id || ns.id,
+                     title: ns.title, description: ns.description, targetTime: ns.targetTime, type: ns.type,
+                     ...(ns.lotOnce !== undefined ? { lotOnce: ns.lotOnce } : {}),
+                     ...(ns.executionMode !== undefined ? { executionMode: ns.executionMode } : {}),
+                     images: (ns.images && ns.images.length) ? ns.images : (orig.images || []),
+                   };
                  });
                  saveData('templates', existing.id, { ...existing, name: importedTitle, steps: mergedSteps });
                  alert('「' + importedTitle + '」を更新しました (' + mergedSteps.length + '工程)');
@@ -25632,19 +27536,20 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const allBorder = { top: thin, bottom: thin, left: thin, right: thin };
 
        // Row 1: Template name (A1, merged)
-       ws.mergeCells('A1:F1');
+       ws.mergeCells('A1:H1');
        const titleCell = ws.getCell('A1');
        titleCell.value = template.name || 'テンプレート';
        titleCell.font = { bold: true, size: 16 };
        titleCell.alignment = { vertical: 'middle' };
 
        // Row 2: Instructions
-       ws.mergeCells('A2:F2');
-       ws.getCell('A2').value = '※ この行以下を編集してください。行の追加・削除も可能です。画像列は再アップロード時に元の画像が保持されます。';
+       ws.mergeCells('A2:H2');
+       ws.getCell('A2').value = '※ この行以下を編集→保存→「Excel取込」で反映。行の追加/削除/並べ替え可。種別=normal/important/danger/measurement。段取り=ロット1回なら○。実行モード=手動 または 自動(バッチ)。画像・測定詳細・チェック項目・機械占有はアプリ側の設定を保持します(Excelでは編集しません)。';
        ws.getCell('A2').font = { italic: true, size: 9, color: { argb: 'FF666666' } };
+       ws.getRow(2).height = 28; ws.getCell('A2').alignment = { vertical: 'middle', wrapText: true };
 
        // Row 3: Headers
-       const headers = ['No.', '工程名', '作業内容/注意事項', '目標時間(秒)', '種別', '画像枚数'];
+       const headers = ['No.', '工程名', '作業内容/注意事項', '目標時間(秒)', '種別', '段取り(ロット1回)', '実行モード', '画像枚数'];
        const headerRow = ws.getRow(3);
        headers.forEach((h, i) => {
          const cell = headerRow.getCell(i + 1);
@@ -25652,16 +27557,18 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } };
          cell.border = allBorder;
-         cell.alignment = { vertical: 'middle', horizontal: 'center' };
+         cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
        });
 
        // Column widths
        ws.getColumn(1).width = 6;
        ws.getColumn(2).width = 28;
-       ws.getColumn(3).width = 50;
-       ws.getColumn(4).width = 14;
-       ws.getColumn(5).width = 18;
-       ws.getColumn(6).width = 12;
+       ws.getColumn(3).width = 46;
+       ws.getColumn(4).width = 13;
+       ws.getColumn(5).width = 13;
+       ws.getColumn(6).width = 14;
+       ws.getColumn(7).width = 13;
+       ws.getColumn(8).width = 10;
 
        // Row 4+: Step data with embedded images
        for (let idx = 0; idx < template.steps.length; idx++) {
@@ -25673,14 +27580,16 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          row.getCell(3).value = step.description || '';
          row.getCell(4).value = step.targetTime || 0;
          row.getCell(5).value = step.type || 'normal';
+         row.getCell(6).value = step.lotOnce ? '○' : '';
+         row.getCell(7).value = step.executionMode === 'batch' ? '自動(バッチ)' : '手動';
 
          const imgCount = step.images?.length || 0;
-         row.getCell(6).value = imgCount;
+         row.getCell(8).value = imgCount;
          if (imgCount > 0) {
-           row.getCell(6).font = { color: { argb: 'FF2563EB' } };
+           row.getCell(8).font = { color: { argb: 'FF2563EB' } };
          }
 
-         // Embed first image per step into column G
+         // Embed first image per step into column I (参考表示)
          if (step.images && step.images.length > 0) {
            try {
              const imgData = step.images[0];
@@ -25689,16 +27598,16 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              if (base64Only) {
                const imageId = wb.addImage({ base64: base64Only, extension: ext });
                ws.addImage(imageId, {
-                 tl: { col: 6, row: rowNum - 1 },
+                 tl: { col: 8, row: rowNum - 1 },
                  ext: { width: 120, height: 90 }
                });
                row.height = 72;
-               if (!ws.getColumn(7).width || ws.getColumn(7).width < 18) ws.getColumn(7).width = 18;
+               if (!ws.getColumn(9).width || ws.getColumn(9).width < 18) ws.getColumn(9).width = 18;
              }
            } catch (imgErr) { /* skip broken image */ }
          }
 
-         for (let c = 1; c <= 6; c++) {
+         for (let c = 1; c <= 8; c++) {
            row.getCell(c).border = allBorder;
            row.getCell(c).alignment = { vertical: 'middle', wrapText: c === 3 };
          }
@@ -26181,7 +28090,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      ws.addRow(['※ 1 規格に複数テンプレが紐付いている場合、テンプレID 列を正しく入力しないと規格が適用されません (▲ 表示時は要注意)']);
      ws.addRow(['※ 優先度: 「通常」または「急ぎ」（空欄は通常扱い）']);
      ws.addRow(['※ 納期: yyyy-mm-dd 形式（空欄可）']);
-     ws.addRow(['※ 入庫日時: yyyy-mm-dd HH:MM 形式 / 空欄可（空欄=取込実行時刻）']);
+     ws.addRow(['※ 入庫日時: yyyy-mm-dd HH:MM 形式 / 空欄可（空欄=納期の3日前 08:30、納期も空欄なら取込実行時刻）']);
      ws.addRow(['※ 機番1〜10: 台数分のみ入力。空欄は #1, #2... 自動採番']);
      ws.addRow(['※ テンプレートID: 「テンプレート一覧」シートからコピペ']);
      ws.addRow(['※ 既存ロットは指図番号で上書き / 作業中ロットはスキップ']);
@@ -26498,25 +28407,45 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      if (!file) return;
      e.target.value = '';
      try {
-       const ExcelJS = await loadExcelJS();
-       const wb = new ExcelJS.Workbook();
        const buf = await file.arrayBuffer();
-       await wb.xlsx.load(buf);
-       const ws = wb.getWorksheet('入荷登録') || wb.getWorksheet(1);
-       if (!ws) { alert('シートが見つかりません'); return; }
+       // 「1始まり行 × 1始まり列」の文字列グリッドを作る。
+       //   通常は ExcelJS。読めない xlsx (Google スプレッドシート由来など。load が "sheets" 等で失敗) は
+       //   JSZip で直接読むフォールバックに切替えて取込を成立させる。
+       let grid = null;
+       let primaryErr = null;
+       try {
+         const ExcelJS = await loadExcelJS();
+         const wb = new ExcelJS.Workbook();
+         await wb.xlsx.load(buf);
+         const ws = wb.getWorksheet('入荷登録') || wb.getWorksheet(1);
+         if (!ws) throw new Error('シートが見つかりません');
+         grid = [];
+         ws.eachRow((row, rowNum) => {
+           const cells = [];
+           for (let c = 1; c <= 30; c++) cells[c] = xlsxCellText_pi(row.getCell(c).value);
+           grid[rowNum] = cells;
+         });
+       } catch (ex) {
+         primaryErr = ex;
+         try {
+           grid = await readXlsxGridWithJSZip_pi(buf, '入荷登録');
+         } catch (ex2) {
+           throw primaryErr || ex2; // ExcelJS も JSZip も失敗
+         }
+       }
+       if (!grid || grid.length === 0) { alert('シートが見つかりません'); return; }
 
-       // ヘッダー行を解析して列名 → インデックスのマップを作る (新旧フォーマット両対応)
-       // 新フォーマット: 規格状態列が 2 列目に挿入されている
-       // 旧フォーマット: 規格状態列なし
-       const headerCellText = (i) => {
-         const v = ws.getRow(1).getCell(i).value;
-         if (v == null) return '';
-         if (typeof v === 'object' && v.richText) return v.richText.map(t => t.text).join('');
-         return String(v).trim();
-       };
+       const cellTxt = (rowArr, i) => (rowArr && rowArr[i] != null) ? String(rowArr[i]).trim() : '';
+       // ヘッダー行を探す (先頭が空行/タイトル行でもズレないよう、先頭数行から「型式」「指図番号」を含む行を採用)
+       let headerRowNum = 1;
+       for (let r = 1; r < grid.length && r <= 6; r++) {
+         const joined = (grid[r] || []).filter(Boolean).join(',');
+         if (/指図番号/.test(joined) && /型式/.test(joined)) { headerRowNum = r; break; }
+       }
+       const headerRow = grid[headerRowNum] || [];
        const colIndex = {};
        for (let i = 1; i <= 30; i++) {
-         const h = headerCellText(i);
+         const h = cellTxt(headerRow, i);
          if (!h) continue;
          // 「規格状態 (自動)」のような括弧付きにも対応
          const normalized = h.replace(/\s*[\(（].*[\)）]\s*/g, '').trim();
@@ -26531,38 +28460,53 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const C_PRIORITY = col('優先度', 5);
        const C_DUE = col('納期', 6);
        const C_ENTRY = col('入庫日時', 7);
-       // 機番は最初の「機番1」列から連続して読む
        const C_SERIAL_START = col('機番1', 8);
 
        const rows = [];
-       ws.eachRow((row, rowNum) => {
-         if (rowNum === 1) return; // ヘッダースキップ
-         const model = row.getCell(C_MODEL).value?.toString?.() || row.getCell(C_MODEL).value;
-         const orderNo = row.getCell(C_ORDER).value?.toString?.() || row.getCell(C_ORDER).value;
-         if (!model || !orderNo) return; // 空行スキップ
-         const qty = parseInt(row.getCell(C_QTY).value) || 1;
-         const templateId = row.getCell(C_TEMPLATE).value?.toString?.() || 'demo';
-         const priorityRaw = row.getCell(C_PRIORITY).value?.toString?.() || '通常';
+       for (let r = headerRowNum + 1; r < grid.length; r++) {
+         const rowArr = grid[r];
+         if (!rowArr) continue;
+         const model = cellTxt(rowArr, C_MODEL);
+         const orderNo = cellTxt(rowArr, C_ORDER);
+         if (!model || !orderNo) continue; // 空行スキップ
+         const qty = parseInt(rowArr[C_QTY]) || 1;
+         const templateId = cellTxt(rowArr, C_TEMPLATE) || 'demo';
+         const priorityRaw = cellTxt(rowArr, C_PRIORITY) || '通常';
          const priority = priorityRaw === '急ぎ' ? 'high' : 'normal';
-         const dueDate = row.getCell(C_DUE).value?.toString?.() || '';
-         const entryAtRaw = row.getCell(C_ENTRY).value;
-         const entryAt = entryAtRaw ? new Date(entryAtRaw).getTime() : Date.now();
-
+         // 納期: 2026/8/15・7/1/2026・Excelシリアル等を "YYYY-MM-DD" に正規化(アプリ全体の日付処理に合わせる)
+         const dueDate = parseImportDateToYMD_pi(cellTxt(rowArr, C_DUE));
+         // 入庫日時: 入力があればそれを採用。空欄なら「納期の3日前」を自動で入庫日にする(納期あり時)。
+         const entryRaw = cellTxt(rowArr, C_ENTRY);
+         let entryAt;
+         if (entryRaw) {
+           const eYMD = parseImportDateToYMD_pi(entryRaw);
+           // 時刻(HH:MM)が書かれていればそれを使う。無ければ始業想定の08:30(旧実装は常に08:30固定で時刻入力が無視されていた)
+           const tm = /(\d{1,2}):(\d{2})/.exec(String(entryRaw));
+           const hhmm = tm ? `${String(Math.min(23, parseInt(tm[1], 10))).padStart(2, '0')}:${tm[2]}` : '08:30';
+           const t = eYMD ? new Date(`${eYMD}T${hhmm}:00`).getTime() : new Date(entryRaw).getTime();
+           entryAt = isNaN(t) ? Date.now() : t;
+         } else if (dueDate) {
+           const d = new Date(dueDate + 'T08:30:00'); d.setDate(d.getDate() - 3); entryAt = d.getTime();
+         } else {
+           entryAt = Date.now();
+         }
          const serials = [];
          for (let i = 0; i < qty; i++) {
-           const sn = row.getCell(C_SERIAL_START + i).value?.toString?.() || '';
+           const sn = cellTxt(rowArr, C_SERIAL_START + i);
            serials.push(sn || `#${i + 1}`);
          }
          rows.push({ model, orderNo, qty, templateId, priority, dueDate, entryAt, serials });
-       });
+       }
 
        if (rows.length === 0) { alert('有効なデータ行がありません'); return; }
 
-       // 重複チェック: 指図番号で既存ロットと照合
+       // ===== パス1: 計画づくり(書き込みは一切しない) =====
+       //   旧実装は保存し終えた後に confirm「OKで確定」を出しており、キャンセルしても取り消せない嘘UIだった(監査確定)。
+       //   先に計画+プレビューを見せ、OKされてから書き込む。
        let newCount = 0, updateCount = 0, skipCount = 0;
        const details = [];
-
-       const processedKeys = new Set(); // このバッチで作成済みの「指図+テンプレID」(二重作成防止)
+       const plan = [];
+       const processedKeys = new Set(); // このバッチで作成予定の「指図+テンプレID」(二重作成防止)
        for (const row of rows) {
          // 重複判定は「指図番号 + テンプレートID」で行う。
          //   こうしないと、同じ指図で複数テンプレ(別ロット)を登録しても1つに潰れてしまう。
@@ -26570,13 +28514,17 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          const existing = lots.find(l => l.orderNo === row.orderNo && l.templateId === row.templateId);
 
          if (existing && existing.status === 'processing') {
-           // 作業中のロットは無視
            skipCount++;
            details.push(`⏭ ${row.orderNo} (テンプレ:${row.templateId}) — 作業中のため無視`);
            continue;
          }
+         if (existing && (existing.status === 'completed' || existing.location === 'completed')) {
+           // 完了済みロットはExcel再取込で書き換えない(entryAt等の上書きはリードタイム実績を壊す)
+           skipCount++;
+           details.push(`⏭ ${row.orderNo} (テンプレ:${row.templateId}) — 完了済みのため無視`);
+           continue;
+         }
          if (!existing && processedKeys.has(dupKey)) {
-           // 同一Excel内に「同じ指図+同じテンプレID」の行が複数 → 2件目以降は無視 (二重作成防止)
            skipCount++;
            details.push(`⏭ ${row.orderNo} (テンプレ:${row.templateId}) — 同一ファイル内の重複行`);
            continue;
@@ -26587,25 +28535,57 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          if (template?.steps) baseSteps = template.steps;
          // 品質規格 / 型式オーバーライドを適用 (共通ヘルパー: ロット登録画面と同じ挙動)
          const { steps, appliedStandard, naStepIds } = applyQualityStandardToSteps(row.model, baseSteps, settings, row.templateId);
+         const stdLabel = appliedStandard?.source === 'qualityStandard' ? ` [${appliedStandard.standardNo} Rev.${appliedStandard.revision}]` : '';
 
          if (existing) {
-           // 既存ロットを上書き（作業中以外）
-           // 既存ロットが既に作業開始後 (workStartTime あり) でない場合のみ規格スナップショットも更新
-           const isUntouched = !existing.workStartTime && (!existing.tasks || Object.keys(existing.tasks).length === 0);
-           const updates = {
-             model: row.model, quantity: row.qty,
-             unitSerialNumbers: row.serials,
-             templateId: row.templateId, priority: row.priority,
-             dueDate: row.dueDate, entryAt: row.entryAt, steps,
-             ...(isUntouched && appliedStandard ? { appliedStandard } : {}),
-             ...(isUntouched && naStepIds && naStepIds.length > 0 ? { tasks: buildProfileSkippedTasks(steps, naStepIds, row.qty) } : {})
-           };
-           await saveData('lots', existing.id, updates);
+           // 未着手(workStartTime無し かつ どのタスクも firstStartTime 無し=規格の該当なしは着手扱いにしない)の時だけ
+           //   工程/規格スナップショット/該当なしタスクを最新で作り直す。
+           const isUntouched = !existing.workStartTime && !Object.values(existing.tasks || {}).some(t => t && t.firstStartTime);
+           plan.push({ type: 'update', row, existing, isUntouched, steps, appliedStandard, naStepIds });
            updateCount++;
-           const stdLabel = appliedStandard?.source === 'qualityStandard' ? ` [${appliedStandard.standardNo} Rev.${appliedStandard.revision}]` : '';
-           details.push(`🔄 ${row.orderNo} — 上書き更新${stdLabel}`);
+           // 着手済み(一時停止など)は納期/優先度のみ更新し、台数・機番・型式・テンプレ・入庫は実測保護(手動編集パスと同方針)
+           details.push(isUntouched ? `🔄 ${row.orderNo} — 上書き更新${stdLabel}` : `🔄 ${row.orderNo} — 納期/優先度のみ更新(着手済みのため台数・機番等は保護)`);
          } else {
-           // 新規登録
+           plan.push({ type: 'new', row, steps, appliedStandard, naStepIds });
+           newCount++;
+           processedKeys.add(dupKey);
+           details.push(`✅ ${row.orderNo} — 新規登録${stdLabel}`);
+         }
+       }
+
+       // ===== 確認(この時点ではまだ何も書き込んでいない) =====
+       const msg = [`取込内容の確認:`, `  新規: ${newCount}件`, `  上書き: ${updateCount}件`, `  無視: ${skipCount}件`, '', ...details].join('\n');
+       if (!confirm(msg + '\n\nOKで書き込みます（キャンセルすると何も変更しません）')) return;
+
+       // ===== パス2: 書き込み =====
+       for (const p of plan) {
+         if (p.type === 'update') {
+           const { row, existing, isUntouched, steps, appliedStandard, naStepIds } = p;
+           const updates = isUntouched
+             ? {
+                 model: row.model, quantity: row.qty,
+                 unitSerialNumbers: row.serials,
+                 templateId: row.templateId, priority: row.priority,
+                 dueDate: row.dueDate, entryAt: row.entryAt,
+                 steps, appliedStandard: appliedStandard ?? null, tasks: buildProfileSkippedTasks(steps, naStepIds, row.qty),
+               }
+             : { priority: row.priority, dueDate: row.dueDate }; // 着手済みは実測に関わる項目を書き換えない(監査確定)
+           await saveData('lots', existing.id, updates);
+           // 未着手ロットは、規格変更/台数縮小で不要になった古い profileSkipped タスクを deleteField で掃除(merge:true は sub-key を消さない)。
+           if (isUntouched) {
+             const naSet = new Set(naStepIds || []);
+             const removals = {};
+             Object.keys(existing.tasks || {}).forEach(k => {
+               const t = existing.tasks[k];
+               if (t && t.status === 'skipped' && t.profileSkipped) {
+                 const sid = k.includes('-lot-') ? k.split('-lot-')[0] : k.slice(0, k.lastIndexOf('-'));
+                 if (!naSet.has(sid)) removals[`tasks.${k}`] = deleteField();
+               }
+             });
+             if (Object.keys(removals).length) await updateDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'lots', existing.id), removals).catch(() => {});
+           }
+         } else {
+           const { row, steps, appliedStandard, naStepIds } = p;
            const id = generateId();
            const lot = {
              id, batchId: generateId(), model: row.model, orderNo: row.orderNo,
@@ -26618,15 +28598,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              appliedStandard, // 適用された品質規格のスナップショット
            };
            await saveData('lots', id, lot);
-           newCount++;
-           processedKeys.add(dupKey); // このバッチで作成済みとして記録 (同一ファイル内の二重作成防止)
-           const stdLabel = appliedStandard?.source === 'qualityStandard' ? ` [${appliedStandard.standardNo} Rev.${appliedStandard.revision}]` : '';
-           details.push(`✅ ${row.orderNo} — 新規登録${stdLabel}`);
          }
        }
-
-       const msg = [`処理完了:`, `  新規: ${newCount}件`, `  上書き: ${updateCount}件`, `  無視(作業中): ${skipCount}件`, '', ...details].join('\n');
-       if (!confirm(msg + '\n\nOKで確定')) return;
        alert(`✅ 完了 — 新規${newCount}件 / 上書き${updateCount}件 / 無視${skipCount}件`);
      } catch (err) {
        console.error(err);
@@ -26855,51 +28828,24 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    };
 
    const anomalyCount = anomalies.length;
-   const fixAnomaly = async (a) => {
-     const lot = lots.find(l => l.id === a.lotId);
+   // 完了ロットに残った未完了タスク(lot-status-mismatch)を「該当なし」に変換して消す。
+   //   これらは status が paused/waiting/processing でセルが赤くならず、表のタップでは消せないため専用ボタンで処理する。
+   const clearLotStatusMismatch = (lotId, stuckKeys) => {
+     const lot = lots.find(l => l.id === lotId);
      if (!lot) return;
+     const now = Date.now();
      const newTasks = { ...(lot.tasks || {}) };
-     try {
-       if (a.kind === 'duration-zero' || a.kind === 'duration-tiny' || a.kind === 'duration-huge') {
-         const fixVal = a.suggestedFix;
-         if (!fixVal) {
-           const v = prompt(`${a.stepTitle} ${a.unitNo} の実時間 (秒) を入力してください:`, a.duration || 0);
-           if (!v) return;
-           const num = parseInt(v, 10);
-           if (!num || num <= 0) return;
-           newTasks[a.taskKey] = { ...newTasks[a.taskKey], duration: num };
-         } else {
-           newTasks[a.taskKey] = { ...newTasks[a.taskKey], duration: fixVal };
-         }
-       } else if (a.kind === 'lot-status-mismatch') {
-         const now = Date.now();
-         (a.stuckKeys || []).forEach(sk => {
-           const cur = newTasks[sk] || {};
-           newTasks[sk] = {
-             ...cur,
-             status: 'skipped',
-             skipReason: '該当なし (ロット完了後の自動変換)',
-             skipAt: now,
-             firstStartTime: cur.firstStartTime || cur.startTime || now,
-             endTime: cur.endTime || now,
-             startTime: null,
-           };
-         });
-       } else if (a.kind === 'time-inversion') {
-         const cur = newTasks[a.taskKey] || {};
-         newTasks[a.taskKey] = { ...cur, firstStartTime: null, endTime: null };
-       }
-       await saveData('lots', a.lotId, { tasks: newTasks });
-     } catch (e) {
-       console.error('fixAnomaly failed:', e);
-       alert('修正に失敗しました: ' + e.message);
-     }
+     (stuckKeys || []).forEach(k => {
+       const cur = newTasks[k] || {};
+       newTasks[k] = {
+         ...cur, status: 'skipped', skipReason: '該当なし (ロット完了後の自動変換)', skipAt: now,
+         firstStartTime: cur.firstStartTime || cur.startTime || now, endTime: cur.endTime || now, startTime: null,
+       };
+     });
+     saveData('lots', lotId, { tasks: newTasks });
    };
-   const fixAllAnomalies = async () => {
-     if (!confirm(`${anomalyCount}件の異常値を一括修正します。継続しますか?`)) return;
-     for (const a of anomalies) await fixAnomaly(a);
-     alert('一括修正完了');
-   };
+   // (fixAnomaly / fixAllAnomalies は未配線の死にコード+stale-snapshot上書きの潜在バグのため削除。
+   //  現役の異常値修正は LotTimeTable(onSaveTasks) と clearLotStatusMismatch を使用。)
 
    const handleMoveLot = async (lotId, newLocation, workerId = null) => {
      const lot = lots.find(l => l.id === lotId);
@@ -26937,6 +28883,21 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      }
      // 3. Move to Completed
      else if (newLocation === 'completed') {
+        // ロットを「完了」に動かす際、一時停止/待機/処理中のまま取り残されたタスクを「該当なし」に自動整理する。
+        // これをしないと「ロットは完了済みだが未完了タスクが残っている」異常(lot-status-mismatch)として
+        // 異常値検出に残り続け、セルが赤くならないため消せなくなる(根本対策)。完了済み/該当なしタスクは不可触。
+        const completeNow = Date.now();
+        const srcTasks = lot.tasks || {};
+        let leftover = 0;
+        const cleanTasks = {};
+        Object.entries(srcTasks).forEach(([k, t]) => {
+          if (t && (t.status === 'paused' || t.status === 'waiting' || t.status === 'processing')) {
+            leftover++;
+            cleanTasks[k] = { ...t, status: 'skipped', skipReason: '該当なし (ロット完了時の自動整理)', skipAt: completeNow, firstStartTime: t.firstStartTime || t.startTime || completeNow, endTime: t.endTime || completeNow, startTime: null };
+          } else {
+            cleanTasks[k] = t;
+          }
+        });
         // 「いつから〜いつまで」を絶対に失わないため firstWorkStartTime / completedAt を保持
         await saveData('lots', lotId, {
           location: 'completed',
@@ -26944,6 +28905,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
           workStartTime: null,
           firstWorkStartTime: lot.firstWorkStartTime || lot.workStartTime || null,
           completedAt: lot.completedAt || Date.now(),
+          ...(leftover > 0 ? { tasks: cleanTasks } : {}),
         });
      }
      // 4. Move back to Arrival
@@ -26975,7 +28937,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        new Date(l.createdAt).toLocaleString(),
        l.entryAt ? new Date(l.entryAt).toLocaleString() : '-'
      ]);
-     const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+     const csvContent = [headers.map(csvCell).join(','), ...rows.map(r => r.map(csvCell).join(','))].join('\n');
      const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: 'text/csv;charset=utf-8;' });
      const link = document.createElement('a');
      link.href = URL.createObjectURL(blob);
@@ -27007,7 +28969,20 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        if (targets.length > 0 && confirm(`このテンプレを使う「未着手」の検査ロット ${targets.length}件 にも、変更した工程を反映しますか？\n\n・反映する＝各ロットの工程が最新テンプレに更新されます\n・作業中／完了のロットは実測データを守るため反映しません`)) {
          targets.forEach(l => {
            const { steps, appliedStandard, naStepIds } = applyQualityStandardToSteps(l.model, templateData.steps, settings, id);
-           saveData('lots', l.id, { steps, ...(appliedStandard ? { appliedStandard } : {}), tasks: buildProfileSkippedTasks(steps, naStepIds, l.quantity || 1) });
+           const naSet = new Set(naStepIds || []);
+           // appliedStandard は常に書く(?? null)。規格が外れた時に古い規格スナップショットが残って証明書へ誤印字されるのを防ぐ(正規編集パスと同じ)。
+           saveData('lots', l.id, { steps, appliedStandard: appliedStandard ?? null, tasks: buildProfileSkippedTasks(steps, naStepIds, l.quantity || 1) });
+           // 規格変更で「該当なし」でなくなった工程の古い profileSkipped タスクを除去(merge:true は sub-key を消さないため deleteField が必要)。
+           //   放置すると検査すべき工程が「該当なし」のまま残り、進捗も完了済みに誤計上される。
+           const removals = {};
+           Object.keys(l.tasks || {}).forEach(k => {
+             const t = (l.tasks || {})[k];
+             if (t && t.status === 'skipped' && t.profileSkipped) {
+               const sid = k.includes('-lot-') ? k.split('-lot-')[0] : k.slice(0, k.lastIndexOf('-'));
+               if (!naSet.has(sid)) removals[`tasks.${k}`] = deleteField();
+             }
+           });
+           if (Object.keys(removals).length) updateDoc(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'lots', l.id), removals).catch(() => {});
          });
          alert(`✅ 未着手の ${targets.length}件 に最新テンプレを反映しました。`);
        }
@@ -27098,6 +29073,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            <button onClick={() => setSyncStatus('idle')} className="hover:bg-white/20 rounded p-0.5"><X className="w-3.5 h-3.5"/></button>
          </div>
        )}
+       {!EMBED_MAP && (
        <header data-fs="header" className="h-14 bg-slate-800 text-white flex items-center justify-between px-6 shadow-md z-50 shrink-0">
          <div className="flex items-center gap-3">
            <div className="bg-blue-600 p-1.5 rounded"><Layout className="w-5 h-5 text-white" /></div>
@@ -27174,6 +29150,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            </div>
          </div>
        </header>
+       )}
        {hdrMenu && (
          <>
            <div className="fixed inset-0 z-[90]" onClick={() => setHdrMenu(null)} />
@@ -27194,7 +29171,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          </>
        )}
 
-       <main className="flex-1 overflow-hidden relative bg-slate-100 h-[calc(100vh-3.5rem)] flex flex-col">
+       <main className={`flex-1 overflow-hidden relative bg-slate-100 ${EMBED_MAP ? 'h-screen' : 'h-[calc(100vh-3.5rem)]'} flex flex-col`}>
          {(() => {
            const parent = TAB_PARENT[activeTab] || activeTab;
            const group = TAB_GROUPS[parent];
@@ -27222,7 +29199,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
@@ -27252,7 +29229,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          {activeTab === 'template-mgr' && (
            editingTemplate ? (
              <div className="p-4 h-full flex flex-col overflow-hidden">
-               <TemplateEditor template={editingTemplate} onSave={handleSaveTemplate} onCancel={() => setEditingTemplate(null)} customLayouts={settings?.customLayouts || {}} onSaveLayouts={(layouts) => saveSettings({ customLayouts: layouts })} comboPresets={settings?.comboPresets || []} builtInOverrides={settings?.builtInOverrides || {}} hiddenBuiltIns={settings?.hiddenBuiltIns || []} />
+               <TemplateEditor template={editingTemplate} onSave={handleSaveTemplate} onCancel={() => setEditingTemplate(null)} customLayouts={settings?.customLayouts || {}} onSaveLayouts={(layouts) => saveSettings({ customLayouts: layouts })} comboPresets={settings?.comboPresets || []} builtInOverrides={settings?.builtInOverrides || {}} hiddenBuiltIns={settings?.hiddenBuiltIns || []} videoRecipes={videoRecipes} onSaveVideoRecipe={(id, data) => saveData('video_recipes', id, data)} onDeleteVideoRecipe={(id) => deleteData('video_recipes', id)} />
              </div>
            ) : (
              <TemplateListSection
@@ -27311,7 +29288,6 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
        {/* Daily Summary Modal */}
        {showDailySummary && <DailySummaryModal lots={lots} indirectWork={indirectWork} currentUserName={currentUserName} workers={workers} settings={settings} saveData={saveData} onClose={() => setShowDailySummary(false)} />}
-       {showShiftHandover && <ShiftHandoverModal lots={lots} indirectWork={indirectWork} currentUserName={currentUserName} workers={workers} saveData={saveData} onClose={() => setShowShiftHandover(false)} />}
 
        {showNoteModal && <NoteModal notes={notes} templates={templates} workers={workers} selectedWorker={selectedWorker} saveData={saveData} deleteData={deleteData} onClose={() => setShowNoteModal(false)} currentUserName={currentUserName} />}
 
@@ -27348,7 +29324,26 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                      セルをタップ →「目標で埋める / 実時間を手入力 / <b className="text-amber-700">📦該当なし(対象外)</b> / そのまま」。<br/>
                      <b className="text-amber-700">該当なし(対象外)</b>＝この台はこの工程をやらない（例: 制御装置用意など「ロットで1回だけ」の工程の2台目以降）。集計・異常から外れます。<b>工程名をタップ</b>すると「#2以降をまとめて該当なし」にできます（過去データの片付け用・1台目は残す）。
                    </div>
-                   {[...new Set(anomalies.map(a => a.lotId))].map(lotId => { const lot = lots.find(l => l.id === lotId); if (!lot) return null; return <LotTimeTable key={lotId} lot={lot} onSaveTasks={(nt) => saveData('lots', lotId, { tasks: nt })} />; })}
+                   {[...new Set(anomalies.map(a => a.lotId))].map(lotId => {
+                     const lot = lots.find(l => l.id === lotId);
+                     if (!lot) return null;
+                     // 完了ロットの未完了タスク(lot-status-mismatch)は赤セルにならず表からは消せない → 専用ボタンを出す。
+                     const mismatch = anomalies.find(a => a.lotId === lotId && a.kind === 'lot-status-mismatch');
+                     return (
+                       <div key={lotId} className="mb-4">
+                         {mismatch && (
+                           <div className="mb-1.5 flex items-center justify-between gap-2 bg-amber-50 border-2 border-amber-300 rounded-lg px-3 py-2 flex-wrap">
+                             <div className="text-xs text-amber-900 flex-1 min-w-[200px]">
+                               <b>{lot.orderNo}</b>：ロットは完了済みですが <b>{mismatch.stuckKeys.length}件</b> のタスクが未完了状態で残っています。
+                               <span className="text-amber-700">（セルが赤くならないので、このボタンで消します）</span>
+                             </div>
+                             <button onClick={() => clearLotStatusMismatch(lotId, mismatch.stuckKeys)} className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded shadow">📦 未完了タスクを「該当なし」にして消す</button>
+                           </div>
+                         )}
+                         <LotTimeTable lot={lot} onSaveTasks={(nt) => saveData('lots', lotId, { tasks: nt })} />
+                       </div>
+                     );
+                   })}
                  </>
                )}
              </div>
@@ -27397,6 +29392,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            db={db}
            rotaryConfig={settings.rotaryLink || {}}
            observationPlans={observationPlans}
+           videoRecipes={videoRecipes}
+           onSaveVideoRecipe={(id, data) => saveData('video_recipes', id, data)}
+           onDeleteVideoRecipe={(id) => deleteData('video_recipes', id)}
            voiceSettingsConfig={settings.voiceSettings || {}}
            voiceCommandsConfig={settings.voiceCommands || null}
            undoTimeout={settings.undoTimeout || 5}
