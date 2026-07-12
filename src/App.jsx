@@ -14,10 +14,10 @@ import {
   Brush, Type, Square, Circle, MoveDiagonal, Undo2, Mic, Sparkles, Image as ImageIcon,
   FileUp, FileJson, DownloadCloud, RefreshCw,
   User, Calendar, LogOut, Users, Edit, Grip, LayoutGrid, MapPin, Eye, Filter, List,
-  Bot, Zap, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool, Award,
+  Bot, Zap, Cpu, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool, Award,
   Bell, BellRing, Megaphone, Lightbulb, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
   ListChecks, ArrowUpDown, Calculator, Ruler, MicOff, Printer, Coffee, ChevronDown,
-  Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag
+  Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag, Wand2
 } from 'lucide-react';
 
 // --- Firebase Imports (SDK v9) ---
@@ -48,6 +48,9 @@ import { StrictModeManagerModal, computeStrictEvidence, strictComboKey, MultiUni
 // スキルマップ（作業者×スキル：レベル＋回数）
 import { SkillMapView, DEFAULT_SKILLS } from './SkillMap.jsx';
 import RotaryMeasurementsPanel from './RotaryMeasurements.jsx';
+// 制御装置(号機)割当・取り合い可視化の純ロジック（分割アプリの容量判定を移植）
+import * as CD from './controlDevices.js';
+import ControlDeviceView from './ControlDeviceView.jsx';
 
 // --- 一度だけ実行: 管理者未承認の厳密モード(localStorageの古い残骸)を全消去して既定OFFに戻す ---
 // 厳密モードは「厳密モード一元管理(settings.strictModeRules)」での承認のみを正とする方針。
@@ -726,6 +729,20 @@ const findObsPlan = (plans, templateId, stepKey, model) => {
   if (!templateId || !stepKey) return null;
   const ps = (plans || []).filter(p => p.enabled && p.templateId === templateId && p.stepKey === stepKey && Array.isArray(p.elements) && p.elements.length);
   return ps.find(p => p.model && p.model === model) || ps.find(p => !p.model) || null;
+};
+// 工程(step)に直付けした要素(じっと見る)。工程テンプレ編集で常設設定したもの → 旧 observationPlans コレクションより優先。
+//   明示OFF(observationEnabled===false)は {enabled:false} を返し、旧プランへのフォールバックを止める。
+const stepObsPlan = (step) => {
+  if (!step || !Array.isArray(step.observationElements)) return null;
+  if (step.observationEnabled === false) return { enabled: false, elements: [] };
+  const els = step.observationElements.filter(e => e && (e.label || '').trim() !== '').slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+  if (els.length < 2) return null;
+  return { source: 'step', enabled: true, model: '', elements: els };
+};
+// 旧 observationPlans の「型式専用(model一致)」プランのみを返す。step直付け(全型式)より優先させて型式別プランの黙殺を防ぐ。
+const findObsPlanModel = (plans, templateId, stepKey, model) => {
+  if (!templateId || !stepKey || !model) return null;
+  return (plans || []).find(p => p.enabled && p.templateId === templateId && p.stepKey === stepKey && p.model === model && Array.isArray(p.elements) && p.elements.length) || null;
 };
 // 要素別の実績集計: 完了タスクの elementDurations を要素IDごとに集める→中央値/n
 const obsElementStats = (lots, { model, templateId, stepKey, plan }) => {
@@ -2828,6 +2845,7 @@ const DEFAULT_LOT_CARD_DISPLAY = {
   timeRange: true,     // 予測時間範囲 (開始〜ETA)
   delayStatus: true,   // 遅延ラベル
   progressBar: true,   // 下部の進捗バー
+  unitBadge: true,     // 制御装置(号機)バッジ
 };
 
 // アプリ全体で共有: 各 LotCard が個別に display を渡さなくても済む
@@ -2844,6 +2862,198 @@ const formatWorkElapsed = (startMs, schedule) => {
   const h = Math.floor(min / 60);
   const m = min % 60;
   return m > 0 ? `${h}h${m}m` : `${h}h`;
+};
+
+// ── 制御装置(号機)タグの色（モーターの HV/DD/D/-B/BL）。作業画面の準備カードとバッジで共用。
+const CD_TAG_CLS = { HV: 'bg-orange-400', DD: 'bg-teal-500', D: 'bg-purple-500', '-B': 'bg-fuchsia-600', BL: 'bg-cyan-500' };
+const CdTags = ({ model, size = 'xs' }) => {
+  const tags = CD.motorBadgeTags(model);
+  if (!tags.length) return null;
+  const s = size === 'sm' ? 'text-[10px] px-1.5 py-0.5' : 'text-[8px] px-1';
+  return <>{tags.map(t => <span key={t} className={`${CD_TAG_CLS[t] || 'bg-slate-400'} text-white font-black rounded ${s}`}>{t}</span>)}</>;
+};
+
+// ── A: 検査リストのカードに出す「使う号機」バッジ（cdByOrder の要約1件を色分けチップで表示）。
+//    緑=すんなり / 黄=取り合い・一部 / 赤=使える号機なし。号機を"探す"時間を消すのが目的。
+const UnitBadge = ({ summary, compact = false }) => {
+  if (!summary) return null;
+  const { state, units, both, perAxis, unmetAxes } = summary;
+  const axShort = (l) => l === '回転軸' ? '回' : l === '傾斜軸' ? '傾' : (l || '軸');
+  const tone = state === 'ok' ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+    : state === 'none' ? 'bg-rose-50 border-rose-300 text-rose-700'
+    : 'bg-amber-50 border-amber-300 text-amber-800';
+  // 号機の本文
+  let core;
+  if (state === 'none') core = <span className="font-black">使える号機なし</span>;
+  else if (both) core = <span className="font-black">号機{units[0]} <span className="font-bold opacity-80">両軸</span></span>;
+  else if (perAxis.length) core = <span className="font-black">{perAxis.map(p => `${axShort(p.label)}${p.unit}`).join(' ')}</span>;
+  else core = <span className="font-black">号機—</span>;
+  const warn = state === 'contention' ? '取り合い' : state === 'partial' ? '一部のみ' : '';
+  const model = (perAxis[0] && perAxis[0].model) || (unmetAxes[0] && unmetAxes[0].model) || summary.model || '';
+  return (
+    <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 w-fit ${tone} ${compact ? 'text-[10px]' : 'text-[11px]'}`} title="この指図につなぐ制御装置(号機)。設定＞ロットカード表示で非表示にできます。">
+      <span aria-hidden>🔌</span>
+      {core}
+      {warn && <span className="font-bold">⚠{warn}{unmetAxes.length ? `(号機${[...new Set(unmetAxes.flatMap(u => u.units))].join(',') || '?'})` : ''}</span>}
+      {!compact && <span className="flex items-center gap-0.5 ml-0.5"><CdTags model={model} /></span>}
+    </span>
+  );
+};
+
+// 社内の仮モーター在庫で回せるもの（回せる号機付き）を1行で。回せないものは engine 側で除外済み。
+const CdSpareLine = ({ spares }) => {
+  if (!spares || !spares.length) return null;
+  return (
+    <div className="mt-1 flex items-start gap-1 flex-wrap text-[10px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">
+      <span className="font-black shrink-0">社内の仮モーターで回せる:</span>
+      {spares.map((s, i) => (
+        <span key={i} className="inline-flex items-center gap-1">
+          <span className="font-mono font-bold">{s.motorModel}</span>
+          {s.capacity && <span className="opacity-80">{s.capacity}</span>}
+          {s.group && <span className="bg-emerald-600 text-white rounded px-1">{s.group}</span>}
+          {s.qty > 1 && <span className="opacity-70">×{s.qty}</span>}
+          <span className="opacity-90">→号機{s.usableUnits.join(',')}</span>
+          {i < spares.length - 1 && <span className="text-emerald-300">/</span>}
+        </span>
+      ))}
+    </div>
+  );
+};
+
+// ── B: 作業画面の頭に出す「制御装置の準備」カード。クリックで開閉（既定は畳んで号機だけ表示＝不良情報パネルと同じ）。
+const PrepCard = ({ summary, orderNo }) => {
+  const [open, setOpen] = useState(false);
+  // 未登録（この指図に軸要求が無い＝モーター未登録の製品）は控えめな一行だけ。非モーター製品も多いので大きく出さない。
+  if (!summary) {
+    return (
+      <div className="shrink-0 mx-3 mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-[11px] text-slate-500 flex items-center gap-1.5">
+        <span aria-hidden>🔌</span><span>制御装置：この指図はモーター未登録です（制御装置が要る製品なら「制御装置」タブ＞指図モーター登録で登録すると、ここに使う号機が出ます）。</span>
+      </div>
+    );
+  }
+  const { state, units, both, perAxis, unmetAxes } = summary;
+  const axShort = (l) => l === '回転軸' ? '回転軸' : l === '傾斜軸' ? '傾斜軸' : (l || '軸');
+  const vLabel = (v) => CD.is400V(v) ? '400V' : (v ? '200V' : '');
+  const head = state === 'ok'
+    ? { cls: 'border-emerald-300 bg-emerald-50', hdr: 'bg-emerald-100', icon: '✅', text: both ? `号機${units[0]} で両軸OK` : '使う号機が決まっています' }
+    : state === 'none'
+    ? { cls: 'border-rose-300 bg-rose-50', hdr: 'bg-rose-100', icon: '⛔', text: '使える号機がありません（要確認）' }
+    : { cls: 'border-amber-300 bg-amber-50', hdr: 'bg-amber-100', icon: '⚠️', text: state === 'contention' ? '取り合い：他の指図と号機が競合しています' : '一部の軸だけ号機が決まっています' };
+  // 畳んだ時に見せる号機サマリ
+  const compact = state === 'none' ? '使える号機なし'
+    : both ? `号機${units[0]} 両軸`
+    : perAxis.length ? perAxis.map(p => `${axShort(p.label).replace('軸', '')}${p.unit}`).join(' ')
+    : '要確認';
+  return (
+    <div className={`shrink-0 mx-3 mt-2 rounded-xl border-2 ${head.cls} overflow-hidden`}>
+      <button type="button" onClick={() => setOpen(o => !o)} className={`w-full px-3 py-2 flex items-center gap-2 text-left ${head.hdr}`}>
+        <span className="text-sm" aria-hidden>{head.icon}</span>
+        <span className="text-[13px] font-black text-slate-800 shrink-0">制御装置</span>
+        <span className="text-[13px] font-black text-indigo-700">{compact}</span>
+        {!open && perAxis[0] && <CdTags model={perAxis[0].model} />}
+        <span className="ml-auto text-[11px] text-slate-500 shrink-0">{open ? '▲ 閉じる' : '▼ 詳細'}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-2 pt-1">
+          <div className="text-[12px] font-bold text-slate-600 mb-1.5">{head.text}</div>
+          <div className="flex flex-col gap-1.5">
+            {perAxis.map((p, i) => (
+              <div key={'a' + i} className="rounded-lg bg-white border border-slate-300 px-2.5 py-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[11px] font-bold text-slate-500 shrink-0 w-11">{axShort(p.label)}</span>
+                  <span className="font-mono text-[12px] font-bold text-slate-700">{p.model || '（型式不明）'}</span>
+                  {p.capacity && <span className="text-[11px] font-black text-slate-600 bg-slate-100 rounded px-1">{p.capacity}</span>}
+                  <span className="text-slate-400">→</span>
+                  <span className="text-base font-black text-indigo-700">号機{p.unit}</span>
+                  {vLabel(p.voltage) && <span className={`text-[10px] font-black px-1 rounded ${CD.is400V(p.voltage) ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600'}`}>{vLabel(p.voltage)}</span>}
+                  <CdTags model={p.model} size="sm" />
+                </div>
+                {p.usableUnits && p.usableUnits.length > 0 && (
+                  <div className="mt-1 flex items-center gap-1 flex-wrap text-[10px] text-slate-500">
+                    <span className="font-bold">使える号機:</span>
+                    {p.usableUnits.map(u => <span key={u} className={`px-1 rounded font-bold ${u === p.unit ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600'}`}>{u}{u === p.unit ? '★' : ''}</span>)}
+                  </div>
+                )}
+                <CdSpareLine spares={p.spareCandidates} />
+              </div>
+            ))}
+            {unmetAxes.map((u, i) => (
+              <div key={'u' + i} className="rounded-lg bg-white border border-rose-300 px-2.5 py-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[11px] font-bold text-slate-500 shrink-0 w-11">{axShort(u.label)}</span>
+                  <span className="font-mono text-[12px] font-bold text-slate-700">{u.model || '（型式不明）'}</span>
+                  {u.capacity && <span className="text-[11px] font-black text-slate-600 bg-slate-100 rounded px-1">{u.capacity}</span>}
+                  <span className="text-slate-400">→</span>
+                  <span className="text-[13px] font-black text-rose-600">{u.reason === 'none' ? '使える号機なし' : `取り合い(号機${u.units.join(',') || '?'})`}</span>
+                  {vLabel(u.voltage) && <span className={`text-[10px] font-black px-1 rounded ${CD.is400V(u.voltage) ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600'}`}>{vLabel(u.voltage)}</span>}
+                  <CdTags model={u.model} size="sm" />
+                </div>
+                {u.usableUnits && u.usableUnits.length > 0 && (
+                  <div className="mt-1 flex items-center gap-1 flex-wrap text-[10px] text-slate-500">
+                    <span className="font-bold">使える号機:</span>
+                    {u.usableUnits.map(x => <span key={x} className="px-1 rounded font-bold bg-slate-100 text-slate-600">{x}</span>)}
+                  </div>
+                )}
+                <CdSpareLine spares={u.spareCandidates} />
+              </div>
+            ))}
+          </div>
+          {both && <div className="mt-1 text-[11px] text-emerald-700 font-bold">※ 回転軸・傾斜軸とも 号機{units[0]} 1台で回せます</div>}
+          {(state === 'contention' || state === 'partial') && <div className="mt-1 text-[11px] text-amber-700">※ 競合しています。空いていなければ「制御装置」タブの取り合いガントで空き状況を確認してください。</div>}
+          <div className="mt-1 text-[10px] text-slate-400">電圧が違う号機につなぐとモーター/アンプを焼きます。上の号機・電圧のとおりに結線してください。</div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── モーター未登録だが過去実績が有る指図の準備カード。クリックで開閉（既定は畳む）。過去のモーター/号機＋社内の仮モーターで回せるを表示。
+const PrepHistoryCard = ({ history }) => {
+  const [open, setOpen] = useState(false);
+  if (!history || !history.motorAxes || !history.motorAxes.length) return null;
+  const axShort = (l) => l === '回転軸' ? '回転軸' : l === '傾斜軸' ? '傾斜軸' : (l || '軸');
+  const vLabel = (v) => CD.is400V(v) ? '400V' : (v ? '200V' : '');
+  const compact = [...new Set(history.motorAxes.map(a => (a.usableUnits && a.usableUnits[0]) ? `号機${a.usableUnits[0]}` : '?'))].join(' ');
+  return (
+    <div className="shrink-0 mx-3 mt-2 rounded-xl border-2 border-sky-300 bg-sky-50 overflow-hidden">
+      <button type="button" onClick={() => setOpen(o => !o)} className="w-full px-3 py-2 flex items-center gap-2 text-left bg-sky-100">
+        <span className="text-sm" aria-hidden>🔌</span>
+        <span className="text-[13px] font-black text-slate-800 shrink-0">制御装置（過去実績）</span>
+        <span className="text-[12px] font-bold text-sky-700">モーター未登録</span>
+        {!open && compact && <span className="text-[12px] font-black text-indigo-700">{compact}で回せる</span>}
+        <span className="ml-auto text-[11px] text-slate-500 shrink-0">{open ? '▲ 閉じる' : '▼ 詳細'}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-2 pt-1">
+          <div className="text-[12px] font-bold text-sky-700 mb-1.5">過去はこのモーター/号機で回しています</div>
+          <div className="flex flex-col gap-1.5">
+            {history.motorAxes.map((a, i) => (
+              <div key={i} className="rounded-lg bg-white border border-slate-300 px-2.5 py-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[11px] font-bold text-slate-500 shrink-0 w-11">{axShort(a.label)}</span>
+                  <span className="font-mono text-[12px] font-bold text-slate-700">{a.motorModel || '（型式不明）'}</span>
+                  {a.capacity && <span className="text-[11px] font-black text-slate-600 bg-slate-100 rounded px-1">{a.capacity}</span>}
+                  {vLabel(a.voltage) && <span className={`text-[10px] font-black px-1 rounded ${CD.is400V(a.voltage) ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600'}`}>{vLabel(a.voltage)}</span>}
+                  <CdTags model={a.motorModel} size="sm" />
+                </div>
+                {a.usableUnits && a.usableUnits.length > 0 && (
+                  <div className="mt-1 flex items-center gap-1 flex-wrap text-[10px] text-slate-500">
+                    <span className="font-bold">使える号機:</span>
+                    {a.usableUnits.map(u => <span key={u} className="px-1 rounded font-bold bg-slate-100 text-slate-600">{u}</span>)}
+                  </div>
+                )}
+                <CdSpareLine spares={a.spareCandidates} />
+              </div>
+            ))}
+          </div>
+          {history.usedUnits && history.usedUnits.length > 0 && (
+            <div className="mt-1 text-[11px] text-sky-700 font-bold">過去に回した号機: {history.usedUnits.map(u => `${u.label || ''}号機${u.unit}`).join(' / ')}</div>
+          )}
+          <div className="mt-1 text-[10px] text-slate-400">出典: 指図 {history.orderNo || '?'}{history.date ? `（${history.date}）` : ''}。同じ or 同容量の仮モーターを上の「使える号機」に載せれば回せます（電圧一致を確認）。</div>
+        </div>
+      )}
+    </div>
+  );
 };
 
 const LotCard = ({ lot, workers, templates, mapZones, onOpenExecution, saveData, setDraggedLotId, draggedLotId, variant = 'full', onEdit, onDelete, onMove, display: displayProp }) => {
@@ -5433,6 +5643,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const [type, setType] = useState('normal');
   // 確認チェック項目 (type 不問で工程に添付できる)
   const [checklistItems, setChecklistItems] = useState([]);
+  const [obsEnabled, setObsEnabled] = useState(true);      // じっと見る(要素作業) ON/OFF
+  const [obsElements, setObsElements] = useState([]);       // [{id,label,order}]
   const [targetTime, setTargetTime] = useState(0);
   // 自動測定 (機械占有) 工程か / この工程は他の台の自動測定中に並行できるか
   const [executionMode, setExecutionMode] = useState('manual'); // 'manual' | 'batch' (= 自動)
@@ -5575,6 +5787,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const addStep = () => {
     if (!title) return alert('工程名入力');
     const validChecklistItems = (checklistItems || []).filter(i => i.label?.trim());
+    const validObsElements = (obsElements || []).filter(e => (e.label || '').trim()).map((e, i) => ({ id: e.id || generateId(), label: e.label.trim(), order: i }));
     const newStep = {
       id: editingStepId || generateId(),
       title, description, type, targetTime, images, pdfData,
@@ -5586,12 +5799,14 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       ...(rotaryLink && !lotOnce && executionMode !== 'batch' ? { rotaryLink: true, rotaryRole, rotaryMode } : {}),  // 分割測定アプリ連携(準備/測定開始の指令送信+測定モード)。lotOnce/batchとは併用不可(workId採番が噛み合わない)
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
       // checklistItems は type 問わず保存可能 (測定 + チェックの併用OK)
-      ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {})
+      ...(validChecklistItems.length > 0 ? { checklistItems: validChecklistItems } : {}),
+      // じっと見る(要素作業分割): 2要素以上で常設。ONで作業画面に区切りボタンが出る。
+      ...(validObsElements.length >= 2 ? { observationElements: validObsElements, observationEnabled: obsEnabled } : {})
     };
     if (editingStepId) { setSteps(steps.map(s => s.id === editingStepId ? newStep : s)); } else { setSteps([...steps, newStep]); }
     resetInput();
   };
-  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); setRotaryLink(false); setRotaryRole('capture'); setRotaryMode('回転分割'); };
+  const resetInput = () => { setTitle(''); setDescription(''); setType('normal'); setTargetTime(0); setImages([]); setPdfData(null); setEditingStepId(null); setMeasurementConfig(null); setChecklistItems([]); setExecutionMode('manual'); setWorkResource(''); setAutoEndEnabled(false); setAutoEndSec(0); setLotOnce(false); setRotaryLink(false); setRotaryRole('capture'); setRotaryMode('回転分割'); setObsEnabled(true); setObsElements([]); };
   const editStep = (s) => {
     setEditingStepId(s.id);
     setTitle(s.title);
@@ -5611,6 +5826,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     setRotaryRole(s.rotaryRole || (s.type === 'measurement' ? 'capture' : 'prepare'));
     setRotaryMode(s.rotaryMode || '回転分割');
     setChecklistItems(Array.isArray(s.checklistItems) ? s.checklistItems : []);
+    setObsElements(Array.isArray(s.observationElements) ? s.observationElements.map(e => ({ ...e })) : []);
+    setObsEnabled(s.observationEnabled !== false);
   };
   const deleteStep = (id) => setSteps(steps.filter(s => s.id !== id));
   const moveStep = (index, direction) => { const newSteps = [...steps]; if (direction === 'up' && index > 0) { [newSteps[index-1], newSteps[index]] = [newSteps[index], newSteps[index-1]]; } else if (direction === 'down' && index < steps.length-1) { [newSteps[index+1], newSteps[index]] = [newSteps[index], newSteps[index+1]]; } setSteps(newSteps); };
@@ -5884,6 +6101,45 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                   )}
                 </div>
               </div>
+
+            {/* じっと見る（要素作業分割）— 工程をさらに小さな要素に分けて内訳時間を観測する。テンプレに常設。 */}
+            <div className="bg-blue-50/30 border-2 border-blue-100 rounded-lg p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-bold text-blue-800 flex items-center gap-1">
+                  <Eye className="w-4 h-4"/> じっと見る（要素作業）{obsElements.length > 0 ? `（${obsElements.length}要素）` : ''}
+                  <span className="text-[10px] font-normal text-blue-500 ml-1">(任意 — 工程を要素に分けて内訳時間を観測)</span>
+                </label>
+                <div className="flex items-center gap-2">
+                  {obsElements.length >= 2 && (
+                    <label className="flex items-center gap-1 text-[11px] font-bold text-slate-600 cursor-pointer" title="作業画面で区切りボタンを出す">
+                      <input type="checkbox" checked={obsEnabled} onChange={e => setObsEnabled(e.target.checked)} className="w-3.5 h-3.5 accent-blue-600"/>ON
+                    </label>
+                  )}
+                  <button type="button" onClick={() => setObsElements(p => [...(p || []), { id: generateId(), label: '', order: (p || []).length }])} className="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded font-bold flex items-center gap-1"><Plus className="w-3 h-3"/> 要素追加</button>
+                </div>
+              </div>
+              {obsElements.length > 0 && obsElements.length < 2 && <p className="text-[10px] text-amber-600">要素は2つ以上で有効になります（1つでは分割になりません）。</p>}
+              {obsElements.length >= 2 && <p className="text-[10px] text-blue-700">作業者がこの工程を計測すると、要素ごとの「区切り」ボタンが出ます。<b>合計は工程時間のまま</b>、要素ごとの内訳も取れます（1要素6秒以上が目安）。</p>}
+              <div className="space-y-1.5">
+                {(obsElements || []).map((el, idx) => {
+                  const setLabel = (v) => setObsElements(obsElements.map((x, j) => j === idx ? { ...x, label: v } : x));
+                  const move = (d) => setObsElements(p => { const a = [...p]; const j = idx + d; if (j < 0 || j >= a.length) return a; [a[idx], a[j]] = [a[j], a[idx]]; return a.map((x, k) => ({ ...x, order: k })); });
+                  const remove = () => setObsElements(obsElements.filter((_, j) => j !== idx).map((x, k) => ({ ...x, order: k })));
+                  return (
+                    <div key={el.id || idx} className="bg-white border border-blue-200 rounded p-2 flex items-center gap-1.5">
+                      <span className="text-[10px] font-bold text-blue-500 w-5 text-center">{idx + 1}</span>
+                      <input value={el.label || ''} onChange={e => setLabel(e.target.value)} placeholder={idx === 0 ? '例: 治具に取り付け' : (idx === 1 ? '例: 測定' : '例: 取り外し・記録')} className="flex-1 border rounded px-2 py-1 text-sm"/>
+                      <button type="button" onClick={() => move(-1)} disabled={idx === 0} className="text-slate-300 hover:text-slate-600 disabled:opacity-30"><ArrowUp className="w-4 h-4"/></button>
+                      <button type="button" onClick={() => move(1)} disabled={idx === obsElements.length - 1} className="text-slate-300 hover:text-slate-600 disabled:opacity-30"><ArrowDown className="w-4 h-4"/></button>
+                      <button type="button" onClick={remove} className="text-rose-400 hover:text-rose-600"><X className="w-4 h-4"/></button>
+                    </div>
+                  );
+                })}
+                {obsElements.length === 0 && (
+                  <div className="text-center text-blue-400 text-xs py-3 bg-white rounded border border-dashed border-blue-200">「要素追加」で工程を小分けにして観測できます（任意）。</div>
+                )}
+              </div>
+            </div>
 
             {type === 'measurement' && measurementConfig && (() => {
               const mcCalcs = measurementConfig.calculations || [{ id: 'default', label: '計算結果', method: measurementConfig.calculation || 'max-min', formula: measurementConfig.formula || '', inputIds: [], toleranceUpper: measurementConfig.toleranceUpper ?? 0.05, toleranceLower: measurementConfig.toleranceLower ?? -0.05, unit: measurementConfig.unit || 'mm' }];
@@ -7444,7 +7700,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {} }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -9674,7 +9930,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const key = step.id ? `${step.id}-${unitIdx}` : `${stepIdx}-${unitIdx}`;
     const t = tasks[key];
     if (!t || t.status !== 'processing') return null;
-    const plan = findObsPlan(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model);
+    const plan = findObsPlanModel(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model) || stepObsPlan(step) || findObsPlan(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model);
     if (!plan || plan.enabled === false || !(plan.elements || []).length) return null;
     return { key, step, stepIdx, unitIdx, plan, els: plan.elements };
   }, [activeCustomTaskKey, localSteps, tasks, observationPlans, lot.templateId, lot.model]);
@@ -9716,7 +9972,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     // プラン要素(完了時に再解決)
     const { stepIdx } = parseActiveTaskKey(key);
     const step = localSteps[stepIdx];
-    const plan = step ? findObsPlan(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model) : null;
+    const plan = step ? (findObsPlanModel(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model) || stepObsPlan(step) || findObsPlan(observationPlans, lot.templateId, targetTimeStepKey(step), lot.model)) : null;
     const els = plan?.elements || [];
     const t0 = taskObj.firstStartTime || laps[0].atMs;
     const wallSpanSec = (endMs - t0) / 1000;
@@ -11287,6 +11543,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  </div>
              </div>
           </div>
+
+          {/* 制御装置の準備カード: この指図につなぐ号機・軸・電圧・モーター/容量を頭に出す(作業者の"どの号機だ？"を消す)。
+              登録済み→割当を表示。未登録でも過去実績が有れば「過去はこのモーター/号機」＋仮モーターの使える号機を表示。 */}
+          {cdByOrder[String(lot.orderNo)]
+            ? <PrepCard summary={cdByOrder[String(lot.orderNo)]} orderNo={lot.orderNo} />
+            : (cdHistoryByModel[String(lot.model || '').trim()] && <PrepHistoryCard history={cdHistoryByModel[String(lot.model || '').trim()]} />)}
 
           {/* 別エリアの自動測定ステータス: ヘッダ下のサブバー (常時表示) — 大幅に拡大して見やすく */}
           {otherActiveAutos.length > 0 && (
@@ -13691,6 +13953,7 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
     const [newModelInput, setNewModelInput] = useState('');
     const [collapsedEntries, setCollapsedEntries] = useState({}); // { entryIdx: true } で折りたたみ
     const [profileStepOpen, setProfileStepOpen] = useState({}); // 工程プロファイルの詳細上書きを開いている step
+    const [skelTplId, setSkelTplId] = useState(''); // 新規規格の雛形Excel 用に選んだテンプレ
 
     const qsList = useMemo(() => Object.values(qualityStandards || {}).sort((a, b) =>
         (a.standardNo || '').localeCompare(b.standardNo || '')), [qualityStandards]);
@@ -13950,6 +14213,138 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
         }
     };
 
+    // === 品質規格マスタ Excel往復 (全項目: 規格一覧/公差/測定条件/初期値/工程設定/チェック項目) ===
+    const QS_CHK = 10;
+    const qsCellText = (cell) => { const v = cell == null ? null : cell.value; if (v == null) return ''; if (typeof v === 'object') { if (v.text != null) return String(v.text); if (v.result != null) return String(v.result); if (Array.isArray(v.richText)) return v.richText.map(t => t.text).join(''); if (v.hyperlink) return String(v.text || v.hyperlink); return ''; } return String(v); };
+    const qsNum = (s) => { const t = String(s == null ? '' : s).trim().replace(/[^0-9.\-]/g, ''); if (t === '' || t === '-') return undefined; const n = Number(t); return Number.isFinite(n) ? n : undefined; };
+    const qsBool = (raw, dflt) => { const s = String(raw == null ? '' : raw).trim(); if (/^(はい|true|1|有効|○|yes|on)$/i.test(s)) return true; if (/^(いいえ|false|0|無効|×|no|off)$/i.test(s)) return false; return dflt; };
+    const qsBuildWorkbook = async (ExcelJS, qsList) => {
+        const wb = new ExcelJS.Workbook();
+        const thin = { style: 'thin', color: { argb: 'FF000000' } };
+        const bd = { top: thin, bottom: thin, left: thin, right: thin };
+        const head = (row) => row.eachCell(c => { c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4F46E5' } }; c.border = bd; c.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true }; });
+        const body = (row) => row.eachCell(c => { c.border = bd; c.alignment = { vertical: 'middle', wrapText: true }; });
+        const modelsByQs = {}; Object.entries(modelStandardMap || {}).forEach(([m, qid]) => { (modelsByQs[qid] = modelsByQs[qid] || []).push(m); });
+        const tplById = {}; (templates || []).forEach(t => { tplById[t.id] = t; });
+        const ws1 = wb.addWorksheet('規格一覧'); head(ws1.addRow(['規格ID', '規格No', '名称', '改訂', 'メモ', '対象型式(カンマ区切り)']));
+        [16, 16, 24, 8, 30, 40].forEach((w, i) => { ws1.getColumn(i + 1).width = w; });
+        const ws2 = wb.addWorksheet('公差・規格値'); head(ws2.addRow(['規格ID', '規格No', 'テンプレID', 'テンプレ名', '検査日オフセット', '工程ID', '工程名', '計算ID', '測定項目', '単位(参考)', '基準値', '公差上限', '公差下限', '判定有効']));
+        [16, 14, 14, 20, 12, 14, 20, 14, 18, 10, 12, 12, 12, 10].forEach((w, i) => { ws2.getColumn(i + 1).width = w; });
+        const ws3 = wb.addWorksheet('測定条件'); head(ws3.addRow(['規格ID', '規格No', 'テンプレID', 'テンプレ名', '工程ID', '工程名', '条件キー', '値', 'メモ']));
+        [16, 14, 14, 20, 14, 20, 20, 20, 30].forEach((w, i) => { ws3.getColumn(i + 1).width = w; });
+        const ws4 = wb.addWorksheet('初期値'); head(ws4.addRow(['規格ID', '規格No', 'テンプレID', 'テンプレ名', '工程ID', '工程名', '入力ID', '入力名', '初期値']));
+        [16, 14, 14, 20, 14, 20, 16, 20, 14].forEach((w, i) => { ws4.getColumn(i + 1).width = w; });
+        const ws5 = wb.addWorksheet('工程設定'); head(ws5.addRow(['規格ID', '規格No', 'テンプレID', 'テンプレ名', '工程ID', '工程名', '該当あり(はい/いいえ)', '説明上書き', '目標時間(秒)', 'PDF(参考)', '画像枚数(参考)']));
+        [16, 14, 14, 20, 14, 20, 18, 36, 12, 10, 12].forEach((w, i) => { ws5.getColumn(i + 1).width = w; });
+        const chkHdr = ['規格ID', '規格No', 'テンプレID', 'テンプレ名', '工程ID', '工程名', 'テンプレ標準(参考)', ...Array.from({ length: QS_CHK }, (_, i) => `チェック${i + 1}`)];
+        const ws6 = wb.addWorksheet('チェック項目'); head(ws6.addRow(chkHdr));
+        [16, 14, 14, 20, 14, 20, 30, ...Array(QS_CHK).fill(16)].forEach((w, i) => { ws6.getColumn(i + 1).width = w; });
+        qsList.forEach(qs => {
+            body(ws1.addRow([qs.id || '', qs.standardNo || '', qs.name || '', qs.revision || '', qs.note || '', (modelsByQs[qs.id] || []).join(', ')]));
+            getQsTemplateEntries(qs).forEach(entry => {
+                const tpl = tplById[entry.templateId]; const tplName = tpl ? (tpl.name || '') : '(テンプレ未登録)';
+                const steps = (tpl && tpl.steps) ? tpl.steps : [];
+                const ov = entry.measurementOverrides || {}, conds = entry.measurementConditions || {}, defs = entry.defaultValues || {}, prof = entry.stepProfile || {}, chk = entry.checklistItemsByStep || {};
+                steps.forEach(s => {
+                    const isM = s.type === 'measurement' && s.measurementConfig; const cfg = s.measurementConfig || {};
+                    if (isM) (cfg.calculations || []).forEach(c => {
+                        const o = (ov[s.id] && ov[s.id][c.id]) || {};
+                        const nominal = o.nominal != null ? o.nominal : (c.nominal != null ? c.nominal : '');
+                        const tu = o.toleranceUpper != null ? o.toleranceUpper : (c.toleranceUpper != null ? c.toleranceUpper : '');
+                        const tl = o.toleranceLower != null ? o.toleranceLower : (c.toleranceLower != null ? c.toleranceLower : '');
+                        const en = o.toleranceEnabled != null ? o.toleranceEnabled : c.toleranceEnabled;
+                        body(ws2.addRow([qs.id || '', qs.standardNo || '', entry.templateId || '', tplName, (entry.daysBefore != null ? entry.daysBefore : ''), s.id || '', s.title || '', c.id || '', c.label || '', c.unit || '', nominal, tu, tl, (en === false ? 'いいえ' : (en === true ? 'はい' : ''))]));
+                    });
+                    if (isM) { const cd = conds[s.id] || { params: [], note: '' }; const ps = (cd.params && cd.params.length) ? cd.params : [{ key: '', value: '' }]; ps.forEach((p, i) => body(ws3.addRow([qs.id || '', qs.standardNo || '', entry.templateId || '', tplName, s.id || '', s.title || '', p.key || '', p.value || '', (i === 0 ? (cd.note || '') : '')]))); }
+                    if (isM) (cfg.inputs || []).forEach(inp => { const dv = defs[s.id] && defs[s.id][inp.id]; body(ws4.addRow([qs.id || '', qs.standardNo || '', entry.templateId || '', tplName, s.id || '', s.title || '', inp.id || '', inp.label || inp.id || '', (dv != null ? dv : '')])); });
+                    const pf = prof[s.id] || {}; body(ws5.addRow([qs.id || '', qs.standardNo || '', entry.templateId || '', tplName, s.id || '', s.title || '', (pf.enabled === false ? 'いいえ' : (pf.enabled === true ? 'はい' : '')), pf.description || '', (pf.targetTime != null ? pf.targetTime : ''), (pf.pdfData ? 'あり' : ''), (Array.isArray(pf.images) ? pf.images.length : 0)]));
+                    const tplChk = Array.isArray(s.checklistItems) ? s.checklistItems : []; const custom = chk[s.id]; const items = Array.isArray(custom) ? custom : [];
+                    const chkRow = [qs.id || '', qs.standardNo || '', entry.templateId || '', tplName, s.id || '', s.title || '', tplChk.map(it => it.label || '').filter(Boolean).join(' / ')];
+                    for (let i = 0; i < QS_CHK; i++) { const it = items[i]; chkRow.push(it ? ((it.required === false ? '' : '★') + (it.label || '')) : ''); }
+                    body(ws6.addRow(chkRow));
+                });
+            });
+        });
+        return wb;
+    };
+    const qsDownloadBlob = async (wb, filename) => { const buf = await wb.xlsx.writeBuffer(); const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click(); };
+    const qsExcelDownload = async () => {
+        try {
+            const ExcelJS = await loadExcelJS();
+            const qsAll = Object.values(qualityStandards || {}).sort((a, b) => (a.standardNo || '').localeCompare(b.standardNo || '', 'ja'));
+            const wb = await qsBuildWorkbook(ExcelJS, qsAll);
+            await qsDownloadBlob(wb, '品質規格マスタ.xlsx');
+        } catch (err) { console.error(err); alert('品質規格Excelの生成に失敗しました: ' + (err && err.message || err)); }
+    };
+    const qsSkeletonDownload = async () => {
+        if (!skelTplId) { alert('雛形にするテンプレートを選んでください'); return; }
+        try {
+            const ExcelJS = await loadExcelJS();
+            const tpl = (templates || []).find(t => t.id === skelTplId);
+            const virt = { id: 'qs-' + generateId(), standardNo: '', name: '', revision: 'A', note: '', templates: [{ templateId: skelTplId, measurementOverrides: {}, measurementConditions: {} }] };
+            const wb = await qsBuildWorkbook(ExcelJS, [virt]);
+            await qsDownloadBlob(wb, `品質規格_雛形_${tpl ? tpl.name : 'template'}.xlsx`);
+        } catch (err) { console.error(err); alert('雛形の生成に失敗しました: ' + (err && err.message || err)); }
+    };
+    const qsExcelImport = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        try {
+            const ExcelJS = await loadExcelJS();
+            const wb = new ExcelJS.Workbook(); await wb.xlsx.load(await file.arrayBuffer());
+            const ws1 = wb.getWorksheet('規格一覧'), ws2 = wb.getWorksheet('公差・規格値'), ws3 = wb.getWorksheet('測定条件'), ws4 = wb.getWorksheet('初期値'), ws5 = wb.getWorksheet('工程設定'), ws6 = wb.getWorksheet('チェック項目');
+            const T = qsCellText; const keyOf = (id, no) => id ? ('ID::' + id) : ('NO::' + no);
+            const ensure = (m, k, def) => { if (!m.has(k)) m.set(k, def()); return m.get(k); };
+            const headerQs = new Map();
+            if (ws1) ws1.eachRow((row, idx) => { if (idx < 2) return; const id = T(row.getCell(1)).trim(), no = T(row.getCell(2)).trim(), name = T(row.getCell(3)).trim(); if (!id && !no) return; const models = T(row.getCell(6)).split(/[,、\n]+/).map(x => x.trim()).filter(Boolean); headerQs.set(keyOf(id, no), { id: id || '', standardNo: no, name, revision: T(row.getCell(4)).trim(), note: T(row.getCell(5)), models }); });
+            const _qtplById = {}; (templates || []).forEach(t => { _qtplById[t.id] = t; });
+            const tolByQs = new Map();
+            if (ws2) ws2.eachRow((row, idx) => { if (idx < 2) return; const id = T(row.getCell(1)).trim(), no = T(row.getCell(2)).trim(), tplId = T(row.getCell(3)).trim(), stepId = T(row.getCell(6)).trim(), calcId = T(row.getCell(8)).trim(); if ((!id && !no) || !stepId || !calcId) return; const rec = ensure(ensure(tolByQs, keyOf(id, no), () => new Map()), tplId, () => ({ daysBefore: undefined, ov: {} })); const db = qsNum(T(row.getCell(5))); if (db !== undefined && rec.daysBefore === undefined) rec.daysBefore = db; const nom = qsNum(T(row.getCell(11))), tu = qsNum(T(row.getCell(12))), tl = qsNum(T(row.getCell(13))); const eb = qsBool(T(row.getCell(14)), undefined); const _st = _qtplById[tplId] && (_qtplById[tplId].steps || []).find(x => x.id === stepId); const _c = _st && _st.measurementConfig && (_st.measurementConfig.calculations || []).find(x => x.id === calcId); const dN = qsNum(_c && _c.nominal), dU = qsNum(_c && _c.toleranceUpper), dL = qsNum(_c && _c.toleranceLower), dE = _c ? _c.toleranceEnabled : undefined; const cell = {}; if (nom !== undefined && nom !== dN) cell.nominal = nom; if (tu !== undefined && tu !== dU) cell.toleranceUpper = tu; if (tl !== undefined && tl !== dL) cell.toleranceLower = tl; if (eb !== undefined && eb !== dE) cell.toleranceEnabled = eb; if (Object.keys(cell).length) (rec.ov[stepId] = rec.ov[stepId] || {})[calcId] = cell; });
+            const condByQs = new Map();
+            if (ws3) ws3.eachRow((row, idx) => { if (idx < 2) return; const id = T(row.getCell(1)).trim(), no = T(row.getCell(2)).trim(), tplId = T(row.getCell(3)).trim(), stepId = T(row.getCell(5)).trim(); if ((!id && !no) || !stepId) return; const rec = ensure(ensure(condByQs, keyOf(id, no), () => new Map()), tplId, () => ({})); const st = rec[stepId] || (rec[stepId] = { params: [], note: '' }); const k = T(row.getCell(7)).trim(), v = T(row.getCell(8)), memo = T(row.getCell(9)); if (k) st.params.push({ key: k, value: v }); if (memo && !st.note) st.note = memo; });
+            const defByQs = new Map();
+            if (ws4) ws4.eachRow((row, idx) => { if (idx < 2) return; const id = T(row.getCell(1)).trim(), no = T(row.getCell(2)).trim(), tplId = T(row.getCell(3)).trim(), stepId = T(row.getCell(5)).trim(), inpId = T(row.getCell(7)).trim(); if ((!id && !no) || !stepId || !inpId) return; const rec = ensure(ensure(defByQs, keyOf(id, no), () => new Map()), tplId, () => ({})); const val = T(row.getCell(9)); if (String(val).trim() !== '') (rec[stepId] = rec[stepId] || {})[inpId] = val; });
+            const profByQs = new Map();
+            if (ws5) ws5.eachRow((row, idx) => { if (idx < 2) return; const id = T(row.getCell(1)).trim(), no = T(row.getCell(2)).trim(), tplId = T(row.getCell(3)).trim(), stepId = T(row.getCell(5)).trim(); if ((!id && !no) || !stepId) return; const rec = ensure(ensure(profByQs, keyOf(id, no), () => new Map()), tplId, () => ({})); const p = {}; const enb = qsBool(T(row.getCell(7)), undefined); if (enb !== undefined) p.enabled = enb; const desc = T(row.getCell(8)); if (String(desc).trim() !== '') p.description = desc; const tt = qsNum(T(row.getCell(9))); if (tt !== undefined) p.targetTime = tt; rec[stepId] = p; });
+            const chkByQs = new Map();
+            if (ws6) ws6.eachRow((row, idx) => { if (idx < 2) return; const id = T(row.getCell(1)).trim(), no = T(row.getCell(2)).trim(), tplId = T(row.getCell(3)).trim(), stepId = T(row.getCell(5)).trim(); if ((!id && !no) || !stepId) return; const items = []; for (let i = 0; i < QS_CHK; i++) { const raw = T(row.getCell(8 + i)).trim(); if (raw) { const required = /^[★*]/.test(raw); items.push({ label: raw.replace(/^[★*]\s*/, ''), required }); } } const rec = ensure(ensure(chkByQs, keyOf(id, no), () => new Map()), tplId, () => ({})); rec[stepId] = items; });
+            const allKeys = new Set([...headerQs.keys(), ...tolByQs.keys(), ...condByQs.keys(), ...defByQs.keys(), ...profByQs.keys(), ...chkByQs.keys()]);
+            if (!allKeys.size) { alert('有効なデータが見つかりませんでした（各シートの2行目以降を確認）'); e.target.value = ''; return; }
+            const nextQS = { ...(qualityStandards || {}) }; const nextMap = { ...(modelStandardMap || {}) }; let created = 0, updated = 0; const removedModels = new Set();
+            allKeys.forEach(key => {
+                const hdr = headerQs.get(key); let qsId, existing;
+                if (key.startsWith('ID::')) { qsId = key.slice(4); existing = qualityStandards && qualityStandards[qsId]; } else { qsId = 'qs-' + generateId(); existing = null; }
+                const base = existing ? { ...existing } : { id: qsId, standardNo: (hdr && hdr.standardNo) || '', name: (hdr && hdr.name) || '', revision: 'A', note: '', createdAt: Date.now() };
+                if (hdr) { if (hdr.standardNo) base.standardNo = hdr.standardNo; if (hdr.name) base.name = hdr.name; if (hdr.revision) base.revision = hdr.revision; if (hdr.note != null) base.note = hdr.note; }
+                base.id = qsId;
+                const entryByTpl = new Map();
+                getQsTemplateEntries(existing).forEach(en => entryByTpl.set(en.templateId || '', { ...en }));
+                const tplSet = new Set();
+                [tolByQs, condByQs, defByQs, profByQs, chkByQs].forEach(m => { const bt = m.get(key); if (bt) bt.forEach((_, tpl) => tplSet.add(tpl)); });
+                tplSet.forEach(tpl => { if (!entryByTpl.has(tpl)) entryByTpl.set(tpl, { templateId: tpl, measurementOverrides: {}, measurementConditions: {} }); });
+                entryByTpl.forEach((en, tpl) => {
+                    const tolR = tolByQs.get(key) && tolByQs.get(key).get(tpl);
+                    if (tolR) { en.measurementOverrides = tolR.ov; if (tolR.daysBefore !== undefined) en.daysBefore = tolR.daysBefore; }
+                    if (ws3 && condByQs.get(key) && condByQs.get(key).has(tpl)) { const c = condByQs.get(key).get(tpl); const out = {}; Object.entries(c).forEach(([sid, v]) => { if ((v.params && v.params.length) || v.note) out[sid] = { params: v.params || [], note: v.note || '' }; }); en.measurementConditions = out; }
+                    if (ws4 && defByQs.get(key) && defByQs.get(key).has(tpl)) { en.defaultValues = defByQs.get(key).get(tpl); }
+                    if (ws6 && chkByQs.get(key) && chkByQs.get(key).has(tpl)) { const cm = chkByQs.get(key).get(tpl); const exChk = en.checklistItemsByStep || {}; const out = {}; Object.entries(cm).forEach(([sid, its]) => { if (its.length) out[sid] = its.map((it, i) => ({ id: (exChk[sid] && exChk[sid][i] && exChk[sid][i].id) || ('chk_' + generateId()), label: it.label, required: !!it.required })); }); en.checklistItemsByStep = out; }
+                    if (ws5 && profByQs.get(key) && profByQs.get(key).has(tpl)) { const pm = profByQs.get(key).get(tpl); const exProf = en.stepProfile || {}; const out = { ...exProf }; Object.entries(pm).forEach(([sid, p]) => { const cur = { ...(exProf[sid] || {}) }; if (p.enabled !== undefined) cur.enabled = p.enabled; else delete cur.enabled; if (p.description !== undefined) cur.description = p.description; else delete cur.description; if (p.targetTime !== undefined) cur.targetTime = p.targetTime; else delete cur.targetTime; if (Object.keys(cur).length) out[sid] = cur; else delete out[sid]; }); en.stepProfile = out; }
+                });
+                base.templates = Array.from(entryByTpl.values());
+                delete base.templateId; delete base.measurementOverrides; delete base.measurementConditions;
+                base.updatedAt = Date.now(); nextQS[qsId] = base;
+                if (hdr) { const wanted = new Set(hdr.models); hdr.models.forEach(m => { nextMap[m] = qsId; removedModels.delete(m); }); Object.keys(nextMap).forEach(m => { if (nextMap[m] === qsId && !wanted.has(m)) { delete nextMap[m]; removedModels.add(m); } }); }
+                if (existing) updated++; else created++;
+            });
+            if (!window.confirm(`品質規格マスタを反映します。\n新規規格: ${created}件 / 更新: ${updated}件\n・各シート(公差/測定条件/初期値/工程設定/チェック項目)の内容で反映\n・公差はテンプレ既定と違う値にした項目のみ固定(既定と同じ/空欄=継承) / PDF・写真は保持\n・アップロードしたブックに無いシートは変更しません（Excelに無い規格も削除しません）\nよろしいですか？`)) { e.target.value = ''; return; }
+            await saveSettings({ qualityStandards: nextQS, modelStandardMap: nextMap });
+            const _delModels = [...removedModels].filter(m => !(m in nextMap));
+            if (_delModels.length && typeof deleteSettingsFields === 'function') await deleteSettingsFields(_delModels.map(m => `modelStandardMap.${m}`));
+            alert(`反映しました（新規${created}件・更新${updated}件）`);
+        } catch (err) { console.error(err); alert('品質規格の取込に失敗しました: ' + (err && err.message || err)); }
+        e.target.value = '';
+    };
+
     return (
         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mt-6">
             <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
@@ -13967,6 +14362,29 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
                 💡 <span className="font-bold">規格の名前付けのコツ</span>: 「どんな製品群か」「どんな仕様か」が後で見て分かる名前を。<br/>
                 例: <span className="font-mono">「RT系 標準仕様」</span> / <span className="font-mono">「特注パターンA」</span> / <span className="font-mono">「RBS 高精度モデル」</span> / <span className="font-mono">「KIT-22 改定3」</span><br/>
                 規格番号は社内番号 (例: <span className="font-mono">QS-001</span>) や 図面番号 / 仕様書番号 をそのまま流用してOK。
+            </div>
+
+            {/* Excel往復 (全6シート + 新規雛形) */}
+            <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3 mb-4">
+                <div className="flex flex-wrap gap-2 items-center mb-2">
+                    <button onClick={qsExcelDownload} className="text-xs flex items-center gap-1 bg-indigo-600 text-white px-3 py-2 rounded border border-indigo-700 hover:bg-indigo-700 font-bold"><FileSpreadsheet className="w-4 h-4"/> Excelダウンロード</button>
+                    <label className="text-xs flex items-center gap-1 cursor-pointer bg-white text-indigo-700 px-3 py-2 rounded border border-indigo-300 hover:bg-indigo-100 font-bold"><FileUp className="w-4 h-4"/> Excel取込<input type="file" accept=".xlsx" className="hidden" onChange={qsExcelImport}/></label>
+                    <span className="text-[11px] text-indigo-800 font-bold">設定できる全項目を一括編集（6シート）</span>
+                </div>
+                <div className="flex flex-wrap gap-2 items-center mb-2 border-t border-indigo-200 pt-2">
+                    <span className="text-[11px] font-bold text-slate-600">新規規格の雛形:</span>
+                    <select value={skelTplId} onChange={e => setSkelTplId(e.target.value)} className="text-xs border rounded p-1 bg-white max-w-[220px]">
+                        <option value="">テンプレートを選択…</option>
+                        {(templates || []).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                    <button onClick={qsSkeletonDownload} className="text-xs flex items-center gap-1 bg-white text-indigo-700 px-3 py-1.5 rounded border border-indigo-300 hover:bg-indigo-100 font-bold"><FileSpreadsheet className="w-4 h-4"/> 雛形をダウンロード</button>
+                    <span className="text-[10px] text-slate-500">選んだテンプレの全工程・項目が入った空の規格Excelを作成→規格No/名称/対象型式と値を記入→上の「Excel取込」で新規登録（規格IDは変更しない）</span>
+                </div>
+                <p className="text-[11px] text-slate-600 leading-relaxed">
+                    <b>6シート</b>（規格一覧／公差・規格値／測定条件／初期値／工程設定／チェック項目）で品質規格の<b>設定できる全項目</b>をダウンロード→編集→取込で反映。
+                    公差は<b>テンプレ既定と違う値にした項目だけ</b>がこの規格の固定値になります（既定と同じ値／空欄＝テンプレ既定を継承＝テンプレ変更が伝播）。チェック項目は先頭<b>★＝必須</b>。<b>PDF・写真はアプリ側を保持</b>。測定項目そのもの（点・計算・図）の新設は<b>工程テンプレート</b>側で。
+                    <b className="text-indigo-700">規格ID空欄＝新規規格</b>。ブックに<b>無いシートは変更しません</b>（部分編集OK）。
+                </p>
             </div>
 
             {/* 規格一覧 + 新規作成 */}
@@ -15381,6 +15799,135 @@ const EXPORT_SOURCES = {
   ]},
 };
 
+// ===== 各種データ Excel往復 (ダウンロード→編集→アップロード反映) =====
+const mxCellText = (cell) => {
+  const v = cell == null ? null : cell.value;
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    if (v.text != null) return String(v.text);
+    if (v.result != null) return String(v.result);
+    if (Array.isArray(v.richText)) return v.richText.map(t => t.text).join('');
+    if (v.hyperlink) return String(v.text || v.hyperlink);
+    return '';
+  }
+  return String(v);
+};
+const mxOut = (val, t) => {
+  if (t === 'list') return Array.isArray(val) ? val.join('\n') : (val || '');
+  if (t === 'bool') return val ? 'はい' : 'いいえ';
+  return (val === 0 || val) ? val : '';
+};
+const mxIn = (raw, t) => {
+  const s = (raw == null ? '' : String(raw)).trim();
+  if (t === 'list') return s ? s.split(/[\n,、\/]+/).map(x => x.trim()).filter(Boolean) : [];
+  if (t === 'bool') return /^(はい|true|1|有効|on|○|yes)$/i.test(s);
+  if (t === 'num') { const n = Number(s.replace(/[^0-9.\-]/g, '')); return Number.isFinite(n) ? n : 0; }
+  return s;
+};
+const mxExport = async (entry, settings) => {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('data');
+  const cols = entry.columns;
+  const head = ws.addRow(cols.map(c => c.h));
+  head.font = { bold: true };
+  head.eachCell(c => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFF6FF' } }; c.border = { bottom: { style: 'thin' } }; });
+  entry.toRows(settings).forEach(r => ws.addRow(cols.map(c => mxOut(r[c.f], c.t))));
+  cols.forEach((c, i) => { ws.getColumn(i + 1).width = c.w || 18; });
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${entry.file}.xlsx`; a.click();
+};
+const mxParse = async (entry, file) => {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(await file.arrayBuffer());
+  const ws = wb.worksheets[0];
+  if (!ws) throw new Error('シートが読み取れませんでした');
+  const cols = entry.columns;
+  const raw = [];
+  ws.eachRow((row, idx) => {
+    if (idx === 1) return;
+    const o = {};
+    cols.forEach((c, i) => { o[c.f] = mxIn(mxCellText(row.getCell(i + 1)), c.t); });
+    raw.push(o);
+  });
+  return entry.fromRows(raw);
+};
+const MX_REGISTRY = [
+  { key: 'modelGroups', label: '型式グループ', file: '型式グループ',
+    columns: [{ h: 'ID', f: 'id', w: 22 }, { h: 'グループ名', f: 'name', w: 24 }, { h: '型式一覧(改行/カンマ区切り)', f: 'models', t: 'list', w: 40 }],
+    count: (s) => (s.modelGroups || []).length,
+    toRows: (s) => (s.modelGroups || []).map(g => ({ id: g.id, name: g.name, models: g.models || [] })),
+    fromRows: (rows) => { const arr = rows.filter(r => String(r.name || '').trim()).map((r, i) => ({ id: r.id || ('mg_' + Date.now() + '_' + i), name: String(r.name).trim(), models: r.models || [] })); return { count: arr.length, patch: { modelGroups: arr } }; } },
+  { key: 'defectProcessOptions', label: '不具合の原因工程', file: '原因工程',
+    columns: [{ h: '原因工程', f: 'value', w: 30 }],
+    count: (s) => (s.defectProcessOptions || []).length,
+    toRows: (s) => (s.defectProcessOptions || []).map(v => ({ value: v })),
+    fromRows: (rows) => { const arr = rows.map(r => String(r.value || '').trim()).filter(Boolean); return { count: arr.length, patch: { defectProcessOptions: arr } }; } },
+  { key: 'complaintOptions', label: '軽微不良の選択肢', file: '軽微不良の選択肢',
+    columns: [{ h: '選択肢', f: 'value', w: 36 }],
+    count: (s) => (s.complaintOptions || []).length,
+    toRows: (s) => (s.complaintOptions || []).map(v => ({ value: v })),
+    fromRows: (rows) => { const arr = rows.map(r => String(r.value || '').trim()).filter(Boolean); return { count: arr.length, patch: { complaintOptions: arr } }; } },
+  { key: 'breakAlerts', label: '休憩アラート', file: '休憩アラート',
+    columns: [{ h: 'ID', f: 'id', w: 16 }, { h: '時刻(HH:MM)', f: 'time', w: 14 }, { h: 'メッセージ', f: 'message', w: 44 }, { h: '有効(はい/いいえ)', f: 'enabled', t: 'bool', w: 16 }],
+    count: (s) => (s.breakAlerts || []).length,
+    toRows: (s) => (s.breakAlerts || []).map(b => ({ id: b.id, time: b.time, message: b.message, enabled: !!b.enabled })),
+    fromRows: (rows) => { const arr = rows.filter(r => String(r.time || '').trim()).map((r, i) => ({ id: r.id || ('break_' + (i + 1)), time: String(r.time).trim(), message: String(r.message || ''), enabled: r.enabled })); return { count: arr.length, patch: { breakAlerts: arr } }; } },
+  { key: 'customTargetTimes', label: '目標時間(較正値)', file: '目標時間', mode: 'merge', note: '対象×工程×秒',
+    columns: [{ h: '対象(model_型式)', f: 'targetKey', w: 30 }, { h: '工程キー', f: 'procKey', w: 40 }, { h: '目標秒', f: 'seconds', t: 'num', w: 12 }],
+    count: (s) => { const m = s.customTargetTimes || {}; let n = 0; Object.values(m).forEach(o => n += Object.keys(o || {}).length); return n; },
+    toRows: (s) => { const m = s.customTargetTimes || {}; const out = []; Object.entries(m).forEach(([tk, o]) => Object.entries(o || {}).forEach(([pk, sec]) => out.push({ targetKey: tk, procKey: pk, seconds: sec }))); return out; },
+    fromRows: (rows) => { const m = {}; let n = 0; rows.forEach(r => { const tk = String(r.targetKey || '').trim(), pk = String(r.procKey || '').trim(); if (!tk || !pk) return; const sec = Number(r.seconds); if (!Number.isFinite(sec)) return; (m[tk] = m[tk] || {})[pk] = sec; n++; }); return { count: n, patch: { customTargetTimes: m } }; } },
+];
+const MasterExcelPanel = ({ settings = {}, onSave = null }) => {
+  const [busy, setBusy] = useState('');
+  const [status, setStatus] = useState(null);
+  const doDownload = async (entry) => {
+    try { setBusy(entry.key); await mxExport(entry, settings); setStatus({ ok: true, msg: `「${entry.label}」をダウンロードしました` }); }
+    catch (e) { setStatus({ ok: false, msg: `ダウンロード失敗: ${e && e.message || e}` }); }
+    finally { setBusy(''); }
+  };
+  const doUpload = async (entry, file) => {
+    if (!file) return;
+    if (!onSave) { setStatus({ ok: false, msg: '保存機能が利用できません' }); return; }
+    try {
+      setBusy(entry.key);
+      const result = await mxParse(entry, file);
+      const n = result.count;
+      const msg = entry.mode === 'merge'
+        ? `「${entry.label}」に Excelの内容(${n}件)を追加・上書きします。（Excelに無い行は消えません）\n全端末に反映されます。よろしいですか？`
+        : `「${entry.label}」を Excelの内容(${n}件)で置き換えます。（Excelに無い行は削除されます）\n全端末に反映されます。よろしいですか？`;
+      if (!confirm(msg)) { setBusy(''); return; }
+      await onSave(result.patch);
+      setStatus({ ok: true, msg: `✓「${entry.label}」を ${n}件 で反映しました` });
+    } catch (e) { setStatus({ ok: false, msg: `取込失敗: ${e && e.message || e}` }); }
+    finally { setBusy(''); }
+  };
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 mb-4">
+      <div className="flex items-center gap-2 mb-1"><FileSpreadsheet className="w-5 h-5 text-emerald-600" /><h3 className="font-bold text-slate-800">各種データを Excelで編集（往復）</h3></div>
+      <p className="text-[11px] text-slate-500 mb-3">Excelダウンロード → 編集 → アップロードで反映。<b className="text-rose-600">アップロードはその項目を丸ごと置き換え</b>ます（行を消す＝そのデータを削除／目標時間のみ追加・上書き）。反映前に確認します。</p>
+      {status && <div className={`text-xs font-bold mb-3 px-3 py-2 rounded ${status.ok ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-rose-50 text-rose-700 border border-rose-200'}`}>{status.msg}</div>}
+      <div className="space-y-2">
+        {MX_REGISTRY.map(entry => (
+          <div key={entry.key} className="flex items-center gap-2 flex-wrap border rounded-lg px-3 py-2 bg-slate-50/60">
+            <div className="flex-1 min-w-[160px]">
+              <div className="font-bold text-slate-700 text-sm">{entry.label}{entry.mode === 'merge' && <span className="ml-1 text-[10px] text-amber-600 font-bold">(追加・上書き)</span>}</div>
+              <div className="text-[11px] text-slate-400">現在 {entry.count(settings)} 件{entry.note ? ` ・ ${entry.note}` : ''}</div>
+            </div>
+            <button disabled={!!busy} onClick={() => doDownload(entry)} className="px-3 py-1.5 text-xs font-bold rounded border bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50 disabled:opacity-50 flex items-center gap-1"><DownloadCloud className="w-4 h-4" />Excelダウンロード</button>
+            <label className={`px-3 py-1.5 text-xs font-bold rounded border bg-white text-blue-700 border-blue-200 hover:bg-blue-50 cursor-pointer flex items-center gap-1 ${busy ? 'opacity-50 pointer-events-none' : ''}`}>
+              <FileUp className="w-4 h-4" />アップロード反映
+              <input type="file" accept=".xlsx" className="hidden" onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; doUpload(entry, f); }} />
+            </label>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const DataExportCenter = ({ lots = [], workers = [], indirectWork = [], settings = {}, currentUserName = '', saveSettings = null }) => {
   const toMs = (raw) => { if (raw == null) return null; if (typeof raw === 'number') return raw; if (raw.seconds) return raw.seconds * 1000; const t = new Date(raw).getTime(); return isNaN(t) ? null : t; };
   const wname = (idOrName) => (workers.find(w => w.id === idOrName)?.name) || idOrName || '';
@@ -15928,10 +16475,12 @@ const AchievementRateView = ({ lots = [], customTargetTimes = {}, settings = {},
 //  ①時間オーバー: 進行中タスク(全作業者)が目標時間を超過  ②NG発生: 未修正のNGタスク
 //  5秒毎に再集計。読み取りのみ。「30分非表示」で一時ミュート可。
 // =============================================================================
-const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [], improvements = [] }) => {
+const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [], improvements = [], cfg = {} }) => {
+  const c = { enabled: false, showNG: true, showOverrun: true, showStale: true, autoDismissMin: 0, ...(cfg || {}) };
   const [tick, setTick] = useState(0);
   const [open, setOpen] = useState(false);
   const [mutedUntil, setMutedUntil] = useState(0);
+  const shownRef = useRef({ sig: '', at: 0 }); // 表示後N分で自動消滅の基準(同じ内容が出続けた時間)
   useEffect(() => { const iv = setInterval(() => setTick(t => t + 1), 5000); return () => clearInterval(iv); }, []);
   const { overs, ngs, stales } = useMemo(() => {
     const overs = []; const ngs = []; const stales = []; const now = Date.now();
@@ -15984,37 +16533,45 @@ const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [], 
     overs.sort((a, b) => (b.sec / b.tgt) - (a.sec / a.tgt));
     return { overs, ngs, stales };
   }, [lots, tick, customTargetTimes, modelGroups, improvements]);
-  const total = overs.length + ngs.length + stales.length;
+  const fOvers = c.showOverrun ? overs : [];
+  const fNgs = c.showNG ? ngs : [];
+  const fStales = c.showStale ? stales : [];
+  const total = fOvers.length + fNgs.length + fStales.length;
   const fmtMS = (s) => { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
-  if (!total || Date.now() < mutedUntil) return null;
+  // 表示後N分で自動消滅(内容=id集合 が変われば再表示。0=消えない)。
+  const sig = [...fOvers, ...fNgs, ...fStales].map(x => x.id).sort().join('|');
+  if (shownRef.current.sig !== sig) shownRef.current = { sig, at: Date.now() };
+  const autoMin = Number(c.autoDismissMin) || 0;
+  const autoHidden = autoMin > 0 && !!sig && (Date.now() - shownRef.current.at) >= autoMin * 60000;
+  if (!c.enabled || !total || Date.now() < mutedUntil || autoHidden) return null;
   return (
     <div className="fixed bottom-4 right-4 z-[120] w-[340px] max-w-[92vw] pointer-events-auto">
       <div className="bg-white rounded-2xl shadow-2xl border-2 border-rose-300 overflow-hidden">
         <button onClick={() => setOpen(o => !o)} className="w-full px-4 py-2.5 bg-rose-600 text-white flex items-center justify-between gap-2 animate-pulse">
           <span className="font-black text-sm flex items-center gap-2">⚠ 作業アラート
-            {overs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">⏰ 時間オーバー {overs.length}</span>}
-            {ngs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">🛑 NG {ngs.length}</span>}
-            {stales.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">📋 効果なし {stales.length}</span>}
+            {fOvers.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">⏰ 時間オーバー {fOvers.length}</span>}
+            {fNgs.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">🛑 NG {fNgs.length}</span>}
+            {fStales.length > 0 && <span className="bg-white/25 px-1.5 py-0.5 rounded text-xs">📋 効果なし {fStales.length}</span>}
           </span>
           <span className="text-xs font-bold">{open ? '閉じる ▼' : '詳細 ▲'}</span>
         </button>
         {open && (
           <div className="max-h-72 overflow-auto divide-y divide-slate-100">
-            {overs.map(o => (
+            {fOvers.map(o => (
               <div key={'o' + o.id} className="px-3 py-2 text-xs bg-rose-50/50">
                 <div className="flex items-center gap-1.5"><span className="font-black text-rose-600">⏰ 時間オーバー</span><span className="font-mono text-slate-500">{o.ord}</span><span className="text-slate-400 truncate">{o.model}</span></div>
                 <div className="mt-0.5 font-bold text-slate-700 truncate">{o.title} #{o.u + 1}{o.worker ? <span className="font-normal text-slate-500"> ／ {o.worker}</span> : null}</div>
                 <div className="font-mono text-rose-600 font-bold">{fmtMS(o.sec)} <span className="text-slate-400 font-normal">/ 目標 {fmtMS(o.tgt)} ({Math.round(o.sec / o.tgt * 100)}%)</span></div>
               </div>
             ))}
-            {ngs.map(n => (
+            {fNgs.map(n => (
               <div key={'n' + n.id} className="px-3 py-2 text-xs">
                 <div className="flex items-center gap-1.5"><span className="font-black text-rose-600">🛑 {n.reworking ? 'NG修正中' : 'NG発生'}</span><span className="font-mono text-slate-500">{n.ord}</span><span className="text-slate-400 truncate">{n.model}</span></div>
                 <div className="mt-0.5 font-bold text-slate-700 truncate">{n.title} #{n.u + 1}{n.worker ? <span className="font-normal text-slate-500"> ／ {n.worker}</span> : null}</div>
                 {n.reason && <div className="text-slate-500 truncate" title={n.reason}>理由: {n.reason}</div>}
               </div>
             ))}
-            {stales.map(s => (
+            {fStales.map(s => (
               <div key={'s' + s.id} className="px-3 py-2 text-xs bg-amber-50/60">
                 <div className="flex items-center gap-1.5"><span className="font-black text-amber-700">📋 改善が効いていない</span><span className="text-slate-400 truncate">{s.model}</span></div>
                 <div className="mt-0.5 font-bold text-slate-700 truncate">{s.title}</div>
@@ -17811,12 +18368,19 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
   //   作業/集計が記録に使う findObsPlan(有効&型式専用優先) を最優先、無ければ無効/空プランも編集できるよう「型式専用→全型式」で決定的にフォールバック。
   const resolveObsPlan = (stepKey) => {
     if (!templateId || !stepKey) return null;
+    // 型式専用の旧プランがあれば最優先(step直付けの全型式に黙殺されないように)
+    const _modelPlan = findObsPlanModel(observationPlans, templateId, stepKey, model);
+    if (_modelPlan) return _modelPlan;
+    // テンプレ工程に常設した要素(step.observationElements)を次に優先(記録/表示を一致させる)
+    const _stepObj = (((templates || []).find(t => t.id === templateId) || {}).steps || []).find(s => targetTimeStepKey(s) === stepKey);
+    const _sp = stepObsPlan(_stepObj);
+    if (_sp) return _sp.enabled === false ? null : _sp;
     const live = findObsPlan(observationPlans, templateId, stepKey, model);
     if (live) return live;
     const ps = (observationPlans || []).filter(p => p.templateId === templateId && p.stepKey === stepKey);
     return ps.find(p => p.model && p.model === model) || ps.find(p => !p.model) || null;
   };
-  const planForSel = useMemo(() => sel ? resolveObsPlan(sel.stepKey) : null, [observationPlans, templateId, sel, model]);
+  const planForSel = useMemo(() => sel ? resolveObsPlan(sel.stepKey) : null, [observationPlans, templateId, sel, model, templates]);
   const elStats = useMemo(() => (sel && templateId) ? obsElementStats(lots, { model, templateId, stepKey: sel.stepKey, plan: planForSel }) : null, [lots, model, templateId, sel, planForSel]);
   const cvBadge = (cv) => cv < 0.3 ? ['安定', 'bg-emerald-100 text-emerald-700'] : (cv < 0.5 ? ['ややバラつき', 'bg-amber-100 text-amber-700'] : ['バラつき大', 'bg-rose-100 text-rose-700']);
   // 見ながら計画: この工程を改善カルテ(計画)にして改善PDCAへ。進行中カルテがあればそれを案内。
@@ -18010,7 +18574,9 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
                   )}
                   {saveData && !sel.stepKey?.includes('lot') && (
                     templateId
-                      ? <button onClick={() => setObsEditor(true)} className="text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{planForSel ? 'じっと見る設定' : 'じっと見る（要素に分ける）'}</button>
+                      ? (planForSel && planForSel.source === 'step'
+                          ? <span className="text-[11px] px-2 py-1 rounded border border-blue-200 bg-blue-50 text-blue-500 flex items-center gap-1" title="この工程の要素は工程テンプレート編集で設定されています"><Eye className="w-3.5 h-3.5" />要素はテンプレ編集で設定済み</span>
+                          : <button onClick={() => setObsEditor(true)} className="text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{planForSel ? 'じっと見る設定' : 'じっと見る（要素に分ける）'}</button>)
                       : tplOptions.length
                         ? <button onClick={() => { setTemplateId(tplOptions[0].id); setObsEditor(true); }} className="text-[11px] px-2 py-1 rounded border border-blue-300 bg-blue-50 text-blue-700 font-bold hover:bg-blue-100 flex items-center gap-1"><Eye className="w-3.5 h-3.5" />じっと見る（要素に分ける）</button>
                         : <span className="text-[10px] text-slate-400">この型式に完了データがありません</span>
@@ -18129,7 +18695,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
           )}
         </>
       )}
-      {obsEditor && sel && templateId && (
+      {obsEditor && sel && templateId && !(planForSel && planForSel.source === 'step') && (
         <ObservationPlanEditor plan={planForSel} templateId={templateId} stepKey={sel.stepKey} stepTitle={sel.stepTitle} model={model} models={models} allPlans={observationPlans} saveData={saveData} deleteData={deleteData} onClose={() => setObsEditor(false)} />
       )}
       {obsHelp && <ObsHelpModal onClose={() => setObsHelp(false)} />}
@@ -18329,6 +18895,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
   const [editLabel, setEditLabel] = useState('');
   const [editCauseProcess, setEditCauseProcess] = useState('');
   const [editPhotos, setEditPhotos] = useState([]);
+  const [editWorkerName, setEditWorkerName] = useState('');
   const defectProcessOptions = settings?.defectProcessOptions || DEFAULT_DEFECT_PROCESS_OPTIONS;
 
   const defectStats = useMemo(() => {
@@ -18518,6 +19085,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
     setEditLabel(data.label || '');
     setEditCauseProcess(data.causeProcess || '');
     setEditPhotos(data.photos ? [...data.photos] : []);
+    { const _raw = (lots.find(l => l.id === lotId)?.interruptions || []).find(x => x.id === data.id); setEditWorkerName((_raw && _raw.workerName != null) ? _raw.workerName : (data.workerName || '')); }
     setEditModal({ isOpen: true, type, data, lotId });
   };
 
@@ -18531,6 +19099,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
         const updated = { ...i, label: editLabel };
         if (editCauseProcess) updated.causeProcess = editCauseProcess; else delete updated.causeProcess;
         if (editPhotos.length > 0) updated.photos = editPhotos; else delete updated.photos;
+        updated.workerName = editWorkerName;
         return updated;
       }
       return { ...i, label: editLabel };
@@ -18606,6 +19175,12 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                </div></div>
              )}
              <div className="mb-4"><div className="text-sm font-bold text-slate-700 mb-2">内容</div><textarea className="w-full border rounded p-3 h-28 text-sm" value={editLabel} onChange={e => setEditLabel(e.target.value)} /></div>
+             {editModal.type === 'defect' && (
+               <div className="mb-4"><div className="text-sm font-bold text-slate-700 mb-2">発見者（報告者）</div>
+                 <input list="edit-defect-workers" value={editWorkerName} onChange={e => setEditWorkerName(e.target.value)} placeholder="発見者名" className="w-full border rounded p-2 text-sm bg-slate-50" />
+                 <datalist id="edit-defect-workers">{(workers || []).map((w, i) => <option key={i} value={w.name || w} />)}</datalist>
+               </div>
+             )}
              <div className="flex justify-end gap-2">
                <button onClick={() => setEditModal({ isOpen: false, type: null, data: null, lotId: null })} className="px-4 py-2 border rounded font-bold text-slate-600 hover:bg-slate-50">キャンセル</button>
                <button onClick={saveEditInterruption} className="px-6 py-2 bg-blue-600 text-white rounded font-bold shadow hover:bg-blue-700">保存</button>
@@ -20078,7 +20653,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            })()}
 
            {activeMode === 'monthly' && <MonthlyReportView lots={lots} workers={workers} settings={settings} customTargetTimes={settings.customTargetTimes || {}} targetTimeHistory={settings.targetTimeHistory || []} improvements={improvements} currentUserName={currentUserName} templates={templates} indirectWork={indirectWork} onSaveSettings={saveSettings} />}
-           {activeMode === 'export' && <DataExportCenter lots={lots} workers={workers} indirectWork={indirectWork} settings={settings} currentUserName={currentUserName} saveSettings={saveSettings} />}
+           {activeMode === 'export' && <div className="space-y-4"><MasterExcelPanel settings={settings} onSave={saveSettings} /><DataExportCenter lots={lots} workers={workers} indirectWork={indirectWork} settings={settings} currentUserName={currentUserName} saveSettings={saveSettings} /></div>}
            {activeMode === 'dashboard' && <ManagerDashboard lots={lots} settings={settings} />}
            {activeMode === 'kpi' && <KpiDetailView lots={lots} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
            {activeMode === 'achievement' && <AchievementRateView lots={lots} customTargetTimes={settings.customTargetTimes || {}} settings={settings} templates={templates} />}
@@ -21074,7 +21649,7 @@ const MeasurementSettingsView = ({ settings, saveSettings, comboPresets = [], te
 };
 
 // テンプレート管理: 検索 / フィルタ / 並び替えサポート
-const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplate, deleteData, handleExcelImport, handleExcelDownload, handleBackupExport, handleBackupImport, excelInputRef, backupInputRef }) => {
+const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplate, deleteData, handleExcelImport, handleExcelDownload, handleBackupExport, handleBackupImport, excelInputRef, backupInputRef, handleAllTemplatesDownload, handleAllTemplatesImport, allTplInputRef }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [sortOrder, setSortOrder] = useState('name_asc'); // name_asc | name_desc | steps_desc | steps_asc | recent | usage_desc
   // フィルタ (multi-select)
@@ -21155,11 +21730,21 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
         <div className="flex justify-between items-center mb-4">
           <h3 className="font-bold text-lg flex items-center gap-2"><ClipboardList className="w-5 h-5" /> 工程テンプレート管理</h3>
-          <div className="flex gap-2">
-            <label className="text-xs flex items-center gap-1 cursor-pointer bg-green-50 text-green-700 px-3 py-2 rounded border border-green-200 hover:bg-green-100"><FileUp className="w-4 h-4"/> Excel取込<input type="file" ref={excelInputRef} accept=".xlsx" onChange={handleExcelImport} className="hidden"/></label>
+          <div className="flex gap-2 flex-wrap">
+            {handleAllTemplatesDownload && (<>
+              <button onClick={handleAllTemplatesDownload} className="text-xs flex items-center gap-1 bg-indigo-600 text-white px-3 py-2 rounded border border-indigo-700 hover:bg-indigo-700 font-bold"><FileSpreadsheet className="w-4 h-4"/> 全テンプレExcel</button>
+              <label className="text-xs flex items-center gap-1 cursor-pointer bg-indigo-50 text-indigo-700 px-3 py-2 rounded border border-indigo-200 hover:bg-indigo-100 font-bold"><FileUp className="w-4 h-4"/> まとめて取込<input type="file" ref={allTplInputRef} accept=".xlsx" onChange={handleAllTemplatesImport} className="hidden"/></label>
+            </>)}
+            <label className="text-xs flex items-center gap-1 cursor-pointer bg-green-50 text-green-700 px-3 py-2 rounded border border-green-200 hover:bg-green-100"><FileUp className="w-4 h-4"/> Excel取込(1件)<input type="file" ref={excelInputRef} accept=".xlsx" onChange={handleExcelImport} className="hidden"/></label>
             <button onClick={handleBackupExport} className="text-xs flex items-center gap-1 bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><DownloadCloud className="w-4 h-4"/> バックアップ</button>
             <label className="text-xs flex items-center gap-1 cursor-pointer bg-slate-100 text-slate-600 px-3 py-2 rounded border hover:bg-slate-200"><RefreshCw className="w-4 h-4"/> 復元<input type="file" ref={backupInputRef} accept=".json" onChange={handleBackupImport} className="hidden"/></label>
           </div>
+        </div>
+
+        {/* Excel往復の導線を明示 */}
+        <div className="text-[11px] text-slate-700 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2 mb-3 flex items-start gap-2">
+          <FileSpreadsheet className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5"/>
+          <span><b className="text-indigo-700">全テンプレまとめて</b>: 上の <span className="font-bold text-indigo-700">「全テンプレExcel」</span> で全テンプレ・全工程を1つのExcelに出力（左端＝テンプレID/名）。工程名・目標時間・種別・<b>チェック項目(最大10・先頭★で必須)</b>等を編集し <span className="font-bold text-indigo-700">「まとめて取込」</span> で反映。<b>テンプレID空欄の行＝新規テンプレ</b>として登録されます。／ <b className="text-emerald-700">1テンプレずつ</b>: 各テンプレ右の <span className="font-bold text-emerald-700">Excel</span> でDL→編集→上の <span className="font-bold text-green-700">「Excel取込(1件)」</span>。</span>
         </div>
 
         {/* 検索 + 並び替え + フィルタトグル */}
@@ -21264,7 +21849,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0 ml-2">
-                  <button onClick={(e) => { e.stopPropagation(); handleExcelDownload(t); }} className="p-2 text-slate-400 hover:text-emerald-600 bg-slate-50 rounded" title="Excel出力"><FileSpreadsheet className="w-4 h-4"/></button>
+                  <button onClick={(e) => { e.stopPropagation(); handleExcelDownload(t); }} className="px-2 py-2 flex items-center gap-1 text-emerald-700 hover:text-white hover:bg-emerald-600 bg-emerald-50 border border-emerald-200 rounded text-xs font-bold" title="このテンプレをExcelでダウンロード"><FileSpreadsheet className="w-4 h-4"/>Excel</button>
                   <button onClick={(e) => { e.stopPropagation(); setEditingTemplate({ ...t, id: '', name: t.name + ' (コピー)', steps: t.steps?.map(s => ({...s, id: generateId()})) || [] }); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="複製"><Copy className="w-4 h-4"/></button>
                   <button onClick={(e) => { e.stopPropagation(); setEditingTemplate(t); }} className="p-2 text-slate-400 hover:text-blue-600 bg-slate-50 rounded" title="編集"><Pencil className="w-4 h-4"/></button>
                   <button onClick={(e) => { e.stopPropagation(); if (confirm(`テンプレ「${t.name}」を削除しますか？`)) deleteData('templates', t.id); }} className="p-2 text-slate-400 hover:text-rose-600 bg-slate-50 rounded" title="削除"><Trash2 className="w-4 h-4"/></button>
@@ -21565,6 +22150,40 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
            })()}
          </div>
 
+         {/* 作業アラート設定 (管理者向け・右下ライブアラート) */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><Bell className="w-5 h-5 text-rose-600" /> 作業アラート（管理者・画面右下）</h3>
+           <p className="text-xs text-slate-400 mb-4">管理者ログイン中、どの画面でも右下に出る「作業アラート」です。NG発生・目標時間オーバー・改善が効いていないカルテを常時監視して知らせます。<b>既定はOFF</b>。</p>
+           {(() => {
+             const wa = { enabled: false, showNG: true, showOverrun: true, showStale: true, autoDismissMin: 0, ...(settings.workAlert || {}) };
+             const setWA = (patch) => saveSettings({ workAlert: { ...wa, ...patch } });
+             return (
+               <div className="space-y-4">
+                 <label className="flex items-center gap-3 cursor-pointer">
+                   <input type="checkbox" checked={!!wa.enabled} onChange={e => setWA({ enabled: e.target.checked })} className="w-5 h-5 accent-rose-600" />
+                   <span className="text-sm font-bold text-slate-700">作業アラートを表示する</span>
+                   <span className="text-xs text-slate-400">OFF（既定）だと右下に何も出ません</span>
+                 </label>
+                 {wa.enabled && (<>
+                   <div className="pl-8">
+                     <div className="text-sm font-bold text-slate-600 mb-1">表示する内容</div>
+                     <div className="flex flex-wrap gap-4">
+                       <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={wa.showNG !== false} onChange={e => setWA({ showNG: e.target.checked })} className="w-4 h-4 accent-rose-600" /> 🛑 NG発生</label>
+                       <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={wa.showOverrun !== false} onChange={e => setWA({ showOverrun: e.target.checked })} className="w-4 h-4 accent-rose-600" /> ⏰ 時間オーバー</label>
+                       <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={wa.showStale !== false} onChange={e => setWA({ showStale: e.target.checked })} className="w-4 h-4 accent-rose-600" /> 📋 改善が効いていない</label>
+                     </div>
+                   </div>
+                   <div className="pl-8 flex items-center gap-2 flex-wrap">
+                     <span className="text-sm font-bold text-slate-600">表示してから自動で消す</span>
+                     <input type="number" min={0} max={120} step={1} value={Number(wa.autoDismissMin) || 0} onChange={e => setWA({ autoDismissMin: Math.max(0, Math.min(120, parseInt(e.target.value) || 0)) })} className="w-20 border rounded p-2 text-sm text-center font-mono" />
+                     <span className="text-sm text-slate-500">分後（0＝消えない。新しいアラートが出たら再表示）</span>
+                   </div>
+                 </>)}
+               </div>
+             );
+           })()}
+         </div>
+
          {/* 目標時間オーバー警告設定 (カスタム作業画面の点滅・音) */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><Target className="w-5 h-5 text-rose-600" /> 目標時間オーバー警告（カスタム作業画面）</h3>
@@ -21793,6 +22412,8 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
          {/* 勤務時間マスタ (始業・定時・残業・休憩) — 負荷計算で使用 */}
          <WorkScheduleSettingsPanel workSchedule={settings.workSchedule} saveSettings={saveSettings} workloadEffectiveWorkers={settings.workloadEffectiveWorkers} registeredWorkerCount={workers.length} />
 
+         <MascotSettingsPanel settings={settings} onSave={saveSettings} />
+
          {/* 作業順ガイド・厳密モード (管理者向け) — 一元管理は専用画面へ */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-800">
@@ -21846,16 +22467,10 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
 
          <MeasurementOverridesPanel templates={templates} lots={lots} measurementOverrides={settings.measurementOverrides || {}} saveSettings={saveSettings} />
 
-         {/* 品質規格マスタ (新方式: 型式 → 品質規格 → 公差/測定条件) */}
-         <div data-qs-panel>
-           <QualityStandardsPanel
-             templates={templates}
-             lots={lots}
-             qualityStandards={settings.qualityStandards || {}}
-             modelStandardMap={settings.modelStandardMap || {}}
-             saveSettings={saveSettings}
-             deleteSettingsFields={deleteSettingsFields}
-           />
+         {/* 品質規格マスタは上部サブタブ「品質規格マスタ」(測定設定の右横) に移動しました */}
+         <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-4 py-3 text-sm text-indigo-800 flex items-center gap-2">
+           <ClipboardCheck className="w-5 h-5 text-indigo-600 shrink-0" />
+           <span><b>品質規格マスタ</b> は上部の <b>「測定設定」の右横「品質規格マスタ」タブ</b> に移動しました。</span>
          </div>
 
          {/* ロットカード表示項目設定 */}
@@ -21885,6 +22500,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                { key: 'timeRange', label: '予測時間範囲 (開始〜ETA)' },
                { key: 'delayStatus', label: '遅延ラベル' },
                { key: 'progressBar', label: '下部の進捗バー' },
+               { key: 'unitBadge', label: '号機バッジ (制御装置)' },
              ];
              return (
                <>
@@ -21904,7 +22520,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                  <div className="flex gap-2 justify-end">
                    <button
                      type="button"
-                     onClick={() => saveSettings({ lotCardDisplay: { orderNo: true, model: true, quantity: true, workerBadge: true, progressBar: true, templateName: false, entryTime: false, elapsedTime: false, progressPct: false, nextStep: false, timeRange: false, delayStatus: false } })}
+                     onClick={() => saveSettings({ lotCardDisplay: { orderNo: true, model: true, quantity: true, workerBadge: true, progressBar: true, unitBadge: true, templateName: false, entryTime: false, elapsedTime: false, progressPct: false, nextStep: false, timeRange: false, delayStatus: false } })}
                      className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded font-bold"
                    >
                      最小表示 (5項目)
@@ -22233,7 +22849,7 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
   );
 };
 
-const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '', saveData }) => {
+const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '', saveData, cdByOrder = {} }) => {
   const [assignmentLot, setAssignmentLot] = useState(null);
   const [viewMode, setViewMode] = useState('grid');
   const [searchQuery, setSearchQuery] = useState('');
@@ -22665,6 +23281,10 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                       <div className="text-[11px] font-bold text-indigo-800 bg-indigo-100 border border-indigo-300 rounded px-2 py-0.5 inline-flex items-center gap-1 truncate w-fit max-w-full shadow-sm" title={templateName}>
                         <ClipboardList className="w-3.5 h-3.5 shrink-0"/> <span className="truncate">{templateName}</span>
                       </div>
+                    )}
+                    {/* 制御装置(号機)バッジ = この指図につなぐ号機。作業者が"どの号機だ？"を探す時間を消す。設定で非表示可。 */}
+                    {settings?.lotCardDisplay?.unitBadge !== false && cdByOrder[String(lot.orderNo)] && (
+                      <div onClick={(e) => e.stopPropagation()}><UnitBadge summary={cdByOrder[String(lot.orderNo)]} /></div>
                     )}
                     {/* 停止理由バッジ */}
                     {lot.pauseReason && lot.pauseReason.category && (() => {
@@ -26809,7 +27429,161 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
 // --- Main Component ---
  
- export default function App() {
+ // ===== マスコット「ケンサくん」演出 (設定で全部調整可・軽量・安全・lots読み取りのみ・検査ロジックには不干渉) =====
+const MASCOT_EMOJIS = ['🐣', '🐥', '🐤', '🐰', '🐻', '🦉', '🐧', '🐱', '🤖', '🧑‍🔧', '👷', '😊', '⭐', '🌟', '🍀', '🎉', '💪', '🦾'];
+const DEFAULT_MASCOT = {
+    enabled: true, name: 'ケンサくん', emoji: '🐣', position: 'top',
+    confetti: true, sound: false, cooldownSec: 15, milestoneStep: 100, encourageMin: 20,
+    triggers: {
+        dayStart: { on: true, lines: ['今日もいちにち、ご安全に！', 'さあ、はじめよう！', 'おはよう！今日もよろしくね。'] },
+        lotComplete: { on: true, lines: ['おつかれさま！', 'ナイス検査！', 'その調子！', 'バッチリ！', 'ていねいだね！', 'いい流れ！', 'きっちり仕上げたね！'] },
+        milestone: { on: true, lines: ['やったね！大記録だよ！', 'すごい積み上げ！', 'どんどん進むね！'] },
+        ngFound: { on: true, lines: ['ナイス発見！見つけてえらい！', 'よく気づいたね！', 'その一手間が品質を守る！'] },
+        encourage: { on: false, lines: ['がんばってるね！', 'いい集中！', 'ムリせずいこう。'] },
+    },
+};
+const MASCOT_TRIGGER_LABELS = { dayStart: '出勤あいさつ（その日いちばん最初）', lotComplete: 'ロットが完了したとき', milestone: '通算キリ番を達成したとき', ngFound: 'NG（不良）を見つけたとき', encourage: '作業中の応援（一定間隔ごと）' };
+const mergeMascot = (s) => { const m = (s && s.mascot) || {}; return { ...DEFAULT_MASCOT, ...m, triggers: { ...DEFAULT_MASCOT.triggers, ...(m.triggers || {}) } }; };
+const mascotConfetti = (big) => {
+    try {
+        if (typeof document === 'undefined') return;
+        if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        const cvs = document.createElement('canvas');
+        cvs.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:9998';
+        cvs.width = window.innerWidth; cvs.height = window.innerHeight;
+        document.body.appendChild(cvs);
+        const ctx = cvs.getContext('2d');
+        const colors = ['#10b981', '#34d399', '#6366f1', '#f59e0b', '#ef4444', '#3b82f6', '#ec4899'];
+        const parts = Array.from({ length: big ? 180 : 120 }, () => ({ x: cvs.width / 2 + (Math.random() - 0.5) * cvs.width * 0.6, y: -20 - Math.random() * cvs.height * 0.3, vx: (Math.random() - 0.5) * 7, vy: 2 + Math.random() * 5, s: 5 + Math.random() * 8, rot: Math.random() * 6.28, vr: (Math.random() - 0.5) * 0.3, c: colors[Math.floor(Math.random() * colors.length)] }));
+        let frame = 0;
+        const tick = () => { frame++; ctx.clearRect(0, 0, cvs.width, cvs.height); parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += 0.09; p.rot += p.vr; ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillStyle = p.c; ctx.fillRect(-p.s / 2, -p.s / 2, p.s, p.s * 0.6); ctx.restore(); }); if (frame < 170 && parts.some(p => p.y < cvs.height + 40)) requestAnimationFrame(tick); else cvs.remove(); };
+        requestAnimationFrame(tick);
+    } catch (e) { /* 演出失敗は無視 */ }
+};
+const mascotBeep = () => {
+    try {
+        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+        const ac = new AC(); const o = ac.createOscillator(); const g = ac.createGain();
+        o.type = 'sine'; o.connect(g); g.connect(ac.destination);
+        o.frequency.setValueAtTime(880, ac.currentTime); o.frequency.setValueAtTime(1320, ac.currentTime + 0.09);
+        g.gain.setValueAtTime(0.06, ac.currentTime); g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.28);
+        o.start(); o.stop(ac.currentTime + 0.3);
+        setTimeout(() => { try { ac.close(); } catch (e) { /* noop */ } }, 450);
+    } catch (e) { /* noop */ }
+};
+const MascotFx = ({ lots = [], settings = null, onSaveSettings = null }) => {
+    const cfg = useMemo(() => mergeMascot(settings), [settings]);
+    const enabled = cfg.enabled !== false && settings?.funFx !== false;
+    const [toast, setToast] = useState(null);
+    const seenRef = useRef(null); const msRef = useRef(null); const ngRef = useRef(null);
+    const lastShown = useRef(0); const hideT = useRef(null); const encT = useRef(null);
+    const totalUnits = useMemo(() => (lots || []).reduce((n, l) => n + ((l.status === 'completed' || l.location === 'completed') ? (l.quantity || 1) : 0), 0), [lots]);
+    const ngCount = useMemo(() => (lots || []).reduce((n, l) => n + Object.values(l.tasks || {}).filter(t => t && t.status === 'ng').length, 0), [lots]);
+    const showRef = useRef(() => {});
+    showRef.current = (key, opts = {}) => {
+        const t = cfg.triggers[key] || {};
+        if (!opts.force && (!enabled || t.on === false)) return;
+        if (!opts.big && !opts.force && Date.now() - lastShown.current < (cfg.cooldownSec || 0) * 1000) return;
+        lastShown.current = Date.now();
+        const src = opts.cfg || cfg;
+        const lines = (t.lines && t.lines.length) ? t.lines : ['おつかれさま！'];
+        const comment = opts.comment || lines[Math.floor(Math.random() * lines.length)];
+        if ((opts.confetti != null ? opts.confetti : (src.confetti !== false)) && (opts.big || key === 'lotComplete' || key === 'milestone')) mascotConfetti(opts.big);
+        if (src.sound) mascotBeep();
+        setToast({ emoji: opts.emoji || (opts.big ? '🏆' : (src.emoji || '🐣')), name: opts.name || src.name || 'ケンサくん', headline: opts.headline || '', comment, big: !!opts.big, position: opts.position || src.position || 'top' });
+        if (hideT.current) clearTimeout(hideT.current);
+        hideT.current = setTimeout(() => setToast(null), opts.big ? 6000 : 4200);
+    };
+    useEffect(() => {
+        const completed = new Set((lots || []).filter(l => l.status === 'completed' || l.location === 'completed').map(l => l.id));
+        const step = cfg.milestoneStep || 100;
+        if (seenRef.current === null) { seenRef.current = completed; msRef.current = Math.floor(totalUnits / step); ngRef.current = ngCount; return; }
+        let newly = 0; completed.forEach(id => { if (!seenRef.current.has(id)) newly++; }); seenRef.current = completed;
+        const mNow = Math.floor(totalUnits / step);
+        const hit = (msRef.current != null && mNow > msRef.current) ? mNow * step : null; msRef.current = mNow;
+        const ngUp = (ngRef.current != null && ngCount > ngRef.current); ngRef.current = ngCount;
+        if (hit) showRef.current('milestone', { big: true, headline: `通算 ${hit.toLocaleString()} 台 達成！` });
+        else if (newly > 0) showRef.current('lotComplete', { headline: 'ロット完了！' });
+        if (ngUp) showRef.current('ngFound');
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [lots, totalUnits, ngCount]);
+    useEffect(() => {
+        if (!enabled || cfg.triggers.dayStart?.on === false) return;
+        try { const today = new Date().toISOString().slice(0, 10); if (localStorage.getItem('mascotDay') !== today) { localStorage.setItem('mascotDay', today); const id = setTimeout(() => showRef.current('dayStart'), 900); return () => clearTimeout(id); } } catch (e) { /* noop */ }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [enabled]);
+    useEffect(() => {
+        if (encT.current) { clearInterval(encT.current); encT.current = null; }
+        if (enabled && cfg.triggers.encourage?.on) encT.current = setInterval(() => showRef.current('encourage'), Math.max(5, cfg.encourageMin || 20) * 60000);
+        return () => { if (encT.current) clearInterval(encT.current); };
+    }, [enabled, cfg.triggers.encourage?.on, cfg.encourageMin]);
+    useEffect(() => {
+        const h = (e) => { const d = e.detail || {}; showRef.current(d.key || 'lotComplete', d.opts || {}); };
+        window.addEventListener('mascotFire', h);
+        return () => window.removeEventListener('mascotFire', h);
+    }, []);
+    if (!toast) return null;
+    return (
+        <div className={`fixed left-1/2 -translate-x-1/2 z-[9999] pointer-events-none ${toast.position === 'bottom' ? 'bottom-6' : 'top-4'}`}>
+            <div className={`bg-white/95 backdrop-blur border-2 ${toast.big ? 'border-amber-400' : 'border-emerald-300'} rounded-2xl shadow-2xl px-5 py-3 flex items-center gap-3`}>
+                <span className="text-4xl animate-bounce" aria-hidden>{toast.emoji}</span>
+                <div className="min-w-0">
+                    {toast.headline && <div className={`font-black text-sm ${toast.big ? 'text-amber-600' : 'text-emerald-700'}`}>{toast.headline}</div>}
+                    <div className={toast.headline ? 'text-xs text-slate-500' : `font-black text-sm ${toast.big ? 'text-amber-600' : 'text-emerald-700'}`}>{toast.headline ? `${toast.name}「${toast.comment}」` : toast.comment}</div>
+                    {!toast.headline && <div className="text-[10px] text-slate-400">{toast.name}</div>}
+                </div>
+                {onSaveSettings && <button onClick={() => { onSaveSettings({ mascot: { ...cfg, enabled: false } }); setToast(null); }} className="pointer-events-auto text-[10px] text-slate-400 hover:text-slate-600 underline ml-1 self-start" title="マスコットをOFFにする(設定でいつでも戻せます)">OFF</button>}
+            </div>
+        </div>
+    );
+};
+const MascotSettingsPanel = ({ settings, onSave }) => {
+    const [draft, setDraft] = useState(() => mergeMascot(settings));
+    const [dirty, setDirty] = useState(false);
+    const set = (patch) => { setDraft(d => ({ ...d, ...patch })); setDirty(true); };
+    const setTrig = (key, patch) => { setDraft(d => ({ ...d, triggers: { ...d.triggers, [key]: { ...(d.triggers[key] || {}), ...patch } } })); setDirty(true); };
+    const save = () => { const clean = { ...draft, triggers: Object.fromEntries(Object.entries(draft.triggers).map(([k, v]) => [k, { ...v, lines: (v.lines || []).map(s => s.trim()).filter(Boolean) }])) }; onSave({ mascot: clean }); setDraft(clean); setDirty(false); };
+    const test = () => { const lc = draft.triggers.lotComplete || {}; window.dispatchEvent(new CustomEvent('mascotFire', { detail: { key: 'lotComplete', opts: { force: true, headline: 'テスト表示', cfg: draft, comment: (lc.lines && lc.lines[0]) || 'やっほー！' } } })); };
+    const MTog = ({ val, onChange }) => (<button type="button" onClick={() => onChange(!val)} className={`relative w-12 h-6 rounded-full transition-colors shrink-0 ${val ? 'bg-emerald-500' : 'bg-slate-300'}`}><span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${val ? 'translate-x-6' : ''}`} /></button>);
+    const enabled = draft.enabled !== false;
+    return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+            <div className="flex items-center justify-between gap-2 mb-1">
+                <h3 className="text-lg font-bold flex items-center gap-2 text-slate-800"><span className="text-2xl">{draft.emoji}</span> マスコット（{draft.name || 'ケンサくん'}）の設定</h3>
+                <MTog val={enabled} onChange={(v) => set({ enabled: v })} />
+            </div>
+            <p className="text-xs text-slate-500 mb-4">検査中に励ましてくれるマスコット。<b>いつ出るか・何を言うか・見た目</b>を細かく調整できます。うるさければトリガーを切るか、右上のスイッチでOFFに。</p>
+            <div className={enabled ? '' : 'opacity-40 pointer-events-none'}>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                    <div><label className="block text-xs font-bold text-slate-500 mb-1">名前</label><input value={draft.name} onChange={e => set({ name: e.target.value })} className="w-full border rounded p-2 text-sm" placeholder="ケンサくん" /></div>
+                    <div><label className="block text-xs font-bold text-slate-500 mb-1">出る位置</label><select value={draft.position} onChange={e => set({ position: e.target.value })} className="w-full border rounded p-2 text-sm"><option value="top">画面の上</option><option value="bottom">画面の下</option></select></div>
+                </div>
+                <div className="mb-3"><label className="block text-xs font-bold text-slate-500 mb-1">キャラクター</label><div className="flex flex-wrap gap-1.5">{MASCOT_EMOJIS.map(em => <button key={em} type="button" onClick={() => set({ emoji: em })} className={`text-2xl w-10 h-10 rounded-lg border ${draft.emoji === em ? 'border-emerald-500 bg-emerald-50 ring-2 ring-emerald-300' : 'border-slate-200 hover:bg-slate-50'}`}>{em}</button>)}</div></div>
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mb-4 text-sm">
+                    <label className="flex items-center gap-2"><MTog val={draft.confetti !== false} onChange={v => set({ confetti: v })} /> 紙吹雪</label>
+                    <label className="flex items-center gap-2"><MTog val={!!draft.sound} onChange={v => set({ sound: v })} /> 効果音</label>
+                    <label className="flex items-center gap-1 text-slate-600">連発防止 <input type="number" min="0" max="120" value={draft.cooldownSec} onChange={e => set({ cooldownSec: Math.max(0, Number(e.target.value) || 0) })} className="w-16 border rounded px-1 py-0.5" /> 秒あける</label>
+                    <label className="flex items-center gap-1 text-slate-600">キリ番 <input type="number" min="10" step="10" value={draft.milestoneStep} onChange={e => set({ milestoneStep: Math.max(10, Number(e.target.value) || 100) })} className="w-20 border rounded px-1 py-0.5" /> 台ごと</label>
+                </div>
+                <div className="border-t pt-3 space-y-2">
+                    <div className="text-sm font-bold text-slate-600">いつ出す？（それぞれON/OFF・セリフは1行に1つ・自由に編集）</div>
+                    {Object.keys(MASCOT_TRIGGER_LABELS).map(key => { const t = draft.triggers[key] || {}; return (
+                        <div key={key} className="border border-slate-200 rounded-lg p-2">
+                            <label className="flex items-center justify-between gap-2 cursor-pointer"><span className="text-sm font-bold text-slate-700">{MASCOT_TRIGGER_LABELS[key]}</span><MTog val={t.on !== false} onChange={v => setTrig(key, { on: v })} /></label>
+                            {t.on !== false && <textarea value={(t.lines || []).join('\n')} onChange={e => setTrig(key, { lines: e.target.value.split('\n') })} rows={Math.min(7, Math.max(2, (t.lines || []).length + 1))} className="w-full border border-slate-200 rounded p-1.5 text-xs mt-1" placeholder="言ってほしいセリフを1行に1つ" />}
+                        </div>
+                    ); })}
+                </div>
+            </div>
+            <div className="flex items-center gap-2 mt-4">
+                <button onClick={test} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold border">▶ テスト表示</button>
+                <button onClick={save} disabled={!dirty} className={`ml-auto px-6 py-1.5 rounded-lg text-white text-sm font-bold ${dirty ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-slate-300 cursor-not-allowed'}`}>{dirty ? '保存する' : '保存済み'}</button>
+            </div>
+        </div>
+    );
+};
+
+export default function App() {
    // State: Current User (端末使用者)
    const [currentUserName, setCurrentUserName] = useState(() => {
      try { return localStorage.getItem('currentUserName') || ''; } catch { return ''; }
@@ -26859,8 +27633,55 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    }, [lots]);
    const [templates, setTemplates] = useState([]);
    const [workers, setWorkers] = useState([]);
+   const [controllers, setControllers] = useState([]); // 制御装置(号機)マスタ
+   const [orderMotors, setOrderMotors] = useState([]); // 指図別モーター登録(検査リスト非依存・取り合い分析用の全製品)
+   const [motorLedger, setMotorLedger] = useState([]); // 型式↔モーター↔号機↔指図↔日付の実績台帳(別枠DB。全削除でも消えない)
+   const [spareMotors, setSpareMotors] = useState([]); // 社内の仮モーター在庫(検査G/組立Gが持つ予備モーター)
    const [logs, setLogs] = useState([]);
    const [settings, setSettings] = useState({ mapImage: null, mapZones: INITIAL_MAP_ZONES, defectProcessOptions: DEFAULT_DEFECT_PROCESS_OPTIONS, breakAlerts: [], complaintOptions: DEFAULT_COMPLAINT_OPTIONS, customTargetTimes: {}, targetTimeHistory: [], customLayouts: {}, measurementOverrides: {} });
+
+   // ── 制御装置(号機)の割当を1回だけ計算し、指図→推奨号機の要約マップ(cdByOrder)を作る。
+   //    カードバッジ(検査リスト)と準備カード(作業画面)で共用。source=order_motors(＝管理者の取り合いガントと同一＝表示ズレなし)。
+   const cdNormCtls = useMemo(() => (controllers || []).map(c => ({ ...CD.normController(c), id: c.id })), [controllers]);
+   const cdMotorSpecs = useMemo(() => CD.withInheritedTiltUnits(Array.isArray(settings.controlMotorSpecs) ? settings.controlMotorSpecs : []), [settings.controlMotorSpecs]);
+   const cdDueByOrder = useMemo(() => { const m = {}; for (const l of (lots || [])) { const o = String(l.orderNo || '').trim(); if (o && l.dueDate && !m[o]) m[o] = l.dueDate; } return m; }, [lots]);
+   const cdAllocItems = useMemo(() => (orderMotors || []).filter(om => String(om.orderNo || '').trim()).map(om => ({
+     id: 'om:' + om.orderNo, orderNo: om.orderNo, model: om.model || '', quantity: om.quantity || 1,
+     dueDate: om.dueDate || cdDueByOrder[String(om.orderNo)] || '',
+     controlSpec: { axes: Array.isArray(om.axes) ? om.axes : [] },
+   })), [orderMotors, cdDueByOrder]);
+   const cdAlloc = useMemo(() => CD.buildAllocation(cdAllocItems, cdNormCtls, {
+     leadDays: Number.isFinite(Number(settings.controlDeviceLeadDays)) ? Number(settings.controlDeviceLeadDays) : 3,
+     motorSpecs: cdMotorSpecs,
+     dAmpExceptions: Array.isArray(settings.controlDAmpExceptions) ? settings.controlDAmpExceptions : CD.DEFAULT_DAMP_EXCEPTIONS,
+     motorOverrides: Array.isArray(settings.motorOverrides) ? settings.motorOverrides : [],
+     includeCompleted: true,
+   }), [cdAllocItems, cdNormCtls, cdMotorSpecs, settings.controlDeviceLeadDays, settings.controlDAmpExceptions, settings.motorOverrides]);
+   const cdLedgerOpts = useMemo(() => ({ motorSpecs: cdMotorSpecs, dAmpExceptions: Array.isArray(settings.controlDAmpExceptions) ? settings.controlDAmpExceptions : CD.DEFAULT_DAMP_EXCEPTIONS, motorOverrides: Array.isArray(settings.motorOverrides) ? settings.motorOverrides : [] }), [cdMotorSpecs, settings.controlDAmpExceptions, settings.motorOverrides]);
+   const cdByOrder = useMemo(() => {
+     const m = {};
+     for (const it of cdAllocItems) {
+       const s = CD.summarizeOrderAllocation(cdAlloc, it.orderNo, cdNormCtls);
+       if (!s) continue;
+       if (spareMotors.length) { const attach = (ax) => { ax.spareCandidates = CD.inHouseSparesForMotor(spareMotors, s.model, ax.model, cdNormCtls, cdLedgerOpts); }; (s.perAxis || []).forEach(attach); (s.unmetAxes || []).forEach(attach); }
+       m[String(it.orderNo)] = s;
+     }
+     return m;
+   }, [cdAlloc, cdAllocItems, cdNormCtls, spareMotors, cdLedgerOpts]);
+   // ── 実績台帳(motor_ledger)を型式→最新実績にまとめる。モーター未登録の指図で「過去にこのモーター/号機で回した」＋社内の仮モーターで回せるを出す。
+   const cdHistoryByModel = useMemo(() => {
+     const byModel = {}; const key = (s) => String(s || '').trim();
+     const recs = [...(motorLedger || [])].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+     for (const r of recs) {
+       const m = key(r.model); if (!m || byModel[m]) continue;
+       if (!Array.isArray(r.axes) || !r.axes.length) continue;
+       byModel[m] = {
+         model: r.model, orderNo: r.orderNo, date: r.date, usedUnits: Array.isArray(r.usedUnits) ? r.usedUnits : [],
+         motorAxes: r.axes.map(a => ({ ...a, usableUnits: CD.usableUnitsForMotor(cdNormCtls, r.model, a.motorModel, cdLedgerOpts), spareCandidates: CD.inHouseSparesForMotor(spareMotors, r.model, a.motorModel, cdNormCtls, cdLedgerOpts) })),
+       };
+     }
+     return byModel;
+   }, [motorLedger, cdNormCtls, cdLedgerOpts, spareMotors]);
 
    // State: Break Alert
    const [showBreakAlert, setShowBreakAlert] = useState(null);
@@ -26987,19 +27808,50 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      analysis: [
        { id: 'analysis', label: '分析', icon: BarChart3 },
        { id: 'optimize', label: '作業最適化', icon: Zap },
+       { id: 'control-devices', label: '制御装置', icon: Cpu },
      ],
      templates: [
        { id: 'templates', label: 'マスタ設定', icon: Settings },
        { id: 'template-mgr', label: '工程テンプレート', icon: ClipboardList },
        { id: 'measurement-settings', label: '測定設定', icon: Ruler },
+       { id: 'quality-standards', label: '品質規格マスタ', icon: ClipboardCheck },
      ],
    };
-   const TAB_PARENT = { inspection: 'inspection', history: 'inspection', analysis: 'analysis', optimize: 'analysis', templates: 'templates', 'template-mgr': 'templates', 'measurement-settings': 'templates' };
+   const TAB_PARENT = { inspection: 'inspection', history: 'inspection', analysis: 'analysis', optimize: 'analysis', 'control-devices': 'analysis', templates: 'templates', 'template-mgr': 'templates', 'measurement-settings': 'templates', 'quality-standards': 'templates' };
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
    const [showLotModal, setShowLotModal] = useState(false);
    const [lotFormQty, setLotFormQty] = useState(1);
+   // 新規ロット登録モーダルのモーター(制御装置割当用)入力。軸ごと {model,capacity,voltage,batteryless,dAmpManual}
+   const [lotMotorAxes, setLotMotorAxes] = useState([]);
+   const [lotFormModel, setLotFormModel] = useState(''); // 型式→モーター自動提案の判定用(model入力のミラー)
+   // controlSpec.axes ⇄ エディタ行 の相互変換
+   //   旧式の単一モーター形 {model,capacity,dd,...}(axes無し)も1行として読む=編集保存で消さないため。
+   const controlSpecToAxes = (spec) => {
+     const raw = (spec && Array.isArray(spec.axes)) ? spec.axes : ((spec && spec.model) ? [spec] : []);
+     const specsForHit = Array.isArray(settings.controlMotorSpecs) ? settings.controlMotorSpecs : [];
+     return raw.map(a => ({
+       model: a.model || '', capacity: a.capacity || '', voltage: a.voltage || '',
+       batteryless: !!a.batteryless,
+       // D駆動((D)ｱﾝﾌﾟ=号機32/35)の手動フラグ。レガシー a.dd=true は「直駆動(Dis/DD表)でなければ旧UIのD駆動チェックの意図」として引き継ぐ。
+       dAmpManual: a.dAmp != null ? !!a.dAmp
+         : ((specsForHit.length && a.dd === true && !CD.isDD(a.model) && !CD.findMotorSpecByModel(a.model, specsForHit)) ? true : null), // specs未ロード中は再解釈を保留(誤dAmp化して保存しない)
+     }));
+   };
+   const axesToControlSpecAxes = (axes) => (axes || [])
+     // 型式/容量が無くても 400V/BL/D駆動 のフラグだけの軸は要求として残す(黙って消さない)。
+     .filter(a => (a.model || '').trim() || a.capacity || a.batteryless || a.dAmpManual === true || CD.is400V(a.voltage))
+     .map((a, i) => ({
+       model: (a.model || '').trim(),
+       capacity: a.capacity || undefined,
+       voltage: a.voltage || undefined,
+       dAmp: a.dAmpManual != null ? a.dAmpManual : undefined, // (D)ｱﾝﾌﾟ必須。直駆動(dd)は型式/DD表から自動判定のため保存しない
+       batteryless: a.batteryless || undefined,
+       label: a.label || `軸${i + 1}`,
+     }));
+   // 傾斜軸「(記載なし)」は回転軸のunitsを継承(新規ロット登録の型式→候補提案にも反映)。
+   const lotMotorSpecs = CD.withInheritedTiltUnits(Array.isArray(settings.controlMotorSpecs) ? settings.controlMotorSpecs : []);
    const [showAnomalyPanel, setShowAnomalyPanel] = useState(false);
    // 「❓使い方」マニュアル
    const [showHelp, setShowHelp] = useState(false);
@@ -27013,6 +27865,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const lotExcelInputRef = useRef(null);
    const excelInputRef = useRef(null);
    const backupInputRef = useRef(null);
+   const allTplInputRef = useRef(null);
    const progressMgmtInputRef = useRef(null);
    const [progressImportPreview, setProgressImportPreview] = useState(null);  // 工機進捗管理表 取込プレビュー結果
  
@@ -27156,6 +28009,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setTemplates(data);
         }),
+       onSnapshot(getPath('controllers'), (snap) => setControllers(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('order_motors'), (snap) => setOrderMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('motor_ledger'), (snap) => setMotorLedger(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('spare_motors'), (snap) => setSpareMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('workers'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setWorkers(data);
@@ -27212,24 +28069,32 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    }, [settings.imageQuality]);
 
    // --- Break Alert Timer ---
+   const breakWindowRef = useRef(null);    // 現在の表示窓に入っている休憩アラートの id
+   const dismissedBreakRef = useRef(null); // ×で閉じたアラートの id (同じ窓では再表示しない)
    useEffect(() => {
      const breakAlerts = settings.breakAlerts || [];
      const checkAlerts = () => {
        const now = new Date();
-       const currentHour = now.getHours();
-       const currentMinute = now.getMinutes();
+       const nowMin = now.getHours() * 60 + now.getMinutes();
+       // 表示窓 = [休憩時刻の10分前 〜 休憩時刻の3分後]。窓を過ぎたら自動で消す。
+       let active = null;
        breakAlerts.forEach(alert => {
-         if (!alert.enabled) return;
-         const [alertHour, alertMinute] = alert.time.split(':').map(Number);
-         let targetHour = alertHour;
-         let targetMinute = alertMinute - 10;
-         if (targetMinute < 0) { targetMinute += 60; targetHour -= 1; }
-         if (currentHour === targetHour && currentMinute === targetMinute) {
-           setShowBreakAlert(alert.message);
-         }
+         if (!alert.enabled || !alert.time) return;
+         const [h, m] = alert.time.split(':').map(Number);
+         const base = h * 60 + m;
+         const diff = ((nowMin - base) % 1440 + 1440) % 1440; if (diff <= 3 || diff >= 1430) active = alert;
        });
+       if (active) {
+         breakWindowRef.current = active.id;
+         if (dismissedBreakRef.current === active.id) return; // 閉じられたので再表示しない
+         setShowBreakAlert(active.message);
+       } else {
+         breakWindowRef.current = null;
+         dismissedBreakRef.current = null; // 窓を抜けたらリセット
+         setShowBreakAlert(prev => (prev ? null : prev));
+       }
      };
-     const interval = setInterval(checkAlerts, 60000);
+     const interval = setInterval(checkAlerts, 30000);
      checkAlerts();
      return () => clearInterval(interval);
    }, [settings.breakAlerts]);
@@ -27445,10 +28310,10 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
 
          ws.eachRow((row, rowNumber) => {
              if (rowNumber < startRow) return;
-             let title, desc, targetTime, type, lotOnce, executionMode;
+             let title, desc, targetTime, type, lotOnce, executionMode, srcId;
 
              if (isNewFormat) {
-               // Download format: B=工程名, C=作業内容, D=目標時間, E=種別, F=段取り(ロット1回), G=実行モード
+               // Download format: B=工程名, C=作業内容, D=目標時間, E=種別, F=段取り(ロット1回), G=実行モード, I=工程ID
                title = row.getCell(2).value?.toString();
                desc = row.getCell(3).value?.toString() || '';
                const rawTime = row.getCell(4).value;
@@ -27459,6 +28324,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                lotOnce = /^(○|◯|✓|はい|yes|true|1|y)$/i.test(f);
                const g = (row.getCell(7).value?.toString() || '').trim();
                executionMode = /自動|batch/i.test(g) ? 'batch' : 'manual';
+               srcId = (row.getCell(9).value?.toString() || '').trim();
              } else {
                // Legacy format: E=title, F=description
                title = row.getCell(5).value?.toString();
@@ -27477,11 +28343,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                      images: imageMap.get(rowNumber) || []
                  };
                  if (isNewFormat) { st.lotOnce = lotOnce; st.executionMode = executionMode; }
+                 if (srcId) st.__srcId = srcId; // 工程ID列(高度設定引き継ぎの目印・保存前に除去)
                  newSteps.push(st);
              }
          });
 
          if (newSteps.length > 0) {
+             // 保存用に目印(__srcId)を除去したクリーンな工程配列(新規作成パス用)
+             const cleanSteps = newSteps.map(({ __srcId, ...r }) => r);
              // Same name exists - offer update or copy
              const existing = templates.find(t => t.name === importedTitle);
              if (existing) {
@@ -27489,10 +28358,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  '「' + importedTitle + '」は既に存在します。\n上書き更新しますか？\n（キャンセルで新規コピー作成）'
                );
                if (overwrite) {
-                 // 既存工程の高度な設定(機械占有/測定詳細/チェック項目/PDF/rotary等)と画像を保持し、Excelで編集した項目だけ上書き。
-                 //   行の並べ替えに強いよう、まず同名の既存工程を母体に、無ければ同じ位置の既存工程を使う。
+                 // 既存工程の高度な設定(機械占有/測定詳細/チェック項目/PDF/rotary/じっと見る要素等)と画像を保持し、Excelで編集した項目だけ上書き。
+                 //   ①工程ID(__srcId)一致 ②同名 ③同位置 の順で母体を特定。名前変更・並べ替えでも設定を引き継ぐ。
                  const mergedSteps = newSteps.map((ns, i) => {
-                   const orig = (existing.steps || []).find(s => s.title === ns.title) || (existing.steps || [])[i] || {};
+                   const orig = (ns.__srcId ? (existing.steps || []).find(s => s.id === ns.__srcId) : null)
+                             || (existing.steps || []).find(s => s.title === ns.title)
+                             || (existing.steps || [])[i] || {};
                    return {
                      ...orig,
                      id: orig.id || ns.id,
@@ -27506,12 +28377,12 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  alert('「' + importedTitle + '」を更新しました (' + mergedSteps.length + '工程)');
                } else {
                  const id = generateId();
-                 saveData('templates', id, { id, name: importedTitle + ' (コピー)', steps: newSteps });
+                 saveData('templates', id, { id, name: importedTitle + ' (コピー)', steps: cleanSteps });
                  alert('「' + importedTitle + ' (コピー)」を新規作成しました');
                }
              } else {
                const id = generateId();
-               saveData('templates', id, { id, name: importedTitle, steps: newSteps });
+               saveData('templates', id, { id, name: importedTitle, steps: cleanSteps });
                alert('「' + importedTitle + '」を取り込みました (' + newSteps.length + '工程)');
              }
          } else {
@@ -27536,20 +28407,20 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const allBorder = { top: thin, bottom: thin, left: thin, right: thin };
 
        // Row 1: Template name (A1, merged)
-       ws.mergeCells('A1:H1');
+       ws.mergeCells('A1:I1');
        const titleCell = ws.getCell('A1');
        titleCell.value = template.name || 'テンプレート';
        titleCell.font = { bold: true, size: 16 };
        titleCell.alignment = { vertical: 'middle' };
 
        // Row 2: Instructions
-       ws.mergeCells('A2:H2');
-       ws.getCell('A2').value = '※ この行以下を編集→保存→「Excel取込」で反映。行の追加/削除/並べ替え可。種別=normal/important/danger/measurement。段取り=ロット1回なら○。実行モード=手動 または 自動(バッチ)。画像・測定詳細・チェック項目・機械占有はアプリ側の設定を保持します(Excelでは編集しません)。';
+       ws.mergeCells('A2:I2');
+       ws.getCell('A2').value = '※ この行以下を編集→保存→「Excel取込」で反映。行の追加/削除/並べ替え可。種別=normal/important/danger/measurement。段取り=ロット1回なら○。実行モード=手動 または 自動(バッチ)。画像・測定詳細・チェック項目・機械占有・じっと見る要素はアプリ側の設定を保持します(Excelでは編集しません)。※ 工程ID列は消さないでください(名前変更・並べ替えても設定を引き継ぐ目印です)。新規行はID空欄でOK。';
        ws.getCell('A2').font = { italic: true, size: 9, color: { argb: 'FF666666' } };
        ws.getRow(2).height = 28; ws.getCell('A2').alignment = { vertical: 'middle', wrapText: true };
 
        // Row 3: Headers
-       const headers = ['No.', '工程名', '作業内容/注意事項', '目標時間(秒)', '種別', '段取り(ロット1回)', '実行モード', '画像枚数'];
+       const headers = ['No.', '工程名', '作業内容/注意事項', '目標時間(秒)', '種別', '段取り(ロット1回)', '実行モード', '画像枚数', '工程ID(変更しない)'];
        const headerRow = ws.getRow(3);
        headers.forEach((h, i) => {
          const cell = headerRow.getCell(i + 1);
@@ -27569,6 +28440,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        ws.getColumn(6).width = 14;
        ws.getColumn(7).width = 13;
        ws.getColumn(8).width = 10;
+       ws.getColumn(9).width = 16;
 
        // Row 4+: Step data with embedded images
        for (let idx = 0; idx < template.steps.length; idx++) {
@@ -27589,7 +28461,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            row.getCell(8).font = { color: { argb: 'FF2563EB' } };
          }
 
-         // Embed first image per step into column I (参考表示)
+         // 工程ID(変更しない): 名前変更・並べ替えでも高度設定を引き継ぐための目印
+         row.getCell(9).value = step.id || '';
+         row.getCell(9).font = { size: 8, color: { argb: 'FF999999' } };
+
+         // Embed first image per step into column J (参考表示)
          if (step.images && step.images.length > 0) {
            try {
              const imgData = step.images[0];
@@ -27598,16 +28474,16 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              if (base64Only) {
                const imageId = wb.addImage({ base64: base64Only, extension: ext });
                ws.addImage(imageId, {
-                 tl: { col: 8, row: rowNum - 1 },
+                 tl: { col: 9, row: rowNum - 1 },
                  ext: { width: 120, height: 90 }
                });
                row.height = 72;
-               if (!ws.getColumn(9).width || ws.getColumn(9).width < 18) ws.getColumn(9).width = 18;
+               if (!ws.getColumn(10).width || ws.getColumn(10).width < 18) ws.getColumn(10).width = 18;
              }
            } catch (imgErr) { /* skip broken image */ }
          }
 
-         for (let c = 1; c <= 8; c++) {
+         for (let c = 1; c <= 9; c++) {
            row.getCell(c).border = allBorder;
            row.getCell(c).alignment = { vertical: 'middle', wrapText: c === 3 };
          }
@@ -27623,6 +28499,131 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        console.error(err);
        alert('Excelファイルの生成に失敗しました');
      }
+   };
+
+   // 1c. 全テンプレまとめて Excel ダウンロード (1シート・1行=1工程・テンプレIDでグループ)
+   const TPL_CHK_COLS = 10; // チェック項目の列数(最大10)
+   const tplResLabel = (wr) => wr === 'measurement-machine' ? '測定機占有' : (wr === 'jig-shared' ? '治具占有' : (wr || ''));
+   const tplResValue = (l) => { const s = (l || '').trim(); if (/測定機/.test(s)) return 'measurement-machine'; if (/治具/.test(s)) return 'jig-shared'; return s; };
+   const handleAllTemplatesDownload = async () => {
+     try {
+       const ExcelJS = await loadExcelJS();
+       const wb = new ExcelJS.Workbook();
+       const ws = wb.addWorksheet('全テンプレート');
+       const thin = { style: 'thin', color: { argb: 'FF000000' } };
+       const bd = { top: thin, bottom: thin, left: thin, right: thin };
+       const headers = ['テンプレID', 'テンプレ名', '工程ID', 'No', '工程名', '作業内容/注意事項', '目標時間(秒)', '種別', '段取り(ロット1回)', '実行モード', '占有リソース', '自動終了(秒)', ...Array.from({ length: TPL_CHK_COLS }, (_, i) => `チェック項目${i + 1}`), '画像枚数(参考)'];
+       const NC = headers.length;
+       ws.mergeCells(1, 1, 1, NC);
+       const t1 = ws.getCell('A1'); t1.value = '全テンプレート一覧（まとめて編集用）'; t1.font = { bold: true, size: 14 };
+       ws.mergeCells(2, 1, 2, NC);
+       const t2 = ws.getCell('A2');
+       t2.value = '※この行より下を編集→「まとめて取込」で反映。●テンプレID/工程IDは変更しない(空欄=新規追加)。●同じテンプレIDの行が1つのテンプレの工程群。新規テンプレはテンプレID空欄+同じテンプレ名を複数行。●種別=normal/important/danger/measurement。段取り=○。実行モード=手動/自動。●チェック項目は先頭★で必須(最大10)。●測定図の詳細/画像/PDFはアプリ側で保持(ここでは編集しません)。●Excelから消したテンプレは削除されません(削除は一覧のゴミ箱で)。';
+       t2.font = { italic: true, size: 9, color: { argb: 'FF666666' } }; ws.getRow(2).height = 54; t2.alignment = { vertical: 'middle', wrapText: true };
+       const hr = ws.getRow(3);
+       headers.forEach((h, i) => { const c = hr.getCell(i + 1); c.value = h; c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } }; c.border = bd; c.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true }; });
+       const widths = [16, 24, 14, 5, 26, 40, 12, 13, 14, 13, 14, 12, ...Array(TPL_CHK_COLS).fill(18), 11];
+       widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+       let r = 4;
+       const sorted = [...templates].sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ja'));
+       sorted.forEach(tpl => {
+         const steps = tpl.steps || [];
+         const emit = (s, idx) => {
+           const row = ws.getRow(r);
+           row.getCell(1).value = tpl.id || '';
+           row.getCell(2).value = tpl.name || '';
+           row.getCell(3).value = s ? (s.id || '') : '';
+           row.getCell(4).value = s ? (idx + 1) : '';
+           row.getCell(5).value = s ? (s.title || '') : '';
+           row.getCell(6).value = s ? (s.description || '') : '';
+           row.getCell(7).value = s ? (s.targetTime || 0) : '';
+           row.getCell(8).value = s ? (s.type || 'normal') : '';
+           row.getCell(9).value = s && s.lotOnce ? '○' : '';
+           row.getCell(10).value = s ? (s.executionMode === 'batch' ? '自動(バッチ)' : '手動') : '';
+           row.getCell(11).value = s ? tplResLabel(s.workResource) : '';
+           row.getCell(12).value = s && s.autoEndEnabled && s.autoEndSec ? s.autoEndSec : '';
+           const chk = (s && s.checklistItems) || [];
+           for (let i = 0; i < TPL_CHK_COLS; i++) { const it = chk[i]; row.getCell(13 + i).value = it ? ((it.required ? '★' : '') + (it.label || '')) : ''; }
+           row.getCell(13 + TPL_CHK_COLS).value = s ? (s.images ? s.images.length : 0) : '';
+           for (let c = 1; c <= NC; c++) { row.getCell(c).border = bd; row.getCell(c).alignment = { vertical: 'middle', wrapText: c === 6 }; }
+           r++;
+         };
+         if (steps.length) steps.forEach((s, i) => emit(s, i)); else emit(null, 0);
+       });
+       const buf = await wb.xlsx.writeBuffer();
+       const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+       const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = '全テンプレート一覧.xlsx'; a.click();
+     } catch (err) { console.error(err); alert('全テンプレExcelの生成に失敗しました: ' + (err && err.message || err)); }
+   };
+
+   // 1d. 全テンプレまとめて Excel 取込 (グループ→upsert・非編集項目は工程IDで保持・削除はしない)
+   const handleAllTemplatesImport = async (e) => {
+     const file = e.target.files?.[0];
+     if (!file) { return; }
+     try {
+       const ExcelJS = await loadExcelJS();
+       const wb = new ExcelJS.Workbook();
+       await wb.xlsx.load(file);
+       const ws = wb.getWorksheet(1);
+       if (!ws) throw new Error('シートが見つかりません');
+       const cellTxt = (cell) => { const v = cell == null ? null : cell.value; if (v == null) return ''; if (typeof v === 'object') { if (v.text != null) return String(v.text); if (v.result != null) return String(v.result); if (Array.isArray(v.richText)) return v.richText.map(t => t.text).join(''); if (v.hyperlink) return String(v.text || v.hyperlink); return ''; } return String(v); };
+       const recs = [];
+       ws.eachRow((row, idx) => {
+         if (idx < 4) return;
+         const g = (c) => cellTxt(row.getCell(c)).trim();
+         const rec = { tplId: g(1), tplName: g(2), stepId: g(3), title: g(5), description: cellTxt(row.getCell(6)), targetTime: parseInt(g(7)) || 0, type: (g(8) || 'normal'), lotOnce: /^(○|◯|✓|はい|yes|true|1|y)$/i.test(g(9)), execMode: /自動|batch/i.test(g(10)) ? 'batch' : 'manual', res: g(11), autoEndSec: parseInt(g(12)) || 0, chk: [] };
+         for (let i = 0; i < TPL_CHK_COLS; i++) { const raw = g(13 + i); if (raw) { const required = /^[★*]/.test(raw); rec.chk.push({ label: raw.replace(/^[★*]\s*/, ''), required }); } }
+         if (!rec.tplId && !rec.tplName && !rec.title) return; // 空行
+         recs.push(rec);
+       });
+       if (!recs.length) { alert('有効なデータが見つかりませんでした（4行目以降を確認）'); e.target.value = ''; return; }
+       // テンプレ単位にグループ (IDあり=既存/ID空=テンプレ名で新規)
+       const groups = new Map();
+       recs.forEach(rec => {
+         const key = rec.tplId ? ('ID::' + rec.tplId) : ('NEW::' + (rec.tplName || '無題'));
+         if (!groups.has(key)) groups.set(key, { tplId: rec.tplId, tplName: rec.tplName, recs: [] });
+         const grp = groups.get(key); if (!grp.tplName && rec.tplName) grp.tplName = rec.tplName; grp.recs.push(rec);
+       });
+       let created = 0, updated = 0; const ops = [];
+       groups.forEach(grp => {
+         const existing = grp.tplId ? templates.find(t => t.id === grp.tplId) : null;
+         const templateId = grp.tplId || generateId();
+         const name = grp.tplName || (existing && existing.name) || '無題テンプレート';
+         const _seenIds = new Set();
+         const steps = grp.recs.filter(rec => rec.title && rec.title.trim()).map(rec => {
+           // 工程IDで既存stepを引く。別テンプレへ移動した行でも全テンプレ横断で探し、高度設定(observationElements/measurementConfig等)を保持。
+           let orig = rec.stepId ? ((existing && (existing.steps || []).find(s => s.id === rec.stepId)) || (templates || []).map(t => (t.steps || []).find(s => s.id === rec.stepId)).find(Boolean)) : null;
+           // 工程IDが空でも、同テンプレ内に同名工程が1つだけあれば母体として継承(measurementConfig/observation等の消失を防ぐ)
+           if (!orig && existing && rec.title && rec.title.trim()) { const _cand = (existing.steps || []).filter(s => (s.title || '').trim() === rec.title.trim()); if (_cand.length === 1) orig = _cand[0]; }
+           const base = orig ? { ...orig } : {};
+           const chkItems = rec.chk.map((c, ci) => ({ id: (orig && orig.checklistItems && orig.checklistItems[ci] && orig.checklistItems[ci].id) || generateId(), label: c.label, required: !!c.required }));
+           let _sid = (orig && orig.id) || rec.stepId || generateId();
+           if (_seenIds.has(_sid)) _sid = generateId();
+           _seenIds.add(_sid);
+           const st = {
+             ...base,
+             id: _sid,
+             title: rec.title.trim(),
+             description: rec.description || '',
+             targetTime: rec.targetTime,
+             type: ['normal', 'important', 'danger', 'measurement'].includes(rec.type) ? rec.type : 'normal',
+             lotOnce: rec.lotOnce,
+             executionMode: rec.execMode,
+             workResource: tplResValue(rec.res),
+             checklistItems: chkItems,
+           };
+           if (rec.autoEndSec > 0) { st.autoEndEnabled = true; st.autoEndSec = rec.autoEndSec; } else { st.autoEndEnabled = false; }
+           return st;
+         });
+         const doc = { id: templateId, name, steps, overview: (existing && existing.overview) || null, createdAt: (existing && existing.createdAt) || Date.now(), updatedAt: Date.now() };
+         ops.push([templateId, doc]);
+         if (existing) updated++; else created++;
+       });
+       if (!window.confirm(`まとめて反映します。\n新規テンプレ: ${created}件 / 更新: ${updated}件\n（工程ID空=新規工程、テンプレID空=新規テンプレとして登録。Excelに無いテンプレは削除しません）\nよろしいですか？`)) { e.target.value = ''; return; }
+       for (const [id, doc] of ops) { await saveData('templates', id, doc); }
+       alert(`反映しました（新規${created}件・更新${updated}件）`);
+     } catch (err) { console.error(err); alert('まとめて取込に失敗しました: ' + (err && err.message || err)); }
+     e.target.value = '';
    };
 
    // 2. Backup Export
@@ -27660,6 +28661,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
  
    const handleAddLot = async (formData) => {
      const { model, orderNo, quantity, templateId, priority, dueDate, entryAt } = formData;
+
+     // モーター(制御装置割当用): モーダルの lotMotorAxes → controlSpec。
+     //   新規で未入力なら controlSpec は付けない。編集で全消しなら {axes:[]} でクリア。既存 leadDays は保持。
+     const _motorAxes = axesToControlSpecAxes(lotMotorAxes);
+     const _prevLead = editingLot && editingLot.controlSpec && editingLot.controlSpec.leadDays;
+     let _controlSpec = null;
+     if (_motorAxes.length) _controlSpec = { axes: _motorAxes, ...(_prevLead != null ? { leadDays: _prevLead } : {}) };
+     else if (editingLot && editingLot.controlSpec) _controlSpec = { axes: [], ...(_prevLead != null ? { leadDays: _prevLead } : {}) };
 
      // 柔軟な日付パース: "2026/5/15" や "2026-5-15" → "2026-05-15"
      // 不正な値はそのまま (空 → null)。途中で alert 出さない (フォームのバリデーション任せ)
@@ -27752,6 +28761,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
         const updates = {
           model, orderNo, priority, dueDate: parsedDueDate || '', quantity: qty,
           entryAt: entryTimestamp, unitSerialNumbers: serials,
+          ...(_controlSpec ? { controlSpec: _controlSpec } : {}),
         };
         // テンプレを変えていなくて、かつ作業中なら steps は触らない
         if (preserveSteps && !templateChanged) {
@@ -27778,6 +28788,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
             serialNo: `${orderNo}`,
             quantity: qty,
             unitSerialNumbers: serials,
+            ...(_controlSpec ? { controlSpec: _controlSpec } : {}),
             templateId, priority: priority || 'normal',
             dueDate: parsedDueDate || '',
             entryAt: entryTimestamp,
@@ -27812,7 +28823,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      // 「規格状態」列 (B) と「テンプレ名 (自動)」列 (F) を挿入。
      // ・規格状態 (B): 型式の隣で一目で状態が分かる
      // ・テンプレ名 (F): テンプレートID を選んだら自動で表示。手入力不要
-     const headers = ['型式', '規格状態 (自動)', '指図番号', '台数', 'テンプレートID', 'テンプレ名 (自動)', '優先度', '納期', '入庫日時', '機番1', '機番2', '機番3', '機番4', '機番5', '機番6', '機番7', '機番8', '機番9', '機番10'];
+     const headers = ['型式', '規格状態 (自動)', '指図番号', '台数', 'テンプレートID', 'テンプレ名 (自動)', '優先度', '納期', '入庫日時', '機番1', '機番2', '機番3', '機番4', '機番5', '機番6', '機番7', '機番8', '機番9', '機番10', 'モーター型式1', '容量1', 'モーター型式2', '容量2'];
      ws.addRow(headers);
      const headerRow = ws.getRow(1);
      headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -27985,14 +28996,21 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            lot.dueDate || '',
            lot.entryAt ? (() => { const d = new Date(lot.entryAt); return `${localYMD(d)} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; })() : ''
          ];
-         for (let i = 0; i < (lot.quantity || 1); i++) row.push(lot.unitSerialNumbers?.[i] || `#${i+1}`);
+         // 機番は常に10枠ぶん埋めて(不足は空欄)、モーター列(T列〜)の位置を固定する
+         for (let i = 0; i < 10; i++) row.push(i < (lot.quantity || 1) ? (lot.unitSerialNumbers?.[i] || `#${i + 1}`) : '');
+         // モーター(制御装置割当用) 2軸ぶんを現状値で埋める(往復編集できるように)
+         const _ax = (lot.controlSpec && Array.isArray(lot.controlSpec.axes)) ? lot.controlSpec.axes : [];
+         row.push(_ax[0]?.model || '', _ax[0]?.capacity || '', _ax[1]?.model || '', _ax[1]?.capacity || '');
          ws.addRow(row);
          // テンプレートID セルにドロップダウン付与 (この行の型式に応じた候補)
          applyTemplateDropdown(ws.getCell(`E${rowIdx}`), lot.model);
        });
      } else {
-       // サンプル行
-       ws.addRow(['A-100', lookupFormula(2), 'M-001', 2, templates[0]?.id || 'demo', templateNameFormula(2), '通常', '2026-04-01', '', 'SN-001', 'SN-002']);
+       // サンプル行 (機番を10枠に揃えてからモーター例を付ける)
+       const sampleRow = ['A-100', lookupFormula(2), 'M-001', 2, templates[0]?.id || 'demo', templateNameFormula(2), '通常', '2026-04-01', '', 'SN-001', 'SN-002'];
+       while (sampleRow.length < 19) sampleRow.push('');
+       sampleRow.push('αiS22/4000HV', '80A', 'Dis 150/300', '80A'); // 回転軸/傾斜軸の例
+       ws.addRow(sampleRow);
        applyTemplateDropdown(ws.getCell('E2'), 'A-100');
      }
 
@@ -28076,6 +29094,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        if (i === 4) return { width: 18 };       // テンプレートID
        if (i === 5) return { width: 28 };       // テンプレ名 (自動) - テンプレ名は長め
        if (i < 9) return { width: 14 };         // 指図〜入庫日時
+       if (typeof h === 'string' && h.startsWith('モーター型式')) return { width: 20 }; // モーター型式
+       if (h === '容量1' || h === '容量2') return { width: 8 };
        return { width: 12 };                     // 機番
      });
 
@@ -28092,6 +29112,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
      ws.addRow(['※ 納期: yyyy-mm-dd 形式（空欄可）']);
      ws.addRow(['※ 入庫日時: yyyy-mm-dd HH:MM 形式 / 空欄可（空欄=納期の3日前 08:30、納期も空欄なら取込実行時刻）']);
      ws.addRow(['※ 機番1〜10: 台数分のみ入力。空欄は #1, #2... 自動採番']);
+     ws.addRow(['※ モーター型式1/容量1・モーター型式2/容量2: 制御装置(号機)割当用。回転軸→1、傾斜軸→2。型式にHV記載=400V自動。容量空欄は型式番手から自動判定。空欄なら既存のモーター登録を保持']);
      ws.addRow(['※ テンプレートID: 「テンプレート一覧」シートからコピペ']);
      ws.addRow(['※ 既存ロットは指図番号で上書き / 作業中ロットはスキップ']);
 
@@ -28461,6 +29482,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const C_DUE = col('納期', 6);
        const C_ENTRY = col('入庫日時', 7);
        const C_SERIAL_START = col('機番1', 8);
+       // モーター(制御装置割当用) 2軸ぶん。列が無い旧雛形は fallback=0 で常に空扱い。
+       const C_MOTOR1 = col('モーター型式1', 0), C_CAP1 = col('容量1', 0);
+       const C_MOTOR2 = col('モーター型式2', 0), C_CAP2 = col('容量2', 0);
 
        const rows = [];
        for (let r = headerRowNum + 1; r < grid.length; r++) {
@@ -28492,10 +29516,19 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
          }
          const serials = [];
          for (let i = 0; i < qty; i++) {
-           const sn = cellTxt(rowArr, C_SERIAL_START + i);
+           // 機番は雛形の10枠まで。11台目以降を読むとモーター列(20列目〜)に食い込むので読まない。
+           const sn = i < 10 ? cellTxt(rowArr, C_SERIAL_START + i) : '';
            serials.push(sn || `#${i + 1}`);
          }
-         rows.push({ model, orderNo, qty, templateId, priority, dueDate, entryAt, serials });
+         // モーター(制御装置割当用): 型式/容量が入っていれば軸として拾う。空なら controlSpec は付けない(既存を保護)。
+         const motorAxes = [];
+         for (const [mc, cc] of [[C_MOTOR1, C_CAP1], [C_MOTOR2, C_CAP2]]) {
+           const mm = cellTxt(rowArr, mc);
+           const cap = CD.normCap(cellTxt(rowArr, cc));
+           if (mm || cap) motorAxes.push({ model: mm, capacity: cap || undefined, label: `軸${motorAxes.length + 1}` });
+         }
+         const controlSpec = motorAxes.length ? { axes: motorAxes } : null;
+         rows.push({ model, orderNo, qty, templateId, priority, dueDate, entryAt, serials, controlSpec });
        }
 
        if (rows.length === 0) { alert('有効なデータ行がありません'); return; }
@@ -28557,6 +29590,32 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        const msg = [`取込内容の確認:`, `  新規: ${newCount}件`, `  上書き: ${updateCount}件`, `  無視: ${skipCount}件`, '', ...details].join('\n');
        if (!confirm(msg + '\n\nOKで書き込みます（キャンセルすると何も変更しません）')) return;
 
+       // 入荷Excelのモーター2列は 型式/容量 のみ。既存ロットへ取り込む際は、
+       //   ①既存軸のフラグ(voltage/dd/batteryless)を軸番号ごとに引き継ぐ ②Excelに出せない3軸目以降を残す。
+       const mergeImportControlSpec = (rowSpec, existingSpec) => {
+         if (!rowSpec) return null;
+         const exAxes = (existingSpec && Array.isArray(existingSpec.axes)) ? existingSpec.axes : [];
+         const merged = rowSpec.axes.map((ax, i) => {
+           const ex = exAxes[i] || {};
+           const out = { model: ax.model, capacity: ax.capacity, label: ax.label };
+           // フラグ(電圧/D/DD/BL)は「同じ型式のまま」の軸だけ引き継ぐ。Excelで型式を別モーターに書き換えた軸に
+           //   旧フラグ(特にdAmp)が残ると、普通のモーターが32/35専用扱いになる等の誤マッチを生むため。
+           const norm = (s) => CD.toHalfWidth(String(s || '')).replace(/[\s\-_]/g, '').toUpperCase();
+           const sameModel = norm(ax.model) === norm(ex.model);
+           if (sameModel) {
+             if (ex.voltage != null) out.voltage = ex.voltage;
+             if (ex.dd != null) out.dd = ex.dd;
+             if (ex.dAmp != null) out.dAmp = ex.dAmp; // D駆動((D)ｱﾝﾌﾟ)フラグもExcel往復で消さない
+             if (ex.batteryless != null) out.batteryless = ex.batteryless;
+           }
+           return out;
+         });
+         for (let i = rowSpec.axes.length; i < exAxes.length; i++) merged.push(exAxes[i]); // 3軸目以降を保持
+         const spec = { axes: merged };
+         if (existingSpec && existingSpec.leadDays != null) spec.leadDays = existingSpec.leadDays;
+         return spec;
+       };
+
        // ===== パス2: 書き込み =====
        for (const p of plan) {
          if (p.type === 'update') {
@@ -28568,8 +29627,9 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                  templateId: row.templateId, priority: row.priority,
                  dueDate: row.dueDate, entryAt: row.entryAt,
                  steps, appliedStandard: appliedStandard ?? null, tasks: buildProfileSkippedTasks(steps, naStepIds, row.qty),
+                 ...(row.controlSpec ? { controlSpec: mergeImportControlSpec(row.controlSpec, existing.controlSpec) } : {}), // モーター(制御装置)はExcelに記載時のみ上書き(既存フラグ/3軸目以降は保持)
                }
-             : { priority: row.priority, dueDate: row.dueDate }; // 着手済みは実測に関わる項目を書き換えない(監査確定)
+             : { priority: row.priority, dueDate: row.dueDate, ...(row.controlSpec ? { controlSpec: mergeImportControlSpec(row.controlSpec, existing.controlSpec) } : {}) }; // 着手済みは実測項目は保護。モーター割当メタは記載時のみ更新可
            await saveData('lots', existing.id, updates);
            // 未着手ロットは、規格変更/台数縮小で不要になった古い profileSkipped タスクを deleteField で掃除(merge:true は sub-key を消さない)。
            if (isUntouched) {
@@ -28596,6 +29656,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              currentStepIndex: 0, steps, totalWorkTime: 0, workStartTime: null,
              tasks: buildProfileSkippedTasks(steps, naStepIds, row.qty), stepTimes: {}, interruptions: [], // 型式別プロファイルの該当なし工程を事前スキップ
              appliedStandard, // 適用された品質規格のスナップショット
+             ...(row.controlSpec ? { controlSpec: row.controlSpec } : {}), // モーター(制御装置割当用)
            };
            await saveData('lots', id, lot);
          }
@@ -28993,6 +30054,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
    const onEditLot = (lot) => {
      setEditingLot(lot);
      setLotFormQty(lot.quantity || 1);
+     setLotFormModel(lot.model || '');
+     setLotMotorAxes(controlSpecToAxes(lot.controlSpec));
      setShowLotModal(true);
    };
    
@@ -29023,10 +30086,11 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        }
      `}</style>
      <div className="h-screen bg-slate-100 font-sans flex flex-col text-slate-900 overflow-hidden relative">
+       <MascotFx lots={lots} settings={settings} onSaveSettings={saveSettings} />
        {showBreakAlert && (
          <div className="absolute top-0 left-0 right-0 bg-orange-500 text-white z-[100] p-4 flex justify-between items-center shadow-lg">
            <div className="flex items-center gap-3 text-lg font-bold"><Bell className="w-6 h-6 animate-bounce" />{String(showBreakAlert)}</div>
-           <button onClick={() => setShowBreakAlert(null)} className="bg-white/20 hover:bg-white/30 rounded-full p-1"><X className="w-6 h-6" /></button>
+           <button onClick={() => { setShowBreakAlert(null); dismissedBreakRef.current = breakWindowRef.current; }} className="bg-white/20 hover:bg-white/30 rounded-full p-1"><X className="w-6 h-6" /></button>
          </div>
        )}
        {/* お知らせ/不具合 通知バナー (不具合は赤、それ以外は紫) */}
@@ -29144,7 +30208,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                {(() => { const unread = announcements.filter(a => (a.mode || 'confirm') === 'confirm' && !(a.confirmedBy || []).includes(currentUserName)).length; return unread > 0 ? <span className="absolute -top-1 -right-1 bg-red-500 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{unread}</span> : null; })()}
              </button>
              {/* 厳密モードは「作業最適化」タブに統合（ヘッダーボタンは廃止） */}
-             <button onClick={() => { setEditingLot(null); setLotFormQty(1); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-1.5 shadow-sm" title="入荷登録">
+             <button onClick={() => { setEditingLot(null); setLotFormQty(1); setLotFormModel(''); setLotMotorAxes([]); setShowLotModal(true); }} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-sm font-bold flex items-center gap-1.5 shadow-sm" title="入荷登録">
                <Plus className="w-4 h-4" /> 登録
              </button>
            </div>
@@ -29198,7 +30262,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            </div>
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
-         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} />}
+         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
@@ -29219,6 +30283,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
              </div>
            </div>
          )}
+         {activeTab === 'control-devices' && <ControlDeviceView controllers={controllers} lots={lots} orderMotors={orderMotors} motorLedger={motorLedger} spareMotors={spareMotors} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} />}
          {analysisCombo && <WorkOrderReviewModal combo={analysisCombo} lots={lots} settings={settings}
            currentStrict={(settings.strictModeRules || {})[strictComboKey(analysisCombo.model, analysisCombo.templateId)]?.enabled ?? null}
            onMakeStrict={() => { const key = strictComboKey(analysisCombo.model, analysisCombo.templateId); const row = (computeStrictEvidence(lots, templates, strictMaturityUnits) || []).find(r => r.key === key); if (row) handleStrictDecide(row, true); }}
@@ -29244,10 +30309,14 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                handleBackupImport={handleBackupImport}
                excelInputRef={excelInputRef}
                backupInputRef={backupInputRef}
+               handleAllTemplatesDownload={handleAllTemplatesDownload}
+               handleAllTemplatesImport={handleAllTemplatesImport}
+               allTplInputRef={allTplInputRef}
              />
            )
          )}
          {activeTab === 'measurement-settings' && <MeasurementSettingsView settings={settings} saveSettings={saveSettings} comboPresets={settings?.comboPresets || []} templates={templates} />}
+         {activeTab === 'quality-standards' && <div className="h-full overflow-y-auto p-4"><div data-qs-panel><QualityStandardsPanel templates={templates} lots={lots} qualityStandards={settings.qualityStandards || {}} modelStandardMap={settings.modelStandardMap || {}} saveSettings={saveSettings} deleteSettingsFields={deleteSettingsFields} /></div></div>}
          {activeTab === 'templates' && <TemplatesView editingTemplate={editingTemplate} setEditingTemplate={setEditingTemplate} handleSaveTemplate={handleSaveTemplate} workers={workers} saveData={saveData} deleteData={deleteData} templates={templates} lots={lots} handleExcelImport={handleExcelImport} handleExcelDownload={handleExcelDownload} handleBackupExport={handleBackupExport} handleBackupImport={handleBackupImport} excelInputRef={excelInputRef} backupInputRef={backupInputRef} settings={settings} saveSettings={saveSettings} mapZones={settings.mapZones} deleteSettingsFields={deleteSettingsFields} />}
          </div>
        </main>
@@ -29392,6 +30461,8 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
            db={db}
            rotaryConfig={settings.rotaryLink || {}}
            observationPlans={observationPlans}
+           cdByOrder={cdByOrder}
+           cdHistoryByModel={cdHistoryByModel}
            videoRecipes={videoRecipes}
            onSaveVideoRecipe={(id, data) => saveData('video_recipes', id, data)}
            onDeleteVideoRecipe={(id) => deleteData('video_recipes', id)}
@@ -29412,7 +30483,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
        )}
 
        {/* 管理者向けライブアラート: NG発生 + 進行中タスクの目標時間オーバーを右下に常時表示 */}
-       {currentUserName === '管理者' && <AdminLiveAlerts lots={lots} customTargetTimes={settings.customTargetTimes || {}} modelGroups={settings.modelGroups || []} improvements={improvementCards} />}
+       {currentUserName === '管理者' && <AdminLiveAlerts lots={lots} customTargetTimes={settings.customTargetTimes || {}} modelGroups={settings.modelGroups || []} improvements={improvementCards} cfg={settings.workAlert || {}} />}
 
        {showLotModal && (
          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
@@ -29435,7 +30506,7 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                <div className="grid grid-cols-2 gap-4">
                  <div>
                     <label className="block text-sm font-bold text-slate-700 mb-1">型式 (Model)</label>
-                    <input name="model" defaultValue={editingLot?.model} required className="w-full border rounded p-2 bg-slate-50" placeholder="例: A-100" />
+                    <input name="model" defaultValue={editingLot?.model} onChange={e => setLotFormModel(e.target.value)} required className="w-full border rounded p-2 bg-slate-50" placeholder="例: A-100" />
                  </div>
                  <div>
                     <label className="block text-sm font-bold text-slate-700 mb-1">指図番号</label>
@@ -29537,7 +30608,52 @@ const HistoryView = ({ lots, workers, templates, saveData, onEditLot, onDeleteLo
                   </div>
                   <p className="text-xs text-slate-400 mt-1">空欄の場合は #1, #2... が自動設定されます</p>
                </div>
- 
+
+               {/* モーター（制御装置割当用）: 型式のモーター型式→必要容量を判定し、号機の取り合い可視化に使う */}
+               {(() => {
+                 const suggestions = CD.suggestMotorAxes(lotFormModel, lotMotorSpecs);
+                 const setAx = (i, patch) => setLotMotorAxes(prev => prev.map((a, j) => j === i ? { ...a, ...patch } : a));
+                 return (
+                   <div className="border border-indigo-200 rounded-lg bg-indigo-50/40 p-3">
+                     <div className="flex items-center gap-2 mb-2 flex-wrap">
+                       <span className="text-sm font-bold text-indigo-800 flex items-center gap-1"><Cpu className="w-4 h-4" /> モーター（制御装置の号機割当・任意）</span>
+                       <span className="text-[11px] text-slate-500">型式のモーター型式から必要容量を自動判定し、号機の取り合いを可視化します</span>
+                     </div>
+                     {suggestions.length > 0 && (
+                       <button type="button" onClick={() => setLotMotorAxes(suggestions.map(s => ({ model: s.model, capacity: s.capacity, voltage: s.voltage || '', batteryless: false, dAmpManual: null })))}
+                         className="mb-2 text-[11px] px-2 py-1 rounded border border-emerald-300 bg-emerald-50 text-emerald-700 font-bold hover:bg-emerald-100 flex items-center gap-1">
+                         <Wand2 className="w-3.5 h-3.5" /> 型式「{CD.normProductType(lotFormModel)}」から候補を入れる（{suggestions.map(s => s.label).join('/')}）
+                       </button>
+                     )}
+                     <div className="space-y-1.5">
+                       {lotMotorAxes.map((a, i) => {
+                         const resolved = CD.resolveMotorAxis({ model: a.model, capacity: a.capacity, voltage: a.voltage, batteryless: a.batteryless, dAmp: a.dAmpManual != null ? a.dAmpManual : undefined });
+                         return (
+                           <div key={i} className="flex flex-wrap items-center gap-2 bg-white rounded p-2 border border-slate-200">
+                             <span className="text-[11px] font-bold text-slate-400 w-8">軸{i + 1}</span>
+                             <input value={a.model} onChange={e => setAx(i, { model: e.target.value })} placeholder="モーター型式 例 αiS22/4000HV / Dis 60/400" className="border rounded px-2 py-1 text-sm flex-1 min-w-[160px]" />
+                             <label className="text-[11px] text-slate-500">容量
+                               <select value={a.capacity} onChange={e => setAx(i, { capacity: e.target.value })} className="border rounded px-1 py-1 ml-1 text-sm">
+                                 {['', '10A', '20A', '40A', '80A', '130A', '160A', '180A', '360A'].map(c => <option key={c} value={c}>{c || '自動'}</option>)}
+                               </select>
+                             </label>
+                             <span className="text-[11px] text-slate-500">→ <b className={resolved.capacity ? 'text-indigo-700' : 'text-red-500'}>{resolved.capacity || '容量?'}</b>
+                               <span className="text-slate-400"> {CD.is400V(resolved.voltage) ? '400V' : '200V'}{resolved.dd ? '・DD' : ''}{resolved.dAmp ? '・D' : ''}</span>
+                             </span>
+                             <label className="text-[11px] text-orange-600 flex items-center gap-1" title="型式名にHVが無い400Vモーター用の明示指定"><input type="checkbox" checked={CD.is400V(a.voltage)} onChange={e => setAx(i, { voltage: e.target.checked ? '400V' : '' })} /> 400V</label>
+                             <label className="text-[11px] text-cyan-700 flex items-center gap-1"><input type="checkbox" checked={a.batteryless} onChange={e => setAx(i, { batteryless: e.target.checked })} /> BL</label>
+                             <label className="text-[11px] text-purple-700 flex items-center gap-1" title="D駆動=(D)アンプ専用モーター(号機32/35のみ)。型式の -D 記号から自動判定できないとき手動指定。※直駆動DD(Dis)とは別"><input type="checkbox" checked={a.dAmpManual === true} onChange={e => setAx(i, { dAmpManual: e.target.checked ? true : null })} /> D駆動</label>
+                             <button type="button" onClick={() => setLotMotorAxes(prev => prev.filter((_, j) => j !== i))} className="text-red-400 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
+                           </div>
+                         );
+                       })}
+                     </div>
+                     <button type="button" onClick={() => setLotMotorAxes(prev => [...prev, { model: '', capacity: '', voltage: '', batteryless: false, dAmpManual: null }])} className="mt-1.5 text-indigo-600 text-xs font-bold flex items-center gap-1"><Plus className="w-3.5 h-3.5" /> モーター（軸）を追加</button>
+                     {lotMotorSpecs.length === 0 && <p className="text-[10px] text-slate-400 mt-1">※「制御装置」画面で生産課の制御装置Excelを取り込むと、型式から候補を自動入力できます。</p>}
+                   </div>
+                 );
+               })()}
+
                <div className="flex justify-end gap-3 mt-8">
                  <button type="button" onClick={() => setShowLotModal(false)} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded font-bold">キャンセル</button>
                  <button type="submit" className="px-6 py-2 bg-blue-600 text-white rounded font-bold shadow-lg shadow-blue-500/30 hover:bg-blue-700">{editingLot ? '更新' : '登録実行'}</button>
