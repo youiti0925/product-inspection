@@ -54,6 +54,12 @@ export async function enablePush(vapidKey) {
   if (prob) throw new Error(prob);
   if (!(await isSupported())) throw new Error('このブラウザはプッシュ通知(FCM)に対応していません');
   if (!vapidKey || !String(vapidKey).trim()) throw new Error('VAPID鍵が未設定です。管理者が連絡タブ→宛先・公開設定→通知(プッシュ)で設定してください');
+  // 公開鍵の形式チェック: P-256公開鍵のbase64urlは必ず「B」始まり・約87文字。
+  // 43文字前後は「秘密鍵」を貼ってしまった典型パターンなので、ここで分かりやすく弾く。
+  const k = String(vapidKey).trim();
+  if (!/^B[A-Za-z0-9_-]{85,90}$/.test(k)) {
+    throw new Error(`VAPID鍵が公開鍵の形式ではありません(今の値: 「${k[0] || ''}」始まり・${k.length}文字)。正しいのは「B」で始まる約88文字です。Firebaseコンソール→プロジェクト設定→Cloud Messaging→ウェブプッシュ証明書の「鍵ペア」欄(公開鍵)をコピーしてください${k.length >= 40 && k.length <= 46 ? '(※43文字前後は秘密鍵です。公開鍵の方を貼ってください)' : ''}`);
+  }
   const reg = await ensureSw();
   const perm = await Notification.requestPermission();
   if (perm !== 'granted') throw new Error('通知が許可されませんでした。端末/ブラウザの設定でこのサイトの通知を「許可」にしてください(通知ヘルプ参照)');
