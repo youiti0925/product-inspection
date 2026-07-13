@@ -33,6 +33,12 @@ import {
   getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject
 } from "firebase/storage";
 
+// 工程連絡のプッシュ通知(FCM)ヘルパー (トークン取得/フォアグラウンド受信/Worker経由送信)
+import {
+  pushPlatform, pushSupportProblem, pushDeviceId, enablePush, disablePush,
+  listenForegroundPush, sendPushViaWorker
+} from './push.js';
+
 // 切り出した測定機能ヘルパー (純粋関数)
 import {
   evaluateFormula, evalArith, BLOCK_GAUGE_PRESETS, CALCULATION_METHODS,
@@ -3126,6 +3132,260 @@ const contactAnswerSummary = (req) => {
   return a ? `${contactReplyLabel(a.choice)}${a.comment ? `（${a.comment}）` : ''}` : '';
 };
 
+// ---- プッシュ通知 (FCM) ----
+// 「見てなくても携帯が鳴って気づく」層。設定は settings.push { vapidKey, workerUrl }(管理者が連絡タブで1回設定)。
+// 受信登録は push_tokens コレクション(docId=端末ID)。side:'app'=検査側 / 'portal'=あっち側(グループ名つき)。
+// 送信はWorker(/fcm/send)経由のfire-and-forget — 通知が失敗しても連絡そのもの(Firestore)は必ず届く。
+const pushCfgOf = (settings) => {
+  const p = settings?.push || {};
+  return { vapidKey: String(p.vapidKey || '').trim(), workerUrl: String(p.workerUrl || '').trim() };
+};
+// 依頼payload→通知の文面
+const contactPushMessage = (payload) => {
+  if (payload.kind === 'arrival') {
+    const items = payload.items || [];
+    return { title: `🚚 到着予定を教えてください (${items.length}件)`, body: (items.map(i => i.orderNo).filter(Boolean).slice(0, 5).join(', ') + (items.length > 5 ? ' …' : '')) };
+  }
+  const head = payload.kind === 'repair' ? '🔧 修正依頼' : '📞 呼出・連絡';
+  return { title: `${head}${payload.from ? `（${payload.from}）` : ''}`, body: `${payload.orderNo ? `指図${payload.orderNo}: ` : ''}${payload.message || ''}`.slice(0, 200) };
+};
+// 宛先トークンを選んでWorkerへ送る。unregistered(端末側で無効化済み)のトークンdocは自動掃除。
+const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, link, tag }, deleteData) => {
+  try {
+    const cfg = pushCfgOf(settings);
+    if (!cfg.vapidKey || !cfg.workerUrl) return;
+    const targets = (pushTokens || [])
+      .filter(t => t && t.token && t.enabled !== false)
+      .filter(t => (toSide ? t.side === toSide : true))
+      .filter(t => (toGroup ? t.group === toGroup : true));
+    if (!targets.length) return;
+    sendPushViaWorker(cfg.workerUrl, { tokens: [...new Set(targets.map(t => t.token))], title, body, link, tag }).then(res => {
+      if (res && Array.isArray(res.results) && deleteData) {
+        res.results.filter(r => r.unregistered).forEach(r => {
+          targets.filter(t => t.token === r.token).forEach(t => { try { deleteData('push_tokens', t.id); } catch (e) { /* noop */ } });
+        });
+      }
+    });
+  } catch (e) { console.warn('プッシュ送信に失敗(連絡自体は送信済み)', e); }
+};
+
+// 画面を開いている時の受信表示(閉じている時はService Worker+ブラウザ通知が担当)
+const ForegroundPushToast = ({ ready }) => {
+  const [msg, setMsg] = useState(null);
+  useEffect(() => {
+    if (!ready) return;
+    let unsub = null; let dead = false;
+    listenForegroundPush((m) => setMsg({ ...m, at: Date.now() })).then(u => { if (dead) { try { u(); } catch (e) { /* noop */ } } else unsub = u; });
+    return () => { dead = true; if (unsub) { try { unsub(); } catch (e) { /* noop */ } } };
+  }, [ready]);
+  useEffect(() => { if (!msg) return; const t = setTimeout(() => setMsg(null), 10000); return () => clearTimeout(t); }, [msg]);
+  if (!msg) return null;
+  return (
+    <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[999] max-w-md w-[calc(100%-2rem)] cursor-pointer" onClick={() => setMsg(null)}>
+      <div className="bg-slate-800 text-white rounded-xl shadow-2xl px-4 py-3 flex items-start gap-2.5 border border-slate-600">
+        <BellRing className="w-5 h-5 text-amber-300 shrink-0 mt-0.5 animate-pulse" />
+        <div className="min-w-0 flex-1">
+          <div className="font-black text-sm truncate">{msg.title}</div>
+          {msg.body && <div className="text-xs text-slate-300 break-words">{msg.body}</div>}
+        </div>
+        <X className="w-4 h-4 text-slate-400 shrink-0" />
+      </div>
+    </div>
+  );
+};
+
+// 通知の設定方法ヘルプ(端末別)。連絡タブ(検査側)とポータル(あっち側)の両方から開ける。
+const PushHelpModal = ({ onClose }) => {
+  const Sec = ({ emoji, title, children, open }) => (
+    <details open={open} className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+      <summary className="px-3 py-2.5 font-black text-slate-700 cursor-pointer select-none hover:bg-slate-50">{emoji} {title}</summary>
+      <div className="px-4 pb-3 pt-1 text-sm text-slate-600 flex flex-col gap-2">{children}</div>
+    </details>
+  );
+  const Step = ({ n, children }) => (
+    <div className="flex gap-2 items-start">
+      <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-[11px] font-black flex items-center justify-center mt-0.5">{n}</span>
+      <div className="flex-1">{children}</div>
+    </div>
+  );
+  const Warn = ({ children }) => (<div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">⚠ {children}</div>);
+  return (
+    <div className="fixed inset-0 z-[97] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-slate-100 rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 bg-slate-800 text-white flex items-center gap-2 shrink-0">
+          <BellRing className="w-5 h-5 text-amber-300" />
+          <span className="font-black">通知の設定方法（端末別ヘルプ）</span>
+          <button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-4 overflow-y-auto flex flex-col gap-3">
+          <Sec emoji="🔔" title="これは何？（しくみ）" open>
+            <p>依頼や返信が来たとき、<b>画面を見ていなくても携帯・パソコンに通知が届く</b>ようにする機能です。アプリのインストールは不要で、いつものブラウザ（Chrome/Safari）がそのまま通知を受け取ります。</p>
+            <p>やることは1回だけ: このページの「<b>この端末で通知を受け取る</b>」ボタンを押して、出てきた確認で「<b>許可</b>」を押すだけです。端末ごとに1回行ってください。</p>
+            <p className="text-xs text-slate-400">※通知が失敗しても連絡そのものはアプリ/ポータルの画面に必ず表示されます（通知は「気づかせる」ための上乗せ）。</p>
+          </Sec>
+          <Sec emoji="📱" title="Galaxy・Android の設定">
+            <Step n={1}>このページを <b>Chrome</b>（または Samsung Internet）で開く</Step>
+            <Step n={2}>「<b>この端末で通知を受け取る</b>」ボタンを押す</Step>
+            <Step n={3}>「通知を許可しますか？」→「<b>許可</b>」を押す</Step>
+            <Step n={4}>「テスト通知」ボタンで届くことを確認</Step>
+            <div className="font-bold text-slate-700 mt-1">通知が遅い・来ないとき（Galaxyの省電力が原因のことが多い）:</div>
+            <Step n={1}>端末の「設定」→「アプリ」→「<b>Chrome</b>」→「バッテリー」→「<b>制限なし</b>」を選ぶ</Step>
+            <Step n={2}>「設定」→「バッテリー」（またはデバイスケア）→「バックグラウンド使用の制限」→「<b>スリープ中のアプリ</b>」「<b>ディープスリープ中のアプリ</b>」に Chrome が入っていたら外す</Step>
+            <Step n={3}>「使用していないアプリを自動でスリープ」がONの場合、Chromeを「スリープさせないアプリ」に追加</Step>
+            <Warn>Galaxyは本体アップデート後にこの設定が元に戻ることがあります。通知が来なくなったらここを再確認してください。</Warn>
+          </Sec>
+          <Sec emoji="🍎" title="iPhone・iPad の設定">
+            <p>iPhoneは<b>「ホーム画面に追加」してから開く</b>のが必須です（iOS 16.4以上）。普通にSafariで開いただけでは通知は使えません。</p>
+            <Step n={1}>このページを <b>Safari</b> で開く</Step>
+            <Step n={2}>画面下の「<b>共有ボタン</b>」（四角から↑が出ているマーク）を押す</Step>
+            <Step n={3}>下にスクロールして「<b>ホーム画面に追加</b>」→「追加」</Step>
+            <Step n={4}>ホーム画面にできた<b>アイコンから開き直す</b></Step>
+            <Step n={5}>「<b>この端末で通知を受け取る</b>」→「<b>許可</b>」→「テスト通知」で確認</Step>
+            <Warn>集中モード・おやすみモード中は通知が表示されません（設定→集中モードで確認）。通知が出ないときは 設定→通知 でこのアプリがONになっているかも確認してください。</Warn>
+            <p className="text-xs text-slate-400">※iOS 16.3以前は通知に対応していません。その場合もポータル画面を開けば連絡は見られます。</p>
+          </Sec>
+          <Sec emoji="💻" title="パソコン（Windows / Chrome・Edge）の設定">
+            <Step n={1}>このページを Chrome か Edge で開く</Step>
+            <Step n={2}>「<b>この端末で通知を受け取る</b>」→「<b>許可</b>」</Step>
+            <Step n={3}>「テスト通知」で画面右下に出ることを確認</Step>
+            <Warn>Windowsの「応答不可（集中モード）」がONだと通知が出ません。画面右下の通知センターから確認できます。</Warn>
+            <p className="text-xs text-slate-400">※詰所のPCでポータルを開きっぱなしにする場合は、通知が無くても画面上部に新着が出ます。</p>
+          </Sec>
+          <Sec emoji="🛠" title="管理者の初期設定（最初の1回だけ）">
+            <p>通知の送信にはWorker(送信サーバー)とVAPID鍵の設定が必要です。<b>連絡タブ →「宛先・公開設定」→ 通知（プッシュ）</b>に入力欄があります。</p>
+            <Step n={1}>Firebaseコンソール → プロジェクト設定 → <b>Cloud Messaging</b> → 「ウェブプッシュ証明書」で鍵ペアを生成し、公開鍵（Bで始まる長い文字列）を「<b>VAPID鍵</b>」欄に貼る</Step>
+            <Step n={2}>「<b>Worker URL</b>」欄に既存Worker（gemini-proxy）のURLを入れる</Step>
+            <Step n={3}>Googleコンソール(IAM)でサービスアカウントに「<b>Firebase Cloud Messaging API 管理者</b>」ロールを付与（worker/README_セットアップ手順.md の「FCMプッシュ通知」章に詳細手順）</Step>
+            <Step n={4}>自分の端末で「この端末で通知を受け取る」→「テスト通知」が届けば完了</Step>
+          </Sec>
+          <Sec emoji="❓" title="通知が来ないとき（チェックリスト）">
+            <ol className="list-decimal ml-5 flex flex-col gap-1">
+              <li>「テスト通知」ボタンを押して結果メッセージを確認（エラーが出るなら設定の問題、成功なのに出ないなら端末の問題）</li>
+              <li>ブラウザのサイト設定で通知が「許可」か（アドレスバーの鍵マーク→通知）</li>
+              <li>端末の設定でブラウザ自体の通知がONか（設定→通知→Chrome/Safari）</li>
+              <li>Galaxy: 電池の最適化からChromeを除外しているか（上のGalaxy欄参照）</li>
+              <li>iPhone: ホーム画面のアイコンから開いているか／集中モードがOFFか</li>
+              <li>機内モード・Wi-Fi/電波の状態</li>
+              <li>それでもダメなら一度「この端末の通知を解除」→再度「受け取る」で登録し直す</li>
+            </ol>
+          </Sec>
+        </div>
+        <div className="px-4 py-3 border-t border-slate-200 bg-white flex justify-end shrink-0">
+          <button onClick={onClose} className="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-sm font-bold">閉じる</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 通知(プッシュ)の受信登録+テスト。admin=trueで管理者設定(VAPID鍵/Worker URL)と登録端末一覧も出す。
+// 検査側(連絡タブ, side='app')とあっち側(ポータル, side='portal'+グループ名)の両方で使う。
+const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushTokens = [], side, group = '', personName = '', admin = false, onOpenHelp }) => {
+  const cfg = pushCfgOf(settings);
+  const [vapidDraft, setVapidDraft] = useState(cfg.vapidKey);
+  const [workerDraft, setWorkerDraft] = useState(cfg.workerUrl || 'https://gemini-proxy.you0925.workers.dev');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [info, setInfo] = useState('');
+  const deviceId = pushDeviceId();
+  const mine = (pushTokens || []).find(t => t && t.id === deviceId);
+  const prob = pushSupportProblem();
+  const ready = !!(cfg.vapidKey && cfg.workerUrl);
+  const plat = pushPlatform();
+  const enableHere = async () => {
+    setBusy(true); setErr(''); setInfo('');
+    try {
+      const token = await enablePush(cfg.vapidKey);
+      await saveData('push_tokens', deviceId, {
+        token, side, group: group || '', name: personName || '',
+        platform: `${plat.os}${plat.standalone ? '-pwa' : ''}`,
+        ua: String(navigator.userAgent || '').slice(0, 160), enabled: true, at: Date.now(),
+      });
+      setInfo('この端末を登録しました。「テスト通知」で届くか確認してください');
+    } catch (e) { setErr(e?.message || String(e)); }
+    setBusy(false);
+  };
+  const disableHere = async () => {
+    setBusy(true); setErr(''); setInfo('');
+    try {
+      await disablePush();
+      if (mine && deleteData) await deleteData('push_tokens', deviceId);
+      setInfo('この端末の通知を解除しました');
+    } catch (e) { setErr(e?.message || String(e)); }
+    setBusy(false);
+  };
+  const sendTest = async () => {
+    if (!mine || !cfg.workerUrl) return;
+    setBusy(true); setErr(''); setInfo('');
+    const res = await sendPushViaWorker(cfg.workerUrl, {
+      tokens: [mine.token], title: '✅ テスト通知', body: 'この端末に工程連絡の通知が届きます',
+      link: (typeof window !== 'undefined' ? `${window.location.origin}${side === 'portal' ? '/?renraku=1' : '/'}` : ''), tag: 'push-test',
+    });
+    if (res?.ok && res.sent > 0) setInfo('テスト通知を送りました（数秒で届きます。この画面を開いたままなら上部に表示されます）');
+    else setErr(`テスト送信に失敗: ${res?.results?.[0]?.error || res?.error || '不明なエラー'}`);
+    setBusy(false);
+  };
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="text-xs font-black text-slate-500 flex items-center gap-1.5">
+        <BellRing className="w-3.5 h-3.5 text-amber-500" /> 通知（プッシュ）— 画面を見ていなくても携帯に届く
+        {onOpenHelp && <button onClick={onOpenHelp} className="ml-1 px-2 py-0.5 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-[11px] font-bold flex items-center gap-1"><HelpCircle className="w-3 h-3" /> 設定方法（Galaxy/iPhone/PC）</button>}
+      </div>
+      {admin && (
+        <div className="bg-slate-50 border border-slate-200 rounded-lg p-2.5 flex flex-col gap-1.5">
+          <div className="text-[11px] font-bold text-slate-500">管理者設定（最初の1回。取り方は上の「設定方法」→ 管理者の初期設定）</div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] font-bold text-slate-500 w-20 shrink-0">VAPID鍵</span>
+            <input value={vapidDraft} onChange={e => setVapidDraft(e.target.value)} placeholder="Bで始まる長い文字列（Firebaseコンソール→Cloud Messaging→ウェブプッシュ証明書）" className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs font-mono" />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] font-bold text-slate-500 w-20 shrink-0">Worker URL</span>
+            <input value={workerDraft} onChange={e => setWorkerDraft(e.target.value)} placeholder="https://gemini-proxy.…workers.dev" className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs font-mono" />
+            <button onClick={() => { saveSettings({ push: { ...(settings?.push || {}), vapidKey: vapidDraft.trim(), workerUrl: workerDraft.trim().replace(/\/+$/, '') } }); setInfo('通知設定を保存しました'); }} className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-black shrink-0">保存</button>
+          </div>
+          {!ready && <div className="text-[11px] text-amber-600 font-bold">VAPID鍵とWorker URLの両方を保存すると通知が使えるようになります（未設定の間も連絡機能自体は普通に使えます）</div>}
+        </div>
+      )}
+      {!admin && !ready && <div className="text-xs text-slate-400 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">通知はまだ準備中です（検査側の管理者が設定すると使えるようになります）。連絡はこの画面に表示されます。</div>}
+      {ready && (
+        <div className="flex items-center gap-2 flex-wrap">
+          {prob
+            ? <span className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 font-bold">{prob}</span>
+            : mine
+              ? (<>
+                  <span className="text-xs font-black text-emerald-700 bg-emerald-50 border border-emerald-300 rounded-full px-2.5 py-1 flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> この端末は通知を受け取ります{mine.name ? `（${mine.name}）` : ''}</span>
+                  <button disabled={busy} onClick={sendTest} className="px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold disabled:opacity-40">テスト通知</button>
+                  <button disabled={busy} onClick={disableHere} className="px-2.5 py-1 rounded-lg border border-slate-300 text-slate-500 hover:bg-slate-50 text-xs font-bold disabled:opacity-40">解除</button>
+                </>)
+              : <button disabled={busy} onClick={enableHere} className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-black flex items-center gap-1.5 disabled:opacity-40"><Bell className="w-4 h-4" /> この端末で通知を受け取る</button>}
+          {busy && <Loader2 className="w-4 h-4 animate-spin text-slate-400" />}
+        </div>
+      )}
+      {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 font-bold">{err}</div>}
+      {info && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 font-bold">{info}</div>}
+      {admin && (pushTokens || []).length > 0 && (
+        <div className="border border-slate-200 rounded-lg overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500"><tr><th className="text-left px-2 py-1.5">側</th><th className="text-left px-2 py-1.5">グループ</th><th className="text-left px-2 py-1.5">名前</th><th className="text-left px-2 py-1.5">端末</th><th className="text-left px-2 py-1.5">登録</th><th className="px-2 py-1.5"></th></tr></thead>
+            <tbody className="divide-y divide-slate-100">
+              {(pushTokens || []).filter(t => t).sort((a, b) => (b.at || 0) - (a.at || 0)).map(t => (
+                <tr key={t.id} className={t.id === deviceId ? 'bg-emerald-50/60' : ''}>
+                  <td className="px-2 py-1.5 font-bold">{t.side === 'portal' ? 'あっち' : '検査'}</td>
+                  <td className="px-2 py-1.5">{t.group || '—'}</td>
+                  <td className="px-2 py-1.5">{t.name || '—'}{t.id === deviceId ? '（この端末）' : ''}</td>
+                  <td className="px-2 py-1.5 text-slate-500">{t.platform === 'ios-pwa' ? 'iPhone(ホーム追加)' : t.platform === 'ios' ? 'iPhone' : String(t.platform || '').startsWith('android') ? 'Android' : 'PC'}</td>
+                  <td className="px-2 py-1.5 font-mono text-slate-400">{fmtContactTime(t.at)}</td>
+                  <td className="px-2 py-1.5 text-right"><button onClick={() => { if (window.confirm('この端末の通知登録を削除しますか？')) deleteData('push_tokens', t.id); }} className="text-rose-500 hover:text-rose-700"><Trash2 className="w-3.5 h-3.5" /></button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // 連絡の送信モーダル。NG→修正の「連絡しますか？」と、作業画面/連絡タブの「連絡・呼出」の両方で使う。
 const ContactSendModal = ({ draft, groups, from, lot, onClose, onSend }) => {
   const [to, setTo] = useState(groups[0] || '');
@@ -3278,7 +3538,8 @@ const ContactAskArrivalModal = ({ lots, groups, from, onClose, onSend }) => {
 };
 
 // 連絡タブ: 依頼リスト(状況/送信/経過/返信) + 詳細 + 到着依頼作成 + 宛先/公開設定 + ポータルURL。
-const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName }) => {
+const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName, pushTokens = [], notifyPush = null }) => {
+  const [showPushHelp, setShowPushHelp] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
   const [statusF, setStatusF] = useState('all');
@@ -3308,7 +3569,14 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
   const detail = detailId ? (contactRequests || []).find(r => r.id === detailId) : null;
   const portalUrl = (() => { try { return `${window.location.origin}${window.location.pathname}?renraku=1`; } catch (e) { return '?renraku=1'; } })();
   const portalCfg = settings?.contactPortal || {};
-  const sendReq = (payload) => { saveData('contact_requests', newContactId(), payload); };
+  const sendReq = (payload) => {
+    saveData('contact_requests', newContactId(), payload);
+    // 宛先グループの携帯へプッシュ通知(設定済みなら)。失敗しても連絡自体は届いている。
+    if (notifyPush) {
+      const m = contactPushMessage(payload);
+      notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: 'contact-req' });
+    }
+  };
   return (
     <div className="h-full flex flex-col gap-3 overflow-hidden">
       <div className="shrink-0 flex items-center gap-2 flex-wrap">
@@ -3359,6 +3627,13 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               <input readOnly value={portalUrl} className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-mono bg-slate-50" onFocus={e => e.target.select()} />
               <button onClick={() => { try { navigator.clipboard.writeText(portalUrl); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) { /* noop */ } }} className="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> {copied ? 'コピー済み' : 'コピー'}</button>
             </div>
+          </div>
+          <div className="border-t border-slate-100 pt-3">
+            <PushSettingsPanel
+              settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData}
+              pushTokens={pushTokens} side="app" group="" personName={currentUserName} admin
+              onOpenHelp={() => setShowPushHelp(true)}
+            />
           </div>
         </div>
       )}
@@ -3462,15 +3737,18 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       )}
       {showAsk && <ContactAskArrivalModal lots={lots} groups={groups} from={currentUserName} onClose={() => setShowAsk(false)} onSend={(p) => { sendReq(p); setShowAsk(false); }} />}
       {showSend && <ContactSendModal draft={{ kind: 'call', message: '' }} groups={groups} from={currentUserName} lot={null} onClose={() => setShowSend(false)} onSend={(p) => { sendReq(p); setShowSend(false); }} />}
+      {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} />}
     </div>
   );
 };
 
 // あっち(前後工程)用ポータル: 限定表示。修正依頼へのワンタップ返信+到着予定の時間登録だけができる。
-const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings }) => {
+const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings, pushTokens = [], notifyPush = null, deleteData = null }) => {
   const groups = contactGroupsOf(settings);
   const [group, setGroup] = useState(() => { try { return localStorage.getItem('renrakuGroup') || ''; } catch (e) { return ''; } });
   const [name, setName] = useState(() => { try { return localStorage.getItem('renrakuName') || ''; } catch (e) { return ''; } });
+  const [showPushCfg, setShowPushCfg] = useState(false);
+  const [showPushHelp, setShowPushHelp] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
   const [q, setQ] = useState('');
@@ -3494,9 +3772,12 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
       .slice(0, 60);
   }, [lots, q]);
   const byName = name.trim() || group;
+  // 返信・回答は検査側の端末(side:'app')へプッシュ通知(設定済みなら)
+  const appLink = (() => { try { return `${window.location.origin}/`; } catch (e) { return ''; } })();
   const reply = (r, choice) => {
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice, comment: (commentDraft[r.id] || '').trim(), by: byName, at: Date.now() } });
     setCommentDraft(p => ({ ...p, [r.id]: '' }));
+    if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}` });
   };
   const answerArrivalItem = (r, idx) => {
     const key = `${r.id}__${idx}`;
@@ -3507,12 +3788,14 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     const it = items[idx];
     if (it.lotId) saveData('arrival_times', it.lotId, { orderNo: it.orderNo || '', model: it.model || '', date: d.date || todayStr, time: d.time, by: byName, at: Date.now() });
     setDraftTimes(p => ({ ...p, [key]: {} }));
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定: ${it.orderNo || ''} → ${d.time}`, body: `${byName} が回答しました`, link: appLink, tag: `arr-${r.id}-${idx}` });
   };
   const registerArrival = (lot) => {
     const d = draftTimes[lot.id] || {};
     if (!d.time) return;
     saveData('arrival_times', lot.id, { orderNo: lot.orderNo || '', model: lot.model || '', date: d.date || todayStr, time: d.time, by: byName, at: Date.now() });
     setDraftTimes(p => ({ ...p, [lot.id]: {} }));
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定 登録: ${lot.orderNo || ''} → ${d.time}`, body: `${byName} が登録しました`, link: appLink, tag: `arr-reg-${lot.id}` });
   };
   // 機能OFF時はポータルも閉じる (URLを知っていても何も見えない)
   if (settings?.contactFeature?.enabled === false) {
@@ -3547,7 +3830,24 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
         <span className="bg-blue-600 rounded-full px-2.5 py-0.5 text-sm font-black whitespace-nowrap">{group}</span>
         <button onClick={() => { try { localStorage.removeItem('renrakuGroup'); } catch (e) { /* noop */ } setGroup(''); }} className="text-[11px] text-slate-300 underline whitespace-nowrap">変更</button>
         <input value={name} onChange={e => { setName(e.target.value); try { localStorage.setItem('renrakuName', e.target.value); } catch (err) { /* noop */ } }} placeholder="名前(任意)" className="ml-auto w-28 bg-slate-700 border border-slate-600 rounded-lg px-2 py-1 text-sm" />
+        <button onClick={() => setShowPushCfg(v => !v)} title="通知の設定" className={`relative p-1.5 rounded-lg shrink-0 ${showPushCfg ? 'bg-amber-500 text-white' : 'bg-slate-700 hover:bg-slate-600 text-amber-300'}`}>
+          <Bell className="w-5 h-5" />
+          {/* 通知が使える状態なのに未登録なら赤ドットで気づかせる */}
+          {!!(pushCfgOf(settings).vapidKey && pushCfgOf(settings).workerUrl) && !(pushTokens || []).find(t => t && t.id === pushDeviceId()) && <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-rose-500 rounded-full animate-pulse" />}
+        </button>
       </header>
+      {showPushCfg && (
+        <div className="max-w-3xl mx-auto px-4 pt-3 w-full">
+          <div className="bg-white rounded-xl border border-slate-200 p-3">
+            <PushSettingsPanel
+              settings={settings} saveSettings={null} saveData={saveData} deleteData={deleteData}
+              pushTokens={pushTokens} side="portal" group={group} personName={byName} admin={false}
+              onOpenHelp={() => setShowPushHelp(true)}
+            />
+          </div>
+        </div>
+      )}
+      {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} />}
       <main className="max-w-3xl mx-auto p-4 flex flex-col gap-5 pb-16">
         <section>
           <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Wrench className="w-5 h-5 text-orange-600" /> 修正・呼出の依頼 {inbox.length > 0 && <span className="bg-orange-600 text-white text-xs font-black rounded-full px-2 py-0.5 animate-pulse">{inbox.length}件</span>}</h2>
@@ -8312,7 +8612,7 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true, notifyPush = null }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -12187,7 +12487,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
             <ContactSendModal
               draft={contactDraft} groups={contactGroups.length ? contactGroups : DEFAULT_CONTACT_GROUPS} from={inspectorName} lot={lot}
               onClose={() => setContactDraft(null)}
-              onSend={(payload) => { if (saveData) saveData('contact_requests', newContactId(), payload); setContactDraft(null); setOrderHint('📨 連絡を送信しました。返信はこの画面に表示されます'); }}
+              onSend={(payload) => {
+                if (saveData) saveData('contact_requests', newContactId(), payload);
+                // 宛先グループの携帯へプッシュ通知(設定済みなら)
+                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: 'contact-req' }); }
+                setContactDraft(null); setOrderHint('📨 連絡を送信しました。返信はこの画面に表示されます');
+              }}
             />
           )}
 
@@ -22839,6 +23144,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                </label>
              );
            })()}
+           <p className="text-xs text-slate-400 mt-2">📳 携帯へのプッシュ通知の設定（VAPID鍵・受信端末の登録・端末別の設定方法ヘルプ）は「連絡」タブ →「宛先・公開設定」→ 通知（プッシュ）にあります。</p>
          </div>
 
          {/* 目標時間オーバー警告設定 (カスタム作業画面の点滅・音) */}
@@ -28303,6 +28609,7 @@ export default function App() {
    const [spareMotors, setSpareMotors] = useState([]); // 社内の仮モーター在庫(検査G/組立Gが持つ予備モーター)
    const [contactRequests, setContactRequests] = useState([]); // 工程間連絡: 修正依頼/呼出/到着予定依頼
    const [arrivalTimes, setArrivalTimes] = useState([]); // 到着予定 (docId=lotId。ポータルから登録→検査リストにバッジ)
+   const [pushTokens, setPushTokens] = useState([]); // プッシュ通知の受信端末 (docId=端末ID, side:'app'/'portal')
    const [logs, setLogs] = useState([]);
    const [settings, setSettings] = useState({ mapImage: null, mapZones: INITIAL_MAP_ZONES, defectProcessOptions: DEFAULT_DEFECT_PROCESS_OPTIONS, breakAlerts: [], complaintOptions: DEFAULT_COMPLAINT_OPTIONS, customTargetTimes: {}, targetTimeHistory: [], customLayouts: {}, measurementOverrides: {} });
 
@@ -28490,6 +28797,8 @@ export default function App() {
    const arrivalByLot = useMemo(() => { const m = {}; (arrivalTimes || []).forEach(a => { if (a && a.id) m[a.id] = a; }); return m; }, [arrivalTimes]);
    // 工程連絡 機能全体のON/OFF (マスタ設定で切替。OFF=連絡タブ/連絡ボタン/NG修正フック/到着バッジ/ポータルを全て非表示)
    const contactFeatureOn = settings?.contactFeature?.enabled !== false;
+   // 工程連絡のプッシュ通知送信(fire-and-forget)。settings.push 未設定なら何もしない。
+   const notifyContactPush = (args) => { if (contactFeatureOn) firePushNotify(settings, pushTokens, args, deleteData); };
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
@@ -28687,6 +28996,7 @@ export default function App() {
        onSnapshot(getPath('spare_motors'), (snap) => setSpareMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('contact_requests'), (snap) => setContactRequests(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('arrival_times'), (snap) => setArrivalTimes(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('push_tokens'), (snap) => setPushTokens(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('workers'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setWorkers(data);
@@ -30742,7 +31052,12 @@ export default function App() {
    // 連絡ポータル(?renraku=1): あっち(前後工程)用の限定ビュー。指図/型式/台数/納期と連絡機能だけを表示し、
    // 検査アプリ本体(タブ・分析・設定等)は一切レンダリングしない。
    if (RENRAKU_PORTAL) {
-     return <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={settings} />;
+     return (
+       <>
+         <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={settings} pushTokens={pushTokens} notifyPush={notifyContactPush} deleteData={deleteData} />
+         <ForegroundPushToast ready={!!db} />
+       </>
+     );
    }
 
    return (
@@ -30767,6 +31082,8 @@ export default function App() {
      `}</style>
      <div className="h-screen bg-slate-100 font-sans flex flex-col text-slate-900 overflow-hidden relative">
        <MascotFx lots={lots} settings={settings} onSaveSettings={saveSettings} />
+       {/* プッシュ通知のフォアグラウンド表示(画面を開いている時。閉じている時はブラウザ通知) */}
+       <ForegroundPushToast ready={!!db} />
        {showBreakAlert && (
          <div className="absolute top-0 left-0 right-0 bg-orange-500 text-white z-[100] p-4 flex justify-between items-center shadow-lg">
            <div className="flex items-center gap-3 text-lg font-bold"><Bell className="w-6 h-6 animate-bounce" />{String(showBreakAlert)}</div>
@@ -30944,7 +31261,7 @@ export default function App() {
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
-         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} />}
+         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
@@ -31132,6 +31449,7 @@ export default function App() {
            contactRequests={contactRequests}
            contactGroups={contactGroupsOf(settings)}
            contactEnabled={contactFeatureOn}
+           notifyPush={notifyContactPush}
            onClose={() => setExecutionLotId(null)}
            onSave={(updates) => saveData('lots', executionLotId, updates)}
            onFinish={() => { setExecutionLotId(null); setActiveTab('history'); }}
