@@ -11395,7 +11395,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   //   過去のバグ: バッチは ${stepIdx}-${uIdx} (数値) を使い、個別タスクは ${step.id}-${uIdx} で保存
   //   → 表示は step.id 優先のため、バッチで更新した duration が見えなくなる事故が発生
   // selectedIndices (Set or Array) を渡すと、その台だけを対象にする (飛び番選択用)。
-  const toggleBatch = (stepIdx, fromIdx = 0, toIdx = lot.quantity - 1, selectedIndices = null) => {
+  // resetDuration=true: 「最初から開始」— 一時停止までの累積時間を捨てて0からタイマーを始める
+  const toggleBatch = (stepIdx, fromIdx = 0, toIdx = lot.quantity - 1, selectedIndices = null, resetDuration = false) => {
     const isBatchStarted = !!batchStartTimes[stepIdx];
     const newTasks = { ...tasks };
     const now = Date.now();
@@ -11420,7 +11421,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                 // firstStartTime: 一度設定したら維持 (中断・再開で変わらない)
                 // batchOwner: このバッチに属する安定マーカー。休憩(toggleBreak)で startTime が書き換わっても所属が壊れないようにする
                 //   (旧実装は startTime===batchStart で所属判定→休憩再開で除外され、再開した台が未完了で取り残された)。
-                newTasks[key] = { ...currentTask, status: 'processing', startTime: now, firstStartTime: currentTask.firstStartTime || now, batchOwner: stepIdx, batchStartedAt: now };
+                newTasks[key] = { ...currentTask, status: 'processing', startTime: now, firstStartTime: currentTask.firstStartTime || now, batchOwner: stepIdx, batchStartedAt: now, ...(resetDuration ? { duration: 0 } : {}) };
             }
         }
         setBatchStartTimes({ ...batchStartTimes, [stepIdx]: now });
@@ -11558,6 +11559,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           <div className="bg-indigo-600 text-white p-3 text-center font-bold flex items-center justify-center gap-2"><Timer className="w-5 h-5" /> 時間を手入力 {timeInput.label || ''}</div>
           <div className="p-4 space-y-3">
             <div className="text-[11px] text-slate-500 text-center leading-snug">押し忘れ等で時間が残らなかった工程に、分かる範囲で時間を入れます{n > 1 ? `（${n}台 一括）` : ''}。この工程は「完了」になります。</div>
+            {n > 1 && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-2 text-[11px] text-amber-800 leading-snug">
+                ⚠ ここに入れるのは<b>一台分</b>の時間です。同じ時間が選択した<b>{n}台それぞれ</b>に記録されます（{n}台の合計ではありません）。
+              </div>
+            )}
             <div className="flex items-center justify-center gap-1.5">
               <input type="number" min="0" value={timeInput.min} onChange={e => setTimeInput(p => ({ ...p, min: e.target.value }))} className="border rounded p-2 text-lg w-16 text-center font-mono" placeholder="0" />
               <span className="font-bold text-sm">分</span>
@@ -12471,13 +12477,26 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                   <button
                     onClick={() => {
                       const { stepIdx } = batchRangeModal;
-                      // 個別選択モード: selectedUnits をそのまま渡す
+                      // 最初から: 一時停止までの累積時間を0にリセットしてタイマー開始
+                      toggleBatch(stepIdx, 0, lot.quantity - 1, selectedUnits, true);
+                      setBatchRangeModal(null);
+                    }}
+                    disabled={selectedCount < 1}
+                    title="これまでの時間を捨てて、0からタイマーを開始します"
+                    className="px-4 py-2 bg-white border-2 border-orange-500 text-orange-600 hover:bg-orange-50 disabled:border-slate-300 disabled:text-slate-300 disabled:cursor-not-allowed rounded-lg font-bold flex items-center gap-1">
+                    <RotateCcw className="w-4 h-4"/> 最初から開始
+                  </button>
+                  <button
+                    onClick={() => {
+                      const { stepIdx } = batchRangeModal;
+                      // 続きから(従来): 一時停止した台はこれまでの時間に足していく
                       toggleBatch(stepIdx, 0, lot.quantity - 1, selectedUnits);
                       setBatchRangeModal(null);
                     }}
                     disabled={selectedCount < 1}
+                    title="一時停止した台は、これまでの時間に続けて足していきます"
                     className="px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white rounded-lg font-bold flex items-center gap-1">
-                    <PlayCircle className="w-4 h-4"/> 開始 ({selectedCount}台)
+                    <PlayCircle className="w-4 h-4"/> 続きから開始 ({selectedCount}台)
                   </button>
                 </div>
               </div>
