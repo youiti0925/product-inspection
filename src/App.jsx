@@ -17,7 +17,8 @@ import {
   Bot, Zap, Cpu, TrendingUp, Activity, Target, Timer, Layers, AlertCircle, Loader2, Database, ShieldCheck, HelpCircle, Copy, Radio, PenTool, Award,
   Bell, BellRing, Megaphone, Lightbulb, Search, CalendarDays, History, Palette, CheckSquare, LayoutList,
   ListChecks, ArrowUpDown, Calculator, Ruler, MicOff, Printer, Coffee, ChevronDown,
-  Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag, Wand2
+  Wrench, RotateCcw, XCircle, Pause, Minimize2, Ban, ClipboardCheck, Hash, BookOpen, Tag, Wand2,
+  MessageCircle, Send, Truck
 } from 'lucide-react';
 
 // --- Firebase Imports (SDK v9) ---
@@ -2829,6 +2830,9 @@ const VideoRecordModal = ({ open, sections = [], defaultName = '', onDone = null
 // ヘッダーを隠すだけ(初期タブは元々 main=現場マップ)。画面の中身・見た目・動きは通常と完全に同一で、
 // 通常アクセス(パラメータ無し)には一切影響しない。
 const EMBED_MAP = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('embed') === 'map';
+// 連絡ポータル(?renraku=1): 前後工程(あっち)用の限定ビュー。指図/型式/台数/納期と連絡機能だけを出し、
+// 検査データ・分析などは一切表示しない。通常アクセス(パラメータ無し)には一切影響しない。
+const RENRAKU_PORTAL = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('renraku') === '1';
 
 // ロットカード表示項目のデフォルト (全てON)
 // settings.lotCardDisplay にユーザ設定を保存し、必要なら個別にOFFできる
@@ -2846,6 +2850,7 @@ const DEFAULT_LOT_CARD_DISPLAY = {
   delayStatus: true,   // 遅延ラベル
   progressBar: true,   // 下部の進捗バー
   unitBadge: true,     // 制御装置(号機)バッジ
+  arrivalBadge: true,  // 到着予定バッジ (工程連絡: あっちが登録した「いつ来るか」)
 };
 
 // アプリ全体で共有: 各 LotCard が個別に display を渡さなくても済む
@@ -3052,6 +3057,613 @@ const PrepHistoryCard = ({ history }) => {
           <div className="mt-1 text-[10px] text-slate-400">出典: 指図 {history.orderNo || '?'}{history.date ? `（${history.date}）` : ''}。同じ or 同容量の仮モーターを上の「使える号機」に載せれば回せます（電圧一致を確認）。</div>
         </div>
       )}
+    </div>
+  );
+};
+
+// ==================== 工程間連絡 (contact_requests / arrival_times) ====================
+// 電話連絡(修正に来て/いつ来るか)を「依頼→ワンタップ返信→履歴」に置き換える。
+// contact_requests: kind 'repair'(修正依頼)・'call'(呼出/質問) = すぐ行く/10分後/20分後/行けない のワンタップ返信
+//                   kind 'arrival'(到着予定) = items[] を1件ずつ時間入力で返信
+// arrival_times: docId=lotId の到着予定(自発登録も依頼への回答もここに集約) → 検査リストのカードにバッジ表示
+const CONTACT_REPLY_CHOICES = [
+  { id: 'now', label: 'すぐ行く', cls: 'bg-emerald-600 hover:bg-emerald-700' },
+  { id: '10', label: '10分後', cls: 'bg-sky-600 hover:bg-sky-700' },
+  { id: '20', label: '20分後', cls: 'bg-indigo-600 hover:bg-indigo-700' },
+  { id: 'no', label: '行けない', cls: 'bg-rose-600 hover:bg-rose-700' },
+];
+const contactReplyLabel = (choice) => (CONTACT_REPLY_CHOICES.find(c => c.id === choice)?.label) || choice || '';
+const DEFAULT_CONTACT_GROUPS = ['組立', '機械', '管理者'];
+const contactGroupsOf = (settings) => {
+  const g = Array.isArray(settings?.contactGroups) ? settings.contactGroups.map(x => String(x || '').trim()).filter(Boolean) : [];
+  return g.length ? g : DEFAULT_CONTACT_GROUPS;
+};
+const newContactId = () => `cr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+const fmtContactTime = (ts) => {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+};
+const fmtContactElapsed = (fromTs, toTs) => {
+  if (!fromTs) return '';
+  const sec = Math.max(0, Math.floor(((toTs || Date.now()) - fromTs) / 1000));
+  if (sec < 60) return `${sec}秒`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}分`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}時間${m % 60 ? `${m % 60}分` : ''}`;
+  return `${Math.floor(h / 24)}日`;
+};
+const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼');
+const contactStatusInfo = (req) => {
+  if (!req) return { label: '', cls: '' };
+  if (req.status === 'canceled') return { label: '取消', cls: 'bg-slate-100 text-slate-400 border-slate-300' };
+  if (req.kind === 'arrival') {
+    const items = req.items || [];
+    const done = items.filter(i => i.time).length;
+    if (items.length && done >= items.length) return { label: '返信あり', cls: 'bg-emerald-100 text-emerald-700 border-emerald-300' };
+    if (done > 0) return { label: `返信 ${done}/${items.length}`, cls: 'bg-sky-100 text-sky-700 border-sky-300' };
+    return { label: '待ち', cls: 'bg-amber-100 text-amber-700 border-amber-300 animate-pulse' };
+  }
+  if (req.status === 'answered') return { label: '返信あり', cls: 'bg-emerald-100 text-emerald-700 border-emerald-300' };
+  if (req.status === 'done') return { label: '対応済み', cls: 'bg-slate-100 text-slate-500 border-slate-300' };
+  return { label: '待ち', cls: 'bg-amber-100 text-amber-700 border-amber-300 animate-pulse' };
+};
+const contactReplyAt = (req) => {
+  if (!req) return null;
+  if (req.kind === 'arrival') { const ts = (req.items || []).map(i => i.at || 0).filter(Boolean); return ts.length ? Math.max(...ts) : null; }
+  return req.answer?.at || null;
+};
+const contactAnswerSummary = (req) => {
+  if (!req) return '';
+  if (req.kind === 'arrival') {
+    const done = (req.items || []).filter(i => i.time);
+    if (!done.length) return '';
+    return done.map(i => `${i.orderNo || ''}→${i.date ? `${String(i.date).slice(5).replace('-', '/')} ` : ''}${i.time}`).join(' / ');
+  }
+  const a = req.answer;
+  return a ? `${contactReplyLabel(a.choice)}${a.comment ? `（${a.comment}）` : ''}` : '';
+};
+
+// 連絡の送信モーダル。NG→修正の「連絡しますか？」と、作業画面/連絡タブの「連絡・呼出」の両方で使う。
+const ContactSendModal = ({ draft, groups, from, lot, onClose, onSend }) => {
+  const [to, setTo] = useState(groups[0] || '');
+  const [message, setMessage] = useState(draft?.message || '');
+  if (!draft) return null;
+  const isRepair = draft.kind === 'repair';
+  return (
+    <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className={`px-4 py-3 text-white flex items-center gap-2 ${isRepair ? 'bg-orange-600' : 'bg-blue-600'}`}>
+          <MessageCircle className="w-5 h-5" />
+          <span className="font-black">{isRepair ? '連絡しますか？（修正依頼）' : '連絡・呼出を送る'}</span>
+          <button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-4 flex flex-col gap-3">
+          {lot && lot.id && (
+            <div className="text-xs font-bold text-slate-600 bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+              指図 {lot.orderNo} / {lot.model}{draft.stepTitle ? ` / ${draft.stepTitle}` : ''}{draft.unitLabel ? ` / ${draft.unitLabel}` : ''}
+            </div>
+          )}
+          <label className="text-xs font-bold text-slate-500">宛先
+            <select value={to} onChange={e => setTo(e.target.value)} className="mt-1 w-full border border-slate-300 rounded-lg px-2 py-2 text-sm font-bold">
+              {groups.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </label>
+          <label className="text-xs font-bold text-slate-500">内容
+            <textarea value={message} onChange={e => setMessage(e.target.value)} rows={3} className="mt-1 w-full border border-slate-300 rounded-lg px-2 py-2 text-sm" placeholder="例: ○○の修正をお願いします / 手が空いたら来てください" />
+          </label>
+          <div className="text-[11px] text-slate-400">相手は「すぐ行く / 10分後 / 20分後 / 行けない」からワンタップで返信できます。返信は作業画面と連絡タブに表示されます。</div>
+          <div className="flex gap-2 justify-end">
+            <button onClick={onClose} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">送らない</button>
+            <button
+              disabled={!to || !message.trim()}
+              onClick={() => onSend({
+                kind: isRepair ? 'repair' : 'call', to, from: from || '', message: message.trim(),
+                lotId: lot?.id || '', orderNo: lot?.orderNo || '', model: lot?.model || '',
+                stepTitle: draft.stepTitle || '', unitLabel: draft.unitLabel || '',
+                createdAt: Date.now(), status: 'waiting',
+              })}
+              className="px-4 py-2 rounded-lg text-sm font-black text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 flex items-center gap-1.5"
+            ><Send className="w-4 h-4" /> 送信</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 作業画面ヘッダ下: 呼出ボタン+このロットの連絡と返信(すぐ行く/10分後/…)をライブ表示。
+const WorkContactPanel = ({ lot, contactRequests, onOpenSend }) => {
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
+  const mine = useMemo(() => (contactRequests || [])
+    .filter(r => r && r.lotId === lot.id && r.kind !== 'arrival' && r.status !== 'canceled' && r.status !== 'done')
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, 3), [contactRequests, lot.id]);
+  return (
+    <div className="shrink-0 mx-3 mt-2 flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <button type="button" onClick={() => onOpenSend(null)} className="px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-black flex items-center gap-1.5 shadow-sm" title="他工程を呼ぶ/質問する（返信はここに表示されます）">
+          <MessageCircle className="w-4 h-4" /> 連絡・呼出
+        </button>
+        {mine.length === 0 && <span className="text-[11px] text-slate-400">修正に来てほしい時・質問したい時はここから連絡</span>}
+      </div>
+      {mine.map(r => {
+        const st = contactStatusInfo(r);
+        const fresh = r.answer?.at && (nowTick - r.answer.at) < 10 * 60 * 1000; // 返信10分以内は強調
+        return (
+          <div key={r.id} className={`rounded-lg border px-2.5 py-1.5 text-xs flex items-center gap-2 flex-wrap ${r.status === 'answered' ? (fresh ? 'bg-emerald-50 border-emerald-400 ring-2 ring-emerald-300/60' : 'bg-emerald-50 border-emerald-300') : 'bg-amber-50 border-amber-300'}`}>
+            <span className="font-black text-slate-500 shrink-0">{contactKindLabel(r)}</span>
+            <span className="text-slate-600 truncate max-w-[32ch]" title={r.message}>{r.message}</span>
+            <span className="text-slate-400 shrink-0">→ {r.to}</span>
+            {r.status === 'answered' && r.answer ? (
+              <span className={`font-black shrink-0 ${r.answer.choice === 'no' ? 'text-rose-700' : 'text-emerald-700'}`}>
+                返信: {contactReplyLabel(r.answer.choice)}{r.answer.comment ? `（${r.answer.comment}）` : ''}
+                <span className="font-mono text-[10px] opacity-70 ml-1">{fmtContactTime(r.answer.at)}</span>
+              </span>
+            ) : (
+              <span className={`shrink-0 px-1.5 py-0.5 rounded border font-bold ${st.cls}`}>{st.label} {fmtContactElapsed(r.createdAt, nowTick)}</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// 到着予定を聞くモーダル: 検査リストから複数指定して「いつ来るか」をあっちへ依頼する。
+const ContactAskArrivalModal = ({ lots, groups, from, onClose, onSend }) => {
+  const [to, setTo] = useState(groups[0] || '');
+  const [q, setQ] = useState('');
+  const [sel, setSel] = useState({});
+  const list = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    return (lots || [])
+      .filter(l => l && l.status !== 'completed')
+      .filter(l => !s || String(l.orderNo || '').toLowerCase().includes(s) || String(l.model || '').toLowerCase().includes(s))
+      .sort((a, b) => String(a.dueDate || '9999').localeCompare(String(b.dueDate || '9999')));
+  }, [lots, q]);
+  const count = Object.values(sel).filter(Boolean).length;
+  return (
+    <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 bg-teal-600 text-white flex items-center gap-2 shrink-0">
+          <Truck className="w-5 h-5" />
+          <span className="font-black">到着予定を聞く（いつ来るか）</span>
+          <button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-4 flex flex-col gap-3 min-h-0 flex-1">
+          <div className="flex gap-2 items-center shrink-0">
+            <label className="text-xs font-bold text-slate-500 flex items-center gap-1">宛先
+              <select value={to} onChange={e => setTo(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm font-bold">
+                {groups.map(g => <option key={g} value={g}>{g}</option>)}
+              </select>
+            </label>
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input value={q} onChange={e => setQ(e.target.value)} placeholder="指図・型式で絞り込み" className="w-full border border-slate-300 rounded-lg pl-8 pr-2 py-1.5 text-sm" />
+            </div>
+            <span className="text-xs font-black text-teal-700 shrink-0">{count}件 選択中</span>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+            {list.map(l => (
+              <label key={l.id} className={`flex items-center gap-3 px-3 py-2 cursor-pointer ${sel[l.id] ? 'bg-teal-50' : 'hover:bg-slate-50'}`}>
+                <input type="checkbox" checked={!!sel[l.id]} onChange={e => setSel(p => ({ ...p, [l.id]: e.target.checked }))} className="w-4 h-4 accent-teal-600" />
+                <span className="font-mono text-sm font-bold text-slate-700 w-28 shrink-0 truncate">{l.orderNo}</span>
+                <span className="text-sm font-bold text-slate-800 flex-1 truncate">{l.model}</span>
+                <span className="text-xs text-slate-500 shrink-0">{l.quantity}台</span>
+                <span className="text-xs text-slate-500 shrink-0">納期 {l.dueDate || '—'}</span>
+              </label>
+            ))}
+            {list.length === 0 && <div className="p-4 text-center text-sm text-slate-400">対象ロットがありません</div>}
+          </div>
+          <div className="flex justify-end gap-2 shrink-0">
+            <button onClick={onClose} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">キャンセル</button>
+            <button
+              disabled={!to || count === 0}
+              onClick={() => onSend({
+                kind: 'arrival', to, from: from || '', message: '到着予定（いつ来るか）を教えてください',
+                createdAt: Date.now(), status: 'waiting',
+                items: list.filter(l => sel[l.id]).map(l => ({ lotId: l.id, orderNo: l.orderNo || '', model: l.model || '', quantity: l.quantity || 0, dueDate: l.dueDate || '', date: '', time: '' })),
+              })}
+              className="px-4 py-2 rounded-lg text-sm font-black text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-40 flex items-center gap-1.5"
+            ><Send className="w-4 h-4" /> {count}件を依頼</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 連絡タブ: 依頼リスト(状況/送信/経過/返信) + 詳細 + 到着依頼作成 + 宛先/公開設定 + ポータルURL。
+const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName }) => {
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
+  const [statusF, setStatusF] = useState('all');
+  const [kindF, setKindF] = useState('all');
+  const [q, setQ] = useState('');
+  const [detailId, setDetailId] = useState(null);
+  const [showAsk, setShowAsk] = useState(false);
+  const [showSend, setShowSend] = useState(false);
+  const [showCfg, setShowCfg] = useState(false);
+  const [newGroup, setNewGroup] = useState('');
+  const [copied, setCopied] = useState(false);
+  const groups = contactGroupsOf(settings);
+  const list = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    return (contactRequests || [])
+      .filter(r => r)
+      .filter(r => kindF === 'all' || (kindF === 'arrival' ? r.kind === 'arrival' : r.kind !== 'arrival'))
+      .filter(r => {
+        if (statusF === 'all') return true;
+        const lbl = contactStatusInfo(r).label;
+        if (statusF === 'waiting') return lbl.startsWith('待ち') || lbl.startsWith('返信 ');
+        return lbl === '返信あり' || lbl === '対応済み';
+      })
+      .filter(r => !s || [r.orderNo, r.model, r.message, r.to, r.from].some(v => String(v || '').toLowerCase().includes(s)))
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  }, [contactRequests, kindF, statusF, q]);
+  const detail = detailId ? (contactRequests || []).find(r => r.id === detailId) : null;
+  const portalUrl = (() => { try { return `${window.location.origin}${window.location.pathname}?renraku=1`; } catch (e) { return '?renraku=1'; } })();
+  const portalCfg = settings?.contactPortal || {};
+  const sendReq = (payload) => { saveData('contact_requests', newContactId(), payload); };
+  return (
+    <div className="h-full flex flex-col gap-3 overflow-hidden">
+      <div className="shrink-0 flex items-center gap-2 flex-wrap">
+        <h2 className="text-lg font-black text-slate-800 flex items-center gap-2"><MessageCircle className="w-5 h-5 text-blue-600" /> 工程連絡</h2>
+        <button onClick={() => setShowAsk(true)} className="px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-sm font-black flex items-center gap-1.5"><Truck className="w-4 h-4" /> 到着予定を聞く</button>
+        <button onClick={() => setShowSend(true)} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black flex items-center gap-1.5"><Send className="w-4 h-4" /> 連絡・呼出</button>
+        <div className="relative">
+          <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="検索 (指図/型式/内容/宛先)" className="border border-slate-300 rounded-lg pl-8 pr-2 py-1.5 text-sm w-56" />
+        </div>
+        <div className="flex rounded-lg border border-slate-300 overflow-hidden text-xs font-bold">
+          {[['all', 'すべて'], ['waiting', '待ち'], ['answered', '返信あり']].map(([id, lbl]) => (
+            <button key={id} onClick={() => setStatusF(id)} className={`px-2.5 py-1.5 ${statusF === id ? 'bg-blue-600 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>{lbl}</button>
+          ))}
+        </div>
+        <div className="flex rounded-lg border border-slate-300 overflow-hidden text-xs font-bold">
+          {[['all', '全種類'], ['repair', '修正/呼出'], ['arrival', '到着予定']].map(([id, lbl]) => (
+            <button key={id} onClick={() => setKindF(id)} className={`px-2.5 py-1.5 ${kindF === id ? 'bg-slate-700 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>{lbl}</button>
+          ))}
+        </div>
+        <button onClick={() => setShowCfg(v => !v)} className={`ml-auto px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 ${showCfg ? 'bg-slate-700 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'}`}><Settings className="w-4 h-4" /> 宛先・公開設定</button>
+      </div>
+      {showCfg && (
+        <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-3">
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">宛先グループ（相手側もこの名前でポータルに入ります）</div>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {groups.map(g => (
+                <span key={g} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-full px-2.5 py-1 text-xs font-bold text-slate-700">
+                  {g}
+                  <button onClick={() => { if (!window.confirm(`宛先「${g}」を削除しますか？`)) return; saveSettings({ contactGroups: groups.filter(x => x !== g) }); }} className="text-slate-400 hover:text-rose-600"><X className="w-3 h-3" /></button>
+                </span>
+              ))}
+              <input value={newGroup} onChange={e => setNewGroup(e.target.value)} placeholder="グループ追加" className="border border-slate-300 rounded-lg px-2 py-1 text-xs w-28" />
+              <button disabled={!newGroup.trim() || groups.includes(newGroup.trim())} onClick={() => { saveSettings({ contactGroups: [...groups, newGroup.trim()] }); setNewGroup(''); }} className="px-2 py-1 rounded-lg bg-blue-600 text-white text-xs font-bold disabled:opacity-40">追加</button>
+            </div>
+          </div>
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">ポータル（あっち側の画面）に出す情報 — 指図と型式以外は隠せます</div>
+            <div className="flex gap-4 text-xs font-bold text-slate-600">
+              <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showQuantity !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showQuantity: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 台数を表示</label>
+              <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showDueDate !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showDueDate: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 納期を表示</label>
+            </div>
+          </div>
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">あっち側に渡すURL（限定表示: 連絡の返信と到着予定の登録だけができます）</div>
+            <div className="flex items-center gap-2">
+              <input readOnly value={portalUrl} className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-mono bg-slate-50" onFocus={e => e.target.select()} />
+              <button onClick={() => { try { navigator.clipboard.writeText(portalUrl); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) { /* noop */ } }} className="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> {copied ? 'コピー済み' : 'コピー'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="flex-1 min-h-0 overflow-y-auto bg-white rounded-xl border border-slate-200">
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-slate-50 text-[11px] text-slate-500 z-10">
+            <tr className="border-b border-slate-200">
+              <th className="text-left px-3 py-2 whitespace-nowrap">種類</th>
+              <th className="text-left px-3 py-2">内容</th>
+              <th className="text-left px-2 py-2 whitespace-nowrap">宛先</th>
+              <th className="text-left px-2 py-2 whitespace-nowrap">状況</th>
+              <th className="text-left px-2 py-2 whitespace-nowrap">送信時間</th>
+              <th className="text-left px-2 py-2 whitespace-nowrap">経過</th>
+              <th className="text-left px-2 py-2 whitespace-nowrap">返信時間</th>
+              <th className="text-left px-3 py-2">返信内容</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {list.map(r => {
+              const st = contactStatusInfo(r);
+              const rAt = contactReplyAt(r);
+              const waiting = st.label.startsWith('待ち') || st.label.startsWith('返信 ');
+              return (
+                <tr key={r.id} onClick={() => setDetailId(r.id)} className="cursor-pointer hover:bg-blue-50/50">
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    <span className={`text-[11px] font-black px-1.5 py-0.5 rounded ${r.kind === 'arrival' ? 'bg-teal-100 text-teal-700' : r.kind === 'call' ? 'bg-blue-100 text-blue-700' : 'bg-orange-100 text-orange-700'}`}>{contactKindLabel(r)}</span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      {r.orderNo && <span className="font-mono text-xs font-bold text-slate-500 shrink-0">{r.orderNo}</span>}
+                      {r.kind === 'arrival'
+                        ? <span className="text-xs text-slate-600 truncate">{(r.items || []).length}件: {(r.items || []).map(i => i.orderNo).filter(Boolean).slice(0, 4).join(', ')}{(r.items || []).length > 4 ? '…' : ''}</span>
+                        : <span className="text-slate-700 truncate max-w-[36ch]" title={r.message}>{r.message}</span>}
+                    </div>
+                  </td>
+                  <td className="px-2 py-2 whitespace-nowrap text-xs font-bold text-slate-600">{r.to}</td>
+                  <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[11px] font-black px-1.5 py-0.5 rounded border ${st.cls}`}>{st.label}</span></td>
+                  <td className="px-2 py-2 whitespace-nowrap font-mono text-xs text-slate-500">{fmtContactTime(r.createdAt)}</td>
+                  <td className="px-2 py-2 whitespace-nowrap font-mono text-xs">{waiting ? <span className="text-amber-700 font-bold">{fmtContactElapsed(r.createdAt, nowTick)}</span> : <span className="text-slate-400">{rAt ? fmtContactElapsed(r.createdAt, rAt) : '—'}</span>}</td>
+                  <td className="px-2 py-2 whitespace-nowrap font-mono text-xs text-slate-500">{rAt ? fmtContactTime(rAt) : '—'}</td>
+                  <td className="px-3 py-2"><span className={`text-xs font-bold truncate block max-w-[30ch] ${r.answer?.choice === 'no' ? 'text-rose-700' : 'text-emerald-700'}`} title={contactAnswerSummary(r)}>{contactAnswerSummary(r) || '—'}</span></td>
+                </tr>
+              );
+            })}
+            {list.length === 0 && <tr><td colSpan={8} className="px-3 py-8 text-center text-sm text-slate-400">連絡はまだありません。「到着予定を聞く」「連絡・呼出」から送れます。作業画面のNG→修正からも自動で聞かれます。</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {detail && (
+        <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4" onClick={() => setDetailId(null)}>
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-4 py-3 bg-slate-700 text-white flex items-center gap-2 shrink-0">
+              <span className="font-black">{contactKindLabel(detail)} の詳細</span>
+              <span className={`text-[11px] font-black px-1.5 py-0.5 rounded border ${contactStatusInfo(detail).cls}`}>{contactStatusInfo(detail).label}</span>
+              <button onClick={() => setDetailId(null)} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
+            </div>
+            <div className="p-4 overflow-y-auto flex flex-col gap-2 text-sm">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                <div><span className="text-slate-400 font-bold">宛先:</span> <span className="font-bold">{detail.to}</span></div>
+                <div><span className="text-slate-400 font-bold">依頼者:</span> <span className="font-bold">{detail.from || '—'}</span></div>
+                <div><span className="text-slate-400 font-bold">送信:</span> <span className="font-mono">{fmtContactTime(detail.createdAt)}</span></div>
+                <div><span className="text-slate-400 font-bold">返信:</span> <span className="font-mono">{contactReplyAt(detail) ? fmtContactTime(contactReplyAt(detail)) : '—'}</span></div>
+                {detail.orderNo && <div><span className="text-slate-400 font-bold">指図:</span> <span className="font-mono font-bold">{detail.orderNo}</span></div>}
+                {detail.model && <div><span className="text-slate-400 font-bold">型式:</span> <span className="font-bold">{detail.model}</span></div>}
+                {detail.stepTitle && <div><span className="text-slate-400 font-bold">工程:</span> <span className="font-bold">{detail.stepTitle} {detail.unitLabel}</span></div>}
+              </div>
+              {detail.message && <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-700 whitespace-pre-wrap">{detail.message}</div>}
+              {detail.kind !== 'arrival' && detail.answer && (
+                <div className={`border rounded-lg px-3 py-2 ${detail.answer.choice === 'no' ? 'bg-rose-50 border-rose-300' : 'bg-emerald-50 border-emerald-300'}`}>
+                  <div className={`font-black ${detail.answer.choice === 'no' ? 'text-rose-700' : 'text-emerald-700'}`}>返信: {contactReplyLabel(detail.answer.choice)}</div>
+                  {detail.answer.comment && <div className="text-xs text-slate-600 mt-0.5">{detail.answer.comment}</div>}
+                  <div className="text-[10px] text-slate-400 mt-0.5">{detail.answer.by || ''} ・ {fmtContactTime(detail.answer.at)}</div>
+                </div>
+              )}
+              {detail.kind === 'arrival' && (
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 text-slate-500"><tr><th className="text-left px-2 py-1.5">指図</th><th className="text-left px-2 py-1.5">型式</th><th className="text-left px-2 py-1.5">到着予定</th><th className="text-left px-2 py-1.5">回答者</th></tr></thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(detail.items || []).map((it, i) => (
+                        <tr key={i}>
+                          <td className="px-2 py-1.5 font-mono font-bold">{it.orderNo}</td>
+                          <td className="px-2 py-1.5">{it.model}</td>
+                          <td className="px-2 py-1.5">{it.time ? <span className="font-black text-emerald-700">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time}</span> : <span className="text-amber-600 font-bold animate-pulse">待ち</span>}</td>
+                          <td className="px-2 py-1.5 text-slate-500">{it.by || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+            <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end shrink-0">
+              <button onClick={() => { if (window.confirm('この連絡を削除しますか？（履歴からも消えます）')) { deleteData('contact_requests', detail.id); setDetailId(null); } }} className="px-3 py-1.5 rounded-lg text-xs font-bold text-rose-600 hover:bg-rose-50 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> 削除</button>
+              {detail.status === 'waiting' && <button onClick={() => saveData('contact_requests', detail.id, { status: 'canceled' })} className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-500 border border-slate-300 hover:bg-slate-50">取消にする</button>}
+              {detail.kind !== 'arrival' && detail.status === 'answered' && <button onClick={() => saveData('contact_requests', detail.id, { status: 'done' })} className="px-3 py-1.5 rounded-lg text-xs font-black text-white bg-emerald-600 hover:bg-emerald-700">対応済みにする</button>}
+              <button onClick={() => setDetailId(null)} className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-600 border border-slate-300 hover:bg-slate-50">閉じる</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showAsk && <ContactAskArrivalModal lots={lots} groups={groups} from={currentUserName} onClose={() => setShowAsk(false)} onSend={(p) => { sendReq(p); setShowAsk(false); }} />}
+      {showSend && <ContactSendModal draft={{ kind: 'call', message: '' }} groups={groups} from={currentUserName} lot={null} onClose={() => setShowSend(false)} onSend={(p) => { sendReq(p); setShowSend(false); }} />}
+    </div>
+  );
+};
+
+// あっち(前後工程)用ポータル: 限定表示。修正依頼へのワンタップ返信+到着予定の時間登録だけができる。
+const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings }) => {
+  const groups = contactGroupsOf(settings);
+  const [group, setGroup] = useState(() => { try { return localStorage.getItem('renrakuGroup') || ''; } catch (e) { return ''; } });
+  const [name, setName] = useState(() => { try { return localStorage.getItem('renrakuName') || ''; } catch (e) { return ''; } });
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
+  const [q, setQ] = useState('');
+  const [commentDraft, setCommentDraft] = useState({});
+  const [draftTimes, setDraftTimes] = useState({}); // lotId -> {date,time} 下書き(入力途中で保存しない)
+  const [showAnswered, setShowAnswered] = useState(false);
+  const portalCfg = settings?.contactPortal || {};
+  const showQty = portalCfg.showQuantity !== false;
+  const showDue = portalCfg.showDueDate !== false;
+  const todayStr = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
+  const arrivalByLot = useMemo(() => { const m = {}; (arrivalTimes || []).forEach(a => { if (a && a.id) m[a.id] = a; }); return m; }, [arrivalTimes]);
+  const inbox = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'waiting').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
+  const answeredRecent = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'answered' && (nowTick - (r.answer?.at || 0)) < 24 * 3600 * 1000).sort((a, b) => (b.answer?.at || 0) - (a.answer?.at || 0)), [contactRequests, group, nowTick]);
+  const arrivalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'arrival' && r.to === group && r.status !== 'canceled' && (r.items || []).some(i => !i.time)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
+  const lotList = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    return (lots || [])
+      .filter(l => l && l.status !== 'completed')
+      .filter(l => !s || String(l.orderNo || '').toLowerCase().includes(s) || String(l.model || '').toLowerCase().includes(s))
+      .sort((a, b) => String(a.dueDate || '9999').localeCompare(String(b.dueDate || '9999')))
+      .slice(0, 60);
+  }, [lots, q]);
+  const byName = name.trim() || group;
+  const reply = (r, choice) => {
+    saveData('contact_requests', r.id, { status: 'answered', answer: { choice, comment: (commentDraft[r.id] || '').trim(), by: byName, at: Date.now() } });
+    setCommentDraft(p => ({ ...p, [r.id]: '' }));
+  };
+  const answerArrivalItem = (r, idx) => {
+    const key = `${r.id}__${idx}`;
+    const d = draftTimes[key] || {};
+    if (!d.time) return;
+    const items = (r.items || []).map((it, i) => i === idx ? { ...it, date: d.date || todayStr, time: d.time, by: byName, at: Date.now() } : it);
+    saveData('contact_requests', r.id, { items, status: items.every(i => i.time) ? 'answered' : 'waiting' });
+    const it = items[idx];
+    if (it.lotId) saveData('arrival_times', it.lotId, { orderNo: it.orderNo || '', model: it.model || '', date: d.date || todayStr, time: d.time, by: byName, at: Date.now() });
+    setDraftTimes(p => ({ ...p, [key]: {} }));
+  };
+  const registerArrival = (lot) => {
+    const d = draftTimes[lot.id] || {};
+    if (!d.time) return;
+    saveData('arrival_times', lot.id, { orderNo: lot.orderNo || '', model: lot.model || '', date: d.date || todayStr, time: d.time, by: byName, at: Date.now() });
+    setDraftTimes(p => ({ ...p, [lot.id]: {} }));
+  };
+  // 機能OFF時はポータルも閉じる (URLを知っていても何も見えない)
+  if (settings?.contactFeature?.enabled === false) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
+        <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md text-center">
+          <MessageCircle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+          <div className="font-black text-slate-700">工程連絡は現在停止中です</div>
+          <div className="text-xs text-slate-400 mt-1">検査側の「マスタ設定 → 工程連絡」でONにすると使えるようになります</div>
+        </div>
+      </div>
+    );
+  }
+  if (!group) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
+        <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md flex flex-col gap-4">
+          <div className="flex items-center gap-2"><MessageCircle className="w-6 h-6 text-blue-600" /><h1 className="text-xl font-black text-slate-800">工程連絡ポータル</h1></div>
+          <p className="text-sm text-slate-500">あなたのグループを選んでください（検査からの連絡がここに届きます）</p>
+          {groups.map(g => (
+            <button key={g} onClick={() => { try { localStorage.setItem('renrakuGroup', g); } catch (e) { /* noop */ } setGroup(g); }} className="w-full py-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-lg font-black">{g}</button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="min-h-screen bg-slate-100">
+      <header className="sticky top-0 z-20 bg-slate-800 text-white px-4 py-3 flex items-center gap-3 shadow-md">
+        <MessageCircle className="w-5 h-5 text-blue-300 shrink-0" />
+        <div className="font-black whitespace-nowrap">工程連絡ポータル</div>
+        <span className="bg-blue-600 rounded-full px-2.5 py-0.5 text-sm font-black whitespace-nowrap">{group}</span>
+        <button onClick={() => { try { localStorage.removeItem('renrakuGroup'); } catch (e) { /* noop */ } setGroup(''); }} className="text-[11px] text-slate-300 underline whitespace-nowrap">変更</button>
+        <input value={name} onChange={e => { setName(e.target.value); try { localStorage.setItem('renrakuName', e.target.value); } catch (err) { /* noop */ } }} placeholder="名前(任意)" className="ml-auto w-28 bg-slate-700 border border-slate-600 rounded-lg px-2 py-1 text-sm" />
+      </header>
+      <main className="max-w-3xl mx-auto p-4 flex flex-col gap-5 pb-16">
+        <section>
+          <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Wrench className="w-5 h-5 text-orange-600" /> 修正・呼出の依頼 {inbox.length > 0 && <span className="bg-orange-600 text-white text-xs font-black rounded-full px-2 py-0.5 animate-pulse">{inbox.length}件</span>}</h2>
+          {inbox.length === 0 && <div className="bg-white rounded-xl border border-slate-200 p-4 text-sm text-slate-400">いま対応待ちの依頼はありません</div>}
+          <div className="flex flex-col gap-3">
+            {inbox.map(r => (
+              <div key={r.id} className="bg-white rounded-xl border-2 border-orange-300 shadow-sm overflow-hidden">
+                <div className="px-3 py-2 bg-orange-50 flex items-center gap-2 flex-wrap text-xs">
+                  <span className="font-black text-orange-700">{contactKindLabel(r)}</span>
+                  <span className="text-slate-500 font-bold">{r.from || '検査'} から</span>
+                  <span className="font-mono text-slate-400">{fmtContactTime(r.createdAt)}（{fmtContactElapsed(r.createdAt, nowTick)}前）</span>
+                  {r.orderNo && <span className="font-mono font-bold text-slate-600">指図 {r.orderNo}</span>}
+                  {r.model && <span className="font-bold text-slate-600">{r.model}</span>}
+                  {r.stepTitle && <span className="text-slate-500">{r.stepTitle} {r.unitLabel}</span>}
+                </div>
+                <div className="px-3 py-2 text-base font-bold text-slate-800 whitespace-pre-wrap">{r.message}</div>
+                <div className="px-3 pb-3 flex flex-col gap-2">
+                  <input value={commentDraft[r.id] || ''} onChange={e => setCommentDraft(p => ({ ...p, [r.id]: e.target.value }))} placeholder="ひとことコメント（任意）" className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" />
+                  <div className="grid grid-cols-4 gap-2">
+                    {CONTACT_REPLY_CHOICES.map(c => (
+                      <button key={c.id} onClick={() => reply(r, c.id)} className={`py-3 rounded-xl text-white text-sm font-black ${c.cls}`}>{c.label}</button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {answeredRecent.length > 0 && (
+            <div className="mt-2">
+              <button onClick={() => setShowAnswered(v => !v)} className="text-xs font-bold text-slate-500 underline">返信済み {answeredRecent.length}件（24時間以内）{showAnswered ? 'を隠す' : 'を見る'}</button>
+              {showAnswered && (
+                <div className="mt-1 flex flex-col gap-1">
+                  {answeredRecent.map(r => (
+                    <div key={r.id} className="bg-white rounded-lg border border-slate-200 px-3 py-1.5 text-xs flex items-center gap-2 flex-wrap">
+                      <span className="text-slate-500 truncate max-w-[40ch]">{r.message}</span>
+                      <span className={`ml-auto font-black shrink-0 ${r.answer?.choice === 'no' ? 'text-rose-600' : 'text-emerald-600'}`}>{contactReplyLabel(r.answer?.choice)}</span>
+                      <span className="font-mono text-slate-400 shrink-0">{fmtContactTime(r.answer?.at)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+        <section>
+          <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Clock className="w-5 h-5 text-teal-600" /> 「いつ来るか」の依頼 {arrivalReqs.length > 0 && <span className="bg-teal-600 text-white text-xs font-black rounded-full px-2 py-0.5 animate-pulse">{arrivalReqs.length}件</span>}</h2>
+          {arrivalReqs.length === 0 && <div className="bg-white rounded-xl border border-slate-200 p-4 text-sm text-slate-400">いま回答待ちの依頼はありません</div>}
+          <div className="flex flex-col gap-3">
+            {arrivalReqs.map(r => (
+              <div key={r.id} className="bg-white rounded-xl border-2 border-teal-300 shadow-sm overflow-hidden">
+                <div className="px-3 py-2 bg-teal-50 flex items-center gap-2 text-xs">
+                  <span className="font-black text-teal-700">到着予定を教えてください</span>
+                  <span className="text-slate-500 font-bold">{r.from || '検査'} から</span>
+                  <span className="font-mono text-slate-400">{fmtContactTime(r.createdAt)}</span>
+                </div>
+                <div className="divide-y divide-slate-100">
+                  {(r.items || []).map((it, idx) => {
+                    const key = `${r.id}__${idx}`;
+                    const d = draftTimes[key] || {};
+                    return (
+                      <div key={idx} className="px-3 py-2 flex items-center gap-2 flex-wrap">
+                        <span className="font-mono text-sm font-black text-slate-700 shrink-0">{it.orderNo}</span>
+                        <span className="text-sm font-bold text-slate-600 truncate">{it.model}</span>
+                        {showQty && it.quantity ? <span className="text-xs text-slate-400 shrink-0">{it.quantity}台</span> : null}
+                        {showDue && it.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {it.dueDate}</span> : null}
+                        {it.time ? (
+                          <span className="ml-auto font-black text-emerald-700 shrink-0">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time} ✓</span>
+                        ) : (
+                          <span className="ml-auto flex items-center gap-1.5 shrink-0">
+                            <input type="date" value={d.date || todayStr} onChange={e => setDraftTimes(p => ({ ...p, [key]: { ...d, date: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
+                            <input type="time" value={d.time || ''} onChange={e => setDraftTimes(p => ({ ...p, [key]: { ...d, time: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
+                            <button disabled={!d.time} onClick={() => answerArrivalItem(r, idx)} className="px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-sm font-black disabled:opacity-40">返信</button>
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+        <section>
+          <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Truck className="w-5 h-5 text-blue-600" /> 到着予定を登録（頼まれる前に知らせる）</h2>
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            <div className="p-2 border-b border-slate-100">
+              <div className="relative">
+                <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input value={q} onChange={e => setQ(e.target.value)} placeholder="指図・型式で検索" className="w-full border border-slate-300 rounded-lg pl-8 pr-2 py-2 text-sm" />
+              </div>
+            </div>
+            <div className="divide-y divide-slate-100 max-h-[50vh] overflow-y-auto">
+              {lotList.map(l => {
+                const cur = arrivalByLot[l.id];
+                const d = draftTimes[l.id] || {};
+                return (
+                  <div key={l.id} className="px-3 py-2 flex items-center gap-2 flex-wrap">
+                    <span className="font-mono text-sm font-black text-slate-700 shrink-0">{l.orderNo}</span>
+                    <span className="text-sm font-bold text-slate-600 truncate">{l.model}</span>
+                    {showQty ? <span className="text-xs text-slate-400 shrink-0">{l.quantity}台</span> : null}
+                    {showDue && l.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {l.dueDate}</span> : null}
+                    {cur && cur.time && <span className="text-xs font-black text-teal-700 bg-teal-50 border border-teal-200 rounded px-1.5 py-0.5 shrink-0">登録済 {cur.date ? `${String(cur.date).slice(5).replace('-', '/')} ` : ''}{cur.time}</span>}
+                    <span className="ml-auto flex items-center gap-1.5 shrink-0">
+                      <input type="date" value={d.date || todayStr} onChange={e => setDraftTimes(p => ({ ...p, [l.id]: { ...d, date: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
+                      <input type="time" value={d.time || ''} onChange={e => setDraftTimes(p => ({ ...p, [l.id]: { ...d, time: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
+                      <button disabled={!d.time} onClick={() => registerArrival(l)} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black disabled:opacity-40">{cur && cur.time ? '更新' : '登録'}</button>
+                    </span>
+                  </div>
+                );
+              })}
+              {lotList.length === 0 && <div className="p-4 text-center text-sm text-slate-400">対象がありません</div>}
+            </div>
+          </div>
+          <p className="text-[11px] text-slate-400 mt-1.5">このページは限定表示です（指図・型式{showQty ? '・台数' : ''}{showDue ? '・納期' : ''}のみ）。登録した時間は検査側の検査リストにすぐ表示されます。</p>
+        </section>
+      </main>
     </div>
   );
 };
@@ -7700,11 +8312,13 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {} }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
   const lot = _lotProp || {};
+  // 工程間連絡: 「連絡しますか？」送信モーダルの下書き。NG→修正で自動オープン、呼出ボタンでも開く。
+  const [contactDraft, setContactDraft] = useState(null);
   // この検査を実施している作業者名 = ロットの担当者(lot.workerId)。担当を切替えると以降の完了が新担当で記録される。
   // これを各タスクの workerName に焼き付けることで、台ごとに別の人が作業しても集計が正しくなる。
   const inspectorName = (lot.workerId && workers.find(w => w.id === lot.workerId)?.name) || currentUserName || '';
@@ -10162,6 +10776,21 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       // ngReason 引数を「この修正回の理由」として記録する (2回目以降は同異確認 picker から渡る)。
       const reworks = [...(captured.reworks || []), { startTime: Date.now(), duration: 0, round: (captured.reworks?.length || 0) + 1, ...(ngReason ? { reason: ngReason } : {}) }];
       newTasks[key] = { ...captured, status: 'reworking', reworkStartTime: Date.now(), reworks };
+      // 工程間連絡: 修正開始と同時に「連絡しますか？」を開く。
+      // 宛先+修正内容を送ると、相手は「すぐ行く/10分後/20分後/行けない」でワンタップ返信→この画面に表示される。
+      if (saveData && contactEnabled) {
+        const m = String(key).match(/^(.*)-(\d+)$/);
+        const sid = m ? m[1] : '';
+        const uIdx = m ? parseInt(m[2], 10) : null;
+        const st = localSteps.find(s => String(s?.id) === sid) || localSteps[parseInt(sid, 10)] || null;
+        const rsn = ngReason || currentTask.ngReason || '';
+        const stepTitle = st?.title || '';
+        setContactDraft({
+          kind: 'repair', stepTitle,
+          unitLabel: uIdx != null && !Number.isNaN(uIdx) ? `${uIdx + 1}台目` : '',
+          message: `${stepTitle}${uIdx != null && !Number.isNaN(uIdx) ? ` ${uIdx + 1}台目` : ''}${rsn ? `：${rsn}` : ''} の修正をお願いします`.trim(),
+        });
+      }
     } else if (action === 'rework-ok') {
       // 修正完了: firstStartTime は currentTask から維持される (spread で継承)
       const okAt = Date.now();
@@ -11549,6 +12178,18 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
           {cdByOrder[String(lot.orderNo)]
             ? <PrepCard summary={cdByOrder[String(lot.orderNo)]} orderNo={lot.orderNo} />
             : (cdHistoryByModel[String(lot.model || '').trim()] && <PrepHistoryCard history={cdHistoryByModel[String(lot.model || '').trim()]} />)}
+
+          {/* 工程間連絡: 呼出ボタン+このロットへの返信(すぐ行く/10分後/…)をライブ表示 */}
+          {saveData && contactEnabled && (
+            <WorkContactPanel lot={lot} contactRequests={contactRequests} onOpenSend={(d) => setContactDraft(d || { kind: 'call', message: '' })} />
+          )}
+          {contactDraft && contactEnabled && (
+            <ContactSendModal
+              draft={contactDraft} groups={contactGroups.length ? contactGroups : DEFAULT_CONTACT_GROUPS} from={inspectorName} lot={lot}
+              onClose={() => setContactDraft(null)}
+              onSend={(payload) => { if (saveData) saveData('contact_requests', newContactId(), payload); setContactDraft(null); setOrderHint('📨 連絡を送信しました。返信はこの画面に表示されます'); }}
+            />
+          )}
 
           {/* 別エリアの自動測定ステータス: ヘッダ下のサブバー (常時表示) — 大幅に拡大して見やすく */}
           {otherActiveAutos.length > 0 && (
@@ -22184,6 +22825,22 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
            })()}
          </div>
 
+         {/* 工程連絡設定 (機能全体のON/OFF) */}
+         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+           <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><MessageCircle className="w-5 h-5 text-blue-600" /> 工程連絡（前後工程との連絡）</h3>
+           <p className="text-xs text-slate-400 mb-4">「連絡」タブ・作業画面の連絡ボタン・NG→修正の「連絡しますか？」・到着予定バッジ・相手用ポータル(?renraku=1)を、まとめてON/OFFします。OFFにしても過去の連絡データは消えません。</p>
+           {(() => {
+             const on = settings?.contactFeature?.enabled !== false;
+             return (
+               <label className="flex items-center gap-3 cursor-pointer">
+                 <input type="checkbox" checked={on} onChange={e => saveSettings({ contactFeature: { ...(settings.contactFeature || {}), enabled: e.target.checked } })} className="w-5 h-5 accent-blue-600" />
+                 <span className="text-sm font-bold text-slate-700">工程連絡を使う</span>
+                 <span className="text-xs text-slate-400">OFFにすると連絡タブ・連絡ボタン・ポータルが全て非表示になります（宛先や公開項目の細かい設定は連絡タブ内）</span>
+               </label>
+             );
+           })()}
+         </div>
+
          {/* 目標時間オーバー警告設定 (カスタム作業画面の点滅・音) */}
          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
            <h3 className="text-lg font-bold mb-2 flex items-center gap-2"><Target className="w-5 h-5 text-rose-600" /> 目標時間オーバー警告（カスタム作業画面）</h3>
@@ -22501,6 +23158,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                { key: 'delayStatus', label: '遅延ラベル' },
                { key: 'progressBar', label: '下部の進捗バー' },
                { key: 'unitBadge', label: '号機バッジ (制御装置)' },
+               { key: 'arrivalBadge', label: '到着予定 (工程連絡)' },
              ];
              return (
                <>
@@ -22520,7 +23178,7 @@ const TemplateListSection = ({ templates, lots = [], settings, setEditingTemplat
                  <div className="flex gap-2 justify-end">
                    <button
                      type="button"
-                     onClick={() => saveSettings({ lotCardDisplay: { orderNo: true, model: true, quantity: true, workerBadge: true, progressBar: true, unitBadge: true, templateName: false, entryTime: false, elapsedTime: false, progressPct: false, nextStep: false, timeRange: false, delayStatus: false } })}
+                     onClick={() => saveSettings({ lotCardDisplay: { orderNo: true, model: true, quantity: true, workerBadge: true, progressBar: true, unitBadge: true, arrivalBadge: true, templateName: false, entryTime: false, elapsedTime: false, progressPct: false, nextStep: false, timeRange: false, delayStatus: false } })}
                      className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded font-bold"
                    >
                      最小表示 (5項目)
@@ -22849,7 +23507,7 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
   );
 };
 
-const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '', saveData, cdByOrder = {} }) => {
+const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '', saveData, cdByOrder = {}, arrivalByLot = {} }) => {
   const [assignmentLot, setAssignmentLot] = useState(null);
   const [viewMode, setViewMode] = useState('grid');
   const [searchQuery, setSearchQuery] = useState('');
@@ -23285,6 +23943,12 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                     {/* 制御装置(号機)バッジ = この指図につなぐ号機。作業者が"どの号機だ？"を探す時間を消す。設定で非表示可。 */}
                     {settings?.lotCardDisplay?.unitBadge !== false && cdByOrder[String(lot.orderNo)] && (
                       <div onClick={(e) => e.stopPropagation()}><UnitBadge summary={cdByOrder[String(lot.orderNo)]} /></div>
+                    )}
+                    {/* 到着予定バッジ (工程連絡: あっちがポータルで登録した「いつ来るか」) */}
+                    {settings?.lotCardDisplay?.arrivalBadge !== false && arrivalByLot[lot.id]?.time && (
+                      <div className="text-[11px] font-black text-teal-800 bg-teal-50 border border-teal-300 rounded px-1.5 py-0.5 inline-flex items-center gap-1 w-fit max-w-full" title={`到着予定 (登録: ${arrivalByLot[lot.id].by || '相手工程'})`}>
+                        <Truck className="w-3.5 h-3.5 shrink-0" /> 到着 {arrivalByLot[lot.id].date ? `${String(arrivalByLot[lot.id].date).slice(5).replace('-', '/')} ` : ''}{arrivalByLot[lot.id].time}
+                      </div>
                     )}
                     {/* 停止理由バッジ */}
                     {lot.pauseReason && lot.pauseReason.category && (() => {
@@ -27637,6 +28301,8 @@ export default function App() {
    const [orderMotors, setOrderMotors] = useState([]); // 指図別モーター登録(検査リスト非依存・取り合い分析用の全製品)
    const [motorLedger, setMotorLedger] = useState([]); // 型式↔モーター↔号機↔指図↔日付の実績台帳(別枠DB。全削除でも消えない)
    const [spareMotors, setSpareMotors] = useState([]); // 社内の仮モーター在庫(検査G/組立Gが持つ予備モーター)
+   const [contactRequests, setContactRequests] = useState([]); // 工程間連絡: 修正依頼/呼出/到着予定依頼
+   const [arrivalTimes, setArrivalTimes] = useState([]); // 到着予定 (docId=lotId。ポータルから登録→検査リストにバッジ)
    const [logs, setLogs] = useState([]);
    const [settings, setSettings] = useState({ mapImage: null, mapZones: INITIAL_MAP_ZONES, defectProcessOptions: DEFAULT_DEFECT_PROCESS_OPTIONS, breakAlerts: [], complaintOptions: DEFAULT_COMPLAINT_OPTIONS, customTargetTimes: {}, targetTimeHistory: [], customLayouts: {}, measurementOverrides: {} });
 
@@ -27804,6 +28470,8 @@ export default function App() {
      inspection: [
        { id: 'inspection', label: '検査リスト', icon: ListChecks },
        { id: 'history', label: '完了履歴', icon: CheckSquare },
+       // 工程連絡はマスタ設定の contactFeature.enabled でタブごとON/OFF
+       ...((settings?.contactFeature?.enabled !== false) ? [{ id: 'contact', label: '連絡', icon: MessageCircle }] : []),
      ],
      analysis: [
        { id: 'analysis', label: '分析', icon: BarChart3 },
@@ -27817,7 +28485,11 @@ export default function App() {
        { id: 'quality-standards', label: '品質規格マスタ', icon: ClipboardCheck },
      ],
    };
-   const TAB_PARENT = { inspection: 'inspection', history: 'inspection', analysis: 'analysis', optimize: 'analysis', 'control-devices': 'analysis', templates: 'templates', 'template-mgr': 'templates', 'measurement-settings': 'templates', 'quality-standards': 'templates' };
+   const TAB_PARENT = { inspection: 'inspection', history: 'inspection', contact: 'inspection', analysis: 'analysis', optimize: 'analysis', 'control-devices': 'analysis', templates: 'templates', 'template-mgr': 'templates', 'measurement-settings': 'templates', 'quality-standards': 'templates' };
+   // 工程間連絡: 到着予定 (docId=lotId) を lotId 引きに。検査リストのカードバッジで使う。
+   const arrivalByLot = useMemo(() => { const m = {}; (arrivalTimes || []).forEach(a => { if (a && a.id) m[a.id] = a; }); return m; }, [arrivalTimes]);
+   // 工程連絡 機能全体のON/OFF (マスタ設定で切替。OFF=連絡タブ/連絡ボタン/NG修正フック/到着バッジ/ポータルを全て非表示)
+   const contactFeatureOn = settings?.contactFeature?.enabled !== false;
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
@@ -28013,6 +28685,8 @@ export default function App() {
        onSnapshot(getPath('order_motors'), (snap) => setOrderMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('motor_ledger'), (snap) => setMotorLedger(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('spare_motors'), (snap) => setSpareMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('contact_requests'), (snap) => setContactRequests(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       onSnapshot(getPath('arrival_times'), (snap) => setArrivalTimes(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('workers'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setWorkers(data);
@@ -30065,6 +30739,12 @@ export default function App() {
      }
    };
  
+   // 連絡ポータル(?renraku=1): あっち(前後工程)用の限定ビュー。指図/型式/台数/納期と連絡機能だけを表示し、
+   // 検査アプリ本体(タブ・分析・設定等)は一切レンダリングしない。
+   if (RENRAKU_PORTAL) {
+     return <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={settings} />;
+   }
+
    return (
      <WorkScheduleContext.Provider value={settings.workSchedule || DEFAULT_WORK_SCHEDULE}>
      <LotCardDisplayContext.Provider value={settings.lotCardDisplay || DEFAULT_LOT_CARD_DISPLAY}>
@@ -30246,6 +30926,7 @@ export default function App() {
                  <button key={s.id} onClick={() => setActiveTab(s.id)}
                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-t-md text-sm font-bold border-b-2 transition-all ${activeTab === s.id ? 'border-blue-600 text-blue-600 bg-blue-50' : 'border-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-50'}`}>
                    <s.icon className="w-4 h-4" /> {s.label}
+                   {s.id === 'contact' && (() => { const n = (contactRequests || []).filter(r => r && r.status === 'waiting').length; return n > 0 ? <span className="bg-amber-500 text-white text-[9px] rounded-full min-w-4 h-4 px-1 flex items-center justify-center font-black">{n}</span> : null; })()}
                  </button>
                ))}
              </div>
@@ -30262,7 +30943,8 @@ export default function App() {
            </div>
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
-         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} />}
+         {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
+         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
@@ -30447,6 +31129,9 @@ export default function App() {
        {executionLotId && (
          <WorkExecutionModal
            lot={lots.find(l => l.id === executionLotId)}
+           contactRequests={contactRequests}
+           contactGroups={contactGroupsOf(settings)}
+           contactEnabled={contactFeatureOn}
            onClose={() => setExecutionLotId(null)}
            onSave={(updates) => saveData('lots', executionLotId, updates)}
            onFinish={() => { setExecutionLotId(null); setActiveTab('history'); }}
