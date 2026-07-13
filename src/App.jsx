@@ -3319,9 +3319,10 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
     setBusy(true); setErr(''); setInfo('');
     const res = await sendPushViaWorker(cfg.workerUrl, {
       tokens: [mine.token], title: '✅ テスト通知', body: 'この端末に工程連絡の通知が届きます',
-      link: (typeof window !== 'undefined' ? `${window.location.origin}${side === 'portal' ? '/?renraku=1' : '/'}` : ''), tag: 'push-test',
+      // tagは毎回ユニークに(同じtagだと前の通知が残っている時に音なしで置き換わり「届かない」ように見える)
+      link: (typeof window !== 'undefined' ? `${window.location.origin}${side === 'portal' ? '/?renraku=1' : '/'}` : ''), tag: `push-test-${Date.now()}`,
     });
-    if (res?.ok && res.sent > 0) setInfo('テスト通知を送りました（数秒で届きます。この画面を開いたままなら上部に表示されます）');
+    if (res?.ok && res.sent > 0) setInfo('この端末宛てにテスト通知を送りました（テストは押した端末だけに届きます。他の端末はその端末で押してください）');
     else setErr(`テスト送信に失敗: ${res?.results?.[0]?.error || res?.error || '不明なエラー'}`);
     setBusy(false);
   };
@@ -3344,6 +3345,9 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
             <button onClick={() => { saveSettings({ push: { ...(settings?.push || {}), vapidKey: vapidDraft.trim(), workerUrl: workerDraft.trim().replace(/\/+$/, '') } }); setInfo('通知設定を保存しました'); }} className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-black shrink-0">保存</button>
           </div>
           {!ready && <div className="text-[11px] text-amber-600 font-bold">VAPID鍵とWorker URLの両方を保存すると通知が使えるようになります（未設定の間も連絡機能自体は普通に使えます）</div>}
+          <div className="text-[11px] text-slate-500 bg-blue-50 border border-blue-100 rounded-lg px-2.5 py-1.5">
+            💡 <b>組立・機械の端末とのつなげ方:</b> その端末で上の「あっち側に渡すURL」を開く → グループ（組立など）を選ぶ → 右上の🔔 →「この端末で通知を受け取る」。これで<b>そのグループ宛ての依頼</b>がその端末に届きます。ここ（検査側）で登録した端末には<b>返信・到着回答</b>が届きます。
+          </div>
         </div>
       )}
       {!admin && !ready && <div className="text-xs text-slate-400 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">通知はまだ準備中です（検査側の管理者が設定すると使えるようになります）。連絡はこの画面に表示されます。</div>}
@@ -3574,7 +3578,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     // 宛先グループの携帯へプッシュ通知(設定済みなら)。失敗しても連絡自体は届いている。
     if (notifyPush) {
       const m = contactPushMessage(payload);
-      notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: 'contact-req' });
+      notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` });
     }
   };
   return (
@@ -3777,7 +3781,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   const reply = (r, choice) => {
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice, comment: (commentDraft[r.id] || '').trim(), by: byName, at: Date.now() } });
     setCommentDraft(p => ({ ...p, [r.id]: '' }));
-    if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}-${Date.now()}` });
   };
   const answerArrivalItem = (r, idx) => {
     const key = `${r.id}__${idx}`;
@@ -3788,14 +3792,14 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     const it = items[idx];
     if (it.lotId) saveData('arrival_times', it.lotId, { orderNo: it.orderNo || '', model: it.model || '', date: d.date || todayStr, time: d.time, by: byName, at: Date.now() });
     setDraftTimes(p => ({ ...p, [key]: {} }));
-    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定: ${it.orderNo || ''} → ${d.time}`, body: `${byName} が回答しました`, link: appLink, tag: `arr-${r.id}-${idx}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定: ${it.orderNo || ''} → ${d.time}`, body: `${byName} が回答しました`, link: appLink, tag: `arr-${r.id}-${idx}-${Date.now()}` });
   };
   const registerArrival = (lot) => {
     const d = draftTimes[lot.id] || {};
     if (!d.time) return;
     saveData('arrival_times', lot.id, { orderNo: lot.orderNo || '', model: lot.model || '', date: d.date || todayStr, time: d.time, by: byName, at: Date.now() });
     setDraftTimes(p => ({ ...p, [lot.id]: {} }));
-    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定 登録: ${lot.orderNo || ''} → ${d.time}`, body: `${byName} が登録しました`, link: appLink, tag: `arr-reg-${lot.id}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定 登録: ${lot.orderNo || ''} → ${d.time}`, body: `${byName} が登録しました`, link: appLink, tag: `arr-reg-${lot.id}-${Date.now()}` });
   };
   // 機能OFF時はポータルも閉じる (URLを知っていても何も見えない)
   if (settings?.contactFeature?.enabled === false) {
@@ -12490,7 +12494,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
               onSend={(payload) => {
                 if (saveData) saveData('contact_requests', newContactId(), payload);
                 // 宛先グループの携帯へプッシュ通知(設定済みなら)
-                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: 'contact-req' }); }
+                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` }); }
                 setContactDraft(null); setOrderHint('📨 連絡を送信しました。返信はこの画面に表示されます');
               }}
             />
