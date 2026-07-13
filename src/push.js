@@ -64,7 +64,7 @@ export async function enablePush(vapidKey) {
   const perm = await Notification.requestPermission();
   if (perm !== 'granted') throw new Error('通知が許可されませんでした。端末/ブラウザの設定でこのサイトの通知を「許可」にしてください(通知ヘルプ参照)');
   const token = await getToken(getMessaging(getApp()), { vapidKey: String(vapidKey).trim(), serviceWorkerRegistration: reg });
-  if (!token) throw new Error('トークンを取得できませんでした。時間をおいてもう一度試してください');
+  if (!token) throw new Error('この端末を登録できませんでした。電波を確認して、時間をおいてもう一度押してください');
   return token;
 }
 

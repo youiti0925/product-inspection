@@ -3406,8 +3406,10 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
         {onOpenHelp && <button onClick={onOpenHelp} className="ml-1 px-2 py-0.5 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-[11px] font-bold flex items-center gap-1"><HelpCircle className="w-3 h-3" /> 設定方法（Galaxy/iPhone/PC）</button>}
       </div>
       {admin && (
-        <div className="bg-slate-50 border border-slate-200 rounded-lg p-2.5 flex flex-col gap-1.5">
-          <div className="text-[11px] font-bold text-slate-500">管理者設定（最初の1回。取り方は上の「設定方法」→ 管理者の初期設定）</div>
+        <details className="bg-slate-50 border border-slate-200 rounded-lg">
+        <summary className="px-2.5 py-2 text-[11px] font-bold text-slate-500 cursor-pointer select-none">⚙ 管理者はこちら（通知サーバー設定 — 最初の1回だけ。作業者は触らないでください）</summary>
+        <div className="p-2.5 pt-0 flex flex-col gap-1.5">
+          <div className="text-[11px] font-bold text-amber-600">⚠ ここを変えると全員の通知が止まることがあります。取り方は上の「設定方法」→ 管理者の初期設定。</div>
           <div className="flex items-center gap-1.5">
             <span className="text-[11px] font-bold text-slate-500 w-20 shrink-0">VAPID鍵</span>
             <input value={vapidDraft} onChange={e => setVapidDraft(e.target.value)} placeholder="Bで始まる長い文字列（Firebaseコンソール→Cloud Messaging→ウェブプッシュ証明書）" className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs font-mono" />
@@ -3422,6 +3424,7 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
             💡 <b>組立・機械の端末とのつなげ方:</b> その端末で上の「あっち側に渡すURL」を開く → グループ（組立など）を選ぶ → 右上の🔔 →「この端末で通知を受け取る」。これで<b>そのグループ宛ての依頼</b>がその端末に届きます。ここ（検査側）で登録した端末には<b>返信・到着回答</b>が届きます。
           </div>
         </div>
+        </details>
       )}
       {!admin && !ready && <div className="text-xs text-slate-400 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">通知はまだ準備中です（検査側の管理者が設定すると使えるようになります）。連絡はこの画面に表示されます。</div>}
       {ready && (
@@ -3445,7 +3448,12 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
           {busy && <Loader2 className="w-4 h-4 animate-spin text-slate-400" />}
         </div>
       )}
-      {err && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 font-bold">{err}</div>}
+      {err && (
+        <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 font-bold">
+          {err}
+          <div className="mt-1 font-normal text-slate-500">※通知が失敗しても、連絡そのものはこの画面に必ず表示されます。急ぎは今まで通り電話でもOK。直し方は「設定方法」→「通知が来ないとき」。</div>
+        </div>
+      )}
       {info && <div className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 font-bold">{info}</div>}
       {admin && (pushTokens || []).length > 0 && (
         <div className="border border-slate-200 rounded-lg overflow-hidden">
@@ -3483,7 +3491,7 @@ const ContactSendModal = ({ draft, groups, from, lot, onClose, onSend, members =
   const shownChips = moreChips ? allChips : allChips.slice(0, 8);
   const groupMembers = members[to] || [];
   return (
-    <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4" onClick={() => { if (message.trim() && !window.confirm('書きかけの内容を捨てて閉じますか？')) return; onClose(); }}>
       <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className={`px-4 py-3 text-white flex items-center gap-2 ${isRepair ? 'bg-orange-600' : 'bg-blue-600'}`}>
           <MessageCircle className="w-5 h-5" />
@@ -3569,7 +3577,7 @@ const WorkContactPanel = ({ lot, contactRequests, onOpenSend }) => {
   return (
     <div className="shrink-0 mx-3 mt-2 flex flex-col gap-1">
       <div className="flex items-center gap-2">
-        <button type="button" onClick={() => onOpenSend(null)} className="px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-black flex items-center gap-1.5 shadow-sm" title="他工程を呼ぶ/質問する（返信はここに表示されます）">
+        <button type="button" onClick={() => onOpenSend(null)} className="px-4 py-2.5 min-h-[44px] rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black flex items-center gap-1.5 shadow-sm" title="他工程を呼ぶ/質問する（返信はここに表示されます）">
           <MessageCircle className="w-4 h-4" /> 連絡・呼出
         </button>
         {mine.length === 0 && <span className="text-[11px] text-slate-400">修正に来てほしい時・質問したい時はここから連絡</span>}
@@ -3932,6 +3940,8 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   // 返信・回答は検査側の端末(side:'app')へプッシュ通知(設定済みなら)
   const appLink = (() => { try { return `${window.location.origin}/`; } catch (e) { return ''; } })();
   const reply = (r, choice) => {
+    // 「行けない」だけは取り返しがつきにくいので誤タップ防止の確認を挟む
+    if (choice === 'no' && !window.confirm('「行けない」と返信します。よろしいですか？')) return;
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice, comment: (commentDraft[r.id] || '').trim(), by: byName, at: Date.now() } });
     setCommentDraft(p => ({ ...p, [r.id]: '' }));
     if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}-${Date.now()}` });
@@ -3985,7 +3995,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
         <MessageCircle className="w-5 h-5 text-blue-300 shrink-0" />
         <div className="font-black whitespace-nowrap">工程連絡ポータル</div>
         <span className="bg-blue-600 rounded-full px-2.5 py-0.5 text-sm font-black whitespace-nowrap">{group}</span>
-        <button onClick={() => { try { localStorage.removeItem('renrakuGroup'); } catch (e) { /* noop */ } setGroup(''); }} className="text-[11px] text-slate-300 underline whitespace-nowrap">変更</button>
+        <button onClick={() => { if (!window.confirm('グループを選び直しますか？(表示される依頼が切り替わります)')) return; try { localStorage.removeItem('renrakuGroup'); } catch (e) { /* noop */ } setGroup(''); }} className="text-[11px] font-bold text-slate-200 border border-slate-500 rounded-lg px-2.5 py-1.5 whitespace-nowrap hover:bg-slate-700">変更</button>
         <input value={name} onChange={e => { setName(e.target.value); try { localStorage.setItem('renrakuName', e.target.value); } catch (err) { /* noop */ } }} placeholder="名前(任意)" className="ml-auto w-28 bg-slate-700 border border-slate-600 rounded-lg px-2 py-1 text-sm" />
         <button onClick={() => setShowPushCfg(v => !v)} title="通知の設定" className={`relative p-1.5 rounded-lg shrink-0 ${showPushCfg ? 'bg-amber-500 text-white' : 'bg-slate-700 hover:bg-slate-600 text-amber-300'}`}>
           <Bell className="w-5 h-5" />
@@ -4033,9 +4043,10 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                 })()}
                 <div className="px-3 pb-3 flex flex-col gap-2">
                   <input value={commentDraft[r.id] || ''} onChange={e => setCommentDraft(p => ({ ...p, [r.id]: e.target.value }))} placeholder="ひとことコメント（任意）" className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" />
-                  <div className="grid grid-cols-4 gap-2">
+                  {/* 2×2で押しやすく。「行けない」は白地赤枠にして誤タップと視認性を両立 */}
+                  <div className="grid grid-cols-2 gap-2">
                     {CONTACT_REPLY_CHOICES.map(c => (
-                      <button key={c.id} onClick={() => reply(r, c.id)} className={`py-3 rounded-xl text-white text-sm font-black ${c.cls}`}>{c.label}</button>
+                      <button key={c.id} onClick={() => reply(r, c.id)} className={`py-3.5 rounded-xl text-sm font-black ${c.id === 'no' ? 'bg-white border-2 border-rose-500 text-rose-600 hover:bg-rose-50' : `text-white ${c.cls}`}`}>{c.label}</button>
                     ))}
                   </div>
                 </div>
@@ -4052,6 +4063,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                       <span className="text-slate-500 truncate max-w-[40ch]">{r.message}</span>
                       <span className={`ml-auto font-black shrink-0 ${r.answer?.choice === 'no' ? 'text-rose-600' : 'text-emerald-600'}`}>{contactReplyLabel(r.answer?.choice)}</span>
                       <span className="font-mono text-slate-400 shrink-0">{fmtContactTime(r.answer?.at)}</span>
+                      <button onClick={() => { if (window.confirm('この返信を取り消して選び直しますか？')) saveData('contact_requests', r.id, { status: 'waiting', answer: deleteField() }); }} className="shrink-0 px-2 py-1 rounded border border-blue-300 text-blue-600 font-bold hover:bg-blue-50">やり直す</button>
                     </div>
                   ))}
                 </div>
@@ -9334,7 +9346,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       Object.entries(tasks).forEach(([k, t]) => {
         if (t?.status === 'paused' && t.pausedAt) {
           if (!breakMs) breakMs = Math.max(0, now - t.pausedAt); // 休憩時間(全タスク共通の停止→再開幅)
-          newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null, firstStartTime: t.firstStartTime || now };
+          // batchStartedAt も休憩分シフト(下の batchStartTimes シフトと同期)。
+          // ずらさないと「まとめて完了」の所属判定(batchStartedAt === batchStartTimes[stepIdx])が全台不一致になり、
+          // 1台も完了しないまま batchStartTimes だけ消えて全台が processing で取り残される(監査確定HIGH)。
+          newTasks[k] = { ...t, status: 'processing', startTime: now, pausedAt: null, firstStartTime: t.firstStartTime || now, ...(t.batchStartedAt != null ? { batchStartedAt: t.batchStartedAt + breakMs } : {}) };
         } else if (t?.status === 'reworking' && t.reworkPausedAt) {
           // 一時停止していた修正(リワーク)を再開: reworkStartTime を再セット (積み上げ分は reworks[last].duration に確定済み)。
           newTasks[k] = { ...t, reworkStartTime: now, reworkPausedAt: null };
@@ -10897,7 +10912,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       // endTime=now のままだと壁時計幅が duration と無関係になり、ガント/並列分析の窓が手入力値とずれる。
       const fst = Number(t.firstStartTime) || now;
       const dur = Math.round(totalSec);
-      newTasks[key] = { ...t, status: 'completed', duration: dur, startTime: null, firstStartTime: fst, endTime: fst + dur * 1000, manualTime: true, workerName: inspectorName || t.workerName };
+      // batchOwner/batchStartedAt は完了時に必ず外す(残すと後日の同工程バッチ完了に巻き込まれる)
+      newTasks[key] = { ...t, status: 'completed', duration: dur, startTime: null, firstStartTime: fst, endTime: fst + dur * 1000, manualTime: true, workerName: inspectorName || t.workerName, batchOwner: null, batchStartedAt: null };
     });
     setTasks(newTasks);
     onSave({ tasks: newTasks, status: 'processing' });
@@ -12476,8 +12492,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                   </button>
                   <button
                     onClick={() => {
+                      // 最初から: 一時停止までの累積時間を0にリセットしてタイマー開始(誤タップで時間を失わないよう確認)
+                      if (!window.confirm('これまでに記録した時間(一時停止までの分)を捨てて、0から開始します。よろしいですか？')) return;
                       const { stepIdx } = batchRangeModal;
-                      // 最初から: 一時停止までの累積時間を0にリセットしてタイマー開始
                       toggleBatch(stepIdx, 0, lot.quantity - 1, selectedUnits, true);
                       setBatchRangeModal(null);
                     }}
@@ -28999,6 +29016,8 @@ export default function App() {
    const contactFeatureOn = settings?.contactFeature?.enabled !== false;
    // 工程連絡のプッシュ通知送信(fire-and-forget)。settings.push 未設定なら何もしない。
    const notifyContactPush = (args) => { if (contactFeatureOn) firePushNotify(settings, pushTokens, args, deleteData); };
+   // 工程連絡OFFに切り替わった時、連絡タブに居た端末が空白画面に取り残されないよう検査リストへ退避
+   useEffect(() => { if (!contactFeatureOn && activeTab === 'contact') setActiveTab('inspection'); }, [contactFeatureOn, activeTab]);
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
@@ -29186,6 +29205,8 @@ export default function App() {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setLots(data);
          }),
+       // 連絡ポータル(?renraku=1)はロット/連絡系だけ購読する(あっち側の携帯に検査アプリ全データを送らない=通信量と露出の削減)
+       ...(RENRAKU_PORTAL ? [] : [
        onSnapshot(getPath('templates'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setTemplates(data);
@@ -29194,9 +29215,11 @@ export default function App() {
        onSnapshot(getPath('order_motors'), (snap) => setOrderMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('motor_ledger'), (snap) => setMotorLedger(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('spare_motors'), (snap) => setSpareMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       ]),
        onSnapshot(getPath('contact_requests'), (snap) => setContactRequests(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('arrival_times'), (snap) => setArrivalTimes(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('push_tokens'), (snap) => setPushTokens(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       ...(RENRAKU_PORTAL ? [] : [
        onSnapshot(getPath('workers'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setWorkers(data);
@@ -29208,6 +29231,7 @@ export default function App() {
        onSnapshot(getPath('improvements'), (snap) => setImprovementCards(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(getPath('observationPlans'), (snap) => setObservationPlans(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('video_recipes'), (snap) => setVideoRecipes(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
+       ]),
        onSnapshot(doc(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'settings', 'config'), (snap) => {
          if (snap.exists()) {
             const data = snap.data();
@@ -31254,6 +31278,11 @@ export default function App() {
    if (RENRAKU_PORTAL) {
      return (
        <>
+         {!isOnline && (
+           <div className="sticky top-0 z-[99] bg-rose-600 text-white text-center text-sm font-bold py-2 px-3">
+             📡 オフライン中 — 返信・登録は電波が戻ったときに相手へ届きます（急ぎは電話でお願いします）
+           </div>
+         )}
          <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={settings} pushTokens={pushTokens} notifyPush={notifyContactPush} deleteData={deleteData} />
          <ForegroundPushToast ready={!!db} />
        </>
