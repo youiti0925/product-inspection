@@ -3248,15 +3248,53 @@ const PushHelpModal = ({ onClose }) => {
     <div className="fixed inset-0 z-[97] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
       <div className="bg-slate-100 rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className="px-4 py-3 bg-slate-800 text-white flex items-center gap-2 shrink-0">
-          <BellRing className="w-5 h-5 text-amber-300" />
-          <span className="font-black">通知の設定方法（端末別ヘルプ）</span>
+          <MessageCircle className="w-5 h-5 text-blue-300" />
+          <span className="font-black">工程連絡ヘルプ（使い方・通知設定）</span>
           <button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
         </div>
         <div className="p-4 overflow-y-auto flex flex-col gap-3">
-          <Sec emoji="🔔" title="これは何？（しくみ）" open>
-            <p>依頼や返信が来たとき、<b>画面を見ていなくても携帯・パソコンに通知が届く</b>ようにする機能です。アプリのインストールは不要で、いつものブラウザ（Chrome/Safari）がそのまま通知を受け取ります。</p>
-            <p>やることは1回だけ: このページの「<b>この端末で通知を受け取る</b>」ボタンを押して、出てきた確認で「<b>許可</b>」を押すだけです。端末ごとに1回行ってください。</p>
-            <p className="text-xs text-slate-400">※通知が失敗しても連絡そのものはアプリ/ポータルの画面に必ず表示されます（通知は「気づかせる」ための上乗せ）。</p>
+          <Sec emoji="🗺" title="全体のしくみ（1分でわかる）" open>
+            <p>電話で「修正来て」「いつ来る？」とやっていた連絡を、アプリに置き換えるものです。登場するのは2つの画面:</p>
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap">{`【こっち = 検査側】          【あっち = 組立・機械など】
+ このアプリの「連絡」タブ  ⇄   ポータル(渡すURLで開く専用ページ)
+
+ 依頼を送る ────────────────▶ 依頼が表示+携帯に通知🔔
+                              「すぐ行く/10分後/20分後/行けない」
+ 返信が表示+通知🔔 ◀──────── をワンタップで返信`}</div>
+            <ul className="list-disc ml-5 flex flex-col gap-1">
+              <li><b>依頼の種類は3つ</b>: 修正依頼(NG→修正から自動)・呼出/連絡(自由文)・到着予定を聞く(複数製品まとめて)</li>
+              <li>あっちが登録した<b>到着予定</b>は、こっちの検査リストのカードに🚚バッジで出ます</li>
+              <li>やりとりは全部「連絡」タブの一覧に残ります(状況/送信/経過/返信時間つき)</li>
+            </ul>
+          </Sec>
+          <Sec emoji="✅" title="最初にやること（管理者・順番どおり）">
+            <Step n={1}><b>宛先グループを決める</b> — 連絡タブ→「宛先・公開設定」で「組立」「機械」など(既定で入っています)</Step>
+            <Step n={2}><b>班のメンバーを登録</b>(任意) — 同じ画面の「班のメンバー」欄に「小川、佐藤」のように入れると、送信時に人を指名できます</Step>
+            <Step n={3}><b>あっちにURLを渡す</b> — 「あっち側に渡すURL」をコピーして、組立・機械の端末で開いてもらう→グループを選んでもらう(これだけで使えます)</Step>
+            <Step n={4}><b>通知を設定</b>(下の「管理者の初期設定」) — 携帯が鳴るようになります。設定しなくても連絡機能自体は使えます</Step>
+            <Step n={5}>機能ごと止めたい時は マスタ設定→「工程連絡」のチェックをOFF</Step>
+          </Sec>
+          <Sec emoji="📤" title="依頼を送る3つの方法（こっち側）">
+            <div><b>① 連絡タブから</b> — 「連絡・呼出」ボタン。宛先グループ→(任意で人を指名)→内容を書くか「よく使う内容」チップをタップ→送信</div>
+            <div><b>② 作業中のNG→修正から</b> — 修正を押すと「連絡しますか？」が自動で開き、工程・台数・NG理由が入った状態で送れます。返信は作業画面にそのまま表示されます</div>
+            <div><b>③ 不具合報告から</b> — 報告画面の「📨 報告して連絡」。報告内容と<b>写真</b>が依頼に添付され、あっちの画面で写真をタップ拡大できます</div>
+            <div><b>到着予定を聞く</b> — 連絡タブ→「到着予定を聞く」で製品を複数選んで送ると、あっちが1件ずつ日時を入れて返してくれます</div>
+          </Sec>
+          <Sec emoji="📥" title="あっち側の使い方（ポータル）">
+            <Step n={1}>渡されたURLを開く→自分のグループ(組立など)を押す(最初の1回だけ)</Step>
+            <Step n={2}>依頼が来たら「すぐ行く/10分後/20分後/行けない」をタップ+ひとことコメント(任意)</Step>
+            <Step n={3}>「いつ来るか」依頼には日付と時間を入れて返信</Step>
+            <Step n={4}>頼まれる前でも「到着予定を登録」から自発的に知らせられます</Step>
+            <Step n={5}>右上の🔔から「この端末で通知を受け取る」— これで画面を見ていなくても携帯が鳴ります(<b>通知を受け取りたい端末ごと</b>に1回。送るだけなら登録不要)</Step>
+            <p className="text-xs text-slate-400">ポータルは限定表示です(指図・型式と、設定で許可した台数・納期のみ。検査データや分析は見えません)。</p>
+          </Sec>
+          <Sec emoji="📋" title="管理者CC（誰が誰に何を送ったか見る）">
+            <p>管理者は、連絡タブ→通知(プッシュ)で自分の端末を登録した後「<b>📋 管理者CC: ON</b>」にすると、<b>誰かが依頼を送るたびに写しの通知</b>が届きます(例:「📋 CC(組立宛): 🔧修正依頼 → 小川さん（尾田）」)。返信の通知は登録した検査側全端末に元々届きます。現場で起きているアクシデントの把握に使えます。</p>
+          </Sec>
+          <Sec emoji="🔔" title="通知のしくみ（読むだけでOK）">
+            <p>依頼や返信が来たとき、<b>画面を見ていなくても携帯・パソコンに通知が届き</b>ます。アプリのインストールは不要で、いつものブラウザ（Chrome/Safari）がそのまま受け取ります。</p>
+            <p>やることは1回だけ: 「<b>この端末で通知を受け取る</b>」ボタン→「<b>許可</b>」。<b>受け取りたい端末ごと</b>に行ってください（送るだけの端末は不要）。</p>
+            <p className="text-xs text-slate-400">※通知が失敗しても連絡そのものはアプリ/ポータルの画面に必ず表示されます（通知は「気づかせる」ための上乗せ）。テスト通知は「押した端末」だけに届きます。</p>
           </Sec>
           <Sec emoji="📱" title="Galaxy・Android の設定">
             <Step n={1}>このページを <b>Chrome</b>（または Samsung Internet）で開く</Step>
@@ -3684,6 +3722,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
           ))}
         </div>
         <button onClick={() => setShowCfg(v => !v)} className={`ml-auto px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 ${showCfg ? 'bg-slate-700 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'}`}><Settings className="w-4 h-4" /> 宛先・公開設定</button>
+        <button onClick={() => setShowPushHelp(true)} className="px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-700 hover:bg-blue-100"><HelpCircle className="w-4 h-4" /> ヘルプ</button>
       </div>
       {showCfg && (
         <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-3">
