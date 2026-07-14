@@ -20475,7 +20475,15 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
 
     lots.forEach(lot => {
       const lotComplaints = (lot.interruptions || []).filter(i => i.type === 'complaint');
-      lotComplaints.forEach(c => {
+      // カスタムモードの NG判定(理由あり) を軽微不良として合成する。
+      //   task.ngReason は従来どの集計にも入っておらず(=集計漏れ)、作業者が「NG→理由記入」した分が丸ごと欠落していた。
+      //   元データ(task)は一切変更せず、集計時に読むだけ。interruptions とは別 id なので重複なし。
+      const _steps = lot.steps || [];
+      const _titleForKey = (key) => { for (const s of _steps) { if (s?.id && String(key).startsWith(`${s.id}-`)) return s.title || '全体'; } const m = /^(\d+)-/.exec(String(key)); if (m && _steps[+m[1]]) return _steps[+m[1]].title || '全体'; return '全体'; };
+      const ngComplaints = Object.entries(lot.tasks || {})
+        .filter(([, t]) => t && typeof t.ngReason === 'string' && t.ngReason.trim())
+        .map(([key, t]) => ({ id: `ng:${lot.id}:${key}`, type: 'complaint', source: 'NG判定', label: t.ngReason.trim(), timestamp: toMsAny(t.ngAt) || toMsAny(t.endTime) || null, stepInfo: { title: _titleForKey(key) }, workerName: t.workerName || '' }));
+      [...lotComplaints, ...ngComplaints].forEach(c => {
         // 月別推移用の全期間カウント (期間フィルタに依存しない)
         if (c.timestamp) { const d0 = new Date(c.timestamp); const ym0 = `${d0.getFullYear()}-${String(d0.getMonth()+1).padStart(2,'0')}`; monthlyCountsAll[ym0] = (monthlyCountsAll[ym0] || 0) + 1; }
         if (isInDefectPeriod(c.timestamp)) {
