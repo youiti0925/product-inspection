@@ -3153,6 +3153,180 @@ const contactAnswerSummary = (req) => {
   return a ? `${contactReplyLabel(a.choice)}${a.comment ? `（${a.comment}）` : ''}` : '';
 };
 
+// ---- 返信の画面内通知 + 到着回答→検査リスト反映 ----
+// あっちからの返信は、プッシュ通知(携帯が鳴る)に加えて「画面内の通知(ティッカー+連絡タブの赤バッジ)」でも気づける。
+// 既読はこの端末だけ(localStorage)。連絡タブを開いたら自動で既読になる。
+const CONTACT_SEEN_LS_KEY = 'contactRepliesSeenAt';
+// 到着回答(date+time)→タイムスタンプ。dateが無い回答は当日扱い。
+const contactArrivalDT = (it) => {
+  if (!it || !it.time) return null;
+  const d = it.date || (() => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`; })();
+  const ts = new Date(`${d}T${it.time}`).getTime();
+  return Number.isFinite(ts) ? ts : null;
+};
+const fmtContactDT = (ts) => {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+// contactRequests → 返信イベント一覧(新しい順)。'answer'=ワンタップ返信 / 'arrival'=到着予定の回答(1件ずつ)
+const contactReplyEvents = (contactRequests) => {
+  const evs = [];
+  (contactRequests || []).forEach(r => {
+    if (!r) return;
+    if (r.kind === 'arrival') {
+      (r.items || []).forEach((it, idx) => {
+        if (it && it.time && it.at) evs.push({
+          key: `arr-${r.id}-${idx}`, type: 'arrival', at: it.at, reqId: r.id, itemIdx: idx, it,
+          text: `🚚 ${it.orderNo || ''} ${it.model || ''} → 到着 ${it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}${it.time}`,
+          by: it.by || '',
+        });
+      });
+    } else if (r.answer && r.answer.at) {
+      evs.push({
+        key: `ans-${r.id}`, type: 'answer', at: r.answer.at, reqId: r.id,
+        text: `↩ ${contactReplyLabel(r.answer.choice)}${r.answer.comment ? `（${r.answer.comment}）` : ''} — ${r.orderNo ? `指図${r.orderNo} ` : ''}${String(r.message || '').slice(0, 30)}`,
+        by: r.answer.by || '', no: r.answer.choice === 'no',
+      });
+    }
+  });
+  return evs.sort((a, b) => b.at - a.at);
+};
+// 画面内ティッカー: 未読の返信を左下に表示(どのタブに居ても気づける)。到着回答は1タップで検査リストへ反映に進める。
+const ContactReplyTicker = ({ events, onSeen, onOpenTab, onApply }) => {
+  if (!events || !events.length) return null;
+  const shown = events.slice(0, 3);
+  return (
+    <div className="fixed bottom-4 left-4 z-[85] w-[360px] max-w-[92vw] flex flex-col gap-2">
+      {shown.map(ev => (
+        <div key={ev.key} className={`bg-white rounded-xl shadow-2xl border-2 overflow-hidden ${ev.no ? 'border-rose-400' : 'border-emerald-400'}`}>
+          <div className={`px-3 py-1.5 text-[11px] font-black flex items-center gap-1.5 ${ev.no ? 'bg-rose-50 text-rose-700' : 'bg-emerald-50 text-emerald-700'}`}>
+            <MessageCircle className="w-3.5 h-3.5" /> 連絡の返信が届きました
+            <span className="ml-auto font-mono text-slate-400 font-normal">{fmtContactTime(ev.at)}</span>
+          </div>
+          <div className="px-3 py-2 text-sm font-bold text-slate-800">{ev.text}{ev.by ? <span className="text-xs text-slate-400 font-normal">（{ev.by}）</span> : null}</div>
+          <div className="px-3 pb-2 flex gap-2">
+            {ev.type === 'arrival' ? (
+              <button onClick={() => onApply(ev)} className="flex-1 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-sm font-black flex items-center justify-center gap-1"><Truck className="w-4 h-4" /> 検査リストへ反映</button>
+            ) : (
+              <button onClick={onOpenTab} className="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black">連絡タブで見る</button>
+            )}
+          </div>
+        </div>
+      ))}
+      <div className="flex items-center gap-2">
+        {events.length > shown.length && <button onClick={onOpenTab} className="text-xs font-bold text-blue-700 bg-white/90 border border-blue-200 rounded-lg px-2 py-1 shadow">ほか {events.length - shown.length}件 → 連絡タブ</button>}
+        <button onClick={onSeen} className="ml-auto text-xs font-bold text-slate-500 bg-white/90 border border-slate-300 rounded-lg px-2.5 py-1 shadow hover:bg-slate-50">✕ すべて既読にする</button>
+      </div>
+    </div>
+  );
+};
+// 到着回答→検査リストへ反映モーダル:
+// ①同じ指図のロット(テンプレ違いも全部)から対象を選ぶ ②入荷時間(entryAt)へ反映
+// ③終了予定 = 到着 + 検査の見積時間(目標×台数) を自動計算 → 実際に合わせて修正可 → 「返信」で相手に知らせる
+const ContactArrivalApplyModal = ({ req, itemIdx, lots, templates, settings, saveData, notifyPush, currentUserName, estimateSecOf, onClose }) => {
+  const it = (req?.items || [])[itemIdx];
+  const arriveTs = contactArrivalDT(it);
+  const candidates = useMemo(() => (lots || [])
+    .filter(l => l && l.status !== 'completed' && ((it?.orderNo && l.orderNo === it.orderNo) || l.id === it?.lotId))
+    .sort((a, b) => ((a.id === it?.lotId) ? -1 : 0) - ((b.id === it?.lotId) ? -1 : 0)),
+  [lots, it]);
+  const [sel, setSel] = useState(() => {
+    const m = {};
+    const own = (lots || []).find(l => l && l.id === it?.lotId && l.status !== 'completed');
+    if (own) m[own.id] = true;
+    return m;
+  });
+  // 候補が1件だけなら自動選択(テンプレ選択の手間を省く)
+  useEffect(() => { if (candidates.length === 1 && !Object.values(sel).some(Boolean)) setSel({ [candidates[0].id]: true }); }, [candidates.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  const selLots = candidates.filter(l => sel[l.id]);
+  const estFinishOf = (lot) => (arriveTs == null ? null : arriveTs + (estimateSecOf(lot) || 0) * 1000);
+  const autoFinishTs = (selLots.length && arriveTs != null) ? Math.max(...selLots.map(l => estFinishOf(l) || 0)) : null;
+  const [finishEdit, setFinishEdit] = useState(null); // null=自動計算のまま / {date,time}=手で修正した
+  const finishTs = (() => {
+    if (finishEdit && finishEdit.time) { const t = new Date(`${finishEdit.date}T${finishEdit.time}`).getTime(); if (Number.isFinite(t)) return t; }
+    return autoFinishTs;
+  })();
+  const toDateStr = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+  const toTimeStr = (ts) => { const d = new Date(ts); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  const tplName = (lot) => (templates || []).find(t => t.id === lot.templateId)?.name || '';
+  const portalLink = (() => { try { return `${window.location.origin}/?renraku=1`; } catch (e) { return ''; } })();
+  const doApply = (alsoReply) => {
+    if (!arriveTs || !selLots.length) return;
+    if (alsoReply && !finishTs) return;
+    // 入荷時間(entryAt)を選んだロットへ反映(検査リスト・作業予定・リードタイム集計が全部この値を見る)
+    selLots.forEach(l => saveData('lots', l.id, { entryAt: arriveTs }));
+    const now = Date.now();
+    const items = (req.items || []).map((x, i) => i === itemIdx ? {
+      ...x,
+      applied: { at: now, by: currentUserName || '', lotIds: selLots.map(l => l.id), entryAt: arriveTs },
+      ...(alsoReply && finishTs ? { finish: { at: now, by: currentUserName || '', ts: finishTs } } : {}),
+    } : x);
+    saveData('contact_requests', req.id, { items });
+    if (alsoReply && finishTs && notifyPush) {
+      notifyPush({ toSide: 'portal', toGroup: req.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${fmtContactDT(finishTs)}`, body: `${currentUserName || '検査'} より（到着 ${it.time} の予定で計算）`, link: portalLink, tag: `fin-${req.id}-${itemIdx}-${Date.now()}` });
+    }
+    onClose();
+  };
+  if (!it || !it.time || arriveTs == null) return null;
+  return (
+    <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4" onClick={() => onClose()}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 bg-teal-600 text-white flex items-center gap-2 shrink-0">
+          <Truck className="w-5 h-5" />
+          <span className="font-black">到着予定を検査リストへ反映</span>
+          <button onClick={() => onClose()} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-4 overflow-y-auto flex flex-col gap-3 text-sm">
+          <div className="bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 flex items-center gap-2 flex-wrap">
+            <span className="font-mono font-black text-slate-700">{it.orderNo}</span>
+            <span className="font-bold text-slate-600">{it.model}</span>
+            <span className="ml-auto font-black text-teal-700">🚚 到着 {fmtContactDT(arriveTs)}</span>
+            {it.by && <span className="text-xs text-slate-400">回答: {it.by}</span>}
+          </div>
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">① 入荷時間を入れるロットを選ぶ {candidates.length > 1 && <span className="text-amber-600">（同じ指図でテンプレートが分かれています。当てはまる方＝わからなければ両方を選んでください）</span>}</div>
+            <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-56 overflow-y-auto">
+              {candidates.map(l => (
+                <label key={l.id} className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer ${sel[l.id] ? 'bg-teal-50' : 'hover:bg-slate-50'}`}>
+                  <input type="checkbox" checked={!!sel[l.id]} onChange={e => setSel(p => ({ ...p, [l.id]: e.target.checked }))} className="w-4 h-4 accent-teal-600 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-bold text-slate-800 truncate">{l.model}</span>
+                      <span className="text-xs text-slate-400 shrink-0">{l.quantity}台</span>
+                    </div>
+                    {tplName(l) && <div className="text-[11px] text-indigo-700 font-bold truncate">📋 {tplName(l)}</div>}
+                    <div className="text-[11px] text-slate-400">今の入荷: {l.entryAt ? fmtContactDT(l.entryAt) : '未設定'} → <span className="font-black text-teal-700">{fmtContactDT(arriveTs)}</span></div>
+                  </div>
+                </label>
+              ))}
+              {candidates.length === 0 && <div className="px-3 py-4 text-center text-slate-400 text-xs">この指図の未完了ロットが検査リストにありません（先にロット登録してください）</div>}
+            </div>
+          </div>
+          {selLots.length > 0 && (
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+              <div className="text-xs font-black text-slate-500 mb-1.5">② 終了予定（到着 + 検査の見積時間）— 実際に合わない時は直してから返信してください</div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <input type="date" value={finishTs ? (finishEdit?.date ?? toDateStr(finishTs)) : ''} onChange={e => setFinishEdit({ date: e.target.value, time: finishEdit?.time ?? (finishTs ? toTimeStr(finishTs) : '') })} className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm" />
+                <input type="time" value={finishTs ? (finishEdit?.time ?? toTimeStr(finishTs)) : ''} onChange={e => setFinishEdit({ date: finishEdit?.date ?? (finishTs ? toDateStr(finishTs) : ''), time: e.target.value })} className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm font-black" />
+                {finishEdit && <button onClick={() => setFinishEdit(null)} className="text-[11px] font-bold text-blue-600 underline">自動計算に戻す</button>}
+              </div>
+              <div className="text-[11px] text-slate-400 mt-1.5">
+                自動計算: {fmtContactDT(autoFinishTs)}（{selLots.map(l => `${l.model} ${Math.round((estimateSecOf(l) || 0) / 60)}分`).join(' / ')}）。休憩・他の仕事の割り込みは入っていません。
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end shrink-0">
+          <button onClick={() => onClose()} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">キャンセル</button>
+          <button disabled={!selLots.length} onClick={() => doApply(false)} className="px-3 py-2 rounded-lg text-sm font-bold text-teal-700 border-2 border-teal-500 hover:bg-teal-50 disabled:opacity-40">入荷時間だけ反映</button>
+          <button disabled={!selLots.length || !finishTs} onClick={() => doApply(true)} className="px-4 py-2 rounded-lg text-sm font-black text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-40 flex items-center gap-1.5"><Send className="w-4 h-4" /> 反映して終了予定を返信</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ---- プッシュ通知 (FCM) ----
 // 「見てなくても携帯が鳴って気づく」層。設定は settings.push { vapidKey, workerUrl }(管理者が連絡タブで1回設定)。
 // 受信登録は push_tokens コレクション(docId=端末ID)。side:'app'=検査側 / 'portal'=あっち側(グループ名つき)。
@@ -3279,6 +3453,15 @@ const PushHelpModal = ({ onClose }) => {
             <div><b>② 作業中のNG→修正から</b> — 修正を押すと「連絡しますか？」が自動で開き、工程・台数・NG理由が入った状態で送れます。返信は作業画面にそのまま表示されます</div>
             <div><b>③ 不具合報告から</b> — 報告画面の「📨 報告して連絡」。報告内容と<b>写真</b>が依頼に添付され、あっちの画面で写真をタップ拡大できます</div>
             <div><b>到着予定を聞く</b> — 連絡タブ→「到着予定を聞く」で製品を複数選んで送ると、あっちが1件ずつ日時を入れて返してくれます</div>
+            <div className="bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
+              <b>🚚 回答が来たら → 検査リストへ反映 → 🏁 終了予定を返す</b>
+              <ol className="list-decimal ml-5 mt-1 space-y-0.5">
+                <li>回答が届くと<b>画面左下に通知</b>が出ます（連絡タブにも赤バッジ）。「検査リストへ反映」を押す</li>
+                <li>同じ指図で<b>テンプレートが分かれている時はどのロットか選ぶ</b>（わからなければ両方でOK）→ 到着時刻がそのロットの<b>入荷時間</b>に入ります</li>
+                <li><b>終了予定</b>（到着＋検査の見積時間）が自動で出ます。実際に合わない時は時刻を直して「反映して終了予定を返信」→ 相手のポータルに🏁終了予定が表示＋通知されます</li>
+              </ol>
+              <div className="text-[11px] text-slate-500 mt-1">※ 自動計算は「目標時間×台数」の単純計算です。休憩や他の仕事の割り込みは入っていないので、現実に合わせて直してから返すのがおすすめです。</div>
+            </div>
           </Sec>
           <Sec emoji="📥" title="あっち側の使い方（ポータル）">
             <Step n={1}>渡されたURLを開く→自分のグループ(組立など)を押す(最初の1回だけ)</Step>
@@ -3670,7 +3853,7 @@ const ContactAskArrivalModal = ({ lots, groups, from, onClose, onSend }) => {
 };
 
 // 連絡タブ: 依頼リスト(状況/送信/経過/返信) + 詳細 + 到着依頼作成 + 宛先/公開設定 + ポータルURL。
-const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName, pushTokens = [], notifyPush = null }) => {
+const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName, pushTokens = [], notifyPush = null, onApplyArrival = null }) => {
   const [showPushHelp, setShowPushHelp] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 30000); return () => clearInterval(t); }, []);
@@ -3875,7 +4058,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               {detail.kind === 'arrival' && (
                 <div className="border border-slate-200 rounded-lg overflow-hidden">
                   <table className="w-full text-xs">
-                    <thead className="bg-slate-50 text-slate-500"><tr><th className="text-left px-2 py-1.5">指図</th><th className="text-left px-2 py-1.5">型式</th><th className="text-left px-2 py-1.5">到着予定</th><th className="text-left px-2 py-1.5">回答者</th></tr></thead>
+                    <thead className="bg-slate-50 text-slate-500"><tr><th className="text-left px-2 py-1.5">指図</th><th className="text-left px-2 py-1.5">型式</th><th className="text-left px-2 py-1.5">到着予定</th><th className="text-left px-2 py-1.5">回答者</th><th className="text-left px-2 py-1.5">検査リスト反映</th></tr></thead>
                     <tbody className="divide-y divide-slate-100">
                       {(detail.items || []).map((it, i) => (
                         <tr key={i}>
@@ -3883,6 +4066,17 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                           <td className="px-2 py-1.5">{it.model}</td>
                           <td className="px-2 py-1.5">{it.time ? <span className="font-black text-emerald-700">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time}</span> : <span className="text-amber-600 font-bold animate-pulse">待ち</span>}</td>
                           <td className="px-2 py-1.5 text-slate-500">{it.by || '—'}</td>
+                          <td className="px-2 py-1.5">
+                            {!it.time ? <span className="text-slate-300">—</span> : it.applied ? (
+                              <div className="flex flex-col gap-0.5">
+                                <span className="text-emerald-700 font-black whitespace-nowrap">✓ 反映済</span>
+                                {it.finish?.ts && <span className="text-teal-700 font-bold whitespace-nowrap">🏁 {fmtContactDT(it.finish.ts)} 返信済</span>}
+                                {onApplyArrival && <button onClick={() => { onApplyArrival(detail.id, i); setDetailId(null); }} className="text-[10px] underline text-blue-600 text-left">やり直す</button>}
+                              </div>
+                            ) : (
+                              onApplyArrival ? <button onClick={() => { onApplyArrival(detail.id, i); setDetailId(null); }} className="px-2 py-1 rounded bg-teal-600 hover:bg-teal-700 text-white font-black whitespace-nowrap">反映する</button> : <span className="text-slate-300">—</span>
+                            )}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -3928,6 +4122,11 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   const inbox = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'waiting').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
   const answeredRecent = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'answered' && (nowTick - (r.answer?.at || 0)) < 24 * 3600 * 1000).sort((a, b) => (b.answer?.at || 0) - (a.answer?.at || 0)), [contactRequests, group, nowTick]);
   const arrivalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'arrival' && r.to === group && r.status !== 'canceled' && (r.items || []).some(i => !i.time)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
+  // 検査側が返してくれた「検査終了予定」(到着回答へのお返し)。48時間以内のものを表示。
+  const finishInfos = useMemo(() => (contactRequests || [])
+    .filter(r => r && r.kind === 'arrival' && r.to === group)
+    .flatMap(r => (r.items || []).filter(it => it && it.finish && it.finish.ts && (nowTick - (it.finish.at || 0)) < 48 * 3600 * 1000))
+    .sort((a, b) => (b.finish.at || 0) - (a.finish.at || 0)), [contactRequests, group, nowTick]);
   const lotList = useMemo(() => {
     const s = q.trim().toLowerCase();
     return (lots || [])
@@ -4093,7 +4292,10 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                         {showQty && it.quantity ? <span className="text-xs text-slate-400 shrink-0">{it.quantity}台</span> : null}
                         {showDue && it.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {it.dueDate}</span> : null}
                         {it.time ? (
-                          <span className="ml-auto font-black text-emerald-700 shrink-0">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time} ✓</span>
+                          <span className="ml-auto flex flex-col items-end shrink-0">
+                            <span className="font-black text-emerald-700">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time} ✓</span>
+                            {it.finish?.ts && <span className="text-[11px] font-black text-teal-700">🏁 検査終了予定 {fmtContactDT(it.finish.ts)}</span>}
+                          </span>
                         ) : (
                           <span className="ml-auto flex items-center gap-1.5 shrink-0">
                             <input type="date" value={d.date || todayStr} onChange={e => setDraftTimes(p => ({ ...p, [key]: { ...d, date: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
@@ -4109,6 +4311,22 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
             ))}
           </div>
         </section>
+        {finishInfos.length > 0 && (
+          <section>
+            <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2">🏁 検査の終了予定（検査側からのお知らせ・48時間以内）</h2>
+            <div className="bg-white rounded-xl border border-teal-200 divide-y divide-slate-100 overflow-hidden">
+              {finishInfos.map((it, i) => (
+                <div key={i} className="px-3 py-2 flex items-center gap-2 flex-wrap text-sm">
+                  <span className="font-mono font-black text-slate-700 shrink-0">{it.orderNo}</span>
+                  <span className="font-bold text-slate-600 truncate">{it.model}</span>
+                  <span className="text-xs text-slate-400 shrink-0">到着 {it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time}</span>
+                  <span className="ml-auto font-black text-teal-700 shrink-0">🏁 終了予定 {fmtContactDT(it.finish.ts)}</span>
+                  {it.finish.by && <span className="text-[10px] text-slate-400 shrink-0">{it.finish.by}</span>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
         <section>
           <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Truck className="w-5 h-5 text-blue-600" /> 到着予定を登録（頼まれる前に知らせる）</h2>
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
@@ -29018,6 +29236,19 @@ export default function App() {
    const notifyContactPush = (args) => { if (contactFeatureOn) firePushNotify(settings, pushTokens, args, deleteData); };
    // 工程連絡OFFに切り替わった時、連絡タブに居た端末が空白画面に取り残されないよう検査リストへ退避
    useEffect(() => { if (!contactFeatureOn && activeTab === 'contact') setActiveTab('inspection'); }, [contactFeatureOn, activeTab]);
+   // 返信の画面内通知: 未読 = 既読時刻(この端末のlocalStorage)より新しい返信。連絡タブを開いたら自動既読。
+   // 初回起動の端末は「今」を既読起点にする(過去の返信が全部未読で溢れるのを防ぐ。通知は今後の新着だけ)
+   const [contactSeenAt, setContactSeenAt] = useState(() => { try { const v = Number(localStorage.getItem(CONTACT_SEEN_LS_KEY)); if (v) return v; localStorage.setItem(CONTACT_SEEN_LS_KEY, String(Date.now())); } catch (e) { /* noop */ } return Date.now(); });
+   const markContactSeen = () => { const t = Date.now(); setContactSeenAt(t); try { localStorage.setItem(CONTACT_SEEN_LS_KEY, String(t)); } catch (e) { /* noop */ } };
+   const contactUnseen = useMemo(() => {
+     if (!contactFeatureOn) return [];
+     // 到着回答は「検査リストへ反映」済みなら通知からも消す(仕事が終わったサイン)
+     return contactReplyEvents(contactRequests).filter(ev => ev.at > contactSeenAt && !(ev.type === 'arrival' && ev.it?.applied));
+   }, [contactFeatureOn, contactRequests, contactSeenAt]);
+   useEffect(() => { if (activeTab === 'contact' && contactUnseen.length) markContactSeen(); }, [activeTab, contactUnseen.length]); // eslint-disable-line react-hooks/exhaustive-deps
+   // 到着回答→検査リスト反映モーダル (ティッカー/連絡タブ詳細のどちらからでも開ける)
+   const [arrivalApply, setArrivalApply] = useState(null); // {reqId, itemIdx}
+   const contactEstimateSecOf = (lot) => calculateLotEstimatedTime(lot, settings?.customTargetTimes || {}, modelGroupsOf(settings));
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
@@ -31313,6 +31544,19 @@ export default function App() {
        <MascotFx lots={lots} settings={settings} onSaveSettings={saveSettings} />
        {/* プッシュ通知のフォアグラウンド表示(画面を開いている時。閉じている時はブラウザ通知) */}
        <ForegroundPushToast ready={!!db} />
+       {/* 返信の画面内通知: どのタブに居ても左下に出る。到着回答は1タップで検査リストへ反映 */}
+       {contactFeatureOn && activeTab !== 'contact' && (
+         <ContactReplyTicker events={contactUnseen} onSeen={markContactSeen}
+           onOpenTab={() => { setActiveTab('contact'); markContactSeen(); }}
+           onApply={(ev) => setArrivalApply({ reqId: ev.reqId, itemIdx: ev.itemIdx })} />
+       )}
+       {/* 到着回答→検査リスト反映モーダル(ティッカー/連絡タブ詳細のどちらからでも) */}
+       {arrivalApply && contactFeatureOn && (() => {
+         const req = (contactRequests || []).find(r => r && r.id === arrivalApply.reqId);
+         const reqIt = req && (req.items || [])[arrivalApply.itemIdx];
+         if (!req || !reqIt || !reqIt.time) return null;
+         return <ContactArrivalApplyModal req={req} itemIdx={arrivalApply.itemIdx} lots={lots} templates={templates} settings={settings} saveData={saveData} notifyPush={notifyContactPush} currentUserName={currentUserName} estimateSecOf={contactEstimateSecOf} onClose={() => setArrivalApply(null)} />;
+       })()}
        {showBreakAlert && (
          <div className="absolute top-0 left-0 right-0 bg-orange-500 text-white z-[100] p-4 flex justify-between items-center shadow-lg">
            <div className="flex items-center gap-3 text-lg font-bold"><Bell className="w-6 h-6 animate-bounce" />{String(showBreakAlert)}</div>
@@ -31401,7 +31645,7 @@ export default function App() {
                   className={`relative flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-bold transition-all ${(TAB_PARENT[activeTab] || activeTab) === tab.id ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}
                 >
                   <tab.icon className="w-4 h-4" /> {tab.label}
-                  {tab.id === 'contact' && (() => { const n = (contactRequests || []).filter(r => r && r.status === 'waiting').length; return n > 0 ? <span className="absolute -top-1 -right-1 bg-amber-500 text-white text-[9px] rounded-full min-w-4 h-4 px-1 flex items-center justify-center font-black">{n}</span> : null; })()}
+                  {tab.id === 'contact' && (() => { const u = contactUnseen.length; const n = (contactRequests || []).filter(r => r && r.status === 'waiting').length; return (u || n) ? <span className={`absolute -top-1 -right-1 ${u ? 'bg-rose-600 animate-pulse' : 'bg-amber-500'} text-white text-[9px] rounded-full min-w-4 h-4 px-1 flex items-center justify-center font-black`}>{u || n}</span> : null; })()}
                 </button>
               ))}
            </div>
@@ -31475,7 +31719,7 @@ export default function App() {
                  <button key={s.id} onClick={() => setActiveTab(s.id)}
                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-t-md text-sm font-bold border-b-2 transition-all ${activeTab === s.id ? 'border-blue-600 text-blue-600 bg-blue-50' : 'border-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-50'}`}>
                    <s.icon className="w-4 h-4" /> {s.label}
-                   {s.id === 'contact' && (() => { const n = (contactRequests || []).filter(r => r && r.status === 'waiting').length; return n > 0 ? <span className="bg-amber-500 text-white text-[9px] rounded-full min-w-4 h-4 px-1 flex items-center justify-center font-black">{n}</span> : null; })()}
+                   {s.id === 'contact' && (() => { const u = contactUnseen.length; const n = (contactRequests || []).filter(r => r && r.status === 'waiting').length; return (u || n) ? <span className={`${u ? 'bg-rose-600 animate-pulse' : 'bg-amber-500'} text-white text-[9px] rounded-full min-w-4 h-4 px-1 flex items-center justify-center font-black`}>{u || n}</span> : null; })()}
                  </button>
                ))}
              </div>
@@ -31493,7 +31737,7 @@ export default function App() {
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
-         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} />}
+         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} onApplyArrival={(reqId, itemIdx) => setArrivalApply({ reqId, itemIdx })} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
