@@ -3327,6 +3327,40 @@ const ContactArrivalApplyModal = ({ req, itemIdx, lots, templates, settings, sav
   );
 };
 
+// ---- 宛先ルーティング(役職: 職長/工長/グループ長) ----
+// あっち側の端末登録に役職を持たせ、グループごとに「どの役職の携帯へ送るか」を切替できる。
+// 職長が休みの日=「職長 不在」ON→自動で上司(工長/グループ長)へ。重い不良は送信時に「職長+上司」等を選べる。
+// 未返信エスカレーション=設定分数を過ぎた待ち依頼を上司へも自動通知(1回だけ)。
+const CONTACT_ROLES = ['職長', '工長', 'グループ長', '一般'];
+const CONTACT_BOSS_ROLES = ['工長', 'グループ長'];
+const CONTACT_LEVELS = [
+  ['auto', '自動（設定どおり）'], ['chief', '職長'], ['both', '職長＋上司'], ['boss', '上司のみ'], ['all', '全員'],
+];
+const contactRoutingOf = (settings, group) => {
+  const r = (settings?.contactRouting || {})[group] || {};
+  return { mode: r.mode || 'chief', chiefAway: !!r.chiefAway, escalateMin: Math.max(0, Number(r.escalateMin) || 0) };
+};
+// 送信レベルの決定: 送信時の指定(toLevel)が最優先。無ければグループの既定モード。職長不在ONなら職長→上司へ振替。
+const contactResolveLevel = (settings, group, toLevel) => {
+  if (toLevel && toLevel !== 'auto') return toLevel;
+  const r = contactRoutingOf(settings, group);
+  if (r.chiefAway) return r.mode === 'chief' ? 'boss' : (r.mode === 'both' ? 'boss' : r.mode);
+  return r.mode;
+};
+// グループ内の端末をレベルで絞る。役職未設定の端末=職長扱い(既存登録が黙って通知から外れないため)。
+// 該当0台なら 職長→上司→全員 の順で落とし、「誰にも届かない」を防ぐ。
+const contactFilterByLevel = (groupTokens, settings, group, toLevel) => {
+  const lvl = contactResolveLevel(settings, group, toLevel);
+  const roleOf = (t) => t.role || '職長';
+  const pick = (roles) => groupTokens.filter(t => roles.includes(roleOf(t)));
+  if (lvl === 'all') return groupTokens;
+  let out = lvl === 'boss' ? pick(CONTACT_BOSS_ROLES) : lvl === 'both' ? pick(['職長', ...CONTACT_BOSS_ROLES]) : pick(['職長']);
+  if (!out.length && lvl !== 'boss') out = pick(CONTACT_BOSS_ROLES);
+  if (!out.length && lvl === 'boss') out = pick(['職長']);
+  if (!out.length) out = groupTokens;
+  return out;
+};
+
 // ---- プッシュ通知 (FCM) ----
 // 「見てなくても携帯が鳴って気づく」層。設定は settings.push { vapidKey, workerUrl }(管理者が連絡タブで1回設定)。
 // 受信登録は push_tokens コレクション(docId=端末ID)。side:'app'=検査側 / 'portal'=あっち側(グループ名つき)。
@@ -3346,7 +3380,7 @@ const contactPushMessage = (payload) => {
 };
 // 宛先トークンを選んでWorkerへ送る。unregistered(端末側で無効化済み)のトークンdocは自動掃除。
 // 依頼(toSide:'portal')は、管理者CC(admin:true登録の端末)へ「誰が誰に何を送ったか」を自動で写し送りする。
-const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, link, tag }, deleteData) => {
+const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, link, tag, toLevel }, deleteData) => {
   try {
     const cfg = pushCfgOf(settings);
     if (!cfg.vapidKey || !cfg.workerUrl) return;
@@ -3358,9 +3392,11 @@ const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, li
         });
       }
     };
-    const targets = alive
+    let targets = alive
       .filter(t => (toSide ? t.side === toSide : true))
       .filter(t => (toGroup ? t.group === toGroup : true));
+    // あっち側宛ては役職ルーティング(職長/上司/全員…)で絞る。検査側宛て(返信・到着回答)は従来どおり全端末。
+    if (toSide === 'portal' && toGroup) targets = contactFilterByLevel(targets, settings, toGroup, toLevel);
     if (targets.length) {
       sendPushViaWorker(cfg.workerUrl, { tokens: [...new Set(targets.map(t => t.token))], title, body, link, tag }).then(cleanup(targets));
     }
@@ -3443,6 +3479,16 @@ const PushHelpModal = ({ onClose }) => {
           </Sec>
           <Sec emoji="✅" title="最初にやること（管理者・順番どおり）">
             <Step n={1}><b>宛先グループを決める</b> — 連絡タブ→「宛先・公開設定」で「組立」「機械」など(既定で入っています)</Step>
+            <div className="bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 my-1">
+              <b>👥 誰の携帯が鳴るか（役職と宛先ルール）</b>
+              <ul className="list-disc ml-5 mt-1 space-y-0.5">
+                <li>あっち側の端末は登録時に<b>役職</b>（職長/工長/グループ長/一般）を選べます。普段の通知は<b>職長</b>の携帯へ（役職未設定の端末も職長あつかい）</li>
+                <li><b>職長が休みの日</b> → 宛先・公開設定→宛先ルールで「職長 不在」をONにすると、自動で<b>上司（工長・グループ長）</b>へ切り替わります</li>
+                <li><b>重い内容（大きい不良など）</b> → 送信画面の「誰の携帯を鳴らすか」で<b>職長＋上司</b>や<b>上司のみ</b>を選べます</li>
+                <li><b>返信が来ない時</b> → 宛先ルールで「未返信◯分で上司にも自動通知」を設定できます（0=しない）</li>
+                <li>該当役職の端末が1台も無い時は 職長→上司→全員 の順に自動で振り替え、<b>誰にも届かない事態を防ぎます</b>。通知が絞られても、連絡そのものはポータル画面に全員分表示されます</li>
+              </ul>
+            </div>
             <Step n={2}><b>班のメンバーを登録</b>(任意) — 同じ画面の「班のメンバー」欄に「小川、佐藤」のように入れると、送信時に人を指名できます</Step>
             <Step n={3}><b>あっちにURLを渡す</b> — 「あっち側に渡すURL」をコピーして、組立・機械の端末で開いてもらう→グループを選んでもらう(これだけで使えます)</Step>
             <Step n={4}><b>通知を設定</b>(下の「管理者の初期設定」) — 携帯が鳴るようになります。設定しなくても連絡機能自体は使えます</Step>
@@ -3548,12 +3594,20 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
   const prob = pushSupportProblem();
   const ready = !!(cfg.vapidKey && cfg.workerUrl);
   const plat = pushPlatform();
+  // 役職(あっち側のみ): 職長=既定の宛先 / 工長・グループ長=上司(職長不在時・重い内容・エスカレーション先)
+  const [role, setRole] = useState(() => { try { return localStorage.getItem('renrakuRole') || ''; } catch (e) { return ''; } });
+  const saveRole = (r) => {
+    setRole(r);
+    try { localStorage.setItem('renrakuRole', r); } catch (e) { /* noop */ }
+    if (mine) saveData('push_tokens', deviceId, { role: r });
+  };
   const enableHere = async () => {
     setBusy(true); setErr(''); setInfo('');
     try {
       const token = await enablePush(cfg.vapidKey);
       await saveData('push_tokens', deviceId, {
         token, side, group: group || '', name: personName || '',
+        ...(side === 'portal' ? { role: role || '' } : {}),
         platform: `${plat.os}${plat.standalone ? '-pwa' : ''}`,
         ua: String(navigator.userAgent || '').slice(0, 160), enabled: true, at: Date.now(),
       });
@@ -3610,13 +3664,23 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
         </details>
       )}
       {!admin && !ready && <div className="text-xs text-slate-400 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">通知はまだ準備中です（検査側の管理者が設定すると使えるようになります）。連絡はこの画面に表示されます。</div>}
+      {ready && side === 'portal' && !prob && (
+        <div className="flex items-center gap-2 flex-wrap text-xs font-bold text-slate-600">
+          <span className="shrink-0">この端末の役職:</span>
+          <select value={mine ? (mine.role || role || '') : role} onChange={e => saveRole(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1 font-bold">
+            <option value="">未設定（職長あつかい）</option>
+            {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
+          <span className="text-[10px] text-slate-400 font-normal">職長=普段の宛先 / 工長・グループ長=職長が休みの時や重い内容の時に受け取る「上司」/ 一般=「全員」宛てのときだけ</span>
+        </div>
+      )}
       {ready && (
         <div className="flex items-center gap-2 flex-wrap">
           {prob
             ? <span className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 font-bold">{prob}</span>
             : mine
               ? (<>
-                  <span className="text-xs font-black text-emerald-700 bg-emerald-50 border border-emerald-300 rounded-full px-2.5 py-1 flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> この端末は通知を受け取ります{mine.name ? `（${mine.name}）` : ''}</span>
+                  <span className="text-xs font-black text-emerald-700 bg-emerald-50 border border-emerald-300 rounded-full px-2.5 py-1 flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> この端末は通知を受け取ります{mine.name ? `（${mine.name}）` : ''}{mine.role ? <span className="ml-0.5 text-[10px] bg-teal-100 border border-teal-300 text-teal-700 rounded px-1">{mine.role}</span> : null}</span>
                   <button disabled={busy} onClick={sendTest} className="px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold disabled:opacity-40">テスト通知</button>
                   <button disabled={busy} onClick={disableHere} className="px-2.5 py-1 rounded-lg border border-slate-300 text-slate-500 hover:bg-slate-50 text-xs font-bold disabled:opacity-40">解除</button>
                   {side === 'app' && (
@@ -3641,12 +3705,20 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
       {admin && (pushTokens || []).length > 0 && (
         <div className="border border-slate-200 rounded-lg overflow-hidden">
           <table className="w-full text-xs">
-            <thead className="bg-slate-50 text-slate-500"><tr><th className="text-left px-2 py-1.5">側</th><th className="text-left px-2 py-1.5">グループ</th><th className="text-left px-2 py-1.5">名前</th><th className="text-left px-2 py-1.5">端末</th><th className="text-left px-2 py-1.5">登録</th><th className="px-2 py-1.5"></th></tr></thead>
+            <thead className="bg-slate-50 text-slate-500"><tr><th className="text-left px-2 py-1.5">側</th><th className="text-left px-2 py-1.5">グループ</th><th className="text-left px-2 py-1.5">役職</th><th className="text-left px-2 py-1.5">名前</th><th className="text-left px-2 py-1.5">端末</th><th className="text-left px-2 py-1.5">登録</th><th className="px-2 py-1.5"></th></tr></thead>
             <tbody className="divide-y divide-slate-100">
               {(pushTokens || []).filter(t => t).sort((a, b) => (b.at || 0) - (a.at || 0)).map(t => (
                 <tr key={t.id} className={t.id === deviceId ? 'bg-emerald-50/60' : ''}>
                   <td className="px-2 py-1.5 font-bold">{t.side === 'portal' ? 'あっち' : '検査'}{t.admin ? <span className="ml-1 text-[9px] font-black text-purple-600 bg-purple-50 border border-purple-200 rounded px-1">CC</span> : null}</td>
                   <td className="px-2 py-1.5">{t.group || '—'}</td>
+                  <td className="px-2 py-1.5">
+                    {t.side === 'portal' ? (
+                      <select value={t.role || ''} onChange={e => saveData('push_tokens', t.id, { role: e.target.value })} className="border border-slate-200 rounded px-1 py-0.5 text-[11px] font-bold">
+                        <option value="">未設定(職長扱い)</option>
+                        {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    ) : <span className="text-slate-300">—</span>}
+                  </td>
                   <td className="px-2 py-1.5">{t.name || '—'}{t.id === deviceId ? '（この端末）' : ''}</td>
                   <td className="px-2 py-1.5 text-slate-500">{t.platform === 'ios-pwa' ? 'iPhone(ホーム追加)' : t.platform === 'ios' ? 'iPhone' : String(t.platform || '').startsWith('android') ? 'Android' : 'PC'}</td>
                   <td className="px-2 py-1.5 font-mono text-slate-400">{fmtContactTime(t.at)}</td>
@@ -3667,6 +3739,7 @@ const ContactSendModal = ({ draft, groups, from, lot, onClose, onSend, members =
   const [toPerson, setToPerson] = useState('');
   const [message, setMessage] = useState(draft?.message || '');
   const [moreChips, setMoreChips] = useState(false);
+  const [toLevel, setToLevel] = useState('auto'); // 誰の携帯を鳴らすか(重い内容は職長+上司などに切替)
   if (!draft) return null;
   const isRepair = draft.kind === 'repair';
   // タップで本文に挿し込める文例: NG理由など文脈チップ(draft.chips)+軽微不良・改善提案マスタ
@@ -3728,6 +3801,17 @@ const ContactSendModal = ({ draft, groups, from, lot, onClose, onSend, members =
               </div>
             </div>
           )}
+          <div>
+            <div className="text-xs font-bold text-slate-500">誰の携帯を鳴らすか <span className="font-normal text-slate-400">— 重い内容（大きい不良など）は「職長＋上司」がおすすめ</span></div>
+            <div className="flex flex-wrap gap-1.5 mt-1">
+              {CONTACT_LEVELS.map(([id, lbl]) => (
+                <button key={id} onClick={() => setToLevel(id)}
+                  className={`px-2.5 py-1.5 rounded-full text-xs font-bold border ${toLevel === id ? 'bg-teal-600 border-teal-600 text-white' : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50'}`}>
+                  {lbl}{toLevel === id ? ' ✓' : ''}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="text-[11px] text-slate-400">相手は「すぐ行く / 10分後 / 20分後 / 行けない」からワンタップで返信できます。返信は作業画面と連絡タブに表示されます。</div>
           <div className="flex gap-2 justify-end">
             <button onClick={onClose} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">送らない</button>
@@ -3738,6 +3822,7 @@ const ContactSendModal = ({ draft, groups, from, lot, onClose, onSend, members =
                 lotId: lot?.id || '', orderNo: lot?.orderNo || '', model: lot?.model || '',
                 stepTitle: draft.stepTitle || '', unitLabel: draft.unitLabel || '',
                 refIntId: draft.refIntId || '',
+                toLevel,
                 createdAt: Date.now(), status: 'waiting',
               })}
               className="px-4 py-2 rounded-lg text-sm font-black text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 flex items-center gap-1.5"
@@ -3889,7 +3974,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     // 宛先グループの携帯へプッシュ通知(設定済みなら)。失敗しても連絡自体は届いている。
     if (notifyPush) {
       const m = contactPushMessage(payload);
-      notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` });
+      notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` });
     }
   };
   return (
@@ -3947,6 +4032,37 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   />
                 </div>
               ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">宛先ルール — 誰の携帯を鳴らすか（職長が休みの日・重い内容のときの切替）</div>
+            <div className="text-[11px] text-slate-400 mb-1.5">端末の役職は、あっち側ポータルの🔔（またはこの下の端末一覧）で設定します。役職未設定の端末は「職長」あつかい。上司=工長・グループ長。該当の役職が1台も登録されていない時は自動で 職長→上司→全員 の順に振り替えて、誰にも届かない事態を防ぎます。</div>
+            <div className="flex flex-col gap-1">
+              {groups.map(g => {
+                const r = contactRoutingOf(settings, g);
+                const save = (patch) => saveSettings({ contactRouting: { ...(settings?.contactRouting || {}), [g]: { ...r, ...patch } } });
+                return (
+                  <div key={g} className="flex items-center gap-2 flex-wrap bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5">
+                    <span className="text-xs font-black text-slate-700 w-20 shrink-0 truncate">{g}</span>
+                    <label className="text-[11px] font-bold text-slate-500 flex items-center gap-1">普段の宛先
+                      <select value={r.mode} onChange={e => save({ mode: e.target.value })} className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold">
+                        <option value="chief">職長のみ（既定）</option>
+                        <option value="both">職長＋上司</option>
+                        <option value="boss">上司のみ</option>
+                        <option value="all">全員</option>
+                      </select>
+                    </label>
+                    <label className={`text-xs font-black flex items-center gap-1.5 px-2 py-1 rounded-lg border cursor-pointer ${r.chiefAway ? 'bg-rose-50 border-rose-300 text-rose-700' : 'bg-white border-slate-300 text-slate-500'}`}>
+                      <input type="checkbox" checked={r.chiefAway} onChange={e => save({ chiefAway: e.target.checked })} className="w-4 h-4 accent-rose-600" />
+                      職長 不在（休み）→ 上司へ
+                    </label>
+                    <label className="text-[11px] font-bold text-slate-500 flex items-center gap-1">未返信
+                      <input type="number" min="0" max="120" value={r.escalateMin} onChange={e => save({ escalateMin: Math.max(0, Number(e.target.value) || 0) })} className="w-14 border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold text-center" />
+                      分で上司にも自動通知（0=しない）
+                    </label>
+                  </div>
+                );
+              })}
             </div>
           </div>
           <div>
@@ -12922,7 +13038,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
               onSend={(payload) => {
                 if (saveData) saveData('contact_requests', newContactId(), payload);
                 // 宛先グループの携帯へプッシュ通知(設定済みなら)
-                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` }); }
+                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` }); }
                 setContactDraft(null); setOrderHint('📨 連絡を送信しました。返信はこの画面に表示されます');
               }}
             />
@@ -29249,6 +29365,28 @@ export default function App() {
    // 到着回答→検査リスト反映モーダル (ティッカー/連絡タブ詳細のどちらからでも開ける)
    const [arrivalApply, setArrivalApply] = useState(null); // {reqId, itemIdx}
    const contactEstimateSecOf = (lot) => calculateLotEstimatedTime(lot, settings?.customTargetTimes || {}, modelGroupsOf(settings));
+   // 未返信エスカレーション: グループ設定の分数を過ぎた「待ち」依頼(修正/呼出)を上司(工長/グループ長)へも自動通知(1回だけ)。
+   // escalatedAt を先に書いて多重発火を抑える(複数端末が同時に開いていても最悪重複通知1回で実害なし)。
+   useEffect(() => {
+     if (!contactFeatureOn || RENRAKU_PORTAL) return;
+     const check = () => {
+       (contactRequests || []).forEach(r => {
+         if (!r || r.status !== 'waiting' || r.escalatedAt || r.kind === 'arrival') return;
+         const cfg = contactRoutingOf(settings, r.to);
+         if (!cfg.escalateMin || !r.createdAt) return;
+         if (Date.now() - r.createdAt < cfg.escalateMin * 60000) return;
+         saveData('contact_requests', r.id, { escalatedAt: Date.now() });
+         firePushNotify(settings, pushTokens, {
+           toSide: 'portal', toGroup: r.to, toLevel: 'boss',
+           title: `⏰ ${cfg.escalateMin}分 返信なし: ${contactKindLabel(r)}`,
+           body: `${r.from || '検査'} → ${r.to}${r.toPerson ? ` ${r.toPerson}さん` : ''}: ${String(r.message || '').slice(0, 100)}`,
+           link: `${window.location.origin}/?renraku=1`, tag: `esc-${r.id}`,
+         }, deleteData);
+       });
+     };
+     const t = setInterval(check, 60000);
+     return () => clearInterval(t);
+   }, [contactFeatureOn, contactRequests, settings, pushTokens]); // eslint-disable-line react-hooks/exhaustive-deps
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
