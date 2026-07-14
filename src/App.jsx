@@ -17746,6 +17746,129 @@ const ManagerDashboard = ({ lots = [], settings = {} }) => {
 };
 
 // =============================================================================
+// =============================================================================
+//  軽微不良・改善 台帳 (いつでも登録できる・検査フローに紐づかない単独記録)
+//    - 保存先は専用コレクション minor_reports(ロットに載せない=貯めた情報を取りこぼさず・後から自由編集)
+//    - 日時 / 型式・指図 / 工程 / 内容 / 報告者 を追加・編集・削除できる
+//    - 分析「軽微不良・改善提案」にそのまま合流(complaintStats / improvementStats が読む)
+//    - sample:true は「【サンプル】」表示＋一括削除できる=本物の記録と混ざらない
+// =============================================================================
+const MINOR_KINDS = [['complaint', '軽微不良'], ['improvement', '気づき・改善']];
+const MinorReportLedgerModal = ({ reports = [], workers = [], currentUserName = '', saveData, deleteData, onClose }) => {
+  const pad = (n) => String(n).padStart(2, '0');
+  const toLocal = (ms) => { const d = new Date(Number(ms) || Date.now()); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const blank = () => ({ type: 'complaint', at: toLocal(Date.now()), model: '', orderNo: '', stepTitle: '', content: '', workerName: currentUserName || '' });
+  const [form, setForm] = useState(blank());
+  const [editId, setEditId] = useState(null);
+  const [filter, setFilter] = useState('all');
+  const [q, setQ] = useState('');
+  const list = useMemo(() => (reports || []).filter(Boolean)
+    .filter(r => filter === 'all' || r.type === filter)
+    .filter(r => { const s = q.trim(); return !s || [r.content, r.model, r.orderNo, r.stepTitle, r.workerName].some(v => String(v || '').includes(s)); })
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)), [reports, filter, q]);
+  const sampleCount = (reports || []).filter(r => r && r.sample).length;
+  const workerNames = [...new Set((workers || []).map(w => w.name).filter(Boolean))];
+  const save = () => {
+    if (!form.content.trim()) { alert('内容を入力してください'); return; }
+    const id = editId || `mr-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const ts = new Date(form.at).getTime();
+    saveData('minor_reports', id, {
+      type: form.type, timestamp: Number.isFinite(ts) ? ts : Date.now(),
+      model: form.model.trim(), orderNo: form.orderNo.trim(), stepTitle: form.stepTitle.trim(),
+      content: form.content.trim(), workerName: form.workerName.trim(), updatedAt: Date.now(),
+      ...(editId ? {} : { createdAt: Date.now() }),
+    });
+    setForm(blank()); setEditId(null);
+  };
+  const startEdit = (r) => { setEditId(r.id); setForm({ type: r.type || 'complaint', at: toLocal(r.timestamp), model: r.model || '', orderNo: r.orderNo || '', stepTitle: r.stepTitle || '', content: r.content || '', workerName: r.workerName || '' }); };
+  const del = (r) => { if (window.confirm('この記録を削除しますか？')) { deleteData('minor_reports', r.id); if (editId === r.id) { setForm(blank()); setEditId(null); } } };
+  const delAllSample = () => { if (!sampleCount) return; if (!window.confirm(`サンプル ${sampleCount}件をすべて削除しますか？（本物の記録は残ります）`)) return; (reports || []).filter(r => r && r.sample).forEach(r => deleteData('minor_reports', r.id)); };
+  const inputCls = 'border border-slate-300 rounded-lg px-2 py-1.5 text-sm';
+  return (
+    <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 bg-purple-600 text-white flex items-center gap-2 shrink-0">
+          <Megaphone className="w-5 h-5" />
+          <span className="font-black">軽微不良・改善 台帳（いつでも登録・後から編集）</span>
+          <span className="text-[11px] font-normal bg-white/20 rounded px-2 py-0.5">全 {(reports || []).length} 件{sampleCount ? ` / サンプル ${sampleCount}` : ''}</span>
+          <button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
+        </div>
+        {/* 登録・編集フォーム */}
+        <div className="p-4 border-b border-slate-200 bg-slate-50 shrink-0">
+          <div className="text-xs font-black text-slate-500 mb-2">{editId ? '✏ この記録を編集' : '＋ 新しく登録（検査中でなくても・思い出したときにここから）'}</div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+            <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">種類</span>
+              <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className={inputCls}>{MINOR_KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
+            </label>
+            <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">日時</span>
+              <input type="datetime-local" value={form.at} onChange={e => setForm({ ...form, at: e.target.value })} className={inputCls} />
+            </label>
+            <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">報告者</span>
+              <input value={form.workerName} onChange={e => setForm({ ...form, workerName: e.target.value })} list="mr-workers" placeholder="名前" className={inputCls} />
+              <datalist id="mr-workers">{workerNames.map(n => <option key={n} value={n} />)}</datalist>
+            </label>
+            <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">型式</span>
+              <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="例: RTH-612" className={inputCls} />
+            </label>
+            <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">指図番号</span>
+              <input value={form.orderNo} onChange={e => setForm({ ...form, orderNo: e.target.value })} placeholder="任意" className={inputCls} />
+            </label>
+            <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">工程</span>
+              <input value={form.stepTitle} onChange={e => setForm({ ...form, stepTitle: e.target.value })} placeholder="例: 分割精度 / 全体" className={inputCls} />
+            </label>
+            <label className="flex flex-col gap-0.5 col-span-2 md:col-span-3"><span className="text-[10px] font-bold text-slate-400">内容</span>
+              <textarea value={form.content} onChange={e => setForm({ ...form, content: e.target.value })} rows={2} placeholder="何があったか / どう変えたいか" className={inputCls} />
+            </label>
+          </div>
+          <div className="flex justify-end gap-2 mt-2">
+            {editId && <button onClick={() => { setForm(blank()); setEditId(null); }} className="px-3 py-1.5 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">新規に戻す</button>}
+            <button onClick={save} className="px-4 py-1.5 rounded-lg text-sm font-black text-white bg-purple-600 hover:bg-purple-700 flex items-center gap-1.5"><Plus className="w-4 h-4" /> {editId ? '更新' : '登録'}</button>
+          </div>
+        </div>
+        {/* 絞り込み */}
+        <div className="px-4 py-2 border-b border-slate-100 flex items-center gap-2 flex-wrap shrink-0">
+          <div className="flex bg-slate-100 rounded p-0.5">
+            {[['all', 'すべて'], ['complaint', '軽微不良'], ['improvement', '気づき・改善']].map(([id, l]) => (
+              <button key={id} onClick={() => setFilter(id)} className={`px-2.5 py-1 text-xs font-bold rounded ${filter === id ? 'bg-white shadow text-purple-700' : 'text-slate-500'}`}>{l}</button>
+            ))}
+          </div>
+          <div className="relative flex-1 min-w-[160px]">
+            <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input value={q} onChange={e => setQ(e.target.value)} placeholder="内容・型式・工程・報告者で絞り込み" className="w-full border border-slate-300 rounded-lg pl-8 pr-2 py-1.5 text-sm" />
+          </div>
+          {sampleCount > 0 && <button onClick={delAllSample} className="px-2.5 py-1.5 rounded-lg text-xs font-bold text-amber-700 border border-amber-300 bg-amber-50 hover:bg-amber-100 whitespace-nowrap">🧪 サンプル{sampleCount}件を削除</button>}
+        </div>
+        {/* 一覧 */}
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-slate-50 text-[11px] text-slate-500 z-10">
+              <tr className="border-b"><th className="text-left px-3 py-2 whitespace-nowrap">日時</th><th className="text-left px-2 py-2">種類</th><th className="text-left px-2 py-2">型式 / 指図</th><th className="text-left px-2 py-2">工程</th><th className="text-left px-3 py-2">内容</th><th className="text-left px-2 py-2">報告者</th><th className="px-2 py-2"></th></tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {list.map(r => (
+                <tr key={r.id} className={`hover:bg-purple-50/40 ${r.sample ? 'bg-amber-50/40' : ''}`}>
+                  <td className="px-3 py-2 text-xs text-slate-500 whitespace-nowrap">{r.timestamp ? new Date(r.timestamp).toLocaleString('ja-JP', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'}</td>
+                  <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${r.type === 'improvement' ? 'bg-sky-100 text-sky-700' : 'bg-purple-100 text-purple-700'}`}>{r.type === 'improvement' ? '改善' : '軽微'}</span>{r.sample && <span className="ml-1 text-[10px] font-black px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">サンプル</span>}</td>
+                  <td className="px-2 py-2"><div className="font-bold text-slate-700">{r.model || '—'}</div><div className="text-[10px] text-slate-400 font-mono">{r.orderNo || ''}</div></td>
+                  <td className="px-2 py-2 text-xs text-slate-600">{r.stepTitle || '全体'}</td>
+                  <td className="px-3 py-2 text-slate-800 whitespace-pre-wrap max-w-[28ch]">{r.content || ''}</td>
+                  <td className="px-2 py-2 text-xs text-slate-600 whitespace-nowrap">{r.workerName || ''}</td>
+                  <td className="px-2 py-2 text-right whitespace-nowrap">
+                    <button onClick={() => startEdit(r)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded" title="編集"><Pencil className="w-4 h-4" /></button>
+                    <button onClick={() => del(r)} className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded" title="削除"><Trash2 className="w-4 h-4" /></button>
+                  </td>
+                </tr>
+              ))}
+              {list.length === 0 && <tr><td colSpan={7} className="px-3 py-10 text-center text-sm text-slate-400">まだ記録がありません。上の「登録」から、検査中でなくてもいつでも残せます。</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
 //  達成率分析 — 標準時間(目標)に対する実績の達成率(能率)
 //  達成率 = 目標時間合計 ÷ 実績時間合計 ×100 (100%超 = 目標より速い)
 //  ①型式別×期間指定 ②型式関係なく週毎/月毎の全体推移。読み取り集計のみ。
@@ -20233,7 +20356,8 @@ const ANALYSIS_GROUPS = [
     { k: 'rotary', l: '分割測定', color: 'text-cyan-600' },
   ] },
 ];
-const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], notes = [], announcements = [], strictModeHistory = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null }) => {
+const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], notes = [], announcements = [], strictModeHistory = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null, minorReports = [] }) => {
+  const [showMinorLedger, setShowMinorLedger] = useState(false);
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('process-analysis'); // 既定=工程分析(データを見る土台)。グループは activeMode から導出
   const activeGroup = ANALYSIS_GROUPS.find(g => g.tabs.some(t => t.k === activeMode)) || ANALYSIS_GROUPS[0];
@@ -20511,6 +20635,25 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
       });
     });
 
+    // 台帳(minor_reports)の軽微不良も合流(ロット非依存の単独記録・いつでも登録した分)。
+    (minorReports || []).filter(r => r && r.type === 'complaint').forEach(r => {
+      const lot = { id: r.id, model: r.model || '不明', orderNo: r.orderNo || '' };
+      const c = { id: r.id, label: r.content || '', timestamp: toMsAny(r.timestamp), stepInfo: r.stepTitle ? { title: r.stepTitle } : null, workerName: r.workerName || '', source: '台帳', sample: !!r.sample };
+      if (c.timestamp) { const d0 = new Date(c.timestamp); const ym0 = `${d0.getFullYear()}-${String(d0.getMonth() + 1).padStart(2, '0')}`; monthlyCountsAll[ym0] = (monthlyCountsAll[ym0] || 0) + 1; }
+      if (isInDefectPeriod(c.timestamp)) {
+        const wname = (workers.find(x => x.id === c.workerName)?.name) || c.workerName || '不明';
+        complaints.push({ ...c, lot, workerName: wname });
+        const mainLabel = (c.label || '').split(' : ')[0] || 'その他';
+        labelCounts[mainLabel] = (labelCounts[mainLabel] || 0) + 1;
+        const st = c.stepInfo ? c.stepInfo.title : '全体';
+        stepCounts[st] = (stepCounts[st] || 0) + 1;
+        workerCounts[wname] = (workerCounts[wname] || 0) + 1;
+        const m = lot.model || '不明';
+        modelCounts[m] = (modelCounts[m] || 0) + 1;
+        if (c.timestamp) { const d = new Date(c.timestamp); const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; const ymd = `${ym}-${String(d.getDate()).padStart(2, '0')}`; monthlyCounts[ym] = (monthlyCounts[ym] || 0) + 1; dayCounts[ymd] = (dayCounts[ymd] || 0) + 1; if (c.timestamp < minTs) minTs = c.timestamp; if (c.timestamp > maxTs) maxTs = c.timestamp; }
+      } else if (isInPrev(c.timestamp)) { prevCount++; }
+    });
+
     const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
     // 月別推移: 直近 12ヶ月分を出す (データが少なくても枠は作る)
     const trendMonths = [];
@@ -20544,7 +20687,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
       diff,
       diffRate,
     };
-  }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
+  }, [lots, workers, minorReports, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
   // 気づき・改善(type='improvement') の集計。タブ名「軽微不良・改善提案」の“改善”側。
   //   軽微不良(complaint)とは別概念(工程の提案)なので complaintStats とは分けて集計し、同タブ内に別セクションで出す。
@@ -20566,13 +20709,25 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
         workerCounts[wname] = (workerCounts[wname] || 0) + 1;
       });
     });
+    // 台帳(minor_reports)の気づき・改善も合流(いつでも登録した単独記録)。
+    (minorReports || []).filter(r => r && r.type === 'improvement').forEach(r => {
+      if (!isInDefectPeriod(toMsAny(r.timestamp))) return;
+      const wname = (workers.find(x => x.id === r.workerName)?.name) || r.workerName || '不明';
+      const st = r.stepTitle || '全体';
+      const m = r.model || '不明';
+      items.push({ id: r.id, timestamp: toMsAny(r.timestamp), lot: { id: r.id, model: m, orderNo: r.orderNo || '' }, workerName: wname, kindLabel: 'その他', stepTitle: st, label: r.content || '', description: r.content || '', source: '台帳', sample: !!r.sample });
+      kindCounts['その他'] = (kindCounts['その他'] || 0) + 1;
+      stepCounts[st] = (stepCounts[st] || 0) + 1;
+      modelCounts[m] = (modelCounts[m] || 0) + 1;
+      workerCounts[wname] = (workerCounts[wname] || 0) + 1;
+    });
     const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
     return {
       total: items.length,
       items: items.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
       kinds: sortObj(kindCounts), steps: sortObj(stepCounts), models: sortObj(modelCounts), workers: sortObj(workerCounts),
     };
-  }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
+  }, [lots, workers, minorReports, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
 
   const defectFilterLabel = defectFilterMode === 'month' ? defectFilterMonth : `${defectFilterStart} ~ ${defectFilterEnd}`;
   const defectFilterSuffix = defectFilterMode === 'month' ? defectFilterMonth : `${defectFilterStart}_${defectFilterEnd}`;
@@ -20669,6 +20824,10 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
 
   return (
     <div data-fs="tables" className="h-full flex flex-col bg-slate-50 overflow-hidden">
+       {/* 軽微不良・改善 台帳 (いつでも登録・後から編集) */}
+       {showMinorLedger && (
+         <MinorReportLedgerModal reports={minorReports} workers={workers} currentUserName={currentUserName} saveData={saveData} deleteData={deleteData} onClose={() => setShowMinorLedger(false)} />
+       )}
        {/* Edit Modal */}
        {editModal.isOpen && (
          <div className="fixed inset-0 z-[70] bg-black/50 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setEditModal({ isOpen: false, type: null, data: null, lotId: null })}>
@@ -21091,8 +21250,11 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
              const topReporter = cs.workers[0];
              return (
              <div className="space-y-6">
-               {/* フィルタUIはヘッダーに統一済 */}
-
+               {/* 台帳: 検査フローに関係なく「いつでも」登録できる。ここに貯めた分もこの分析に合流する。 */}
+               <div className="flex items-center justify-between bg-purple-50 border border-purple-200 rounded-xl px-4 py-2.5">
+                 <div className="text-xs text-purple-700 font-bold flex items-center gap-1.5"><Megaphone className="w-4 h-4"/> 検査中でなくても、思い出したときに軽微不良・改善を残せます（日時・報告者も後から編集可）</div>
+                 <button onClick={() => setShowMinorLedger(true)} className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-sm font-black flex items-center gap-1.5 shrink-0"><Plus className="w-4 h-4"/> いつでも登録・台帳</button>
+               </div>
                {/* KPI: 4枚カード */}
                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                  <div className="bg-gradient-to-br from-purple-50 to-purple-100 border-2 border-purple-200 p-4 rounded-xl shadow-sm">
@@ -29168,6 +29330,7 @@ export default function App() {
    const [spareMotors, setSpareMotors] = useState([]); // 社内の仮モーター在庫(検査G/組立Gが持つ予備モーター)
    const [contactRequests, setContactRequests] = useState([]); // 工程間連絡: 修正依頼/呼出/到着予定依頼
    const [arrivalTimes, setArrivalTimes] = useState([]); // 到着予定 (docId=lotId。ポータルから登録→検査リストにバッジ)
+   const [minorReports, setMinorReports] = useState([]); // 軽微不良・改善 台帳 (単独記録・ロット非依存。分析に合流)
    const [pushTokens, setPushTokens] = useState([]); // プッシュ通知の受信端末 (docId=端末ID, side:'app'/'portal')
    const [logs, setLogs] = useState([]);
    const [settings, setSettings] = useState({ mapImage: null, mapZones: INITIAL_MAP_ZONES, defectProcessOptions: DEFAULT_DEFECT_PROCESS_OPTIONS, breakAlerts: [], complaintOptions: DEFAULT_COMPLAINT_OPTIONS, customTargetTimes: {}, targetTimeHistory: [], customLayouts: {}, measurementOverrides: {} });
@@ -29606,6 +29769,7 @@ export default function App() {
        onSnapshot(getPath('announcements'), (snap) => setAnnouncements(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
        onSnapshot(getPath('indirectWork'), (snap) => setIndirectWork(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.startTime || 0) - (a.startTime || 0)))),
        onSnapshot(getPath('improvements'), (snap) => setImprovementCards(snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)))),
+       onSnapshot(getPath('minor_reports'), (snap) => setMinorReports(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('observationPlans'), (snap) => setObservationPlans(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('video_recipes'), (snap) => setVideoRecipes(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        ]),
@@ -31884,7 +32048,7 @@ export default function App() {
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
          {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} onApplyArrival={(reqId, itemIdx) => setArrivalApply({ reqId, itemIdx })} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} />}
+         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} minorReports={minorReports} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
