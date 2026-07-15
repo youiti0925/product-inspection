@@ -4004,6 +4004,40 @@ const ContactInternalModal = ({ from, onClose, onSend }) => {
   );
 };
 
+// 連絡カードの会話スレッド(構造化リクエスト＋自由対話のハイブリッド)。検査(app)⇄組立(portal)がその場でやり取り。
+// 依頼カードはそのまま(状態/宛先/返信は従来通り)、その下に会話欄を足すだけ=強み(追跡/集計/ルーティング)を保つ。
+const contactNewCommentId = () => `c-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+const ContactThread = ({ req, mySide, onAdd }) => {
+  const [text, setText] = useState('');
+  const comments = req?.comments || [];
+  const add = () => { const t = text.trim(); if (!t) return; onAdd(t); setText(''); };
+  const seenOther = mySide === 'app' ? req?.seenPortal : req?.seenApp;
+  const otherLabel = mySide === 'app' ? '組立' : '検査';
+  return (
+    <div className="border-t border-slate-200 pt-2 mt-1">
+      <div className="text-[11px] font-black text-slate-500 mb-1 flex items-center gap-1.5 flex-wrap">💬 会話
+        {seenOther?.at && <span className="text-[10px] font-normal text-emerald-600">👁 {otherLabel}が見ました {fmtContactTime(seenOther.at)}{seenOther.by ? `（${seenOther.by}）` : ''}</span>}
+      </div>
+      {comments.length > 0 && (
+        <div className="flex flex-col gap-1 max-h-44 overflow-y-auto mb-1.5">
+          {comments.map((c, i) => (
+            <div key={c.id || i} className={`flex ${c.side === mySide ? 'justify-end' : 'justify-start'}`}>
+              <div className={`max-w-[82%] rounded-2xl px-3 py-1.5 ${c.side === mySide ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-800'}`}>
+                <div className={`text-[10px] ${c.side === mySide ? 'text-blue-100' : 'text-slate-400'}`}>{c.by || (c.side === 'portal' ? '組立' : '検査')} ・ {fmtContactTime(c.at)}</div>
+                <div className="text-sm whitespace-pre-wrap break-words">{c.text}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="flex items-center gap-1.5">
+        <input value={text} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); add(); } }} placeholder="メッセージを書く…" className="flex-1 border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm" />
+        <button onClick={add} disabled={!text.trim()} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black disabled:opacity-40 shrink-0">送信</button>
+      </div>
+    </div>
+  );
+};
+
 const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName, pushTokens = [], notifyPush = null, onApplyArrival = null }) => {
   const [showPushHelp, setShowPushHelp] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
@@ -4069,6 +4103,22 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice: 'ack', by: currentUserName || '職長', at: Date.now() } });
     if (notifyPush) notifyPush({ toSide: 'app', title: `🏭 ${currentUserName || '職長'} が対応します`, body: `${r.topic || ''} ${String(r.message || '').slice(0, 80)}`, link: `${window.location.origin}/`, tag: `intack-${r.id}-${Date.now()}` });
   };
+  // 連絡カードの会話に検査側からコメント追加 → 相手(組立/社内)へ通知。
+  const addComment = (r, text) => {
+    if (!r) return;
+    const c = { id: contactNewCommentId(), by: currentUserName || '検査', text, at: Date.now(), side: 'app' };
+    saveData('contact_requests', r.id, { comments: [...(r.comments || []), c] });
+    if (notifyPush) {
+      if (r.kind === 'internal') notifyPush({ toSide: 'app', internal: true, title: `💬 ${currentUserName || '検査'}: ${text.slice(0, 40)}`, body: `${r.topic || ''} の会話`, link: `${window.location.origin}/`, tag: `cmt-${r.id}-${Date.now()}` });
+      else notifyPush({ toSide: 'portal', toGroup: r.to, title: `💬 ${currentUserName || '検査'}: ${text.slice(0, 40)}`, body: `${r.orderNo ? `指図${r.orderNo} ` : ''}${contactKindLabel(r)}の会話`, link: `${window.location.origin}/?renraku=1`, tag: `cmt-${r.id}-${Date.now()}` });
+    }
+  };
+  // 検査が連絡を開いたら「既読」を記録(初回のみ)。相手側に「検査が見ました」と出る。
+  useEffect(() => {
+    if (!detailId) return;
+    const r = (contactRequests || []).find(x => x && x.id === detailId);
+    if (r && !r.seenApp) saveData('contact_requests', detailId, { seenApp: { at: Date.now(), by: currentUserName || '検査' } });
+  }, [detailId]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="h-full flex flex-col gap-3 overflow-hidden">
       <div className="shrink-0 flex items-center gap-2 flex-wrap">
@@ -4392,6 +4442,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   </div>
                 </div>
               )}
+              <ContactThread req={detail} mySide="app" onAdd={t => addComment(detail, t)} />
             </div>
             <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end shrink-0">
               <button onClick={() => { if (window.confirm('この連絡を削除しますか？（履歴からも消えます）')) { deleteData('contact_requests', detail.id); setDetailId(null); } }} className="px-3 py-1.5 rounded-lg text-xs font-bold text-rose-600 hover:bg-rose-50 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> 削除</button>
@@ -4476,6 +4527,17 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice: 'ack', by: byName, at: Date.now() } });
     if (notifyPush) notifyPush({ toSide: 'app', title: `✅ 組立が確認: ${r.orderNo || ''} ${r.model || ''}`, body: `${byName} が検査完了を確認しました`, link: appLink, tag: `doneack-${r.id}-${Date.now()}` });
   };
+  // 会話に組立側からコメント追加 → 検査側へ通知。
+  const addComment = (r, text) => {
+    if (!r) return;
+    const c = { id: contactNewCommentId(), by: byName, text, at: Date.now(), side: 'portal' };
+    saveData('contact_requests', r.id, { comments: [...(r.comments || []), c] });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `💬 ${byName}: ${text.slice(0, 40)}`, body: `${r.orderNo ? `指図${r.orderNo} ` : ''}${String(r.message || '').slice(0, 60)}`, link: appLink, tag: `cmt-${r.id}-${Date.now()}` });
+  };
+  // 組立がポータルで表示中の依頼は「見た」= 検査側に既読を返す(初回のみ)。
+  useEffect(() => {
+    (inbox || []).forEach(r => { if (r && !r.seenPortal) saveData('contact_requests', r.id, { seenPortal: { at: Date.now(), by: byName } }); });
+  }, [inbox]); // eslint-disable-line react-hooks/exhaustive-deps
   const answerArrivalItem = (r, idx) => {
     const key = `${r.id}__${idx}`;
     const d = draftTimes[key] || {};
@@ -4591,6 +4653,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                       <button key={c.id} onClick={() => reply(r, c.id)} className={`py-3.5 rounded-xl text-sm font-black ${c.id === 'no' ? 'bg-white border-2 border-rose-500 text-rose-600 hover:bg-rose-50' : `text-white ${c.cls}`}`}>{c.label}</button>
                     ))}
                   </div>
+                  <ContactThread req={r} mySide="portal" onAdd={t => addComment(r, t)} />
                 </div>
               </div>
             ))}
