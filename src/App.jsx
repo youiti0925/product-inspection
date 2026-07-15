@@ -3124,7 +3124,7 @@ const fmtContactElapsed = (fromTs, toTs) => {
   if (h < 24) return `${h}時間${m % 60 ? `${m % 60}分` : ''}`;
   return `${Math.floor(h / 24)}日`;
 };
-const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'finish' ? '終了予定' : (req?.kind === 'complete' ? '検査完了' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼')));
+const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'finish' ? '終了予定' : (req?.kind === 'complete' ? '検査完了' : (req?.kind === 'internal' ? '社内連絡' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼'))));
 const contactStatusInfo = (req) => {
   if (!req) return { label: '', cls: '' };
   if (req.status === 'canceled') return { label: '取消', cls: 'bg-slate-100 text-slate-400 border-slate-300' };
@@ -3373,6 +3373,15 @@ const contactFilterByLevel = (groupTokens, settings, group, toLevel) => {
   if (!out.length) out = groupTokens;
   return out;
 };
+// ---- 社内(検査職制)連絡: 現場作業者 → 検査の職長/工長 ----
+// 宛先は検査側(side:'app')端末のうち役職(職長/工長/グループ長)を付けた端末だけ。役職付き端末が1台も無ければ
+// 検査の全端末へ(誰にも届かない事態を防ぐ)。現場作業者の端末は役職未設定=通常は宛先から外れる。
+const CONTACT_INTERNAL_GROUP = '（社内）';
+const CONTACT_INTERNAL_TOPICS = ['応援要請', '相談', '申し送り', '未検査あり', '保留・機番待ち', '設備・道具', 'その他'];
+const contactInternalTargets = (appTokens) => {
+  const roled = (appTokens || []).filter(t => t && (t.role === '職長' || t.role === '工長' || t.role === 'グループ長'));
+  return roled.length ? roled : (appTokens || []);
+};
 
 // ---- プッシュ通知 (FCM) ----
 // 「見てなくても携帯が鳴って気づく」層。設定は settings.push { vapidKey, workerUrl }(管理者が連絡タブで1回設定)。
@@ -3393,7 +3402,7 @@ const contactPushMessage = (payload) => {
 };
 // 宛先トークンを選んでWorkerへ送る。unregistered(端末側で無効化済み)のトークンdocは自動掃除。
 // 依頼(toSide:'portal')は、管理者CC(admin:true登録の端末)へ「誰が誰に何を送ったか」を自動で写し送りする。
-const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, link, tag, toLevel }, deleteData) => {
+const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, link, tag, toLevel, internal }, deleteData) => {
   try {
     const cfg = pushCfgOf(settings);
     if (!cfg.vapidKey || !cfg.workerUrl) return;
@@ -3410,6 +3419,7 @@ const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, li
       .filter(t => (toGroup ? t.group === toGroup : true));
     // あっち側宛ては役職ルーティング(職長/上司/全員…)で絞る。検査側宛て(返信・到着回答)は従来どおり全端末。
     if (toSide === 'portal' && toGroup) targets = contactFilterByLevel(targets, settings, toGroup, toLevel);
+    else if (internal && toSide === 'app') targets = contactInternalTargets(targets); // 社内連絡=検査の職長/工長へ
     if (targets.length) {
       sendPushViaWorker(cfg.workerUrl, { tokens: [...new Set(targets.map(t => t.token))], title, body, link, tag }).then(cleanup(targets));
     }
@@ -3726,12 +3736,10 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
                   <td className="px-2 py-1.5 font-bold">{t.side === 'portal' ? sideLabel : '検査'}{t.admin ? <span className="ml-1 text-[9px] font-black text-purple-600 bg-purple-50 border border-purple-200 rounded px-1">CC</span> : null}</td>
                   <td className="px-2 py-1.5">{t.group || '—'}</td>
                   <td className="px-2 py-1.5">
-                    {t.side === 'portal' ? (
-                      <select value={t.role || ''} onChange={e => saveData('push_tokens', t.id, { role: e.target.value })} className="border border-slate-200 rounded px-1 py-0.5 text-[11px] font-bold">
-                        <option value="">未設定(職長扱い)</option>
-                        {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
-                      </select>
-                    ) : <span className="text-slate-300">—</span>}
+                    <select value={t.role || ''} onChange={e => saveData('push_tokens', t.id, { role: e.target.value })} className="border border-slate-200 rounded px-1 py-0.5 text-[11px] font-bold">
+                      <option value="">{t.side === 'portal' ? '未設定(職長扱い)' : '未設定(社内連絡は対象外)'}</option>
+                      {CONTACT_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
+                    </select>
                   </td>
                   <td className="px-2 py-1.5">{t.name || '—'}{t.id === deviceId ? '（この端末）' : ''}</td>
                   <td className="px-2 py-1.5 text-slate-500">{t.platform === 'ios-pwa' ? 'iPhone(ホーム追加)' : t.platform === 'ios' ? 'iPhone' : String(t.platform || '').startsWith('android') ? 'Android' : 'PC'}</td>
@@ -3952,6 +3960,50 @@ const ContactAskArrivalModal = ({ lots, groups, from, onClose, onSend }) => {
 };
 
 // 連絡タブ: 依頼リスト(状況/送信/経過/返信) + 詳細 + 到着依頼作成 + 宛先/公開設定 + ポータルURL。
+// 社内連絡(現場→検査の職長/工長)の送信モーダル。用件チップ+指図(任意)+内容。組立ではなく検査の職制へ通知。
+const ContactInternalModal = ({ from, onClose, onSend }) => {
+  const [topic, setTopic] = useState(CONTACT_INTERNAL_TOPICS[0]);
+  const [message, setMessage] = useState('');
+  const [orderNo, setOrderNo] = useState('');
+  const send = () => {
+    onSend({
+      kind: 'internal', to: CONTACT_INTERNAL_GROUP, from: from || '現場',
+      topic, orderNo: orderNo.trim(), message: message.trim() || topic,
+      createdAt: Date.now(), status: 'waiting',
+    });
+  };
+  return (
+    <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 bg-indigo-700 text-white flex items-center gap-2"><MessageCircle className="w-5 h-5" /><span className="font-black">職長・工長へ 社内連絡</span><button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button></div>
+        <div className="p-4 flex flex-col gap-3 text-sm">
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">用件</div>
+            <div className="flex flex-wrap gap-1.5">
+              {CONTACT_INTERNAL_TOPICS.map(t => (
+                <button key={t} onClick={() => setTopic(t)} className={`px-2.5 py-1 rounded-full text-xs font-bold border ${topic === t ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>{t}</button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">指図（任意）</div>
+            <input value={orderNo} onChange={e => setOrderNo(e.target.value)} placeholder="指図番号（あれば）" className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" />
+          </div>
+          <div>
+            <div className="text-xs font-black text-slate-500 mb-1">内容</div>
+            <textarea value={message} onChange={e => setMessage(e.target.value)} rows={3} placeholder="例: 5工程で手が足りません。応援お願いします。 / 号機の取り合いで止まっています。" className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm resize-none" />
+          </div>
+          <div className="text-[11px] text-slate-400">検査の職長・工長の携帯に通知が届きます（連絡タブの端末一覧で役職を付けた端末へ。未登録なら検査の全端末へ）。</div>
+        </div>
+        <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end">
+          <button onClick={onClose} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">やめる</button>
+          <button onClick={send} className="px-4 py-2 rounded-lg text-sm font-black text-white bg-indigo-700 hover:bg-indigo-800 flex items-center gap-1.5"><Send className="w-4 h-4" /> 職長へ送る</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettings, saveData, deleteData, currentUserName, pushTokens = [], notifyPush = null, onApplyArrival = null }) => {
   const [showPushHelp, setShowPushHelp] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
@@ -3985,6 +4037,8 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
   const portalUrl = (() => { try { return `${window.location.origin}${window.location.pathname}?renraku=1`; } catch (e) { return '?renraku=1'; } })();
   const portalCfg = settings?.contactPortal || {};
   const [finishDraft, setFinishDraft] = useState({}); // 「いつ終わる？」への回答下書き
+  const [showInternal, setShowInternal] = useState(false); // 社内連絡(現場→職長/工長)モーダル
+  const internalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'internal').sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 30), [contactRequests]);
   const sendReq = (payload) => {
     saveData('contact_requests', newContactId(), payload);
     // 宛先グループの携帯へプッシュ通知(設定済みなら)。失敗しても連絡自体は届いている。
@@ -4004,12 +4058,24 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     const it = items[idx];
     if (notifyPush) notifyPush({ toSide: 'portal', toGroup: r.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}${it.time}`, body: `${currentUserName || '検査'} が回答しました`, link: `${window.location.origin}/?renraku=1`, tag: `fina-${r.id}-${idx}-${Date.now()}` });
   };
+  // 社内連絡(現場→検査の職長/工長)を送る。組立ではなく検査側(side:'app')の役職端末へ通知。
+  const sendInternal = (payload) => {
+    saveData('contact_requests', newContactId(), payload);
+    if (notifyPush) notifyPush({ toSide: 'app', internal: true, title: `🏭 社内: ${payload.topic || ''}（${payload.from || '現場'}）`, body: `${payload.orderNo ? `指図${payload.orderNo}: ` : ''}${payload.message || ''}`.slice(0, 200), link: `${window.location.origin}/`, tag: `int-${Date.now()}` });
+    setShowInternal(false);
+  };
+  // 社内連絡に「対応します」= 検査側(現場含む全端末)に「△△が対応します」を通知して既読を返す。
+  const ackInternal = (r) => {
+    saveData('contact_requests', r.id, { status: 'answered', answer: { choice: 'ack', by: currentUserName || '職長', at: Date.now() } });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🏭 ${currentUserName || '職長'} が対応します`, body: `${r.topic || ''} ${String(r.message || '').slice(0, 80)}`, link: `${window.location.origin}/`, tag: `intack-${r.id}-${Date.now()}` });
+  };
   return (
     <div className="h-full flex flex-col gap-3 overflow-hidden">
       <div className="shrink-0 flex items-center gap-2 flex-wrap">
         <h2 className="text-lg font-black text-slate-800 flex items-center gap-2"><MessageCircle className="w-5 h-5 text-blue-600" /> 工程連絡</h2>
         <button onClick={() => setShowAsk(true)} className="px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-sm font-black flex items-center gap-1.5"><Truck className="w-4 h-4" /> 到着予定を聞く</button>
         <button onClick={() => setShowSend(true)} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black flex items-center gap-1.5"><Send className="w-4 h-4" /> 連絡・呼出</button>
+        <button onClick={() => setShowInternal(true)} className="px-3 py-1.5 rounded-lg bg-indigo-700 hover:bg-indigo-800 text-white text-sm font-black flex items-center gap-1.5" title="検査の職長・工長へ社内連絡(応援要請・相談・申し送り)">🏭 職長へ(社内)</button>
         <div className="relative">
           <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="検索 (指図/型式/内容/宛先)" className="border border-slate-300 rounded-lg pl-8 pr-2 py-1.5 text-sm w-56" />
@@ -4176,6 +4242,20 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
           </details>
         </div>
       )}
+      {internalReqs.some(r => r.status === 'waiting') && (
+        <div className="shrink-0 bg-indigo-50 border border-indigo-200 rounded-xl p-2 flex flex-col gap-1.5 max-h-[28vh] overflow-y-auto overscroll-contain">
+          <div className="text-xs font-black text-indigo-800 flex items-center gap-1.5">🏭 社内連絡（現場→職長・工長）<span className="text-[10px] font-normal text-indigo-500">対応待ち {internalReqs.filter(r => r.status === 'waiting').length}件</span></div>
+          {internalReqs.filter(r => r.status === 'waiting').map(r => (
+            <div key={r.id} className="bg-white rounded-lg border border-indigo-200 px-3 py-2 flex items-center gap-2 flex-wrap">
+              <span className="text-[11px] font-black text-indigo-700 bg-indigo-100 rounded px-1.5 py-0.5 shrink-0">{r.topic || '連絡'}</span>
+              {r.orderNo && <span className="font-mono text-xs font-bold text-slate-500 shrink-0">{r.orderNo}</span>}
+              <span className="text-sm text-slate-800 truncate flex-1 min-w-[8ch]" title={r.message}>{r.message}</span>
+              <span className="text-[11px] text-slate-400 shrink-0">{r.from || ''}・{fmtContactElapsed(r.createdAt, nowTick)}前</span>
+              <button onClick={() => ackInternal(r)} className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black shrink-0">対応します</button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="flex-1 min-h-0 overflow-y-auto bg-white rounded-xl border border-slate-200">
         <table className="w-full text-sm">
           <thead className="sticky top-0 bg-slate-50 text-[11px] text-slate-500 z-10">
@@ -4324,6 +4404,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       )}
       {showAsk && <ContactAskArrivalModal lots={lots} groups={groups} from={currentUserName} onClose={() => setShowAsk(false)} onSend={(p) => { sendReq(p); setShowAsk(false); }} />}
       {showSend && <ContactSendModal draft={{ kind: 'call', message: '' }} groups={groups} members={contactMembersOf(settings)} chipOptions={settings?.complaintOptions || []} from={currentUserName} lot={null} onClose={() => setShowSend(false)} onSend={(p) => { sendReq(p); setShowSend(false); }} />}
+      {showInternal && <ContactInternalModal from={currentUserName} onClose={() => setShowInternal(false)} onSend={sendInternal} />}
       {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} sideLabel={sideLabel} />}
     </div>
   );
@@ -4353,7 +4434,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   const todayStr = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
   const arrivalByLot = useMemo(() => { const m = {}; (arrivalTimes || []).forEach(a => { if (a && a.id) m[a.id] = a; }); return m; }, [arrivalTimes]);
   // 修正・呼出の受信箱。到着/終了予定/完了連絡は専用レーンで扱うので、この一覧(3択返信)からは除外する。
-  const isRepairKind = (r) => r && r.kind !== 'arrival' && r.kind !== 'finish' && r.kind !== 'complete';
+  const isRepairKind = (r) => r && r.kind !== 'arrival' && r.kind !== 'finish' && r.kind !== 'complete' && r.kind !== 'internal';
   const inbox = useMemo(() => (contactRequests || []).filter(r => isRepairKind(r) && r.to === group && r.status === 'waiting').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
   const answeredRecent = useMemo(() => (contactRequests || []).filter(r => isRepairKind(r) && r.to === group && r.status === 'answered' && (nowTick - (r.answer?.at || 0)) < 24 * 3600 * 1000).sort((a, b) => (b.answer?.at || 0) - (a.answer?.at || 0)), [contactRequests, group, nowTick]);
   // 検査側からの「検査完了」お知らせ。ワンタップ「確認しました」で検査側に既読が返る。
