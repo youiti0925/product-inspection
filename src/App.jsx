@@ -3084,6 +3084,8 @@ const contactGroupsOf = (settings) => {
   const g = Array.isArray(settings?.contactGroups) ? settings.contactGroups.map(x => String(x || '').trim()).filter(Boolean) : [];
   return g.length ? g : DEFAULT_CONTACT_GROUPS;
 };
+// 相手側(前後工程)の呼び名。既定「組立」。設定で変更可(将来 機械 等が増えても呼び替えられるように)。
+const contactSideLabel = (settings) => String(settings?.contactSideLabel || '').trim() || '組立';
 const newContactId = () => `cr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 // 班(宛先グループ)ごとのメンバー名簿 settings.contactMembers = { グループ名: [名前,...] }。
 // 送信時に「宛先の人」を指名でき、ポータル/通知に「→○○さん」と出る。
@@ -3446,7 +3448,7 @@ const ForegroundPushToast = ({ ready }) => {
 };
 
 // 通知の設定方法ヘルプ(端末別)。連絡タブ(検査側)とポータル(あっち側)の両方から開ける。
-const PushHelpModal = ({ onClose }) => {
+const PushHelpModal = ({ onClose, sideLabel = '組立' }) => {
   const Sec = ({ emoji, title, children, open }) => (
     <details open={open} className="bg-white border border-slate-200 rounded-xl overflow-hidden">
       <summary className="px-3 py-2.5 font-black text-slate-700 cursor-pointer select-none hover:bg-slate-50">{emoji} {title}</summary>
@@ -3471,7 +3473,7 @@ const PushHelpModal = ({ onClose }) => {
         <div className="p-4 overflow-y-auto flex flex-col gap-3">
           <Sec emoji="🗺" title="全体のしくみ（1分でわかる）" open>
             <p>電話で「修正来て」「いつ来る？」とやっていた連絡を、アプリに置き換えるものです。登場するのは2つの画面:</p>
-            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap">{`【こっち = 検査側】          【あっち = 組立・機械など】
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap">{`【こっち = 検査側】          【相手 = ${sideLabel}・機械など】
  このアプリの「連絡」タブ  ⇄   ポータル(渡すURLで開く専用ページ)
 
  依頼を送る ────────────────▶ 依頼が表示+携帯に通知🔔
@@ -3488,7 +3490,7 @@ const PushHelpModal = ({ onClose }) => {
             <div className="bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 my-1">
               <b>👥 誰の携帯が鳴るか（役職と宛先ルール）</b>
               <ul className="list-disc ml-5 mt-1 space-y-0.5">
-                <li>あっち側の端末は登録時に<b>役職</b>（職長/工長/グループ長/一般）を選べます。普段の通知は<b>職長</b>の携帯へ（役職未設定の端末も職長あつかい）</li>
+                <li>{sideLabel}側の端末は登録時に<b>役職</b>（職長/工長/グループ長/一般）を選べます。普段の通知は<b>職長</b>の携帯へ（役職未設定の端末も職長あつかい）</li>
                 <li><b>職長が休みの日</b> → 宛先・公開設定→宛先ルールで「職長 不在」をONにすると、自動で<b>上司（工長・グループ長）</b>へ切り替わります</li>
                 <li><b>重い内容（大きい不良など）</b> → 送信画面の「誰の携帯を鳴らすか」で<b>職長＋上司</b>や<b>上司のみ</b>を選べます</li>
                 <li><b>返信が来ない時</b> → 宛先ルールで「未返信◯分で上司にも自動通知」を設定できます（0=しない）</li>
@@ -3496,7 +3498,7 @@ const PushHelpModal = ({ onClose }) => {
               </ul>
             </div>
             <Step n={2}><b>班のメンバーを登録</b>(任意) — 同じ画面の「班のメンバー」欄に「小川、佐藤」のように入れると、送信時に人を指名できます</Step>
-            <Step n={3}><b>あっちにURLを渡す</b> — 「あっち側に渡すURL」をコピーして、組立・機械の端末で開いてもらう→グループを選んでもらう(これだけで使えます)</Step>
+            <Step n={3}><b>{sideLabel}にURLを渡す</b> — 「{sideLabel}に渡すURL」をコピーして、組立・機械の端末で開いてもらう→グループを選んでもらう(これだけで使えます)</Step>
             <Step n={4}><b>通知を設定</b>(下の「管理者の初期設定」) — 携帯が鳴るようになります。設定しなくても連絡機能自体は使えます</Step>
             <Step n={5}>機能ごと止めたい時は マスタ設定→「工程連絡」のチェックをOFF</Step>
           </Sec>
@@ -3515,7 +3517,7 @@ const PushHelpModal = ({ onClose }) => {
               <div className="text-[11px] text-slate-500 mt-1">※ 自動計算は「目標時間×台数」の単純計算です。休憩や他の仕事の割り込みは入っていないので、現実に合わせて直してから返すのがおすすめです。</div>
             </div>
           </Sec>
-          <Sec emoji="📥" title="あっち側の使い方（ポータル）">
+          <Sec emoji="📥" title={`${sideLabel}側の使い方（ポータル）`}>
             <Step n={1}>渡されたURLを開く→自分のグループ(組立など)を押す(最初の1回だけ)</Step>
             <Step n={2}>依頼が来たら「すぐ行く/10分後/20分後/行けない」をタップ+ひとことコメント(任意)</Step>
             <Step n={3}>「いつ来るか」依頼には日付と時間を入れて返信</Step>
@@ -3590,6 +3592,7 @@ const PushHelpModal = ({ onClose }) => {
 // 検査側(連絡タブ, side='app')とあっち側(ポータル, side='portal'+グループ名)の両方で使う。
 const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushTokens = [], side, group = '', personName = '', admin = false, onOpenHelp }) => {
   const cfg = pushCfgOf(settings);
+  const sideLabel = contactSideLabel(settings);
   const [vapidDraft, setVapidDraft] = useState(cfg.vapidKey);
   const [workerDraft, setWorkerDraft] = useState(cfg.workerUrl || 'https://gemini-proxy.you0925.workers.dev');
   const [busy, setBusy] = useState(false);
@@ -3664,7 +3667,7 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
           </div>
           {!ready && <div className="text-[11px] text-amber-600 font-bold">VAPID鍵とWorker URLの両方を保存すると通知が使えるようになります（未設定の間も連絡機能自体は普通に使えます）</div>}
           <div className="text-[11px] text-slate-500 bg-blue-50 border border-blue-100 rounded-lg px-2.5 py-1.5">
-            💡 <b>組立・機械の端末とのつなげ方:</b> その端末で上の「あっち側に渡すURL」を開く → グループ（組立など）を選ぶ → 右上の🔔 →「この端末で通知を受け取る」。これで<b>そのグループ宛ての依頼</b>がその端末に届きます。ここ（検査側）で登録した端末には<b>返信・到着回答</b>が届きます。
+            💡 <b>{sideLabel}・機械などの端末とのつなげ方:</b> その端末で上の「{sideLabel}に渡すURL」を開く → グループ（組立など）を選ぶ → 右上の🔔 →「この端末で通知を受け取る」。これで<b>そのグループ宛ての依頼</b>がその端末に届きます。ここ（検査側）で登録した端末には<b>返信・到着回答</b>が届きます。
           </div>
         </div>
         </details>
@@ -3715,7 +3718,7 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
             <tbody className="divide-y divide-slate-100">
               {(pushTokens || []).filter(t => t).sort((a, b) => (b.at || 0) - (a.at || 0)).map(t => (
                 <tr key={t.id} className={t.id === deviceId ? 'bg-emerald-50/60' : ''}>
-                  <td className="px-2 py-1.5 font-bold">{t.side === 'portal' ? 'あっち' : '検査'}{t.admin ? <span className="ml-1 text-[9px] font-black text-purple-600 bg-purple-50 border border-purple-200 rounded px-1">CC</span> : null}</td>
+                  <td className="px-2 py-1.5 font-bold">{t.side === 'portal' ? sideLabel : '検査'}{t.admin ? <span className="ml-1 text-[9px] font-black text-purple-600 bg-purple-50 border border-purple-200 rounded px-1">CC</span> : null}</td>
                   <td className="px-2 py-1.5">{t.group || '—'}</td>
                   <td className="px-2 py-1.5">
                     {t.side === 'portal' ? (
@@ -3958,6 +3961,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
   const [newGroup, setNewGroup] = useState('');
   const [copied, setCopied] = useState(false);
   const groups = contactGroupsOf(settings);
+  const sideLabel = contactSideLabel(settings);
   const list = useMemo(() => {
     const s = q.trim().toLowerCase();
     return (contactRequests || [])
@@ -4063,7 +4067,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
           <details className="border border-slate-200 rounded-lg">
             <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🔔 通知のルール（誰の携帯・再通知・上司へ）</summary>
             <div className="p-3 flex flex-col gap-2">
-              <div className="text-[11px] text-slate-400">端末の役職は、あっち側ポータルの🔔（または下の「通知（プッシュ）」の端末一覧）で設定します。役職未設定の端末は「職長」あつかい。上司=工長・グループ長。該当の役職が1台も無い時は 職長→上司→全員 の順に自動で振り替えます（誰にも届かない事態を防ぐ）。</div>
+              <div className="text-[11px] text-slate-400">端末の役職は、{sideLabel}ポータルの🔔（または下の「通知（プッシュ）」の端末一覧）で設定します。役職未設定の端末は「職長」あつかい。上司=工長・グループ長。該当の役職が1台も無い時は 職長→上司→全員 の順に自動で振り替えます（誰にも届かない事態を防ぐ）。</div>
               {groups.map(g => {
                 const r = contactRoutingOf(settings, g);
                 const save = (patch) => saveSettings({ contactRouting: { ...(settings?.contactRouting || {}), [g]: { ...((settings?.contactRouting || {})[g] || {}), ...patch } } });
@@ -4119,17 +4123,21 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
           </details>
           {/* ③ ポータル公開とURL */}
           <details className="border border-slate-200 rounded-lg">
-            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🌐 あっち側ポータル（公開する情報とURL）</summary>
+            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🌐 {sideLabel}ポータル（公開する情報とURL）</summary>
             <div className="p-3 flex flex-col gap-3">
               <div>
-                <div className="text-xs font-black text-slate-500 mb-1">ポータル（あっち側の画面）に出す情報 — 指図と型式以外は隠せます</div>
+                <div className="text-xs font-black text-slate-500 mb-1">相手側の呼び名 — 画面表示に使います（例: 組立 / 機械 / 前工程）</div>
+                <input defaultValue={sideLabel} onBlur={e => { const v = e.target.value.trim(); if (v && v !== sideLabel) saveSettings({ contactSideLabel: v }); }} placeholder="組立" className="border border-slate-300 rounded-lg px-2 py-1 text-sm w-40" />
+              </div>
+              <div>
+                <div className="text-xs font-black text-slate-500 mb-1">ポータル（{sideLabel}の画面）に出す情報 — 指図と型式以外は隠せます</div>
                 <div className="flex gap-4 text-xs font-bold text-slate-600">
                   <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showQuantity !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showQuantity: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 台数を表示</label>
                   <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showDueDate !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showDueDate: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 納期を表示</label>
                 </div>
               </div>
               <div>
-                <div className="text-xs font-black text-slate-500 mb-1">あっち側に渡すURL（限定表示: 返信・到着/終了予定・履歴だけが使えます）</div>
+                <div className="text-xs font-black text-slate-500 mb-1">{sideLabel}に渡すURL（限定表示: 返信・到着/終了予定・履歴だけが使えます）</div>
                 <div className="flex items-center gap-2">
                   <input readOnly value={portalUrl} className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-mono bg-slate-50" onFocus={e => e.target.select()} />
                   <button onClick={() => { try { navigator.clipboard.writeText(portalUrl); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) { /* noop */ } }} className="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> {copied ? 'コピー済み' : 'コピー'}</button>
@@ -4298,7 +4306,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       )}
       {showAsk && <ContactAskArrivalModal lots={lots} groups={groups} from={currentUserName} onClose={() => setShowAsk(false)} onSend={(p) => { sendReq(p); setShowAsk(false); }} />}
       {showSend && <ContactSendModal draft={{ kind: 'call', message: '' }} groups={groups} members={contactMembersOf(settings)} chipOptions={settings?.complaintOptions || []} from={currentUserName} lot={null} onClose={() => setShowSend(false)} onSend={(p) => { sendReq(p); setShowSend(false); }} />}
-      {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} />}
+      {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} sideLabel={sideLabel} />}
     </div>
   );
 };
@@ -4306,6 +4314,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
 // あっち(前後工程)用ポータル: 限定表示。修正依頼へのワンタップ返信+到着予定の時間登録だけができる。
 const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings, pushTokens = [], notifyPush = null, deleteData = null, templates = [] }) => {
   const groups = contactGroupsOf(settings);
+  const sideLabel = contactSideLabel(settings);
   const tplName = (lot) => (templates || []).find(t => t.id === lot?.templateId)?.name || '';
   const lotById = useMemo(() => { const m = {}; (lots || []).forEach(l => { if (l && l.id) m[l.id] = l; }); return m; }, [lots]);
   const tplNameForItem = (it) => { const l = lotById[it?.lotId]; return l ? tplName(l) : ''; };
@@ -4439,7 +4448,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
           </div>
         </div>
       )}
-      {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} />}
+      {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} sideLabel={sideLabel} />}
       <main className="max-w-3xl mx-auto p-4 flex flex-col gap-5 pb-16">
         <section>
           <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Wrench className="w-5 h-5 text-orange-600" /> 修正・呼出の依頼 {inbox.length > 0 && <span className="bg-orange-600 text-white text-xs font-black rounded-full px-2 py-0.5 animate-pulse">{inbox.length}件</span>}</h2>
