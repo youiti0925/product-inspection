@@ -3122,11 +3122,11 @@ const fmtContactElapsed = (fromTs, toTs) => {
   if (h < 24) return `${h}時間${m % 60 ? `${m % 60}分` : ''}`;
   return `${Math.floor(h / 24)}日`;
 };
-const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼');
+const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'finish' ? '終了予定' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼'));
 const contactStatusInfo = (req) => {
   if (!req) return { label: '', cls: '' };
   if (req.status === 'canceled') return { label: '取消', cls: 'bg-slate-100 text-slate-400 border-slate-300' };
-  if (req.kind === 'arrival') {
+  if (req.kind === 'arrival' || req.kind === 'finish') {
     const items = req.items || [];
     const done = items.filter(i => i.time).length;
     if (items.length && done >= items.length) return { label: '返信あり', cls: 'bg-emerald-100 text-emerald-700 border-emerald-300' };
@@ -3139,12 +3139,12 @@ const contactStatusInfo = (req) => {
 };
 const contactReplyAt = (req) => {
   if (!req) return null;
-  if (req.kind === 'arrival') { const ts = (req.items || []).map(i => i.at || 0).filter(Boolean); return ts.length ? Math.max(...ts) : null; }
+  if (req.kind === 'arrival' || req.kind === 'finish') { const ts = (req.items || []).map(i => i.at || 0).filter(Boolean); return ts.length ? Math.max(...ts) : null; }
   return req.answer?.at || null;
 };
 const contactAnswerSummary = (req) => {
   if (!req) return '';
-  if (req.kind === 'arrival') {
+  if (req.kind === 'arrival' || req.kind === 'finish') {
     const done = (req.items || []).filter(i => i.time);
     if (!done.length) return '';
     return done.map(i => `${i.orderNo || ''}→${i.date ? `${String(i.date).slice(5).replace('-', '/')} ` : ''}${i.time}`).join(' / ');
@@ -3339,6 +3339,12 @@ const CONTACT_LEVELS = [
 const contactRoutingOf = (settings, group) => {
   const r = (settings?.contactRouting || {})[group] || {};
   return { mode: r.mode || 'chief', chiefAway: !!r.chiefAway, escalateMin: Math.max(0, Number(r.escalateMin) || 0) };
+};
+// 職長への再通知(リマインド)設定。kind='repair'(修正/呼出) or 'arrival'(入荷・到着予定)。
+// 未返信の間 min分ごとに最大count回、職長(=普段の宛先ルール)へもう一度プッシュして気づいてもらう。
+const contactRemindOf = (settings, group, kind) => {
+  const r = (((settings?.contactRouting || {})[group] || {}).remind || {})[kind] || {};
+  return { on: !!r.on, min: Math.min(120, Math.max(1, Number(r.min) || 10)), count: Math.min(10, Math.max(1, Number(r.count) || 3)) };
 };
 // 送信レベルの決定: 送信時の指定(toLevel)が最優先。無ければグループの既定モード。職長不在ONなら職長→上司へ振替。
 const contactResolveLevel = (settings, group, toLevel) => {
@@ -3956,7 +3962,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     const s = q.trim().toLowerCase();
     return (contactRequests || [])
       .filter(r => r)
-      .filter(r => kindF === 'all' || (kindF === 'arrival' ? r.kind === 'arrival' : r.kind !== 'arrival'))
+      .filter(r => kindF === 'all' || (kindF === 'arrival' ? (r.kind === 'arrival' || r.kind === 'finish') : (r.kind !== 'arrival' && r.kind !== 'finish')))
       .filter(r => {
         if (statusF === 'all') return true;
         const lbl = contactStatusInfo(r).label;
@@ -3969,6 +3975,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
   const detail = detailId ? (contactRequests || []).find(r => r.id === detailId) : null;
   const portalUrl = (() => { try { return `${window.location.origin}${window.location.pathname}?renraku=1`; } catch (e) { return '?renraku=1'; } })();
   const portalCfg = settings?.contactPortal || {};
+  const [finishDraft, setFinishDraft] = useState({}); // 「いつ終わる？」への回答下書き
   const sendReq = (payload) => {
     saveData('contact_requests', newContactId(), payload);
     // 宛先グループの携帯へプッシュ通知(設定済みなら)。失敗しても連絡自体は届いている。
@@ -3976,6 +3983,17 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       const m = contactPushMessage(payload);
       notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` });
     }
+  };
+  // あっちの「いつ終わる？」に検査側が終了予定を回答 → ポータルへ通知
+  const answerFinish = (r, idx) => {
+    const key = `${r.id}__${idx}`; const dt = finishDraft[key] || {};
+    if (!dt.time) return;
+    const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
+    const items = (r.items || []).map((it, i) => i === idx ? { ...it, date: dt.date || today, time: dt.time, by: currentUserName || '検査', at: Date.now() } : it);
+    saveData('contact_requests', r.id, { items, status: items.every(i => i.time) ? 'answered' : 'waiting' });
+    setFinishDraft(p => ({ ...p, [key]: {} }));
+    const it = items[idx];
+    if (notifyPush) notifyPush({ toSide: 'portal', toGroup: r.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}${it.time}`, body: `${currentUserName || '検査'} が回答しました`, link: `${window.location.origin}/?renraku=1`, tag: `fina-${r.id}-${idx}-${Date.now()}` });
   };
   return (
     <div className="h-full flex flex-col gap-3 overflow-hidden">
@@ -4001,91 +4019,135 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
         <button onClick={() => setShowPushHelp(true)} className="px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-700 hover:bg-blue-100"><HelpCircle className="w-4 h-4" /> ヘルプ</button>
       </div>
       {showCfg && (
-        <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-3">
-          <div>
-            <div className="text-xs font-black text-slate-500 mb-1">宛先グループ（相手側もこの名前でポータルに入ります）</div>
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {groups.map(g => (
-                <span key={g} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-full px-2.5 py-1 text-xs font-bold text-slate-700">
-                  {g}
-                  <button onClick={() => { if (!window.confirm(`宛先「${g}」を削除しますか？`)) return; saveSettings({ contactGroups: groups.filter(x => x !== g) }); }} className="text-slate-400 hover:text-rose-600"><X className="w-3 h-3" /></button>
-                </span>
-              ))}
-              <input value={newGroup} onChange={e => setNewGroup(e.target.value)} placeholder="グループ追加" className="border border-slate-300 rounded-lg px-2 py-1 text-xs w-28" />
-              <button disabled={!newGroup.trim() || groups.includes(newGroup.trim())} onClick={() => { saveSettings({ contactGroups: [...groups, newGroup.trim()] }); setNewGroup(''); }} className="px-2 py-1 rounded-lg bg-blue-600 text-white text-xs font-bold disabled:opacity-40">追加</button>
-            </div>
-          </div>
-          <div>
-            <div className="text-xs font-black text-slate-500 mb-1">班のメンバー（カンマ区切り — 送信時に「宛先の人」として指名でき、通知・ポータルに「→○○さん」と出ます）</div>
-            <div className="flex flex-col gap-1">
-              {groups.map(g => (
-                <div key={g} className="flex items-center gap-1.5">
-                  <span className="text-xs font-bold text-slate-600 w-20 shrink-0 truncate">{g}</span>
-                  <input
-                    defaultValue={(contactMembersOf(settings)[g] || []).join('、')}
-                    onBlur={e => {
-                      const names = e.target.value.split(/[,、\n]/).map(x => x.trim()).filter(Boolean);
-                      saveSettings({ contactMembers: { ...(settings?.contactMembers || {}), [g]: names } });
-                    }}
-                    placeholder="例: 小川、佐藤、田中"
-                    className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs"
-                  />
+        <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-2 max-h-[62vh] overflow-y-auto overscroll-contain">
+          <div className="text-[11px] text-slate-400">設定は4つに分かれています。開きたい所をタップしてください（この枠の中は上下にスクロールできます）。</div>
+          {/* ① グループとメンバー */}
+          <details open className="border border-slate-200 rounded-lg">
+            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">👥 宛先グループと班メンバー</summary>
+            <div className="p-3 flex flex-col gap-3">
+              <div>
+                <div className="text-xs font-black text-slate-500 mb-1">宛先グループ（相手側もこの名前でポータルに入ります）</div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {groups.map(g => (
+                    <span key={g} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-full px-2.5 py-1 text-xs font-bold text-slate-700">
+                      {g}
+                      <button onClick={() => { if (!window.confirm(`宛先「${g}」を削除しますか？`)) return; saveSettings({ contactGroups: groups.filter(x => x !== g) }); }} className="text-slate-400 hover:text-rose-600"><X className="w-3 h-3" /></button>
+                    </span>
+                  ))}
+                  <input value={newGroup} onChange={e => setNewGroup(e.target.value)} placeholder="グループ追加" className="border border-slate-300 rounded-lg px-2 py-1 text-xs w-28" />
+                  <button disabled={!newGroup.trim() || groups.includes(newGroup.trim())} onClick={() => { saveSettings({ contactGroups: [...groups, newGroup.trim()] }); setNewGroup(''); }} className="px-2 py-1 rounded-lg bg-blue-600 text-white text-xs font-bold disabled:opacity-40">追加</button>
                 </div>
-              ))}
+              </div>
+              <div>
+                <div className="text-xs font-black text-slate-500 mb-1">班のメンバー（カンマ区切り — 送信時に「宛先の人」として指名でき、通知・ポータルに「→○○さん」と出ます）</div>
+                <div className="flex flex-col gap-1">
+                  {groups.map(g => (
+                    <div key={g} className="flex items-center gap-1.5">
+                      <span className="text-xs font-bold text-slate-600 w-20 shrink-0 truncate">{g}</span>
+                      <input
+                        defaultValue={(contactMembersOf(settings)[g] || []).join('、')}
+                        onBlur={e => {
+                          const names = e.target.value.split(/[,、\n]/).map(x => x.trim()).filter(Boolean);
+                          saveSettings({ contactMembers: { ...(settings?.contactMembers || {}), [g]: names } });
+                        }}
+                        placeholder="例: 小川、佐藤、田中"
+                        className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
-          </div>
-          <div>
-            <div className="text-xs font-black text-slate-500 mb-1">宛先ルール — 誰の携帯を鳴らすか（職長が休みの日・重い内容のときの切替）</div>
-            <div className="text-[11px] text-slate-400 mb-1.5">端末の役職は、あっち側ポータルの🔔（またはこの下の端末一覧）で設定します。役職未設定の端末は「職長」あつかい。上司=工長・グループ長。該当の役職が1台も登録されていない時は自動で 職長→上司→全員 の順に振り替えて、誰にも届かない事態を防ぎます。</div>
-            <div className="flex flex-col gap-1">
+          </details>
+          {/* ② 通知の宛先ルールと再通知 */}
+          <details className="border border-slate-200 rounded-lg">
+            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🔔 通知のルール（誰の携帯・再通知・上司へ）</summary>
+            <div className="p-3 flex flex-col gap-2">
+              <div className="text-[11px] text-slate-400">端末の役職は、あっち側ポータルの🔔（または下の「通知（プッシュ）」の端末一覧）で設定します。役職未設定の端末は「職長」あつかい。上司=工長・グループ長。該当の役職が1台も無い時は 職長→上司→全員 の順に自動で振り替えます（誰にも届かない事態を防ぐ）。</div>
               {groups.map(g => {
                 const r = contactRoutingOf(settings, g);
-                const save = (patch) => saveSettings({ contactRouting: { ...(settings?.contactRouting || {}), [g]: { ...r, ...patch } } });
+                const save = (patch) => saveSettings({ contactRouting: { ...(settings?.contactRouting || {}), [g]: { ...((settings?.contactRouting || {})[g] || {}), ...patch } } });
+                const saveRemind = (kind, patch) => {
+                  const cur = ((settings?.contactRouting || {})[g] || {}).remind || {};
+                  save({ remind: { ...cur, [kind]: { ...contactRemindOf(settings, g, kind), ...patch } } });
+                };
+                const RemindRow = ({ kind, icon, label }) => {
+                  const rm = contactRemindOf(settings, g, kind);
+                  return (
+                    <div className={`flex items-center gap-2 flex-wrap rounded-lg px-2 py-1.5 border ${rm.on ? 'bg-amber-50 border-amber-300' : 'bg-white border-slate-200'}`}>
+                      <span className="text-xs font-bold text-slate-600 w-32 shrink-0">{icon} {label}</span>
+                      <button onClick={() => saveRemind(kind, { on: !rm.on })} className={`px-2.5 py-1 rounded-full text-xs font-black ${rm.on ? 'bg-amber-500 text-white' : 'bg-slate-200 text-slate-500'}`}>{rm.on ? '再通知 ON' : '再通知 OFF'}</button>
+                      {rm.on && (
+                        <span className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
+                          返信がない間、
+                          <input type="number" min="1" max="120" value={rm.min} onChange={e => saveRemind(kind, { min: Math.min(120, Math.max(1, Number(e.target.value) || 1)) })} className="w-12 border border-slate-300 rounded px-1 py-0.5 text-center" />
+                          分ごとに もう一度職長へ（最大
+                          <input type="number" min="1" max="10" value={rm.count} onChange={e => saveRemind(kind, { count: Math.min(10, Math.max(1, Number(e.target.value) || 1)) })} className="w-10 border border-slate-300 rounded px-1 py-0.5 text-center" />
+                          回）
+                        </span>
+                      )}
+                    </div>
+                  );
+                };
                 return (
-                  <div key={g} className="flex items-center gap-2 flex-wrap bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5">
-                    <span className="text-xs font-black text-slate-700 w-20 shrink-0 truncate">{g}</span>
-                    <label className="text-[11px] font-bold text-slate-500 flex items-center gap-1">普段の宛先
-                      <select value={r.mode} onChange={e => save({ mode: e.target.value })} className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold">
-                        <option value="chief">職長のみ（既定）</option>
-                        <option value="both">職長＋上司</option>
-                        <option value="boss">上司のみ</option>
-                        <option value="all">全員</option>
-                      </select>
-                    </label>
-                    <label className={`text-xs font-black flex items-center gap-1.5 px-2 py-1 rounded-lg border cursor-pointer ${r.chiefAway ? 'bg-rose-50 border-rose-300 text-rose-700' : 'bg-white border-slate-300 text-slate-500'}`}>
-                      <input type="checkbox" checked={r.chiefAway} onChange={e => save({ chiefAway: e.target.checked })} className="w-4 h-4 accent-rose-600" />
-                      職長 不在（休み）→ 上司へ
-                    </label>
-                    <label className="text-[11px] font-bold text-slate-500 flex items-center gap-1">未返信
-                      <input type="number" min="0" max="120" value={r.escalateMin} onChange={e => save({ escalateMin: Math.max(0, Number(e.target.value) || 0) })} className="w-14 border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold text-center" />
-                      分で上司にも自動通知（0=しない）
-                    </label>
+                  <div key={g} className="bg-slate-50 border border-slate-200 rounded-xl p-2 flex flex-col gap-1.5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-black text-slate-800 bg-white border border-slate-300 rounded-lg px-2.5 py-1">{g}</span>
+                      <label className="text-[11px] font-bold text-slate-500 flex items-center gap-1">普段の宛先
+                        <select value={r.mode} onChange={e => save({ mode: e.target.value })} className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold">
+                          <option value="chief">職長のみ（既定）</option>
+                          <option value="both">職長＋上司</option>
+                          <option value="boss">上司のみ</option>
+                          <option value="all">全員</option>
+                        </select>
+                      </label>
+                      <label className={`text-xs font-black flex items-center gap-1.5 px-2 py-1 rounded-lg border cursor-pointer ${r.chiefAway ? 'bg-rose-50 border-rose-300 text-rose-700' : 'bg-white border-slate-300 text-slate-500'}`}>
+                        <input type="checkbox" checked={r.chiefAway} onChange={e => save({ chiefAway: e.target.checked })} className="w-4 h-4 accent-rose-600" />
+                        職長 不在（休み）→ 上司へ
+                      </label>
+                      <label className="text-[11px] font-bold text-slate-500 flex items-center gap-1">未返信
+                        <input type="number" min="0" max="120" value={r.escalateMin} onChange={e => save({ escalateMin: Math.max(0, Number(e.target.value) || 0) })} className="w-14 border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold text-center" />
+                        分で上司にも自動通知（0=しない）
+                      </label>
+                    </div>
+                    <RemindRow kind="repair" icon="🔧" label="修正・呼出の再通知" />
+                    <RemindRow kind="arrival" icon="🚚" label="入荷(到着予定)の再通知" />
                   </div>
                 );
               })}
             </div>
-          </div>
-          <div>
-            <div className="text-xs font-black text-slate-500 mb-1">ポータル（あっち側の画面）に出す情報 — 指図と型式以外は隠せます</div>
-            <div className="flex gap-4 text-xs font-bold text-slate-600">
-              <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showQuantity !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showQuantity: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 台数を表示</label>
-              <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showDueDate !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showDueDate: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 納期を表示</label>
+          </details>
+          {/* ③ ポータル公開とURL */}
+          <details className="border border-slate-200 rounded-lg">
+            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🌐 あっち側ポータル（公開する情報とURL）</summary>
+            <div className="p-3 flex flex-col gap-3">
+              <div>
+                <div className="text-xs font-black text-slate-500 mb-1">ポータル（あっち側の画面）に出す情報 — 指図と型式以外は隠せます</div>
+                <div className="flex gap-4 text-xs font-bold text-slate-600">
+                  <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showQuantity !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showQuantity: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 台数を表示</label>
+                  <label className="flex items-center gap-1.5"><input type="checkbox" checked={portalCfg.showDueDate !== false} onChange={e => saveSettings({ contactPortal: { ...portalCfg, showDueDate: e.target.checked } })} className="w-4 h-4 accent-blue-600" /> 納期を表示</label>
+                </div>
+              </div>
+              <div>
+                <div className="text-xs font-black text-slate-500 mb-1">あっち側に渡すURL（限定表示: 返信・到着/終了予定・履歴だけが使えます）</div>
+                <div className="flex items-center gap-2">
+                  <input readOnly value={portalUrl} className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-mono bg-slate-50" onFocus={e => e.target.select()} />
+                  <button onClick={() => { try { navigator.clipboard.writeText(portalUrl); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) { /* noop */ } }} className="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> {copied ? 'コピー済み' : 'コピー'}</button>
+                </div>
+              </div>
             </div>
-          </div>
-          <div>
-            <div className="text-xs font-black text-slate-500 mb-1">あっち側に渡すURL（限定表示: 連絡の返信と到着予定の登録だけができます）</div>
-            <div className="flex items-center gap-2">
-              <input readOnly value={portalUrl} className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-mono bg-slate-50" onFocus={e => e.target.select()} />
-              <button onClick={() => { try { navigator.clipboard.writeText(portalUrl); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) { /* noop */ } }} className="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> {copied ? 'コピー済み' : 'コピー'}</button>
+          </details>
+          {/* ④ プッシュ通知(VAPID/端末) */}
+          <details className="border border-slate-200 rounded-lg">
+            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">📳 通知（プッシュ）— VAPID鍵・この端末の登録・端末一覧</summary>
+            <div className="p-3">
+              <PushSettingsPanel
+                settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData}
+                pushTokens={pushTokens} side="app" group="" personName={currentUserName} admin
+                onOpenHelp={() => setShowPushHelp(true)}
+              />
             </div>
-          </div>
-          <div className="border-t border-slate-100 pt-3">
-            <PushSettingsPanel
-              settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData}
-              pushTokens={pushTokens} side="app" group="" personName={currentUserName} admin
-              onOpenHelp={() => setShowPushHelp(true)}
-            />
-          </div>
+          </details>
         </div>
       )}
       <div className="flex-1 min-h-0 overflow-y-auto bg-white rounded-xl border border-slate-200">
@@ -4115,7 +4177,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-1.5 min-w-0">
                       {r.orderNo && <span className="font-mono text-xs font-bold text-slate-500 shrink-0">{r.orderNo}</span>}
-                      {r.kind === 'arrival'
+                      {(r.kind === 'arrival' || r.kind === 'finish')
                         ? <span className="text-xs text-slate-600 truncate">{(r.items || []).length}件: {(r.items || []).map(i => i.orderNo).filter(Boolean).slice(0, 4).join(', ')}{(r.items || []).length > 4 ? '…' : ''}</span>
                         : <span className="text-slate-700 truncate max-w-[36ch]" title={r.message}>{r.message}</span>}
                     </div>
@@ -4199,6 +4261,31 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   </table>
                 </div>
               )}
+              {detail.kind === 'finish' && (
+                <div className="border border-indigo-200 rounded-lg overflow-hidden">
+                  <div className="px-2 py-1.5 bg-indigo-50 text-[11px] font-bold text-indigo-700">🏁 「いつ終わりますか？」と聞かれています。終了予定を入れて回答してください。</div>
+                  <div className="divide-y divide-slate-100">
+                    {(detail.items || []).map((it, i) => {
+                      const key = `${detail.id}__${i}`; const dt = finishDraft[key] || {};
+                      return (
+                        <div key={i} className="px-2 py-2 flex items-center gap-2 flex-wrap">
+                          <span className="font-mono text-xs font-black text-slate-700">{it.orderNo}</span>
+                          <span className="text-xs font-bold text-slate-600 truncate">{it.model}</span>
+                          {it.time ? (
+                            <span className="ml-auto font-black text-emerald-700 text-xs">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time} 回答済</span>
+                          ) : (
+                            <span className="ml-auto flex items-center gap-1.5">
+                              <input type="date" value={dt.date || ''} onChange={e => setFinishDraft(p => ({ ...p, [key]: { ...dt, date: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs" />
+                              <input type="time" value={dt.time || ''} onChange={e => setFinishDraft(p => ({ ...p, [key]: { ...dt, time: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs" />
+                              <button disabled={!dt.time} onClick={() => answerFinish(detail, i)} className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black disabled:opacity-40">回答</button>
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
             <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end shrink-0">
               <button onClick={() => { if (window.confirm('この連絡を削除しますか？（履歴からも消えます）')) { deleteData('contact_requests', detail.id); setDetailId(null); } }} className="px-3 py-1.5 rounded-lg text-xs font-bold text-rose-600 hover:bg-rose-50 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> 削除</button>
@@ -4217,8 +4304,11 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
 };
 
 // あっち(前後工程)用ポータル: 限定表示。修正依頼へのワンタップ返信+到着予定の時間登録だけができる。
-const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings, pushTokens = [], notifyPush = null, deleteData = null }) => {
+const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings, pushTokens = [], notifyPush = null, deleteData = null, templates = [] }) => {
   const groups = contactGroupsOf(settings);
+  const tplName = (lot) => (templates || []).find(t => t.id === lot?.templateId)?.name || '';
+  const lotById = useMemo(() => { const m = {}; (lots || []).forEach(l => { if (l && l.id) m[l.id] = l; }); return m; }, [lots]);
+  const tplNameForItem = (it) => { const l = lotById[it?.lotId]; return l ? tplName(l) : ''; };
   const [group, setGroup] = useState(() => { try { return localStorage.getItem('renrakuGroup') || ''; } catch (e) { return ''; } });
   const [name, setName] = useState(() => { try { return localStorage.getItem('renrakuName') || ''; } catch (e) { return ''; } });
   const [showPushCfg, setShowPushCfg] = useState(false);
@@ -4238,11 +4328,19 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   const inbox = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'waiting').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
   const answeredRecent = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'answered' && (nowTick - (r.answer?.at || 0)) < 24 * 3600 * 1000).sort((a, b) => (b.answer?.at || 0) - (a.answer?.at || 0)), [contactRequests, group, nowTick]);
   const arrivalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'arrival' && r.to === group && r.status !== 'canceled' && (r.items || []).some(i => !i.time)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
-  // 検査側が返してくれた「検査終了予定」(到着回答へのお返し)。48時間以内のものを表示。
-  const finishInfos = useMemo(() => (contactRequests || [])
-    .filter(r => r && r.kind === 'arrival' && r.to === group)
-    .flatMap(r => (r.items || []).filter(it => it && it.finish && it.finish.ts && (nowTick - (it.finish.at || 0)) < 48 * 3600 * 1000))
-    .sort((a, b) => (b.finish.at || 0) - (a.finish.at || 0)), [contactRequests, group, nowTick]);
+  // 検査側が返してくれた「検査終了予定」。①到着回答へのお返し(arrival items[].finish) ②終了予定を聞いた回答(finish items[].time)。48時間以内。
+  const finishInfos = useMemo(() => {
+    const out = [];
+    (contactRequests || []).filter(r => r && r.to === group).forEach(r => {
+      if (r.kind === 'arrival') (r.items || []).forEach(it => { if (it && it.finish && it.finish.ts && (nowTick - (it.finish.at || 0)) < 48 * 3600 * 1000) out.push({ orderNo: it.orderNo, model: it.model, date: it.date, time: it.time, ts: it.finish.ts, by: it.finish.by, at: it.finish.at }); });
+      if (r.kind === 'finish') (r.items || []).forEach(it => { if (it && it.time && it.at && (nowTick - it.at) < 48 * 3600 * 1000) out.push({ orderNo: it.orderNo, model: it.model, date: it.date, time: it.time, ts: new Date(`${it.date || todayStr}T${it.time}`).getTime(), by: it.by, at: it.at }); });
+    });
+    return out.sort((a, b) => (b.at || 0) - (a.at || 0));
+  }, [contactRequests, group, nowTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  // このグループがこちら(検査)とやりとりした全履歴(読み取り専用・直近50件)
+  const history = useMemo(() => (contactRequests || [])
+    .filter(r => r && r.to === group && r.status !== 'canceled')
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 50), [contactRequests, group]);
   const lotList = useMemo(() => {
     const s = q.trim().toLowerCase();
     return (lots || [])
@@ -4279,6 +4377,18 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     setDraftTimes(p => ({ ...p, [lot.id]: {} }));
     if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定 登録: ${lot.orderNo || ''} → ${d.time}`, body: `${byName} が登録しました`, link: appLink, tag: `arr-reg-${lot.id}-${Date.now()}` });
   };
+  // あっちから検査へ「いつ終わりますか？」を聞く。検査側(連絡タブ)で終了予定を回答してもらう。
+  const askFinish = (lot) => {
+    if ((contactRequests || []).some(r => r && r.kind === 'finish' && r.from === byName && (r.items || []).some(i => i.lotId === lot.id && !i.time))) { alert('この製品はもう「いつ終わるか」を聞いています（回答待ち）'); return; }
+    const id = newContactId();
+    saveData('contact_requests', id, {
+      kind: 'finish', to: group, from: byName, message: '検査はいつ終わりますか？',
+      createdAt: Date.now(), status: 'waiting',
+      items: [{ lotId: lot.id, orderNo: lot.orderNo || '', model: lot.model || '', quantity: lot.quantity || 0, dueDate: lot.dueDate || '', date: '', time: '' }],
+    });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🏁 いつ終わる？: ${lot.orderNo || ''} ${lot.model || ''}`, body: `${byName} が終了予定を聞いています`, link: appLink, tag: `finq-${id}` });
+  };
+  const myFinishAsks = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'finish' && r.to === group).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 20), [contactRequests, group]);
   // 機能OFF時はポータルも閉じる (URLを知っていても何も見えない)
   if (settings?.contactFeature?.enabled === false) {
     return (
@@ -4405,6 +4515,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                       <div key={idx} className="px-3 py-2 flex items-center gap-2 flex-wrap">
                         <span className="font-mono text-sm font-black text-slate-700 shrink-0">{it.orderNo}</span>
                         <span className="text-sm font-bold text-slate-600 truncate">{it.model}</span>
+                        {tplNameForItem(it) && <span className="text-[11px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 shrink-0">📋 {tplNameForItem(it)}</span>}
                         {showQty && it.quantity ? <span className="text-xs text-slate-400 shrink-0">{it.quantity}台</span> : null}
                         {showDue && it.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {it.dueDate}</span> : null}
                         {it.time ? (
@@ -4435,11 +4546,26 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                 <div key={i} className="px-3 py-2 flex items-center gap-2 flex-wrap text-sm">
                   <span className="font-mono font-black text-slate-700 shrink-0">{it.orderNo}</span>
                   <span className="font-bold text-slate-600 truncate">{it.model}</span>
-                  <span className="text-xs text-slate-400 shrink-0">到着 {it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time}</span>
-                  <span className="ml-auto font-black text-teal-700 shrink-0">🏁 終了予定 {fmtContactDT(it.finish.ts)}</span>
-                  {it.finish.by && <span className="text-[10px] text-slate-400 shrink-0">{it.finish.by}</span>}
+                  <span className="ml-auto font-black text-teal-700 shrink-0">🏁 終了予定 {fmtContactDT(it.ts)}</span>
+                  {it.by && <span className="text-[10px] text-slate-400 shrink-0">{it.by}</span>}
                 </div>
               ))}
+            </div>
+          </section>
+        )}
+        {myFinishAsks.length > 0 && (
+          <section>
+            <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Clock className="w-5 h-5 text-indigo-600" /> 「いつ終わる？」と聞いた分</h2>
+            <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100 overflow-hidden">
+              {myFinishAsks.map(r => (r.items || []).map((it, i) => (
+                <div key={`${r.id}-${i}`} className="px-3 py-2 flex items-center gap-2 flex-wrap text-sm">
+                  <span className="font-mono font-black text-slate-700 shrink-0">{it.orderNo}</span>
+                  <span className="font-bold text-slate-600 truncate">{it.model}</span>
+                  {it.time
+                    ? <span className="ml-auto font-black text-teal-700 shrink-0">🏁 {it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time} 回答あり</span>
+                    : <span className="ml-auto text-amber-600 font-bold animate-pulse shrink-0">検査からの回答待ち</span>}
+                </div>
+              )))}
             </div>
           </section>
         )}
@@ -4460,10 +4586,12 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                   <div key={l.id} className="px-3 py-2 flex items-center gap-2 flex-wrap">
                     <span className="font-mono text-sm font-black text-slate-700 shrink-0">{l.orderNo}</span>
                     <span className="text-sm font-bold text-slate-600 truncate">{l.model}</span>
+                    {tplName(l) && <span className="text-[11px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 shrink-0">📋 {tplName(l)}</span>}
                     {showQty ? <span className="text-xs text-slate-400 shrink-0">{l.quantity}台</span> : null}
                     {showDue && l.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {l.dueDate}</span> : null}
                     {cur && cur.time && <span className="text-xs font-black text-teal-700 bg-teal-50 border border-teal-200 rounded px-1.5 py-0.5 shrink-0">登録済 {cur.date ? `${String(cur.date).slice(5).replace('-', '/')} ` : ''}{cur.time}</span>}
-                    <span className="ml-auto flex items-center gap-1.5 shrink-0">
+                    <span className="ml-auto flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
+                      <button onClick={() => askFinish(l)} className="px-2.5 py-1.5 rounded-lg bg-white border border-indigo-300 text-indigo-700 hover:bg-indigo-50 text-xs font-bold" title="この製品の検査がいつ終わるか、検査側に聞きます">🏁 いつ終わる？</button>
                       <input type="date" value={d.date || todayStr} onChange={e => setDraftTimes(p => ({ ...p, [l.id]: { ...d, date: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
                       <input type="time" value={d.time || ''} onChange={e => setDraftTimes(p => ({ ...p, [l.id]: { ...d, time: e.target.value } }))} className="border border-slate-300 rounded-lg px-1.5 py-1.5 text-sm" />
                       <button disabled={!d.time} onClick={() => registerArrival(l)} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-black disabled:opacity-40">{cur && cur.time ? '更新' : '登録'}</button>
@@ -4474,6 +4602,31 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
               {lotList.length === 0 && <div className="p-4 text-center text-sm text-slate-400">対象がありません</div>}
             </div>
           </div>
+        </section>
+        <section>
+          <details className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            <summary className="px-4 py-2.5 text-base font-black text-slate-700 cursor-pointer select-none flex items-center gap-2">🗒 やりとりの履歴（このグループ・直近{history.length}件）</summary>
+            <div className="divide-y divide-slate-100 max-h-[50vh] overflow-y-auto">
+              {history.map(r => {
+                const st = contactStatusInfo(r);
+                const ans = contactAnswerSummary(r);
+                return (
+                  <div key={r.id} className="px-3 py-2 flex items-start gap-2 text-sm">
+                    <span className={`text-[10px] font-black px-1.5 py-0.5 rounded shrink-0 mt-0.5 ${r.kind === 'arrival' ? 'bg-teal-100 text-teal-700' : r.kind === 'finish' ? 'bg-indigo-100 text-indigo-700' : r.kind === 'call' ? 'bg-blue-100 text-blue-700' : 'bg-orange-100 text-orange-700'}`}>{contactKindLabel(r)}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-slate-700 truncate">{r.kind === 'arrival' || r.kind === 'finish' ? `${(r.items || []).length}件: ${(r.items || []).map(i => i.orderNo).filter(Boolean).slice(0, 4).join(', ')}` : (r.message || '')}</div>
+                      {ans && <div className="text-[11px] text-emerald-700 font-bold truncate">→ {ans}</div>}
+                    </div>
+                    <div className="text-right shrink-0">
+                      <div className="font-mono text-[10px] text-slate-400">{fmtContactTime(r.createdAt)}</div>
+                      <span className={`text-[10px] font-black px-1.5 py-0.5 rounded border ${st.cls}`}>{st.label}</span>
+                    </div>
+                  </div>
+                );
+              })}
+              {history.length === 0 && <div className="p-4 text-center text-sm text-slate-400">まだ履歴がありません</div>}
+            </div>
+          </details>
           <p className="text-[11px] text-slate-400 mt-1.5">このページは限定表示です（指図・型式{showQty ? '・台数' : ''}{showDue ? '・納期' : ''}のみ）。登録した時間は検査側の検査リストにすぐ表示されます。</p>
         </section>
       </main>
@@ -17754,75 +17907,115 @@ const ManagerDashboard = ({ lots = [], settings = {} }) => {
 //    - sample:true は「【サンプル】」表示＋一括削除できる=本物の記録と混ざらない
 // =============================================================================
 const MINOR_KINDS = [['complaint', '軽微不良'], ['improvement', '気づき・改善']];
-const MinorReportLedgerModal = ({ reports = [], workers = [], currentUserName = '', saveData, deleteData, onClose }) => {
+// 台帳の出所: minor=いつでも登録した単独記録 / interruption=検査中に付けた軽微不良・改善 / ng=カスタムのNG判定理由
+const MINOR_SRC_BADGE = { minor: ['台帳', 'bg-purple-100 text-purple-700'], interruption: ['検査中', 'bg-emerald-100 text-emerald-700'], ng: ['NG判定', 'bg-rose-100 text-rose-700'] };
+const MinorReportLedgerModal = ({ reports = [], lots = [], workers = [], currentUserName = '', saveData, deleteData, onClose }) => {
   const pad = (n) => String(n).padStart(2, '0');
   const toLocal = (ms) => { const d = new Date(Number(ms) || Date.now()); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
-  const blank = () => ({ type: 'complaint', at: toLocal(Date.now()), model: '', orderNo: '', stepTitle: '', content: '', workerName: currentUserName || '' });
+  const toMs = (v) => { if (v == null) return null; if (typeof v === 'number') return v; if (typeof v === 'object' && v.seconds != null) return v.seconds * 1000; const n = new Date(v).getTime(); return isNaN(n) ? null : n; };
+  const blank = () => ({ _src: 'minor', type: 'complaint', at: toLocal(Date.now()), model: '', orderNo: '', stepTitle: '', content: '', workerName: currentUserName || '' });
   const [form, setForm] = useState(blank());
-  const [editId, setEditId] = useState(null);
-  const [filter, setFilter] = useState('all');
+  const [editRow, setEditRow] = useState(null); // 編集中の行 (出所つき)
+  const [filter, setFilter] = useState('all');   // complaint/improvement
+  const [srcFilter, setSrcFilter] = useState('all'); // all/minor/interruption/ng
   const [q, setQ] = useState('');
-  const list = useMemo(() => (reports || []).filter(Boolean)
+  // 3つの出所を1つの一覧に合流する。過去の検査中データ・NG判定もここで見える＆直せる。
+  const all = useMemo(() => {
+    const out = [];
+    (reports || []).filter(Boolean).forEach(r => out.push({ _src: 'minor', id: r.id, type: r.type || 'complaint', timestamp: toMs(r.timestamp), model: r.model || '', orderNo: r.orderNo || '', stepTitle: r.stepTitle || '', content: r.content || '', workerName: r.workerName || '', sample: !!r.sample }));
+    (lots || []).forEach(lot => {
+      const steps = lot.steps || [];
+      const titleForKey = (key) => { for (const s of steps) { if (s?.id && String(key).startsWith(`${s.id}-`)) return s.title || '全体'; } const m = /^(\d+)-/.exec(String(key)); if (m && steps[+m[1]]) return steps[+m[1]].title || '全体'; return '全体'; };
+      (lot.interruptions || []).filter(i => i && (i.type === 'complaint' || i.type === 'improvement')).forEach(i => {
+        out.push({ _src: 'interruption', _lotId: lot.id, id: i.id, type: i.type, timestamp: toMs(i.timestamp), model: lot.model || '', orderNo: lot.orderNo || '', stepTitle: i.stepInfo?.title || i.targetStepTitle || '全体', content: i.label || '', workerName: i.workerName || '' });
+      });
+      Object.entries(lot.tasks || {}).forEach(([key, t]) => {
+        if (t && typeof t.ngReason === 'string' && t.ngReason.trim()) out.push({ _src: 'ng', _lotId: lot.id, _key: key, id: `ng:${lot.id}:${key}`, type: 'complaint', timestamp: toMs(t.ngAt) || toMs(t.endTime), model: lot.model || '', orderNo: lot.orderNo || '', stepTitle: titleForKey(key), content: t.ngReason.trim(), workerName: t.workerName || '' });
+      });
+    });
+    return out;
+  }, [reports, lots]);
+  const list = useMemo(() => all
     .filter(r => filter === 'all' || r.type === filter)
+    .filter(r => srcFilter === 'all' || r._src === srcFilter)
     .filter(r => { const s = q.trim(); return !s || [r.content, r.model, r.orderNo, r.stepTitle, r.workerName].some(v => String(v || '').includes(s)); })
-    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)), [reports, filter, q]);
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)), [all, filter, srcFilter, q]);
+  const counts = useMemo(() => ({ minor: all.filter(r => r._src === 'minor').length, interruption: all.filter(r => r._src === 'interruption').length, ng: all.filter(r => r._src === 'ng').length }), [all]);
   const sampleCount = (reports || []).filter(r => r && r.sample).length;
   const workerNames = [...new Set((workers || []).map(w => w.name).filter(Boolean))];
+  const editing = !!editRow;
+  const lockModel = editing && editRow._src !== 'minor';   // 検査中/NGは型式・指図がロットに紐づくので変更不可
+  const lockTime = editing && editRow._src === 'ng';       // NGの日時は判定時刻なので変更不可
   const save = () => {
     if (!form.content.trim()) { alert('内容を入力してください'); return; }
-    const id = editId || `mr-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const ts = new Date(form.at).getTime();
-    saveData('minor_reports', id, {
-      type: form.type, timestamp: Number.isFinite(ts) ? ts : Date.now(),
-      model: form.model.trim(), orderNo: form.orderNo.trim(), stepTitle: form.stepTitle.trim(),
-      content: form.content.trim(), workerName: form.workerName.trim(), updatedAt: Date.now(),
-      ...(editId ? {} : { createdAt: Date.now() }),
-    });
-    setForm(blank()); setEditId(null);
+    const tsSafe = Number.isFinite(ts) ? ts : Date.now();
+    const src = editRow ? editRow._src : 'minor';
+    if (src === 'minor') {
+      const id = editRow ? editRow.id : `mr-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+      saveData('minor_reports', id, { type: form.type, timestamp: tsSafe, model: form.model.trim(), orderNo: form.orderNo.trim(), stepTitle: form.stepTitle.trim(), content: form.content.trim(), workerName: form.workerName.trim(), updatedAt: Date.now(), ...(editRow ? {} : { createdAt: Date.now() }) });
+    } else if (src === 'interruption') {
+      const lot = (lots || []).find(l => l.id === editRow._lotId); if (!lot) return;
+      const ups = (lot.interruptions || []).map(i => i.id === editRow.id ? { ...i, type: form.type, label: form.content.trim(), timestamp: tsSafe, workerName: form.workerName.trim(), stepInfo: { ...(i.stepInfo || {}), title: form.stepTitle.trim() || '全体' } } : i);
+      saveData('lots', lot.id, { interruptions: ups });
+    } else if (src === 'ng') {
+      const lot = (lots || []).find(l => l.id === editRow._lotId); if (!lot) return;
+      const t = (lot.tasks || {})[editRow._key]; if (!t) return;
+      saveData('lots', lot.id, { tasks: { ...lot.tasks, [editRow._key]: { ...t, ngReason: form.content.trim(), workerName: form.workerName.trim() || t.workerName } } });
+    }
+    setForm(blank()); setEditRow(null);
   };
-  const startEdit = (r) => { setEditId(r.id); setForm({ type: r.type || 'complaint', at: toLocal(r.timestamp), model: r.model || '', orderNo: r.orderNo || '', stepTitle: r.stepTitle || '', content: r.content || '', workerName: r.workerName || '' }); };
-  const del = (r) => { if (window.confirm('この記録を削除しますか？')) { deleteData('minor_reports', r.id); if (editId === r.id) { setForm(blank()); setEditId(null); } } };
+  const startEdit = (r) => { setEditRow(r); setForm({ _src: r._src, type: r.type || 'complaint', at: toLocal(r.timestamp), model: r.model || '', orderNo: r.orderNo || '', stepTitle: r.stepTitle || '', content: r.content || '', workerName: r.workerName || '' }); };
+  const del = (r) => {
+    if (r._src === 'minor') { if (!window.confirm('この記録を削除しますか？')) return; deleteData('minor_reports', r.id); }
+    else if (r._src === 'interruption') { const lot = (lots || []).find(l => l.id === r._lotId); if (!lot) return; if (!window.confirm('検査中に付けたこの記録を削除しますか？')) return; saveData('lots', lot.id, { interruptions: (lot.interruptions || []).filter(i => i.id !== r.id) }); }
+    else if (r._src === 'ng') { const lot = (lots || []).find(l => l.id === r._lotId); if (!lot) return; const t = (lot.tasks || {})[r._key]; if (!t) return; if (!window.confirm('このNG判定の「理由」を消しますか？（NG自体は残りますが、理由テキストが空になります）')) return; saveData('lots', lot.id, { tasks: { ...lot.tasks, [r._key]: { ...t, ngReason: '' } } }); }
+    if (editRow && editRow.id === r.id) { setForm(blank()); setEditRow(null); }
+  };
   const delAllSample = () => { if (!sampleCount) return; if (!window.confirm(`サンプル ${sampleCount}件をすべて削除しますか？（本物の記録は残ります）`)) return; (reports || []).filter(r => r && r.sample).forEach(r => deleteData('minor_reports', r.id)); };
   const inputCls = 'border border-slate-300 rounded-lg px-2 py-1.5 text-sm';
+  const lockCls = 'border border-slate-200 rounded-lg px-2 py-1.5 text-sm bg-slate-100 text-slate-400';
   return (
     <div className="fixed inset-0 z-[200] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-        <div className="px-5 py-3 bg-purple-600 text-white flex items-center gap-2 shrink-0">
+        <div className="px-5 py-3 bg-purple-600 text-white flex items-center gap-2 shrink-0 flex-wrap">
           <Megaphone className="w-5 h-5" />
-          <span className="font-black">軽微不良・改善 台帳（いつでも登録・後から編集）</span>
-          <span className="text-[11px] font-normal bg-white/20 rounded px-2 py-0.5">全 {(reports || []).length} 件{sampleCount ? ` / サンプル ${sampleCount}` : ''}</span>
+          <span className="font-black">軽微不良・改善 台帳（過去の分もすべて・後から編集）</span>
+          <span className="text-[11px] font-normal bg-white/20 rounded px-2 py-0.5">全 {all.length} 件（台帳{counts.minor}/検査中{counts.interruption}/NG{counts.ng}）</span>
           <button onClick={onClose} className="ml-auto p-1 hover:bg-white/20 rounded-full"><X className="w-4 h-4" /></button>
         </div>
         {/* 登録・編集フォーム */}
         <div className="p-4 border-b border-slate-200 bg-slate-50 shrink-0">
-          <div className="text-xs font-black text-slate-500 mb-2">{editId ? '✏ この記録を編集' : '＋ 新しく登録（検査中でなくても・思い出したときにここから）'}</div>
+          <div className="text-xs font-black text-slate-500 mb-2 flex items-center gap-2">
+            {editing ? <>✏ この記録を編集 <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${MINOR_SRC_BADGE[editRow._src][1]}`}>{MINOR_SRC_BADGE[editRow._src][0]}</span>{lockModel && <span className="text-[10px] font-normal text-slate-400">型式・指図はロットに紐づくため変更不可</span>}</> : '＋ 新しく登録（検査中でなくても・思い出したときにここから）'}
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
             <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">種類</span>
-              <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className={inputCls}>{MINOR_KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
+              <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} disabled={editing && editRow._src === 'ng'} className={editing && editRow._src === 'ng' ? lockCls : inputCls}>{MINOR_KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
             </label>
             <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">日時</span>
-              <input type="datetime-local" value={form.at} onChange={e => setForm({ ...form, at: e.target.value })} className={inputCls} />
+              <input type="datetime-local" value={form.at} onChange={e => setForm({ ...form, at: e.target.value })} disabled={lockTime} className={lockTime ? lockCls : inputCls} />
             </label>
             <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">報告者</span>
               <input value={form.workerName} onChange={e => setForm({ ...form, workerName: e.target.value })} list="mr-workers" placeholder="名前" className={inputCls} />
               <datalist id="mr-workers">{workerNames.map(n => <option key={n} value={n} />)}</datalist>
             </label>
             <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">型式</span>
-              <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="例: RTH-612" className={inputCls} />
+              <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} disabled={lockModel} placeholder="例: RTH-612" className={lockModel ? lockCls : inputCls} />
             </label>
             <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">指図番号</span>
-              <input value={form.orderNo} onChange={e => setForm({ ...form, orderNo: e.target.value })} placeholder="任意" className={inputCls} />
+              <input value={form.orderNo} onChange={e => setForm({ ...form, orderNo: e.target.value })} disabled={lockModel} placeholder="任意" className={lockModel ? lockCls : inputCls} />
             </label>
             <label className="flex flex-col gap-0.5"><span className="text-[10px] font-bold text-slate-400">工程</span>
-              <input value={form.stepTitle} onChange={e => setForm({ ...form, stepTitle: e.target.value })} placeholder="例: 分割精度 / 全体" className={inputCls} />
+              <input value={form.stepTitle} onChange={e => setForm({ ...form, stepTitle: e.target.value })} disabled={editing && editRow._src === 'ng'} placeholder="例: 分割精度 / 全体" className={editing && editRow._src === 'ng' ? lockCls : inputCls} />
             </label>
             <label className="flex flex-col gap-0.5 col-span-2 md:col-span-3"><span className="text-[10px] font-bold text-slate-400">内容</span>
               <textarea value={form.content} onChange={e => setForm({ ...form, content: e.target.value })} rows={2} placeholder="何があったか / どう変えたいか" className={inputCls} />
             </label>
           </div>
           <div className="flex justify-end gap-2 mt-2">
-            {editId && <button onClick={() => { setForm(blank()); setEditId(null); }} className="px-3 py-1.5 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">新規に戻す</button>}
-            <button onClick={save} className="px-4 py-1.5 rounded-lg text-sm font-black text-white bg-purple-600 hover:bg-purple-700 flex items-center gap-1.5"><Plus className="w-4 h-4" /> {editId ? '更新' : '登録'}</button>
+            {editing && <button onClick={() => { setForm(blank()); setEditRow(null); }} className="px-3 py-1.5 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">新規に戻す</button>}
+            <button onClick={save} className="px-4 py-1.5 rounded-lg text-sm font-black text-white bg-purple-600 hover:bg-purple-700 flex items-center gap-1.5"><Plus className="w-4 h-4" /> {editing ? '更新' : '登録'}</button>
           </div>
         </div>
         {/* 絞り込み */}
@@ -17830,6 +18023,11 @@ const MinorReportLedgerModal = ({ reports = [], workers = [], currentUserName = 
           <div className="flex bg-slate-100 rounded p-0.5">
             {[['all', 'すべて'], ['complaint', '軽微不良'], ['improvement', '気づき・改善']].map(([id, l]) => (
               <button key={id} onClick={() => setFilter(id)} className={`px-2.5 py-1 text-xs font-bold rounded ${filter === id ? 'bg-white shadow text-purple-700' : 'text-slate-500'}`}>{l}</button>
+            ))}
+          </div>
+          <div className="flex bg-slate-100 rounded p-0.5">
+            {[['all', '全部'], ['minor', '台帳'], ['interruption', '検査中'], ['ng', 'NG判定']].map(([id, l]) => (
+              <button key={id} onClick={() => setSrcFilter(id)} className={`px-2.5 py-1 text-xs font-bold rounded ${srcFilter === id ? 'bg-white shadow text-slate-800' : 'text-slate-500'}`}>{l}</button>
             ))}
           </div>
           <div className="relative flex-1 min-w-[160px]">
@@ -17842,12 +18040,13 @@ const MinorReportLedgerModal = ({ reports = [], workers = [], currentUserName = 
         <div className="flex-1 min-h-0 overflow-y-auto">
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-slate-50 text-[11px] text-slate-500 z-10">
-              <tr className="border-b"><th className="text-left px-3 py-2 whitespace-nowrap">日時</th><th className="text-left px-2 py-2">種類</th><th className="text-left px-2 py-2">型式 / 指図</th><th className="text-left px-2 py-2">工程</th><th className="text-left px-3 py-2">内容</th><th className="text-left px-2 py-2">報告者</th><th className="px-2 py-2"></th></tr>
+              <tr className="border-b"><th className="text-left px-3 py-2 whitespace-nowrap">日時</th><th className="text-left px-2 py-2">出所</th><th className="text-left px-2 py-2">種類</th><th className="text-left px-2 py-2">型式 / 指図</th><th className="text-left px-2 py-2">工程</th><th className="text-left px-3 py-2">内容</th><th className="text-left px-2 py-2">報告者</th><th className="px-2 py-2"></th></tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {list.map(r => (
-                <tr key={r.id} className={`hover:bg-purple-50/40 ${r.sample ? 'bg-amber-50/40' : ''}`}>
+                <tr key={r.id} className={`hover:bg-purple-50/40 ${r.sample ? 'bg-amber-50/40' : ''} ${editRow && editRow.id === r.id ? 'ring-2 ring-purple-300' : ''}`}>
                   <td className="px-3 py-2 text-xs text-slate-500 whitespace-nowrap">{r.timestamp ? new Date(r.timestamp).toLocaleString('ja-JP', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'}</td>
+                  <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${MINOR_SRC_BADGE[r._src][1]}`}>{MINOR_SRC_BADGE[r._src][0]}</span></td>
                   <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${r.type === 'improvement' ? 'bg-sky-100 text-sky-700' : 'bg-purple-100 text-purple-700'}`}>{r.type === 'improvement' ? '改善' : '軽微'}</span>{r.sample && <span className="ml-1 text-[10px] font-black px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">サンプル</span>}</td>
                   <td className="px-2 py-2"><div className="font-bold text-slate-700">{r.model || '—'}</div><div className="text-[10px] text-slate-400 font-mono">{r.orderNo || ''}</div></td>
                   <td className="px-2 py-2 text-xs text-slate-600">{r.stepTitle || '全体'}</td>
@@ -17859,7 +18058,7 @@ const MinorReportLedgerModal = ({ reports = [], workers = [], currentUserName = 
                   </td>
                 </tr>
               ))}
-              {list.length === 0 && <tr><td colSpan={7} className="px-3 py-10 text-center text-sm text-slate-400">まだ記録がありません。上の「登録」から、検査中でなくてもいつでも残せます。</td></tr>}
+              {list.length === 0 && <tr><td colSpan={8} className="px-3 py-10 text-center text-sm text-slate-400">該当がありません。絞り込みを「全部」にすると、過去の検査中・NG判定の記録も出ます。</td></tr>}
             </tbody>
           </table>
         </div>
@@ -20826,7 +21025,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
     <div data-fs="tables" className="h-full flex flex-col bg-slate-50 overflow-hidden">
        {/* 軽微不良・改善 台帳 (いつでも登録・後から編集) */}
        {showMinorLedger && (
-         <MinorReportLedgerModal reports={minorReports} workers={workers} currentUserName={currentUserName} saveData={saveData} deleteData={deleteData} onClose={() => setShowMinorLedger(false)} />
+         <MinorReportLedgerModal reports={minorReports} lots={lots} workers={workers} currentUserName={currentUserName} saveData={saveData} deleteData={deleteData} onClose={() => setShowMinorLedger(false)} />
        )}
        {/* Edit Modal */}
        {editModal.isOpen && (
@@ -29536,23 +29735,49 @@ export default function App() {
    // 到着回答→検査リスト反映モーダル (ティッカー/連絡タブ詳細のどちらからでも開ける)
    const [arrivalApply, setArrivalApply] = useState(null); // {reqId, itemIdx}
    const contactEstimateSecOf = (lot) => calculateLotEstimatedTime(lot, settings?.customTargetTimes || {}, modelGroupsOf(settings));
-   // 未返信エスカレーション: グループ設定の分数を過ぎた「待ち」依頼(修正/呼出)を上司(工長/グループ長)へも自動通知(1回だけ)。
-   // escalatedAt を先に書いて多重発火を抑える(複数端末が同時に開いていても最悪重複通知1回で実害なし)。
+   // 未返信の自動フォロー: ①職長への再通知(N分毎×最大M回・修正/入荷それぞれON/OFF) ②上司へのエスカレーション(設定分で1回)。
+   //   多重発火を抑えるため、送る前に doc(reminds/lastRemindAt/escalatedAt)を書いてから通知する。
+   //   arrival(入荷・到着予定)は items が全部埋まると status='answered' になるので、待ちの間だけ対象。
    useEffect(() => {
      if (!contactFeatureOn || RENRAKU_PORTAL) return;
+     const isWaiting = (r) => {
+       if (!r || r.status === 'canceled' || r.status === 'done') return false;
+       if (r.kind === 'arrival' || r.kind === 'finish') return (r.items || []).some(i => !i.time);
+       return r.status === 'waiting';
+     };
      const check = () => {
+       const now = Date.now();
        (contactRequests || []).forEach(r => {
-         if (!r || r.status !== 'waiting' || r.escalatedAt || r.kind === 'arrival') return;
-         const cfg = contactRoutingOf(settings, r.to);
-         if (!cfg.escalateMin || !r.createdAt) return;
-         if (Date.now() - r.createdAt < cfg.escalateMin * 60000) return;
-         saveData('contact_requests', r.id, { escalatedAt: Date.now() });
-         firePushNotify(settings, pushTokens, {
-           toSide: 'portal', toGroup: r.to, toLevel: 'boss',
-           title: `⏰ ${cfg.escalateMin}分 返信なし: ${contactKindLabel(r)}`,
-           body: `${r.from || '検査'} → ${r.to}${r.toPerson ? ` ${r.toPerson}さん` : ''}: ${String(r.message || '').slice(0, 100)}`,
-           link: `${window.location.origin}/?renraku=1`, tag: `esc-${r.id}`,
-         }, deleteData);
+         if (!isWaiting(r) || !r.createdAt) return;
+         const kind = (r.kind === 'arrival' || r.kind === 'finish') ? 'arrival' : 'repair';
+         // ① 職長への再通知(リマインド)
+         const rm = contactRemindOf(settings, r.to, kind);
+         if (rm.on) {
+           const sent = Number(r.reminds || 0);
+           const base = Number(r.lastRemindAt || r.createdAt);
+           if (sent < rm.count && now - base >= rm.min * 60000) {
+             saveData('contact_requests', r.id, { reminds: sent + 1, lastRemindAt: now });
+             firePushNotify(settings, pushTokens, {
+               toSide: 'portal', toGroup: r.to, toLevel: 'auto',
+               title: `🔔 再通知(${sent + 1}/${rm.count}) ${contactKindLabel(r)}`,
+               body: `${r.from || '検査'} → ${r.to}${r.toPerson ? ` ${r.toPerson}さん` : ''}: まだ返信がありません`,
+               link: `${window.location.origin}/?renraku=1`, tag: `rem-${r.id}-${sent + 1}`,
+             }, deleteData);
+           }
+         }
+         // ② 上司へのエスカレーション(修正/呼出のみ・1回)
+         if (kind === 'repair' && !r.escalatedAt) {
+           const cfg = contactRoutingOf(settings, r.to);
+           if (cfg.escalateMin && now - r.createdAt >= cfg.escalateMin * 60000) {
+             saveData('contact_requests', r.id, { escalatedAt: now });
+             firePushNotify(settings, pushTokens, {
+               toSide: 'portal', toGroup: r.to, toLevel: 'boss',
+               title: `⏰ ${cfg.escalateMin}分 返信なし: ${contactKindLabel(r)}`,
+               body: `${r.from || '検査'} → ${r.to}${r.toPerson ? ` ${r.toPerson}さん` : ''}: ${String(r.message || '').slice(0, 100)}`,
+               link: `${window.location.origin}/?renraku=1`, tag: `esc-${r.id}`,
+             }, deleteData);
+           }
+         }
        });
      };
      const t = setInterval(check, 60000);
@@ -29745,12 +29970,13 @@ export default function App() {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setLots(data);
          }),
-       // 連絡ポータル(?renraku=1)はロット/連絡系だけ購読する(あっち側の携帯に検査アプリ全データを送らない=通信量と露出の削減)
-       ...(RENRAKU_PORTAL ? [] : [
+       // テンプレは小さく、ポータルの「入荷登録にテンプレ名表示」で必要なので、ポータルでも購読する。
        onSnapshot(getPath('templates'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setTemplates(data);
         }),
+       // 連絡ポータル(?renraku=1)はロット/連絡系だけ購読する(あっち側の携帯に検査アプリ全データを送らない=通信量と露出の削減)
+       ...(RENRAKU_PORTAL ? [] : [
        onSnapshot(getPath('controllers'), (snap) => setControllers(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('order_motors'), (snap) => setOrderMotors(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
        onSnapshot(getPath('motor_ledger'), (snap) => setMotorLedger(snap.docs.map(d => ({ ...d.data(), id: d.id })))),
@@ -31824,7 +32050,7 @@ export default function App() {
              📡 オフライン中 — 返信・登録は電波が戻ったときに相手へ届きます（急ぎは電話でお願いします）
            </div>
          )}
-         <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={settings} pushTokens={pushTokens} notifyPush={notifyContactPush} deleteData={deleteData} />
+         <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={settings} pushTokens={pushTokens} notifyPush={notifyContactPush} deleteData={deleteData} templates={templates} />
          <ForegroundPushToast ready={!!db} />
        </>
      );
@@ -32047,7 +32273,7 @@ export default function App() {
          )}
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
-         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} onApplyArrival={(reqId, itemIdx) => setArrivalApply({ reqId, itemIdx })} />}
+         {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} onApplyArrival={(reqId, itemIdx) => setArrivalApply({ reqId, itemIdx })} templates={templates} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} minorReports={minorReports} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
