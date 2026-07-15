@@ -3124,7 +3124,7 @@ const fmtContactElapsed = (fromTs, toTs) => {
   if (h < 24) return `${h}時間${m % 60 ? `${m % 60}分` : ''}`;
   return `${Math.floor(h / 24)}日`;
 };
-const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'finish' ? '終了予定' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼'));
+const contactKindLabel = (req) => req?.kind === 'arrival' ? '到着予定' : (req?.kind === 'finish' ? '終了予定' : (req?.kind === 'complete' ? '検査完了' : (req?.kind === 'call' ? '呼出・連絡' : '修正依頼')));
 const contactStatusInfo = (req) => {
   if (!req) return { label: '', cls: '' };
   if (req.status === 'canceled') return { label: '取消', cls: 'bg-slate-100 text-slate-400 border-slate-300' };
@@ -3347,6 +3347,11 @@ const contactRoutingOf = (settings, group) => {
 const contactRemindOf = (settings, group, kind) => {
   const r = (((settings?.contactRouting || {})[group] || {}).remind || {})[kind] || {};
   return { on: !!r.on, min: Math.min(120, Math.max(1, Number(r.min) || 10)), count: Math.min(10, Math.max(1, Number(r.count) || 3)) };
+};
+// 検査完了→次工程(組立)への完了連絡の設定。enabled=既定ON(送信は毎回ワンタップ確認するので勝手には飛ばない)。group=宛先(空なら先頭グループ)。
+const contactCompleteOf = (settings) => {
+  const c = settings?.contactComplete || {};
+  return { enabled: c.enabled !== false, group: String(c.group || '').trim() };
 };
 // 送信レベルの決定: 送信時の指定(toLevel)が最優先。無ければグループの既定モード。職長不在ONなら職長→上司へ振替。
 const contactResolveLevel = (settings, group, toLevel) => {
@@ -4025,6 +4030,19 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       {showCfg && (
         <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-2 max-h-[62vh] overflow-y-auto overscroll-contain">
           <div className="text-[11px] text-slate-400">設定は4つに分かれています。開きたい所をタップしてください（この枠の中は上下にスクロールできます）。</div>
+          {/* 検査完了→次工程(組立)への完了連絡 のON/OFFと宛先 */}
+          {(() => { const cc = contactCompleteOf(settings); return (
+            <div className="border border-emerald-200 bg-emerald-50 rounded-lg px-3 py-2 flex items-center gap-2 flex-wrap">
+              <span className="text-sm font-black text-emerald-800">✅ 検査完了を{sideLabel}へ連絡</span>
+              <button onClick={() => saveSettings({ contactComplete: { ...(settings?.contactComplete || {}), enabled: !cc.enabled } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${cc.enabled ? 'bg-emerald-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{cc.enabled ? 'ON' : 'OFF'}</button>
+              <span className="text-[11px] font-bold text-slate-500">宛先</span>
+              <select value={cc.group || (groups[0] || '')} onChange={e => saveSettings({ contactComplete: { ...(settings?.contactComplete || {}), group: e.target.value } })} className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs font-bold">
+                {groups.length === 0 && <option value="">（グループ未設定）</option>}
+                {groups.map(g => <option key={g} value={g}>{g}</option>)}
+              </select>
+              <span className="text-[11px] text-slate-400">ロット完了時に「連絡する？」の確認が出ます（自動送信ではありません）。</span>
+            </div>
+          ); })()}
           {/* ① グループとメンバー */}
           <details open className="border border-slate-200 rounded-lg">
             <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">👥 宛先グループと班メンバー</summary>
@@ -4334,8 +4352,12 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   const showDue = portalCfg.showDueDate !== false;
   const todayStr = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
   const arrivalByLot = useMemo(() => { const m = {}; (arrivalTimes || []).forEach(a => { if (a && a.id) m[a.id] = a; }); return m; }, [arrivalTimes]);
-  const inbox = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'waiting').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
-  const answeredRecent = useMemo(() => (contactRequests || []).filter(r => r && r.kind !== 'arrival' && r.to === group && r.status === 'answered' && (nowTick - (r.answer?.at || 0)) < 24 * 3600 * 1000).sort((a, b) => (b.answer?.at || 0) - (a.answer?.at || 0)), [contactRequests, group, nowTick]);
+  // 修正・呼出の受信箱。到着/終了予定/完了連絡は専用レーンで扱うので、この一覧(3択返信)からは除外する。
+  const isRepairKind = (r) => r && r.kind !== 'arrival' && r.kind !== 'finish' && r.kind !== 'complete';
+  const inbox = useMemo(() => (contactRequests || []).filter(r => isRepairKind(r) && r.to === group && r.status === 'waiting').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
+  const answeredRecent = useMemo(() => (contactRequests || []).filter(r => isRepairKind(r) && r.to === group && r.status === 'answered' && (nowTick - (r.answer?.at || 0)) < 24 * 3600 * 1000).sort((a, b) => (b.answer?.at || 0) - (a.answer?.at || 0)), [contactRequests, group, nowTick]);
+  // 検査側からの「検査完了」お知らせ。ワンタップ「確認しました」で検査側に既読が返る。
+  const completeNotices = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'complete' && r.to === group && r.status !== 'canceled').sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 20), [contactRequests, group]);
   const arrivalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'arrival' && r.to === group && r.status !== 'canceled' && (r.items || []).some(i => !i.time)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
   // 検査側が返してくれた「検査終了予定」。①到着回答へのお返し(arrival items[].finish) ②終了予定を聞いた回答(finish items[].time)。48時間以内。
   const finishInfos = useMemo(() => {
@@ -4367,6 +4389,11 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice, comment: (commentDraft[r.id] || '').trim(), by: byName, at: Date.now() } });
     setCommentDraft(p => ({ ...p, [r.id]: '' }));
     if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}-${Date.now()}` });
+  };
+  // 検査完了のお知らせに「確認しました」= 検査側に既読を返す(次工程が受け取ったサイン)
+  const ackComplete = (r) => {
+    saveData('contact_requests', r.id, { status: 'answered', answer: { choice: 'ack', by: byName, at: Date.now() } });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `✅ 組立が確認: ${r.orderNo || ''} ${r.model || ''}`, body: `${byName} が検査完了を確認しました`, link: appLink, tag: `doneack-${r.id}-${Date.now()}` });
   };
   const answerArrivalItem = (r, idx) => {
     const key = `${r.id}__${idx}`;
@@ -4505,6 +4532,27 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
             </div>
           )}
         </section>
+        {completeNotices.length > 0 && (
+          <section>
+            <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><CheckCircle2 className="w-5 h-5 text-emerald-600" /> 検査完了のお知らせ <span className="text-[11px] font-normal text-slate-400">（検査側から・確認したらタップ）</span></h2>
+            <div className="flex flex-col gap-2">
+              {completeNotices.map(r => (
+                <div key={r.id} className={`bg-white rounded-xl border-2 shadow-sm overflow-hidden ${r.status === 'answered' ? 'border-slate-200' : 'border-emerald-300'}`}>
+                  <div className="px-3 py-2.5 flex items-center gap-2 flex-wrap">
+                    <span className="text-emerald-700 font-black">✅ 検査完了</span>
+                    <span className="font-mono text-sm font-black text-slate-700">{r.orderNo}</span>
+                    <span className="text-sm font-bold text-slate-600 truncate">{r.model}</span>
+                    {r.quantity ? <span className="text-xs text-slate-400">{r.quantity}台</span> : null}
+                    <span className="font-mono text-[11px] text-slate-400">{fmtContactTime(r.createdAt)}（{r.from || '検査'}）</span>
+                    {r.status === 'answered'
+                      ? <span className="ml-auto text-xs font-black text-slate-500">確認済 {r.answer?.by ? `(${r.answer.by})` : ''}</span>
+                      : <button onClick={() => ackComplete(r)} className="ml-auto px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-black">確認しました</button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
         <section>
           <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Clock className="w-5 h-5 text-teal-600" /> 「いつ来るか」の依頼 {arrivalReqs.length > 0 && <span className="bg-teal-600 text-white text-xs font-black rounded-full px-2 py-0.5 animate-pulse">{arrivalReqs.length}件</span>}</h2>
           {arrivalReqs.length === 0 && <div className="bg-white rounded-xl border border-slate-200 p-4 text-sm text-slate-400">いま回答待ちの依頼はありません</div>}
@@ -29743,7 +29791,24 @@ export default function App() {
    useEffect(() => { if (activeTab === 'contact' && contactUnseen.length) markContactSeen(); }, [activeTab, contactUnseen.length]); // eslint-disable-line react-hooks/exhaustive-deps
    // 到着回答→検査リスト反映モーダル (ティッカー/連絡タブ詳細のどちらからでも開ける)
    const [arrivalApply, setArrivalApply] = useState(null); // {reqId, itemIdx}
+   const [completePrompt, setCompletePrompt] = useState(null); // 検査完了→組立へ完了連絡の確認 {lot}
+   const completeSeenRef = useRef(null); // このセッション開始時点の完了ロット集合(基準)。初回ロード分にはプロンプトを出さない。
    const contactEstimateSecOf = (lot) => calculateLotEstimatedTime(lot, settings?.customTargetTimes || {}, modelGroupsOf(settings));
+   // 検査完了→次工程(組立)へ完了連絡を送る(ワンタップ確認/完了履歴ボタン 共通)。宛先=設定グループ→無ければ先頭グループ、役職ルーティングで職長へ。
+   const sendComplete = (lot) => {
+     if (!lot) return;
+     const grp = contactCompleteOf(settings).group || contactGroupsOf(settings)[0];
+     if (!grp) { alert('連絡先グループが未設定です（連絡タブの「宛先・公開設定」でグループを追加してください）'); return; }
+     const id = newContactId();
+     saveData('contact_requests', id, {
+       kind: 'complete', to: grp, from: currentUserName || '検査',
+       orderNo: lot.orderNo || '', model: lot.model || '', quantity: lot.quantity || 0,
+       message: `検査が完了しました${lot.quantity ? `（${lot.quantity}台）` : ''}`,
+       createdAt: Date.now(), status: 'waiting',
+     });
+     saveData('lots', lot.id, { completeNotified: { at: Date.now(), by: currentUserName || '検査', group: grp, reqId: id } });
+     notifyContactPush({ toGroup: grp, toSide: 'portal', toLevel: 'auto', title: `✅ 検査完了: ${lot.orderNo || ''} ${lot.model || ''}`, body: `${lot.quantity ? `${lot.quantity}台 ` : ''}完了しました（${currentUserName || '検査'}）`, link: `${window.location.origin}/?renraku=1`, tag: `done-${lot.id}-${Date.now()}` });
+   };
    // 未返信の自動フォロー: ①職長への再通知(N分毎×最大M回・修正/入荷それぞれON/OFF) ②上司へのエスカレーション(設定分で1回)。
    //   多重発火を抑えるため、送る前に doc(reminds/lastRemindAt/escalatedAt)を書いてから通知する。
    //   arrival(入荷・到着予定)は items が全部埋まると status='answered' になるので、待ちの間だけ対象。
@@ -29792,6 +29857,25 @@ export default function App() {
      const t = setInterval(check, 60000);
      return () => clearInterval(t);
    }, [contactFeatureOn, contactRequests, settings, pushTokens]); // eslint-disable-line react-hooks/exhaustive-deps
+   // 検査完了→次工程(組立)への完了連絡: ロットが「このセッション中に」新しく完了したらワンタップ確認を出す。
+   //   初回ロード時点の既存完了ロットは基準化して出さない(seenRef)。連絡済(completeNotified)は対象外。勝手には送らず必ず確認を挟む。
+   useEffect(() => {
+     if (RENRAKU_PORTAL || !contactFeatureOn) return;
+     if (!lots || !lots.length) return; // ロット未ロード(初期空)の間は基準化しない。空を基準にすると、後で読み込まれた既完了ロットが全部「新規完了」に見えて起動時に誤発火する。
+     const done = new Set(lots.filter(l => l && (l.status === 'completed' || l.location === 'completed')).map(l => l.id));
+     if (completeSeenRef.current === null) { completeSeenRef.current = done; return; } // ロード完了時点の完了集合を基準に(以後の"新しい完了"だけ拾う)
+     if (contactCompleteOf(settings).enabled && contactGroupsOf(settings).length) {
+       const toMsC = (v) => (typeof v === 'number' ? v : (v && v.seconds ? v.seconds * 1000 : (v ? new Date(v).getTime() : 0)));
+       const fresh = lots.find(l => {
+         if (!l || l.completeNotified || completeSeenRef.current.has(l.id)) return false;
+         if (!(l.status === 'completed' || l.location === 'completed')) return false;
+         const t = toMsC(l.completedAt); // 念のため: 完了時刻が判る場合、6時間より前の古い完了には出さない
+         return !t || (Date.now() - t) < 6 * 3600 * 1000;
+       });
+       if (fresh) setCompletePrompt(p => p || { lot: fresh });
+     }
+     completeSeenRef.current = done;
+   }, [lots, contactFeatureOn, settings]); // eslint-disable-line react-hooks/exhaustive-deps
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
@@ -32102,6 +32186,27 @@ export default function App() {
          if (!req || !reqIt || !reqIt.time) return null;
          return <ContactArrivalApplyModal req={req} itemIdx={arrivalApply.itemIdx} lots={lots} templates={templates} settings={settings} saveData={saveData} notifyPush={notifyContactPush} currentUserName={currentUserName} estimateSecOf={contactEstimateSecOf} onClose={() => setArrivalApply(null)} />;
        })()}
+       {/* 検査完了→次工程(組立)へ完了連絡 の確認プロンプト(自動送信ではなくワンタップ確認) */}
+       {completePrompt && contactFeatureOn && (
+         <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4" onClick={() => setCompletePrompt(null)}>
+           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
+             <div className="px-4 py-3 bg-emerald-600 text-white flex items-center gap-2"><CheckCircle2 className="w-5 h-5" /><span className="font-black">検査完了！</span></div>
+             <div className="p-4 flex flex-col gap-2 text-sm">
+               <div className="text-slate-700">この製品の検査が完了しました。次工程（<span className="font-black">{contactCompleteOf(settings).group || contactGroupsOf(settings)[0] || '組立'}</span>）に完了を連絡しますか？</div>
+               <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 flex items-center gap-2 flex-wrap">
+                 <span className="font-mono font-black text-slate-700">{completePrompt.lot.orderNo}</span>
+                 <span className="font-bold text-slate-600">{completePrompt.lot.model}</span>
+                 {completePrompt.lot.quantity ? <span className="text-xs text-slate-400">{completePrompt.lot.quantity}台</span> : null}
+               </div>
+               <div className="text-[11px] text-slate-400">相手（職長）の携帯にプッシュ通知が届きます。設定でOFFにもできます（連絡タブ→宛先・公開設定）。</div>
+             </div>
+             <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end">
+               <button onClick={() => setCompletePrompt(null)} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">閉じる</button>
+               <button onClick={() => { sendComplete(completePrompt.lot); setCompletePrompt(null); }} className="px-4 py-2 rounded-lg text-sm font-black text-white bg-emerald-600 hover:bg-emerald-700 flex items-center gap-1.5"><Send className="w-4 h-4" /> 組立に連絡する</button>
+             </div>
+           </div>
+         </div>
+       )}
        {showBreakAlert && (
          <div className="absolute top-0 left-0 right-0 bg-orange-500 text-white z-[100] p-4 flex justify-between items-center shadow-lg">
            <div className="flex items-center gap-3 text-lg font-bold"><Bell className="w-6 h-6 animate-bounce" />{String(showBreakAlert)}</div>
