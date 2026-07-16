@@ -3315,7 +3315,7 @@ const ContactArrivalApplyModal = ({ req, itemIdx, lots, templates, settings, sav
     } : x);
     saveData('contact_requests', req.id, { items });
     if (alsoReply && finishTs && notifyPush) {
-      notifyPush({ toSide: 'portal', toGroup: req.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${fmtContactDT(finishTs)}`, body: `${currentUserName || '検査'} より（到着 ${it.time} の予定で計算）`, link: portalLink, tag: `fin-${req.id}-${itemIdx}-${Date.now()}` });
+      notifyPush({ toSide: 'portal', toGroup: req.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${fmtContactDT(finishTs)}`, body: `${currentUserName || '検査'} より（到着 ${it.time} の予定で計算）`, link: portalLink, tag: `fin-${req.id}-${itemIdx}` });
     }
     onClose();
   };
@@ -3488,6 +3488,9 @@ const contactMergeShared = (settings, shared) => {
   if (shared.contactMembers) out.contactMembers = shared.contactMembers;
   if (shared.portalModelFamilies) out.portalModelFamilies = shared.portalModelFamilies; // 型式の仕分けも2アプリ共通
   if (shared.portalModelPrefixMap) out.portalModelPrefixMap = shared.portalModelPrefixMap;
+  // VAPID鍵とWorkerURLは2アプリで同じインフラ(同じFirebaseプロジェクト・同じCloudflare Worker)なので共通の棚に置く。
+  //   → 片方で設定すれば両方でプッシュが飛ぶ。⚠受信端末(push_tokens)はサイトごとに別なので、端末の🔔登録は各ポータルで1回ずつ必要。
+  if (shared.push && (shared.push.vapidKey || shared.push.workerUrl)) out.push = { ...(settings?.push || {}), ...shared.push };
   return out;
 };
 // ---- ポータルの型式しぼり込み ----
@@ -3785,7 +3788,7 @@ const PushHelpModal = ({ onClose, sideLabel = '組立' }) => {
 
 // 通知(プッシュ)の受信登録+テスト。admin=trueで管理者設定(VAPID鍵/Worker URL)と登録端末一覧も出す。
 // 検査側(連絡タブ, side='app')とあっち側(ポータル, side='portal'+グループ名)の両方で使う。
-const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushTokens = [], side, group = '', personName = '', admin = false, onOpenHelp }) => {
+const PushSettingsPanel = ({ settings, saveSettings, saveShared = null, saveData, deleteData, pushTokens = [], side, group = '', personName = '', admin = false, onOpenHelp }) => {
   const cfg = pushCfgOf(settings);
   const sideLabel = contactSideLabel(settings);
   const [vapidDraft, setVapidDraft] = useState(cfg.vapidKey);
@@ -3858,7 +3861,7 @@ const PushSettingsPanel = ({ settings, saveSettings, saveData, deleteData, pushT
           <div className="flex items-center gap-1.5">
             <span className="text-[11px] font-bold text-slate-500 w-20 shrink-0">Worker URL</span>
             <input value={workerDraft} onChange={e => setWorkerDraft(e.target.value)} placeholder="https://gemini-proxy.…workers.dev" className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs font-mono" />
-            <button onClick={() => { saveSettings({ push: { ...(settings?.push || {}), vapidKey: vapidDraft.trim(), workerUrl: workerDraft.trim().replace(/\/+$/, '') } }); setInfo('通知設定を保存しました'); }} className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-black shrink-0">保存</button>
+            <button onClick={() => { (saveShared || saveSettings)({ push: { ...(settings?.push || {}), vapidKey: vapidDraft.trim(), workerUrl: workerDraft.trim().replace(/\/+$/, '') } }); setInfo('通知設定を保存しました（製品検査・最終検査の両方に効きます）'); }} className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-black shrink-0">保存</button>
           </div>
           {!ready && <div className="text-[11px] text-amber-600 font-bold">VAPID鍵とWorker URLの両方を保存すると通知が使えるようになります（未設定の間も連絡機能自体は普通に使えます）</div>}
           <div className="text-[11px] text-slate-500 bg-blue-50 border border-blue-100 rounded-lg px-2.5 py-1.5">
@@ -4285,11 +4288,12 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
   const [showInternal, setShowInternal] = useState(false); // 社内連絡(現場→職長/工長)モーダル
   const internalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'internal').sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 30), [contactRequests]);
   const sendReq = (payload) => {
-    saveData('contact_requests', newContactId(), payload);
+    const reqId = newContactId();
+    saveData('contact_requests', reqId, payload);
     // 宛先グループの携帯へプッシュ通知(設定済みなら)。失敗しても連絡自体は届いている。
     if (notifyPush) {
       const m = contactPushMessage(payload);
-      notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` });
+      notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${reqId}` });
     }
   };
   // あっちの「いつ終わる？」に検査側が終了予定を回答 → ポータルへ通知
@@ -4301,18 +4305,19 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     saveData('contact_requests', r.id, { items, status: items.every(i => i.time) ? 'answered' : 'waiting' });
     setFinishDraft(p => ({ ...p, [key]: {} }));
     const it = items[idx];
-    if (notifyPush) notifyPush({ toSide: 'portal', toGroup: r.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}${it.time}`, body: `${currentUserName || '検査'} が回答しました`, link: `${window.location.origin}/?renraku=1`, tag: `fina-${r.id}-${idx}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'portal', toGroup: r.to, title: `🏁 検査終了予定: ${it.orderNo || ''} → ${it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}${it.time}`, body: `${currentUserName || '検査'} が回答しました`, link: `${window.location.origin}/?renraku=1`, tag: `fina-${r.id}-${idx}` });
   };
   // 社内連絡(現場→検査の職長/工長)を送る。組立ではなく検査側(side:'app')の役職端末へ通知。
   const sendInternal = (payload) => {
-    saveData('contact_requests', newContactId(), payload);
-    if (notifyPush) notifyPush({ toSide: 'app', internal: true, title: `🏭 社内: ${payload.topic || ''}（${payload.from || '現場'}）`, body: `${payload.orderNo ? `指図${payload.orderNo}: ` : ''}${payload.message || ''}`.slice(0, 200), link: `${window.location.origin}/`, tag: `int-${Date.now()}` });
+    const reqId = newContactId();
+    saveData('contact_requests', reqId, payload);
+    if (notifyPush) notifyPush({ toSide: 'app', internal: true, title: `🏭 社内: ${payload.topic || ''}（${payload.from || '現場'}）`, body: `${payload.orderNo ? `指図${payload.orderNo}: ` : ''}${payload.message || ''}`.slice(0, 200), link: `${window.location.origin}/`, tag: `int-${reqId}` });
     setShowInternal(false);
   };
   // 社内連絡に「対応します」= 検査側(現場含む全端末)に「△△が対応します」を通知して既読を返す。
   const ackInternal = (r) => {
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice: 'ack', by: currentUserName || '職長', at: Date.now() } });
-    if (notifyPush) notifyPush({ toSide: 'app', title: `🏭 ${currentUserName || '職長'} が対応します`, body: `${r.topic || ''} ${String(r.message || '').slice(0, 80)}`, link: `${window.location.origin}/`, tag: `intack-${r.id}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🏭 ${currentUserName || '職長'} が対応します`, body: `${r.topic || ''} ${String(r.message || '').slice(0, 80)}`, link: `${window.location.origin}/`, tag: `intack-${r.id}` });
   };
   // 連絡カードの会話に検査側からコメント追加 → 相手(組立/社内)へ通知。
   const addComment = (r, text) => {
@@ -4320,8 +4325,8 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     const c = { id: contactNewCommentId(), by: currentUserName || '検査', text, at: Date.now(), side: 'app' };
     saveData('contact_requests', r.id, { comments: [...(r.comments || []), c] });
     if (notifyPush) {
-      if (r.kind === 'internal') notifyPush({ toSide: 'app', internal: true, title: `💬 ${currentUserName || '検査'}: ${text.slice(0, 40)}`, body: `${r.topic || ''} の会話`, link: `${window.location.origin}/`, tag: `cmt-${r.id}-${Date.now()}` });
-      else notifyPush({ toSide: 'portal', toGroup: r.to, title: `💬 ${currentUserName || '検査'}: ${text.slice(0, 40)}`, body: `${r.orderNo ? `指図${r.orderNo} ` : ''}${contactKindLabel(r)}の会話`, link: `${window.location.origin}/?renraku=1`, tag: `cmt-${r.id}-${Date.now()}` });
+      if (r.kind === 'internal') notifyPush({ toSide: 'app', internal: true, title: `💬 ${currentUserName || '検査'}: ${text.slice(0, 40)}`, body: `${r.topic || ''} の会話`, link: `${window.location.origin}/`, tag: `cmt-${c.id}` });
+      else notifyPush({ toSide: 'portal', toGroup: r.to, title: `💬 ${currentUserName || '検査'}: ${text.slice(0, 40)}`, body: `${r.orderNo ? `指図${r.orderNo} ` : ''}${contactKindLabel(r)}の会話`, link: `${window.location.origin}/?renraku=1`, tag: `cmt-${c.id}` });
     }
   };
   // 検査が連絡を開いたら「既読」を記録(初回のみ)。相手側に「検査が見ました」と出る。
@@ -4605,7 +4610,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">📳 通知（プッシュ）— VAPID鍵・この端末の登録・端末一覧</summary>
             <div className="p-3">
               <PushSettingsPanel
-                settings={settings} saveSettings={saveSettings} saveData={saveData} deleteData={deleteData}
+                settings={settings} saveSettings={saveSettings} saveShared={saveShared} saveData={saveData} deleteData={deleteData}
                 pushTokens={pushTokens} side="app" group="" personName={currentUserName} admin
                 onOpenHelp={() => setShowPushHelp(true)}
               />
@@ -4883,19 +4888,19 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     if (choice === 'no' && !window.confirm('「行けない」と返信します。よろしいですか？')) return;
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice, comment: (commentDraft[r.id] || '').trim(), by: byName, at: Date.now() } });
     setCommentDraft(p => ({ ...p, [r.id]: '' }));
-    if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `↩ ${contactReplyLabel(choice)}（${byName}）`, body: String(r.message || '').slice(0, 120), link: appLink, tag: `reply-${r.id}` });
   };
   // 検査完了のお知らせに「確認しました」= 検査側に既読を返す(次工程が受け取ったサイン)
   const ackComplete = (r) => {
     saveData('contact_requests', r.id, { status: 'answered', answer: { choice: 'ack', by: byName, at: Date.now() } });
-    if (notifyPush) notifyPush({ toSide: 'app', title: `✅ 組立が確認: ${r.orderNo || ''} ${r.model || ''}`, body: `${byName} が検査完了を確認しました`, link: appLink, tag: `doneack-${r.id}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `✅ 組立が確認: ${r.orderNo || ''} ${r.model || ''}`, body: `${byName} が検査完了を確認しました`, link: appLink, tag: `doneack-${r.id}` });
   };
   // 会話に組立側からコメント追加 → 検査側へ通知。
   const addComment = (r, text) => {
     if (!r) return;
     const c = { id: contactNewCommentId(), by: byName, text, at: Date.now(), side: 'portal' };
     saveData('contact_requests', r.id, { comments: [...(r.comments || []), c] });
-    if (notifyPush) notifyPush({ toSide: 'app', title: `💬 ${byName}: ${text.slice(0, 40)}`, body: `${r.orderNo ? `指図${r.orderNo} ` : ''}${String(r.message || '').slice(0, 60)}`, link: appLink, tag: `cmt-${r.id}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `💬 ${byName}: ${text.slice(0, 40)}`, body: `${r.orderNo ? `指図${r.orderNo} ` : ''}${String(r.message || '').slice(0, 60)}`, link: appLink, tag: `cmt-${c.id}` });
   };
   // 組立がポータルで表示中の依頼は「見た」= 検査側に既読を返す(初回のみ)。
   useEffect(() => {
@@ -4911,7 +4916,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     // group=どの班からの到着予定か(連絡タブの表で班ごとに見るため) / viaReq=依頼への回答である印(自発登録と区別)
     if (it.lotId) saveData('arrival_times', it.lotId, { orderNo: it.orderNo || '', model: it.model || '', date: d.date || todayStr, time: d.time, by: byName, group, viaReq: r.id, at: Date.now() });
     setDraftTimes(p => ({ ...p, [key]: {} }));
-    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定: ${it.orderNo || ''} → ${d.time}`, body: `${byName} が回答しました`, link: appLink, tag: `arr-${r.id}-${idx}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定: ${it.orderNo || ''} → ${d.time}`, body: `${byName} が回答しました`, link: appLink, tag: `arr-${r.id}-${idx}` });
   };
   const registerArrival = (lot) => {
     const d = draftTimes[lot.id] || {};
@@ -4919,7 +4924,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
     // 自発登録(頼まれる前に知らせる)。group=どの班が知らせたか / viaReq='' = 依頼への回答ではない
     saveData('arrival_times', lot.id, { orderNo: lot.orderNo || '', model: lot.model || '', date: d.date || todayStr, time: d.time, by: byName, group, viaReq: '', at: Date.now() });
     setDraftTimes(p => ({ ...p, [lot.id]: {} }));
-    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定 登録: ${lot.orderNo || ''} → ${d.time}`, body: `${byName} が登録しました`, link: appLink, tag: `arr-reg-${lot.id}-${Date.now()}` });
+    if (notifyPush) notifyPush({ toSide: 'app', title: `🚚 到着予定 登録: ${lot.orderNo || ''} → ${d.time}`, body: `${byName} が登録しました`, link: appLink, tag: `arr-reg-${lot.id}` });
   };
   // あっちから検査へ「いつ終わりますか？」を聞く。検査側(連絡タブ)で終了予定を回答してもらう。
   const askFinish = (lot) => {
@@ -13808,9 +13813,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
               draft={contactDraft} groups={contactGroups.length ? contactGroups : DEFAULT_CONTACT_GROUPS} members={contactMembers} chipOptions={complaintOptions || []} from={inspectorName} lot={lot}
               onClose={() => setContactDraft(null)}
               onSend={(payload) => {
-                if (saveData) saveData('contact_requests', newContactId(), payload);
+                const reqId = newContactId();
+                if (saveData) saveData('contact_requests', reqId, payload);
                 // 宛先グループの携帯へプッシュ通知(設定済みなら)
-                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${Date.now()}` }); }
+                if (notifyPush) { const m = contactPushMessage(payload); notifyPush({ toGroup: payload.to, toSide: 'portal', toLevel: payload.toLevel || 'auto', title: m.title, body: m.body, link: `${window.location.origin}/?renraku=1`, tag: `req-${reqId}` }); }
                 setContactDraft(null); setOrderHint('📨 連絡を送信しました。返信はこの画面に表示されます');
               }}
             />
@@ -30400,6 +30406,18 @@ export default function App() {
      window.addEventListener('keydown', on, { passive: true });
      return () => { window.removeEventListener('pointerdown', on); window.removeEventListener('keydown', on); };
    }, []);
+   // 引っ越し(1回だけ): VAPID鍵/WorkerURL が共通の棚にまだ無く、このアプリに設定済みなら持ち込む。
+   //   2アプリとも同じFirebaseプロジェクト・同じWorkerを使うので、片方の設定がそのまま両方で使える。
+   //   ⚠受信端末(push_tokens)はサイトごとに別物なので、端末の🔔登録だけは各ポータルで1回ずつ必要(仕組み上避けられない)。
+   useEffect(() => {
+     if (!db || !user || RENRAKU_PORTAL || !contactFeatureOn) return;
+     if (contactShared === null || !settingsLoaded) return;
+     const sp = contactShared.push || {};
+     if (sp.vapidKey || sp.workerUrl) return;                 // もう入っている
+     const mine = settings?.push || {};
+     if (!mine.vapidKey && !mine.workerUrl) return;           // 自分も持っていない
+     saveContactShared({ push: { vapidKey: String(mine.vapidKey || '').trim(), workerUrl: String(mine.workerUrl || '').trim() } });
+   }, [contactShared, settings, settingsLoaded, db, user, contactFeatureOn]); // eslint-disable-line react-hooks/exhaustive-deps
    // 工程連絡のプッシュ通知送信(fire-and-forget)。settings.push 未設定なら何もしない。
    const notifyContactPush = (args) => { if (contactFeatureOn) firePushNotify(contactSettings, pushTokens, args, deleteData); };
    // 工程連絡OFFに切り替わった時、連絡タブに居た端末が空白画面に取り残されないよう検査リストへ退避
@@ -30450,7 +30468,7 @@ export default function App() {
      if (m && contactCompleteOf(contactSettings).modelGroups[m] !== g) {
        saveSettings({ contactComplete: { ...(settings?.contactComplete || {}), modelGroups: { ...contactCompleteOf(contactSettings).modelGroups, [m]: g } } });
      }
-     notifyContactPush({ toGroup: g, toSide: 'portal', toLevel: 'auto', title: `✅ 検査完了: ${lot.orderNo || ''} ${lot.model || ''}`, body: `${lot.quantity ? `${lot.quantity}台 ` : ''}完了しました（${currentUserName || '検査'}）`, link: `${window.location.origin}/?renraku=1`, tag: `done-${lot.id}-${Date.now()}` });
+     notifyContactPush({ toGroup: g, toSide: 'portal', toLevel: 'auto', title: `✅ 検査完了: ${lot.orderNo || ''} ${lot.model || ''}`, body: `${lot.quantity ? `${lot.quantity}台 ` : ''}完了しました（${currentUserName || '検査'}）`, link: `${window.location.origin}/?renraku=1`, tag: `done-${lot.id}` });
    };
    // 未返信の自動フォロー: ①職長への再通知(N分毎×最大M回・修正/入荷それぞれON/OFF) ②上司へのエスカレーション(設定分で1回)。
    //   多重発火を抑えるため、送る前に doc(reminds/lastRemindAt/escalatedAt)を書いてから通知する。
