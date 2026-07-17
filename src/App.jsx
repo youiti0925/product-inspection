@@ -2885,6 +2885,15 @@ const EMBED_MAP = typeof window !== 'undefined' && new URLSearchParams(window.lo
 // 連絡ポータル(?renraku=1): 前後工程(あっち)用の限定ビュー。指図/型式/台数/納期と連絡機能だけを出し、
 // 検査データ・分析などは一切表示しない。通常アクセス(パラメータ無し)には一切影響しない。
 const RENRAKU_PORTAL = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('renraku') === '1';
+// 「アプリとしてインストール」した時に開く先を、いま見ている画面に合わせる。
+//   検査の人は検査画面(/)、組立の人は連絡ポータル(/?renraku=1)を入れたい。manifestはページに1つしか
+//   紐づけられないので、ポータルで開いている時だけ差し替える。ブラウザはインストールする瞬間に読むので、
+//   ここで書き換えれば間に合う。
+//   ⚠これが無いと、組立が ?renraku=1 からインストールしてもアイコンを押すと検査画面が開く(=使えない)。
+if (RENRAKU_PORTAL && typeof document !== 'undefined') {
+  const link = document.querySelector('link[rel="manifest"]');
+  if (link) link.setAttribute('href', '/manifest-renraku.json');
+}
 
 // ロットカード表示項目のデフォルト (全てON)
 // settings.lotCardDisplay にユーザ設定を保存し、必要なら個別にOFFできる
@@ -3811,9 +3820,25 @@ const PushHelpModal = ({ onClose, sideLabel = '組立' }) => {
             <p>管理者は、連絡タブ→通知(プッシュ)で自分の端末を登録した後「<b>📋 管理者CC: ON</b>」にすると、<b>誰かが依頼を送るたびに写しの通知</b>が届きます(例:「📋 CC(組立宛): 🔧修正依頼 → 小川さん（尾田）」)。返信の通知は登録した検査側全端末に元々届きます。現場で起きているアクシデントの把握に使えます。</p>
           </Sec>
           <Sec emoji="🔔" title="通知のしくみ（読むだけでOK）">
-            <p>依頼や返信が来たとき、<b>画面を見ていなくても携帯・パソコンに通知が届き</b>ます。アプリのインストールは不要で、いつものブラウザ（Chrome/Safari）がそのまま受け取ります。</p>
+            <p>依頼や返信が来たとき、<b>画面を見ていなくても携帯・パソコンに通知が届き</b>ます。いつものブラウザ（Chrome/Safari）がそのまま受け取ります。</p>
             <p>やることは1回だけ: 「<b>この端末で通知を受け取る</b>」ボタン→「<b>許可</b>」。<b>受け取りたい端末ごと</b>に行ってください（送るだけの端末は不要）。</p>
             <p className="text-xs text-slate-400">※通知が失敗しても連絡そのものはアプリ/ポータルの画面に必ず表示されます（通知は「気づかせる」ための上乗せ）。テスト通知は「押した端末」だけに届きます。</p>
+          </Sec>
+          {/* PWA(アプリとしてインストール)。「Galaxyで通知に気づかない」への唯一の打ち手なので、通知の章の直後に置く。 */}
+          <Sec emoji="⬇️" title="アプリとして入れる（通知に気づかない人は必ずこれ）">
+            <p><b>これが「通知が出ない・まとめて来る・画面が黒いまま」の唯一の対策です。</b>ブラウザのタブで開いているだけだと、端末の設定に「このアプリ」の項目が出てこないので、通知を強くする方法がそもそも存在しません。入れると独立したアプリとして扱われ、設定をいじれるようになります。</p>
+            <div className="font-bold text-slate-700 mt-1">① 入れる</div>
+            <Step n={1}><b>Galaxy・Android</b>: Chromeで開く →右上の <b>⋮</b> →「<b>アプリをインストール</b>」(または「ホーム画面に追加」)</Step>
+            <Step n={2}><b>iPhone</b>: <b>Safari</b>で開く →下の <b>共有</b>ボタン →「<b>ホーム画面に追加</b>」</Step>
+            <Step n={3}><b>PC(Chrome/Edge)</b>: アドレスバー右端の <b>⊕</b> →「インストール」</Step>
+            <div className="font-bold text-rose-700 mt-1">② 入れたあと、ここまでやらないと意味がありません</div>
+            <Step n={1}><b>Galaxy</b>: 設定 →アプリ →入れたアプリ →<b>通知</b> →重要度を「<b>緊急</b>」(ポップアップ表示)に上げる</Step>
+            <Step n={2}><b>Galaxy</b>: 同じ画面の <b>バッテリー</b> →「<b>制限なし</b>」にする（溜め込まれなくなります）</Step>
+            <Step n={3}><b>PC</b>: Windowsの 設定 →システム →通知 →入れたアプリ →バナー表示ON。集中モードを使うなら「<b>優先通知</b>」に入れる</Step>
+            <Warn><b>iPhoneはホーム画面に追加しないと、そもそも通知が1件も届きません</b>（iPhoneの仕様です）。Safariのタブで開いているだけの人がいたら、必ず追加してもらってください。</Warn>
+            <div className="font-bold text-slate-700 mt-1">③ 入れると出るもの</div>
+            <p>アイコンの右上に<b>未読の件数バッジ</b>が出ます（PCならタスクバー、スマホならホーム画面）。連絡を開けば消えます。通知音も、最初に「🔊音を有効にする」を押さなくても鳴るようになります。</p>
+            <p className="text-xs text-slate-400">※<b>組立の人はポータルの画面から</b>入れてください。そこから入れると、アイコンを押した時にポータルが開きます（検査の画面からだと検査画面が開いてしまいます）。※PCの「作業中に気づかない」はこれでは直りません（画面を見ている間はOS通知が出ない仕組みのため）。そこは通知音と画面内の通知が担当しています。</p>
           </Sec>
           <Sec emoji="📱" title="Galaxy・Android の設定">
             <Step n={1}>このページを <b>Chrome</b>（または Samsung Internet）で開く</Step>
@@ -3852,6 +3877,7 @@ const PushHelpModal = ({ onClose, sideLabel = '組立' }) => {
           </Sec>
           <Sec emoji="❓" title="通知が来ないとき（チェックリスト）">
             <ol className="list-decimal ml-5 flex flex-col gap-1">
+              <li><b>アプリとして入れて、通知の重要度を「緊急」にしたか</b>（上の「⬇️アプリとして入れる」欄。<b>通知が出ない・まとめて来る・画面が黒いままは、ほぼこれで直ります</b>。ブラウザのタブのままだと打つ手がありません）</li>
               <li>「テスト通知」ボタンを押して結果メッセージを確認（エラーが出るなら設定の問題、成功なのに出ないなら端末の問題）</li>
               <li>ブラウザのサイト設定で通知が「許可」か（アドレスバーの鍵マーク→通知）</li>
               <li>端末の設定でブラウザ自体の通知がONか（設定→通知→Chrome/Safari）</li>
@@ -4963,6 +4989,13 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
   // 検査側からの「検査完了」お知らせ。ワンタップ「確認しました」で検査側に既読が返る。
   const completeNotices = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'complete' && r.to === group && r.status !== 'canceled').sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 20), [contactRequests, group]);
   const arrivalReqs = useMemo(() => (contactRequests || []).filter(r => r && r.kind === 'arrival' && r.to === group && r.status !== 'canceled' && (r.items || []).some(i => !i.time)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)), [contactRequests, group]);
+  // ホーム画面アイコンのバッジ = この班が「返事を待たれている件数」(修正依頼+到着予定)。
+  //   ⚠「アプリとしてインストール」した時だけ出る。ブラウザのタブのままだと何も起きない。
+  useEffect(() => {
+    if (!('setAppBadge' in navigator)) return;
+    const n = inbox.length + arrivalReqs.length;
+    try { if (n > 0) navigator.setAppBadge(n); else navigator.clearAppBadge(); } catch (e) { /* バッジは飾りなので握りつぶす */ }
+  }, [inbox.length, arrivalReqs.length]);
   // 検査側が返してくれた「検査終了予定」。①到着回答へのお返し(arrival items[].finish) ②終了予定を聞いた回答(finish items[].time)。48時間以内。
   const finishInfos = useMemo(() => {
     const out = [];
@@ -30619,6 +30652,14 @@ export default function App() {
      return contactFeedEvents(contactRequests, currentUserName).filter(ev => ev.at > contactSeenAt && !(ev.type === 'arrival' && ev.it?.applied));
    }, [contactFeatureOn, contactRequests, contactSeenAt, currentUserName]);
    useEffect(() => { if (activeTab === 'contact' && contactUnseen.length) markContactSeen(); }, [activeTab, contactUnseen.length]); // eslint-disable-line react-hooks/exhaustive-deps
+   // アプリのアイコン(PCのタスクバー/スマホのホーム画面)に未読件数のバッジを出す。
+   //   ⚠これが効くのは「アプリとしてインストール」した時だけ。ブラウザのタブのままだと何も起きない(エラーにもならない)。
+   //   数はタブの赤バッジと同じ = 未読の返信。無ければ待ち件数ではなくバッジを消す(赤い丸を出しっぱなしにすると意味が薄れる)。
+   useEffect(() => {
+     if (!('setAppBadge' in navigator)) return; // 非対応ブラウザ(iOS Safari等)は黙って何もしない
+     const n = contactFeatureOn ? contactUnseen.length : 0;
+     try { if (n > 0) navigator.setAppBadge(n); else navigator.clearAppBadge(); } catch (e) { /* 権限なし等。バッジは飾りなので握りつぶす */ }
+   }, [contactUnseen.length, contactFeatureOn]);
    // 緊急の連絡が新しく届いたら音を鳴らす。鳴らすのは緊急だけ(全部鳴らすと必ず無視されるようになる)。
    //   同じ出来事で二度鳴らさないよう、鳴らしたキーを覚えておく。
    const beepedRef = useRef(new Set());
