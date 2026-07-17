@@ -3138,6 +3138,62 @@ const CONTACT_REPLY_CHOICES = [
 // (これが無いと ack が素通りして、表の「返信内容」に生のまま `ack` と出る)
 const CONTACT_REPLY_EXTRA_LABELS = { ack: '確認しました' };
 const contactReplyLabel = (choice) => (CONTACT_REPLY_CHOICES.find(c => c.id === choice)?.label) || CONTACT_REPLY_EXTRA_LABELS[choice] || choice || '';
+
+// 「このアプリを入れる」ボタン。
+//   ⚠ブラウザのメニュー(⋮→アプリをインストール)を探させてはいけない。実際に「そんなメニューは無い」と
+//     なった。ブラウザが出す合図(beforeinstallprompt)を main.jsx で捕まえておき、ここから1タップで出す。
+//   ⚠入れられない時に黙って消えると「どうなってるのか分からない」になるので、必ず理由を出す。
+//     iPhoneはこの合図が来ない仕様(Safariの共有→ホーム画面に追加しかない)なので、手順を出す。
+const InstallAppButton = ({ compact = false }) => {
+  const isStandalone = () => (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+  const [state, setState] = useState(() => (isStandalone() ? 'installed' : (window.__pwaInstallEvent ? 'ready' : 'wait')));
+  const [swOk, setSwOk] = useState(null);
+  useEffect(() => {
+    const onReady = () => setState(isStandalone() ? 'installed' : 'ready');
+    const onDone = () => setState('installed');
+    window.addEventListener('pwa-installable', onReady);
+    window.addEventListener('pwa-installed', onDone);
+    // 合図が来ない時の切り分け用: Service Worker が居るかどうかだけ見ておく(原因の半分はこれ)
+    if (navigator.serviceWorker?.getRegistrations) navigator.serviceWorker.getRegistrations().then(r => setSwOk(r.length > 0)).catch(() => setSwOk(false));
+    // 合図はページ表示の少し後に来ることがある
+    const t = setTimeout(() => setState(s => (s === 'wait' && window.__pwaInstallEvent ? 'ready' : s)), 3000);
+    return () => { window.removeEventListener('pwa-installable', onReady); window.removeEventListener('pwa-installed', onDone); clearTimeout(t); };
+  }, []);
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && (navigator.maxTouchPoints || 0) > 1);
+
+  if (state === 'installed') {
+    return <div className="text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">✅ このアプリは<b>入っています</b>。あとは端末の設定で通知の重要度を「緊急」に、電池を「制限なし」にすれば完了です（ヘルプの⬇️の章）。</div>;
+  }
+  if (state === 'ready') {
+    return (
+      <button
+        onClick={async () => {
+          const e = window.__pwaInstallEvent;
+          if (!e) return;
+          e.prompt();
+          const r = await e.userChoice.catch(() => null);
+          if (r && r.outcome === 'accepted') setState('installed');
+          window.__pwaInstallEvent = null;
+        }}
+        className={`rounded-lg font-black text-white bg-emerald-600 hover:bg-emerald-700 flex items-center gap-1.5 ${compact ? 'px-3 py-1.5 text-sm' : 'px-4 py-2.5 text-base'}`}>
+        📱 このアプリを入れる（1タップ）
+      </button>
+    );
+  }
+  // 合図が来ない = 自動では入れられない。黙らず理由と代わりの手順を出す。
+  return (
+    <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 flex flex-col gap-1">
+      <div className="font-bold text-slate-600">この画面からは自動で入れられません。手動で入れてください:</div>
+      {ios
+        ? <div><b>Safari</b>で開く →下の<b>共有</b>ボタン →「<b>ホーム画面に追加</b>」（iPhoneはこの方法だけです。<b>追加しないと通知が1件も届きません</b>）</div>
+        : <div><b>Chrome</b>で開く →右上の <b>⋮</b> →「<b>アプリをインストール</b>」（無い場合は「ホーム画面に追加」）／PCはアドレスバー右端の <b>⊕</b></div>}
+      <div className="text-slate-400">
+        状態: {swOk === null ? '確認中…' : swOk ? '準備OK（ブラウザの合図待ち。ページを再読み込みすると出ることがあります）' : '⚠準備できていません（このブラウザは対応していない可能性があります）'}
+        {!ios && ' ／ すでに入れている場合はこの表示のままです。'}
+      </div>
+    </div>
+  );
+};
 const DEFAULT_CONTACT_GROUPS = ['組立', '機械', '管理者'];
 const contactGroupsOf = (settings) => {
   const g = Array.isArray(settings?.contactGroups) ? settings.contactGroups.map(x => String(x || '').trim()).filter(Boolean) : [];
@@ -3827,10 +3883,9 @@ const PushHelpModal = ({ onClose, sideLabel = '組立' }) => {
           {/* PWA(アプリとしてインストール)。「Galaxyで通知に気づかない」への唯一の打ち手なので、通知の章の直後に置く。 */}
           <Sec emoji="⬇️" title="アプリとして入れる（通知に気づかない人は必ずこれ）">
             <p><b>これが「通知が出ない・まとめて来る・画面が黒いまま」の唯一の対策です。</b>ブラウザのタブで開いているだけだと、端末の設定に「このアプリ」の項目が出てこないので、通知を強くする方法がそもそも存在しません。入れると独立したアプリとして扱われ、設定をいじれるようになります。</p>
-            <div className="font-bold text-slate-700 mt-1">① 入れる</div>
-            <Step n={1}><b>Galaxy・Android</b>: Chromeで開く →右上の <b>⋮</b> →「<b>アプリをインストール</b>」(または「ホーム画面に追加」)</Step>
-            <Step n={2}><b>iPhone</b>: <b>Safari</b>で開く →下の <b>共有</b>ボタン →「<b>ホーム画面に追加</b>」</Step>
-            <Step n={3}><b>PC(Chrome/Edge)</b>: アドレスバー右端の <b>⊕</b> →「インストール」</Step>
+            <div className="font-bold text-slate-700 mt-1">① 入れる — <b className="text-emerald-700">このボタンを押すだけです</b></div>
+            <InstallAppButton />
+            <div className="text-[11px] text-slate-400">※ボタンが出ない時は、手動でも入れられます: <b>Galaxy</b>=Chromeの右上 <b>⋮</b> →「アプリをインストール」／<b>iPhone</b>=Safariの<b>共有</b> →「ホーム画面に追加」／<b>PC</b>=アドレスバー右端の <b>⊕</b></div>
             <div className="font-bold text-rose-700 mt-1">② 入れたあと、ここまでやらないと意味がありません</div>
             <Step n={1}><b>Galaxy</b>: 設定 →アプリ →入れたアプリ →<b>通知</b> →重要度を「<b>緊急</b>」(ポップアップ表示)に上げる</Step>
             <Step n={2}><b>Galaxy</b>: 同じ画面の <b>バッテリー</b> →「<b>制限なし</b>」にする（溜め込まれなくなります）</Step>
@@ -4477,6 +4532,14 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
         )}
         <button onClick={() => setShowCfg(v => !v)} className={`ml-auto px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 ${showCfg ? 'bg-slate-700 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'}`}><Settings className="w-4 h-4" /> 宛先・公開設定</button>
         <button onClick={() => setShowPushHelp(true)} className="px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-700 hover:bg-blue-100"><HelpCircle className="w-4 h-4" /> ヘルプ</button>
+      </div>
+      {/* 「アプリとして入れる」= 通知に気づかせる唯一の打ち手。連絡タブを開いた瞬間に見える所に置く。
+          ⚠設定やヘルプの奥に置くと辿り着けない(実際「ヘルプがどこか分からない」「インストールなんて無い」と言われた)。
+          入れ終わった端末では InstallAppButton 側が「✅入っています」に変わるだけなので邪魔にならない。 */}
+      <div className="shrink-0 bg-white rounded-xl border-2 border-emerald-300 px-3 py-2.5 flex flex-col gap-1.5">
+        <div className="text-sm font-black text-emerald-800">⬇️ このアプリを端末に入れる（通知に気づかない人は必ず）</div>
+        <div className="text-[11px] text-slate-500">入れると端末の設定に「このアプリ」の項目が現れ、<b>通知の重要度を「緊急」</b>に上げられます。ブラウザのタブのままだとその設定が存在せず、通知は埋もれたままです。<b>入れた後に重要度を上げるまでが1セット</b>（やり方は右上の「ヘルプ」→<b>⬇️アプリとして入れる</b>）。</div>
+        <InstallAppButton compact />
       </div>
       {showCfg && (
         <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-2 max-h-[62vh] overflow-y-auto overscroll-contain">
