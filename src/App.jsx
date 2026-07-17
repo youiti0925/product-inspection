@@ -973,6 +973,52 @@ const computeElapsedWorkSeconds = (startMs, endMs, schedule, includeOvertime = t
   return Math.floor(totalSec);
 };
 
+// computeElapsedWorkSeconds の逆: 「この時刻から実作業を needSec 秒やったら、実際に何時に終わるか」。
+//   到着予定 + 検査の見積 から終了予定を出す時に使う。単純に足すと嘘になる:
+//   16:00着で見積3hを足すと 19:00 と出るが、実際は 15時休憩・定時17:00・翌朝跨ぎがあるので合わない。
+//   休憩中/勤務時間外の開始は「次に働ける瞬間」まで送る。土日は daysPerWeek<=5 の時だけ飛ばす(既存の判定と同じ)。
+//   ⚠戻り値は「その仕事が終わる壁時計の時刻」。needSec=0 なら開始時刻そのもの(丸めない)。
+const WORK_END_MAX_DAYS = 60; // 見積が異常に大きい時の暴走止め(この日数で見つからなければ null)
+const addWorkSeconds = (startMs, needSec, schedule, includeOvertime = true) => {
+  if (!startMs || !Number.isFinite(needSec)) return null;
+  let remainMs = Math.max(0, needSec) * 1000;
+  if (remainMs === 0) return startMs;
+  const sch = { ...DEFAULT_WORK_SCHEDULE, ...(schedule || {}) };
+  const dayStartMin = timeStrToMinutes(sch.dayStart);
+  const dayEndMin = (includeOvertime && sch.overtimeEnd) ? timeStrToMinutes(sch.overtimeEnd) : timeStrToMinutes(sch.dayEnd);
+  if (!(dayEndMin > dayStartMin)) return null;
+  const breaks = (sch.breaks || []).map(b => ({ start: timeStrToMinutes(b.start), end: timeStrToMinutes(b.end) }))
+    .filter(b => b.end > b.start).sort((a, b) => a.start - b.start);
+  const excludeWeekend = (sch.daysPerWeek || 5) <= 5;
+  const at = (day, min) => { const d = new Date(day); d.setHours(0, min, 0, 0); return d.getTime(); };
+
+  const cursor = new Date(startMs); cursor.setHours(0, 0, 0, 0);
+  for (let guard = 0; guard < WORK_END_MAX_DAYS; guard++) {
+    const dow = cursor.getDay();
+    if (!(excludeWeekend && (dow === 0 || dow === 6))) {
+      // その日の「働ける区間」= 勤務時間から休憩を抜いたもの。区間ごとに残りを削る。
+      const segs = [];
+      let segStart = dayStartMin;
+      for (const b of breaks) {
+        if (b.start > segStart) segs.push([segStart, Math.min(b.start, dayEndMin)]);
+        segStart = Math.max(segStart, b.end);
+      }
+      if (segStart < dayEndMin) segs.push([segStart, dayEndMin]);
+      for (const [s, e] of segs) {
+        if (e <= s) continue;
+        const segStartMs = Math.max(at(cursor, s), startMs); // 初日は開始時刻より前の区間は使えない
+        const segEndMs = at(cursor, e);
+        if (segEndMs <= segStartMs) continue;
+        const cap = segEndMs - segStartMs;
+        if (remainMs <= cap) return segStartMs + remainMs;
+        remainMs -= cap;
+      }
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return null; // 見積が大きすぎて WORK_END_MAX_DAYS 以内に終わらない → 呼び出し側で「算出不可」を出す
+};
+
 // 勤務スケジュールから「1 日の実働時間」を計算 (分単位)
 // 戻り値: { regularMinutes, overtimeMinutes, totalMinutes, regularHours, overtimeHours, totalHours }
 const computeWorkHours = (schedule) => {
@@ -3078,7 +3124,11 @@ const CONTACT_REPLY_CHOICES = [
   { id: '20', label: '20分後', cls: 'bg-indigo-600 hover:bg-indigo-700' },
   { id: 'no', label: '行けない', cls: 'bg-rose-600 hover:bg-rose-700' },
 ];
-const contactReplyLabel = (choice) => (CONTACT_REPLY_CHOICES.find(c => c.id === choice)?.label) || choice || '';
+// 'ack'(確認しました)は CONTACT_REPLY_CHOICES に入れてはいけない: あの配列は相手の返信ボタンを生やす元なので、
+// 足すと修正依頼の返信欄に「確認しました」ボタンが増えてしまう。表示名だけここで補う。
+// (これが無いと ack が素通りして、表の「返信内容」に生のまま `ack` と出る)
+const CONTACT_REPLY_EXTRA_LABELS = { ack: '確認しました' };
+const contactReplyLabel = (choice) => (CONTACT_REPLY_CHOICES.find(c => c.id === choice)?.label) || CONTACT_REPLY_EXTRA_LABELS[choice] || choice || '';
 const DEFAULT_CONTACT_GROUPS = ['組立', '機械', '管理者'];
 const contactGroupsOf = (settings) => {
   const g = Array.isArray(settings?.contactGroups) ? settings.contactGroups.map(x => String(x || '').trim()).filter(Boolean) : [];
@@ -3154,7 +3204,12 @@ const contactAnswerSummary = (req) => {
     return done.map(i => `${i.orderNo || ''}→${i.date ? `${String(i.date).slice(5).replace('-', '/')} ` : ''}${i.time}`).join(' / ');
   }
   const a = req.answer;
-  return a ? `${contactReplyLabel(a.choice)}${a.comment ? `（${a.comment}）` : ''}` : '';
+  if (a) return `${contactReplyLabel(a.choice)}${a.by ? ` — ${a.by}` : ''}${a.comment ? `（${a.comment}）` : ''}`;
+  // 返信が無い時、「返事を待っている」のか「そもそも返事を求めていない」のかを言い分ける。
+  // 完了連絡は確認返信OFF(status='notice')で送れるので、空欄のままだと「無視されている」ように見えてしまう。
+  if (req.status === 'notice') return '返信不要で送信（お知らせのみ）';
+  if (req.kind === 'complete') return '確認待ち';
+  return '';
 };
 
 // ---- 返信の画面内通知 + 到着回答→検査リスト反映 ----
@@ -3291,8 +3346,14 @@ const ContactArrivalApplyModal = ({ req, itemIdx, lots, templates, settings, sav
   // 候補が1件だけなら自動選択(テンプレ選択の手間を省く)
   useEffect(() => { if (candidates.length === 1 && !Object.values(sel).some(Boolean)) setSel({ [candidates[0].id]: true }); }, [candidates.length]); // eslint-disable-line react-hooks/exhaustive-deps
   const selLots = candidates.filter(l => sel[l.id]);
-  const estFinishOf = (lot) => (arriveTs == null ? null : arriveTs + (estimateSecOf(lot) || 0) * 1000);
-  const autoFinishTs = (selLots.length && arriveTs != null) ? Math.max(...selLots.map(l => estFinishOf(l) || 0)) : null;
+  // 終了予定は「到着時刻から実際に働ける時間だけ進めた」時刻。到着＋見積を素で足すと、休憩・定時・土日を
+  // 無視して 16:00着+3h=19:00 のような、現場では絶対に成り立たない時刻を組立に送ってしまう。
+  const estFinishOf = (lot) => (arriveTs == null ? null : addWorkSeconds(arriveTs, estimateSecOf(lot) || 0, settings?.workSchedule));
+  const autoFinishTs = (() => {
+    if (!selLots.length || arriveTs == null) return null;
+    const ends = selLots.map(l => estFinishOf(l)).filter(t => Number.isFinite(t));
+    return ends.length ? Math.max(...ends) : null; // 算出不可(見積が巨大)は混ぜない
+  })();
   const [finishEdit, setFinishEdit] = useState(null); // null=自動計算のまま / {date,time}=手で修正した
   const finishTs = (() => {
     if (finishEdit && finishEdit.time) { const t = new Date(`${finishEdit.date}T${finishEdit.time}`).getTime(); if (Number.isFinite(t)) return t; }
@@ -3356,14 +3417,17 @@ const ContactArrivalApplyModal = ({ req, itemIdx, lots, templates, settings, sav
           </div>
           {selLots.length > 0 && (
             <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
-              <div className="text-xs font-black text-slate-500 mb-1.5">② 終了予定（到着 + 検査の見積時間）— 実際に合わない時は直してから返信してください</div>
+              <div className="text-xs font-black text-slate-500 mb-1.5">② 終了予定（到着してから検査の見積時間ぶん働いたら終わる時刻）— 実際に合わない時は直してから返信してください</div>
               <div className="flex items-center gap-2 flex-wrap">
                 <input type="date" value={finishTs ? (finishEdit?.date ?? toDateStr(finishTs)) : ''} onChange={e => setFinishEdit({ date: e.target.value, time: finishEdit?.time ?? (finishTs ? toTimeStr(finishTs) : '') })} className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm" />
                 <input type="time" value={finishTs ? (finishEdit?.time ?? toTimeStr(finishTs)) : ''} onChange={e => setFinishEdit({ date: finishEdit?.date ?? (finishTs ? toDateStr(finishTs) : ''), time: e.target.value })} className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm font-black" />
                 {finishEdit && <button onClick={() => setFinishEdit(null)} className="text-[11px] font-bold text-blue-600 underline">自動計算に戻す</button>}
               </div>
+              {/* 何をどう計算したかを必ず出す。数字だけ出して根拠が無いと、合わない時に直す判断ができない。 */}
               <div className="text-[11px] text-slate-400 mt-1.5">
-                自動計算: {fmtContactDT(autoFinishTs)}（{selLots.map(l => `${l.model} ${Math.round((estimateSecOf(l) || 0) / 60)}分`).join(' / ')}）。休憩・他の仕事の割り込みは入っていません。
+                {autoFinishTs
+                  ? <>自動計算: {fmtContactDT(autoFinishTs)}（{selLots.map(l => `${l.model} ${Math.round((estimateSecOf(l) || 0) / 60)}分`).join(' / ')}）。<b className="text-slate-500">休憩・定時・土日は避けて計算しています</b>（設定→勤務スケジュール）。他の仕事の割り込み・段取り待ちは入っていません。</>
+                  : <span className="text-amber-600 font-bold">見積が大きすぎて自動計算できませんでした。終了予定を手で入れてください。</span>}
               </div>
             </div>
           )}
@@ -3405,6 +3469,26 @@ const contactCompleteOf = (settings) => {
   return { enabled: c.enabled !== false, group: String(c.group || '').trim(), ack: c.ack !== false, modelGroups: c.modelGroups || {} };
 };
 // 到着予定の設定。autoEntry=あっちが登録/回答した到着予定を、そのロットの入荷時間(entryAt)へ自動で入れる。既定ON。
+// 到着予定の自動お礼。返信をもらった時に「ご協力ありがとうございます」を1回だけ返す。
+//   ⚠鳴らさない: お礼で携帯を鳴らすと、本当に急ぎの連絡(修正依頼/呼出)が埋もれる。ポータルに出すだけ。
+//   ⚠依頼1件につき1回(最初の回答時)。項目ごとに返すと、まとめて答えた時に連打になる。
+const DEFAULT_CONTACT_THANKS = 'ご協力ありがとうございます';
+const contactThanksOf = (settings) => {
+  const a = settings?.contactArrival || {};
+  const t = a.thanks || {};
+  return { on: t.on !== false, text: String(t.text || '').trim() || DEFAULT_CONTACT_THANKS };
+};
+// 到着予定の定時おうかがい。毎日きまった時刻に「まだ到着予定をもらっていない指図」をまとめて聞く。
+//   days: 0=日〜6=土。既定は平日。lookaheadDays=何日先の入荷ぶんまで聞くか。
+const contactAutoAskOf = (settings) => {
+  const a = settings?.contactArrival?.autoAsk || {};
+  return {
+    on: a.on === true,                                   // 既定OFF(勝手に送らない)
+    time: /^\d{2}:\d{2}$/.test(a.time || '') ? a.time : '08:30',
+    days: Array.isArray(a.days) && a.days.length ? a.days : [1, 2, 3, 4, 5],
+    lookaheadDays: Number.isFinite(Number(a.lookaheadDays)) ? Math.max(1, Number(a.lookaheadDays)) : 3,
+  };
+};
 const contactArrivalOf = (settings) => {
   const a = settings?.contactArrival || {};
   return { autoEntry: a.autoEntry !== false };
@@ -3710,9 +3794,9 @@ const PushHelpModal = ({ onClose, sideLabel = '組立' }) => {
               <ol className="list-decimal ml-5 mt-1 space-y-0.5">
                 <li>回答が届くと<b>画面左下に通知</b>が出ます（連絡タブにも赤バッジ）。「検査リストへ反映」を押す</li>
                 <li>同じ指図で<b>テンプレートが分かれている時はどのロットか選ぶ</b>（わからなければ両方でOK）→ 到着時刻がそのロットの<b>入荷時間</b>に入ります</li>
-                <li><b>終了予定</b>（到着＋検査の見積時間）が自動で出ます。実際に合わない時は時刻を直して「反映して終了予定を返信」→ 相手のポータルに🏁終了予定が表示＋通知されます</li>
+                <li><b>終了予定</b>（到着してから検査の見積時間ぶん働いたら終わる時刻）が自動で出ます。実際に合わない時は時刻を直して「反映して終了予定を返信」→ 相手のポータルに🏁終了予定が表示＋通知されます</li>
               </ol>
-              <div className="text-[11px] text-slate-500 mt-1">※ 自動計算は「目標時間×台数」の単純計算です。休憩や他の仕事の割り込みは入っていないので、現実に合わせて直してから返すのがおすすめです。</div>
+              <div className="text-[11px] text-slate-500 mt-1">※ 自動計算は「目標時間×台数」を、<b>休憩・定時・土日を避けて</b>足した時刻です（設定→勤務スケジュールの時間割を使います）。例: 16時到着で見積3時間なら、15時休憩や定時を跨いで<b>翌営業日</b>になることもあります。他の仕事の割り込み・段取り待ちは入っていないので、現実に合わせて直してから返すのがおすすめです。</div>
             </div>
           </Sec>
           <Sec emoji="📥" title={`${sideLabel}側の使い方（ポータル）`}>
@@ -4418,6 +4502,48 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               <span className="text-[11px] text-slate-500">{sideLabel}が登録・回答した到着予定が、そのロットの<b>入荷時間</b>に入ります（検査リストのカード・作業予定・リードタイム集計がこの値を見ます）。<b>後から手で直した入荷時間を上書きし返すことはありません</b>。同じ指図でテンプレが分かれている時は、今までどおり「検査リストへ反映」で選んでください。</span>
             </div>
           ); })()}
+          {/* 定時おうかがい(自動送信) + 自動お礼 */}
+          {(() => {
+            const aa = contactAutoAskOf(settings);
+            const th = contactThanksOf(settings);
+            const patch = (p) => saveSettings({ contactArrival: { ...(settings?.contactArrival || {}), ...p } });
+            const DOW = [['日', 0], ['月', 1], ['火', 2], ['水', 3], ['木', 4], ['金', 5], ['土', 6]];
+            return (
+              <div className="border border-teal-200 bg-teal-50 rounded-lg px-3 py-2 flex flex-col gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-black text-teal-800">⏰ 決まった時刻に「到着予定」を自動で聞く</span>
+                  <button onClick={() => patch({ autoAsk: { ...(settings?.contactArrival?.autoAsk || {}), on: !aa.on } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${aa.on ? 'bg-teal-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{aa.on ? 'ON' : 'OFF'}</button>
+                </div>
+                {aa.on && (
+                  <div className="flex items-center gap-2 flex-wrap text-xs">
+                    <span className="font-bold text-slate-600">毎日</span>
+                    <input type="time" value={aa.time} onChange={e => patch({ autoAsk: { ...(settings?.contactArrival?.autoAsk || {}), time: e.target.value } })} className="border border-slate-300 rounded-lg px-2 py-1 font-black" />
+                    <span className="font-bold text-slate-600">に</span>
+                    <div className="flex items-center gap-1">
+                      {DOW.map(([label, d]) => (
+                        <button key={d} onClick={() => { const cur = aa.days.includes(d) ? aa.days.filter(x => x !== d) : [...aa.days, d].sort(); patch({ autoAsk: { ...(settings?.contactArrival?.autoAsk || {}), days: cur.length ? cur : [d] } }); }}
+                          className={`w-7 h-7 rounded-full font-black ${aa.days.includes(d) ? 'bg-teal-600 text-white' : 'bg-white border border-slate-300 text-slate-400'}`}>{label}</button>
+                      ))}
+                    </div>
+                    <span className="font-bold text-slate-600 ml-2">入荷予定</span>
+                    <input type="number" min="1" max="14" value={aa.lookaheadDays} onChange={e => patch({ autoAsk: { ...(settings?.contactArrival?.autoAsk || {}), lookaheadDays: Number(e.target.value) } })} className="border border-slate-300 rounded-lg px-2 py-1 w-16 font-black" />
+                    <span className="font-bold text-slate-600">日先まで</span>
+                  </div>
+                )}
+                <div className="text-[11px] text-slate-500">
+                  {aa.on
+                    ? <>まだ到着予定をもらっていない指図を<b>班ごとに1件にまとめて</b>自動で聞きます（型式ごとに覚えた班へ。入荷日が未定の指図も含みます）。同じ指図を二度聞くことはありません。ポータルでは「定期」と表示されます。</>
+                    : <>OFFの間は、今までどおり「到着予定を聞く」を押した時だけ送られます。</>}
+                </div>
+                <div className="border-t border-teal-200 pt-2 flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-black text-teal-800">🙏 返信をもらったら自動でお礼</span>
+                  <button onClick={() => patch({ thanks: { ...(settings?.contactArrival?.thanks || {}), on: !th.on } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${th.on ? 'bg-teal-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{th.on ? 'ON' : 'OFF'}</button>
+                  {th.on && <input value={th.text} onChange={e => patch({ thanks: { ...(settings?.contactArrival?.thanks || {}), text: e.target.value } })} className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold flex-1 min-w-[16ch]" placeholder={DEFAULT_CONTACT_THANKS} />}
+                  <span className="text-[11px] text-slate-500 w-full">到着予定の回答が届いたら、この一言を相手のポータルに1回だけ出します。<b>相手の携帯は鳴りません</b>（お礼で鳴らすと、本当に急ぎの修正依頼や呼出が埋もれるため）。</span>
+                </div>
+              </div>
+            );
+          })()}
           {/* 通知音 — 「PCの通知に気づかない」対策。作業中は画面が前面でOS通知が出ないので、音が唯一の合図になる。 */}
           {(() => {
             const on = contactSoundOn(settings);
@@ -4644,6 +4770,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               <th className="text-left px-2 py-2 whitespace-nowrap">経過</th>
               <th className="text-left px-2 py-2 whitespace-nowrap">返信時間</th>
               <th className="text-left px-3 py-2">返信内容</th>
+              <th className="w-10 px-2 py-2"></th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -4670,11 +4797,22 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   <td className="px-2 py-2 whitespace-nowrap font-mono text-xs text-slate-500">{fmtContactTime(r.createdAt)}</td>
                   <td className="px-2 py-2 whitespace-nowrap font-mono text-xs">{waiting ? <span className="text-amber-700 font-bold">{fmtContactElapsed(r.createdAt, nowTick)}</span> : <span className="text-slate-400">{rAt ? fmtContactElapsed(r.createdAt, rAt) : '—'}</span>}</td>
                   <td className="px-2 py-2 whitespace-nowrap font-mono text-xs text-slate-500">{rAt ? fmtContactTime(rAt) : '—'}</td>
-                  <td className="px-3 py-2"><span className={`text-xs font-bold truncate block max-w-[30ch] ${r.answer?.choice === 'no' ? 'text-rose-700' : 'text-emerald-700'}`} title={contactAnswerSummary(r)}>{contactAnswerSummary(r) || '—'}</span></td>
+                  {/* 返信が「来た」のか「不要なので無い」のかを色でも分ける(緑=返信あり / 灰=返信不要・待ち) */}
+                  <td className="px-3 py-2"><span className={`text-xs font-bold truncate block max-w-[30ch] ${r.answer?.choice === 'no' ? 'text-rose-700' : r.answer ? 'text-emerald-700' : 'text-slate-400 font-normal'}`} title={contactAnswerSummary(r)}>{contactAnswerSummary(r) || '—'}</span></td>
+                  {/* 表から直接消せるように(今までは行→詳細を開く→削除、の2手だった)。行クリックで詳細が開くので伝播を止める。 */}
+                  <td className="px-2 py-2 text-right">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (window.confirm(`この連絡を削除しますか？（履歴からも消えます）\n\n${contactKindLabel(r)}${r.orderNo ? ` / 指図 ${r.orderNo}` : ''}\n${fmtContactTime(r.createdAt)} → ${r.to || ''}`)) deleteData('contact_requests', r.id);
+                      }}
+                      title="この連絡を削除"
+                      className="p-1.5 rounded-lg text-slate-300 hover:text-rose-600 hover:bg-rose-50"><Trash2 className="w-3.5 h-3.5" /></button>
+                  </td>
                 </tr>
               );
             })}
-            {list.length === 0 && <tr><td colSpan={8} className="px-3 py-8 text-center text-sm text-slate-400">連絡はまだありません。「到着予定を聞く」「連絡・呼出」から送れます。作業画面のNG→修正からも自動で聞かれます。</td></tr>}
+            {list.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-slate-400">連絡はまだありません。「到着予定を聞く」「連絡・呼出」から送れます。作業画面のNG→修正からも自動で聞かれます。</td></tr>}
           </tbody>
         </table>
       </div>
@@ -5083,7 +5221,14 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                   <span className="font-black text-teal-700">到着予定を教えてください</span>
                   <span className="text-slate-500 font-bold">{r.from || '検査'} から</span>
                   <span className="font-mono text-slate-400">{fmtContactTime(r.createdAt)}</span>
+                  {r.auto && <span className="text-[10px] font-bold text-slate-400 bg-white border border-slate-200 rounded px-1.5 py-0.5" title="設定した時刻に自動で送られた定期のおうかがいです">定期</span>}
                 </div>
+                {/* 検査からの自動お礼。答えてもらった事が相手に見える(鳴らさない=急ぎの連絡を埋もれさせない) */}
+                {r.autoThanks && (
+                  <div className="px-3 py-1.5 bg-emerald-50 border-b border-emerald-100 text-xs font-bold text-emerald-800 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />{r.autoThanks.text}（{r.autoThanks.by || '検査'}）
+                  </div>
+                )}
                 <div className="divide-y divide-slate-100">
                   {(r.items || []).map((it, idx) => {
                     const key = `${r.id}__${idx}`;
@@ -25358,6 +25503,43 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
   );
 };
 
+// 検査リスト(表)の🚚到着予定セル。PCから直接入れられるように(今まで到着予定は組立ポータルからしか入らなかった)。
+//   ⚠書き込む形は ContactPortal の registerArrival と完全に同じにする。ここだけ形が違うと、
+//     到着→入荷時間の自動反映(contactArrivalDT が date+time を読む)が黙って効かなくなる。
+//   by は入れた人。group='' = 検査が自分で入れた(組立の班が知らせたのではない)。
+const ArrivalCell = ({ lot, arrival, saveData, currentUserName }) => {
+  const [open, setOpen] = useState(false);
+  const [d, setD] = useState({ date: '', time: '' });
+  const todayStr = (() => { const x = new Date(); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`; })();
+  const has = arrival && arrival.time;
+  const save = () => {
+    if (!d.time) return;
+    saveData('arrival_times', lot.id, {
+      orderNo: lot.orderNo || '', model: lot.model || '',
+      date: d.date || todayStr, time: d.time,
+      by: currentUserName || '検査', group: '', viaReq: '', at: Date.now(),
+    });
+    setOpen(false);
+  };
+  if (!open) {
+    return has
+      ? <button onClick={() => { setD({ date: arrival.date || todayStr, time: arrival.time }); setOpen(true); }}
+          title={`到着予定 (登録: ${arrival.by || '?'}${arrival.group ? ` / ${arrival.group}` : ''})　クリックで直す`}
+          className="text-[11px] font-black text-teal-800 bg-teal-50 border border-teal-300 rounded px-1.5 py-0.5 whitespace-nowrap hover:bg-teal-100">
+          🚚 {arrival.date ? `${String(arrival.date).slice(5).replace('-', '/')} ` : ''}{arrival.time}
+        </button>
+      : <button onClick={() => { setD({ date: todayStr, time: '' }); setOpen(true); }}
+          title="到着予定を入れる" className="text-[11px] font-bold text-slate-300 border border-dashed border-slate-300 rounded px-1.5 py-0.5 hover:text-teal-700 hover:border-teal-400">＋ 入力</button>;
+  }
+  return (
+    <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+      <input type="date" value={d.date} onChange={e => setD(p => ({ ...p, date: e.target.value }))} className="border border-slate-300 rounded px-1 py-0.5 text-[11px]" />
+      <input type="time" value={d.time} onChange={e => setD(p => ({ ...p, time: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setOpen(false); }} autoFocus className="border border-slate-300 rounded px-1 py-0.5 text-[11px] font-black" />
+      <button onClick={save} disabled={!d.time} className="px-1.5 py-0.5 rounded bg-teal-600 text-white text-[11px] font-black disabled:opacity-40">✓</button>
+      <button onClick={() => setOpen(false)} className="px-1 text-slate-400 text-[11px]">×</button>
+    </div>
+  );
+};
 const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onDeleteLot, setExecutionLotId, currentUserName = '', saveData, cdByOrder = {}, arrivalByLot = {} }) => {
   const [assignmentLot, setAssignmentLot] = useState(null);
   const [viewMode, setViewMode] = useState('grid');
@@ -25791,7 +25973,8 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
           </div>
         ) : (
           viewMode === 'grid' ? (
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 items-start pb-10">
+            // PCの広い画面で右側が余っていたので、xl以上で列を増やす(1024pxまでは従来どおり)
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 items-start pb-10">
               {sortedLots.map(lot => {
                 const isPaused = Object.values(lot.tasks || {}).some(t => t.status === 'paused');
                 const zoneName = mapZones.find(z => z.id === lot.mapZoneId)?.name || '';
@@ -25907,6 +26090,8 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                     <th className="p-3 font-bold border-b">テンプレート</th>
                     <th className="p-3 font-bold border-b text-center">台数</th>
                     <th className="p-3 font-bold border-b">入荷日時</th>
+                    {/* PCから到着予定を直接入れられるように(今までは組立ポータルからしか入らなかった) */}
+                    <th className="p-3 font-bold border-b whitespace-nowrap">🚚 到着予定</th>
                     <th className="p-3 font-bold border-b">納期</th>
                     <th className="p-3 font-bold border-b">場所</th>
                     <th className="p-3 font-bold border-b">担当</th>
@@ -25950,6 +26135,8 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                         </td>
                         <td className="p-3 text-center">{lot.quantity}</td>
                         <td className="p-3 text-slate-500 text-xs">{lot.entryAt ? `${toDateShort(lot.entryAt)} ${new Date(lot.entryAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}` : '-'}</td>
+                        {/* 🚚 到着予定: PCからその場で入れる。組立からの回答も同じ arrival_times に入るので、ここに出る。 */}
+                        <td className="p-3"><ArrivalCell lot={lot} arrival={arrivalByLot[lot.id]} saveData={saveData} currentUserName={currentUserName} /></td>
                         <td className="p-3 text-xs font-bold text-blue-600">{lot.dueDate || '-'}</td>
                         {/* 場所 (エリア) */}
                         <td className="p-3 text-xs">
@@ -30452,6 +30639,19 @@ export default function App() {
    //   確認返信(ack)がOFFの時は status='notice' = 返事を求めないお知らせ。どちらでも催促(再通知・エスカレーション)はしない。
    const sendComplete = (lot, grp) => {
      if (!lot) return;
+     // 二重送信ガード: このプロンプトは開いている全端末に同時に出る。自分がモーダルを開いている間に
+     // 別端末が送信/見送りを済ませている事があるので、押された時点の最新のロットで必ず確かめる
+     // (completePrompt.lot は完了した瞬間のスナップショットで、その後の他端末の操作を知らない)。
+     const cur = (lots || []).find(l => l && l.id === lot.id) || lot;
+     if (cur.completeNotified) {
+       const cn = cur.completeNotified;
+       const when = cn.at ? fmtContactTime(cn.at) : '';
+       alert(cn.declined
+         ? `この指図は ${cn.by || '別の人'} が ${when} に「連絡しない」を選んでいます。二重に送らないよう、送信を取りやめました。`
+         : `この指図は ${cn.by || '別の人'} が ${when} に ${cn.group || ''} へ連絡済みです。二重に送らないよう、送信を取りやめました。`);
+       setCompletePrompt(null);
+       return;
+     }
      const g = String(grp || '').trim() || contactCompleteGroupFor(contactSettings, lot.model);
      if (!g) { alert('連絡先グループが未設定です（連絡タブの「宛先・公開設定」でグループを追加してください）'); return; }
      const needAck = contactCompleteOf(contactSettings).ack;
@@ -30469,6 +30669,15 @@ export default function App() {
        saveSettings({ contactComplete: { ...(settings?.contactComplete || {}), modelGroups: { ...contactCompleteOf(contactSettings).modelGroups, [m]: g } } });
      }
      notifyContactPush({ toGroup: g, toSide: 'portal', toLevel: 'auto', title: `✅ 検査完了: ${lot.orderNo || ''} ${lot.model || ''}`, body: `${lot.quantity ? `${lot.quantity}台 ` : ''}完了しました（${currentUserName || '検査'}）`, link: `${window.location.origin}/?renraku=1`, tag: `done-${lot.id}` });
+   };
+   // 「連絡しない」= 見送りも全端末で共有する。ここを保存しないと、自分の画面から消えるだけで
+   // 他の端末には同じモーダルが開いたまま残り、そこで押されて「キャンセルしたのに送られた」になる。
+   //   送信と同じ completeNotified に declined を立てる(この印は 30533 の新規検出の除外にそのまま効く)。
+   //   連絡は作らない・プッシュも出さない = 見送りは組立には一切伝わらない。
+   const declineComplete = (lot) => {
+     if (!lot) return;
+     const cur = (lots || []).find(l => l && l.id === lot.id) || lot;
+     if (!cur.completeNotified) saveData('lots', lot.id, { completeNotified: { at: Date.now(), by: currentUserName || '検査', declined: true } });
    };
    // 未返信の自動フォロー: ①職長への再通知(N分毎×最大M回・修正/入荷それぞれON/OFF) ②上司へのエスカレーション(設定分で1回)。
    //   多重発火を抑えるため、送る前に doc(reminds/lastRemindAt/escalatedAt)を書いてから通知する。
@@ -30540,6 +30749,14 @@ export default function App() {
      }
      completeSeenRef.current = done;
    }, [lots, contactFeatureOn, settings]); // eslint-disable-line react-hooks/exhaustive-deps
+   // 開いているプロンプトは、別端末が「連絡した/連絡しない」を決めた時点で自動で閉じる。
+   //   このモーダルは開いている全端末に同時に出るので、閉じないと「誰かがもう決めた件」を
+   //   別の人がもう一度押せてしまう(=二重送信/取り消したはずの送信)。
+   useEffect(() => {
+     if (!completePrompt) return;
+     const cur = (lots || []).find(l => l && l.id === completePrompt.lot.id);
+     if (cur && cur.completeNotified) setCompletePrompt(null);
+   }, [lots, completePrompt]);
    // 【初回だけの地ならし】この機能を入れる前から在る到着予定に「もう入れた」の印(applied)だけ付ける。ロットは絶対に触らない。
    //   これが無いと、機能を入れた瞬間に過去の到着予定が全部「新規」に見えて、手で直した入荷時間を黙って上書きしてしまう。
    //   印を付けたあとは「印の無い到着予定 = 本当に新しく登録された分」だけになるので、夜間に登録された分も翌朝ちゃんと入る。
@@ -30576,6 +30793,85 @@ export default function App() {
        if (lot.entryAt !== ts) saveData('lots', a.id, { entryAt: ts });
      });
    }, [arrivalTimes, lots, contactFeatureOn, settings]); // eslint-disable-line react-hooks/exhaustive-deps
+   // 到着予定に返信をもらったら「ご協力ありがとうございます」を自動で返す(依頼1件につき1回)。
+   //   ⚠comments[] への追記にはしない: 配列の読んで書き足す方式は、開いている全端末が同時に走ると
+   //     後勝ちで他人のコメントを消す。単一フィールド(autoThanks)なら何度書いても同じ結果になる。
+   //   ⚠プッシュは出さない(お礼で鳴らすと本当の急ぎが埋もれる)。ポータルの履歴に出るだけ。
+   useEffect(() => {
+     if (RENRAKU_PORTAL || !contactFeatureOn) return;
+     const cfg = contactThanksOf(settings);
+     if (!cfg.on) return;
+     (contactRequests || []).forEach(r => {
+       if (!r || r.autoThanks || r.status === 'canceled') return;
+       if (r.kind !== 'arrival' && r.kind !== 'finish') return;
+       if (r._self) return;                                   // 自発登録(こちらが頼んでいない)は対象外
+       const answered = (r.items || []).some(i => i && i.time); // 1件でも答えてもらえたらお礼
+       if (!answered) return;
+       saveData('contact_requests', r.id, { autoThanks: { at: Date.now(), text: cfg.text, by: '検査' } });
+     });
+   }, [contactRequests, contactFeatureOn, settings]); // eslint-disable-line react-hooks/exhaustive-deps
+   // 【定時おうかがい】設定した時刻に「まだ到着予定をもらっていない指図」を班ごとにまとめて自動で聞く。
+   //   ⚠このアプリにサーバーは無く、動くのは開いているブラウザだけ。全端末が同じ時刻に同じ処理を走らせるので、
+   //     素直に作ると端末の数だけ依頼が飛ぶ。→ **docIdを日付+班で決め打ち**にして、何台が同時に書いても
+   //     同じ1件を上書きするだけ(=物理的に増えない)ようにする。ランダムIDにしたら必ず二重送信になる。
+   //   ⚠プッシュだけは端末ごとに飛びうるが、tag が同じなので携帯側では1つの通知に畳まれる。
+   //   ⚠時刻を過ぎてから起動した端末が「今日のぶん」を送らないよう、送信は設定時刻から60分以内に限る。
+   useEffect(() => {
+     if (RENRAKU_PORTAL || !contactFeatureOn) return;
+     const cfg = contactAutoAskOf(settings);
+     if (!cfg.on) return;
+     if (!settingsLoaded || !arrivalsLoaded) return;      // 未ロードで走ると「到着予定なし」に見えて全部聞いてしまう
+     if (!lots || !lots.length) return;
+     const groups = contactGroupsOf(contactSettings);
+     if (!groups.length) return;
+     const tick = () => {
+       const now = new Date();
+       if (!cfg.days.includes(now.getDay())) return;
+       const [hh, mm] = cfg.time.split(':').map(Number);
+       const due = new Date(now); due.setHours(hh, mm, 0, 0);
+       const diffMin = (now.getTime() - due.getTime()) / 60000;
+       if (diffMin < 0 || diffMin > 60) return;            // まだ時刻前 / 遅れすぎ(今日のぶんは見送る)
+       const dateKey = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+       // 対象 = 未完了で、入荷予定が lookaheadDays 以内(or 未定)で、まだ到着予定をもらっていない指図
+       const horizon = now.getTime() + cfg.lookaheadDays * 86400000;
+       const arrivedIds = new Set((arrivalTimes || []).filter(a => a && a.time).map(a => a.id));
+       const askedIds = new Set((contactRequests || [])
+         .filter(r => r && r.kind === 'arrival' && r.status !== 'canceled' && (r.items || []).some(i => !i.time))
+         .flatMap(r => (r.items || []).map(i => i.lotId)));
+       const targets = (lots || []).filter(l => {
+         if (!l || l.status === 'completed' || l.location === 'completed') return false;
+         if (arrivedIds.has(l.id) || askedIds.has(l.id)) return false;   // もう聞いた/もう来た
+         if (l.entryAt && l.entryAt <= horizon) return true;             // 入荷予定が近い
+         return !l.entryAt;                                             // 入荷未定も聞く
+       });
+       if (!targets.length) return;
+       // 班ごとに1件。宛先は型式で覚えている班(完了連絡と同じ記憶)を使い、無ければ最初の班。
+       const byGroup = {};
+       targets.forEach(l => {
+         const g = contactCompleteGroupFor(contactSettings, l.model) || groups[0];
+         (byGroup[g] = byGroup[g] || []).push(l);
+       });
+       Object.entries(byGroup).forEach(([g, list]) => {
+         const id = `arr-auto-${dateKey}-${g}`;            // ← 決め打ちID(全端末で同じ = 二重にならない)
+         if ((contactRequests || []).some(r => r && r.id === id)) return; // 今日のぶんは送信済み
+         saveData('contact_requests', id, {
+           kind: 'arrival', to: g, from: '検査(自動)', auto: true,
+           message: `到着予定（いつ来るか）を教えてください ※${cfg.time}の定期連絡`,
+           items: list.slice(0, 40).map(l => ({ lotId: l.id, orderNo: l.orderNo || '', model: l.model || '' })),
+           createdAt: Date.now(), status: 'waiting',
+         });
+         notifyContactPush({
+           toGroup: g, toSide: 'portal', toLevel: 'auto',
+           title: `🚚 到着予定を教えてください（${list.length}件）`,
+           body: `${cfg.time}の定期連絡です。ポータルで時間を入れてください`,
+           link: `${window.location.origin}/?renraku=1`, tag: `arr-auto-${dateKey}-${g}`,
+         });
+       });
+     };
+     tick();
+     const t = setInterval(tick, 60000);
+     return () => clearInterval(t);
+   }, [contactFeatureOn, settings, settingsLoaded, arrivalsLoaded, lots, arrivalTimes, contactRequests]); // eslint-disable-line react-hooks/exhaustive-deps
    // ヘッダーのまとめメニュー (間接作業/日次集計, 作業標準/ノート)。overflowで切れないよう fixed配置。
    const [hdrMenu, setHdrMenu] = useState(null); // { type:'time'|'docs', top, right }
    const openHdrMenu = (type, e) => { const r = e.currentTarget.getBoundingClientRect(); setHdrMenu(prev => prev && prev.type === type ? null : { type, top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) }); };
@@ -32896,7 +33192,7 @@ export default function App() {
          const sel = completePrompt.group || '';
          const sideLabel = contactSideLabel(contactSettings);
          return (
-         <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4" onClick={() => setCompletePrompt(null)}>
+         <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4" onClick={() => { declineComplete(completePrompt.lot); setCompletePrompt(null); }}>
            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden" onClick={e => e.stopPropagation()}>
              <div className="px-4 py-3 bg-emerald-600 text-white flex items-center gap-2"><CheckCircle2 className="w-5 h-5" /><span className="font-black">検査完了！</span></div>
              <div className="p-4 flex flex-col gap-2.5 text-sm">
@@ -32927,9 +33223,13 @@ export default function App() {
                    : 'お知らせを流すだけです（相手の確認返信は求めません）。'}
                  設定は連絡タブ→宛先・公開設定。
                </div>
+               {/* この確認は開いている検査端末すべてに同時に出る。どちらを押しても他の端末の分は閉じる、と明示する。 */}
+               <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+                 この確認は、いま開いている検査の画面すべてに出ています。<b>どちらを押しても他の人の画面からは消えます</b>ので、二重に送られることはありません。
+               </div>
              </div>
              <div className="px-4 py-3 border-t border-slate-200 flex gap-2 justify-end">
-               <button onClick={() => setCompletePrompt(null)} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">連絡しない</button>
+               <button onClick={() => { declineComplete(completePrompt.lot); setCompletePrompt(null); }} className="px-3 py-2 rounded-lg text-sm font-bold text-slate-500 hover:bg-slate-100">連絡しない</button>
                <button disabled={!sel} onClick={() => { sendComplete(completePrompt.lot, sel); setCompletePrompt(null); }} className="px-4 py-2 rounded-lg text-sm font-black text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 flex items-center gap-1.5"><Send className="w-4 h-4" /> {sel || sideLabel}に連絡する</button>
              </div>
            </div>
