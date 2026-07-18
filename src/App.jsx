@@ -3361,9 +3361,9 @@ const CONTACT_EVENT_LOOK = {
   sent:     { head: '📤 連絡を出しました',            cls: 'border-slate-300',  headCls: 'bg-slate-50 text-slate-500' },
 };
 // 画面内ティッカー: 未読の連絡を左下に表示(どのタブ・作業画面に居ても気づける)。到着回答は1タップで検査リストへ反映に進める。
-const ContactReplyTicker = ({ events, onSeen, onOpenTab, onApply }) => {
+const ContactReplyTicker = ({ events, onSeen, onOpenTab, onApply, settings }) => {
   if (!events || !events.length) return null;
-  const shown = events.slice(0, 3);
+  const shown = events.slice(0, Math.max(1, Math.floor(Number(contactTickerCfg(settings).maxShown) || 3)));
   return (
     <div className="fixed bottom-4 left-4 z-[85] w-[360px] max-w-[92vw] flex flex-col gap-2">
       {shown.map(ev => {
@@ -3599,17 +3599,20 @@ const contactUnlockAudio = () => {
     if (contactAudioCtx.state === 'suspended') contactAudioCtx.resume().catch(() => {});
   } catch (e) { /* 音が出せない端末でも連絡そのものは届く */ }
 };
-// ピッ…ピッ と鳴らす。長く鳴らすと作業の邪魔なので短く2回。
-const contactBeep = (times = 2) => {
+// ピッ…ピッ と鳴らす。回数・高さ・音量は連絡タブの設定で変えられる(既定=2回/880Hz/0.25)。
+const contactBeep = (times = 2, freq = 880, volume = 0.25) => {
   try {
     if (!contactAudioReady()) return false;
     const ctx = contactAudioCtx;
-    for (let i = 0; i < times; i++) {
+    const n = Math.max(1, Math.floor(Number(times) || 2));
+    const f = Math.max(50, Number(freq) || 880);
+    const vol = Math.max(0.0002, Math.min(1, Number(volume) || 0.25));
+    for (let i = 0; i < n; i++) {
       const t0 = ctx.currentTime + i * 0.28;
       const osc = ctx.createOscillator(); const gain = ctx.createGain();
-      osc.type = 'sine'; osc.frequency.setValueAtTime(880, t0);
+      osc.type = 'sine'; osc.frequency.setValueAtTime(f, t0);
       gain.gain.setValueAtTime(0.0001, t0);
-      gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.2);
       osc.connect(gain); gain.connect(ctx.destination);
       osc.start(t0); osc.stop(t0 + 0.22);
@@ -3618,12 +3621,26 @@ const contactBeep = (times = 2) => {
   } catch (e) { return false; }
 };
 // 音を鳴らす出来事 = 手を止めて動く必要があるものだけ。
-//   'answer'(あっちの返信)/'finish'(いつ終わる?)/'internal'(現場からの社内連絡) と、「行けない」返信。
-//   'sent'(自分たちが出した連絡)/'comment'(会話)/'arrival'(到着予定の回答) は鳴らさない = 画面に出るだけ。
+//   'answer'(あっちの返信)/'finish'(いつ終わる?)/'internal'(現場からの社内連絡) と、「行けない」返信(=擬似タイプ 'no')。
+//   'sent'(自分たちが出した連絡)/'comment'(会話)/'arrival'(到着予定の回答) は既定では鳴らさない = 画面に出るだけ。
 const CONTACT_BEEP_TYPES = ['answer', 'internal', 'finish'];
-const contactShouldBeep = (ev) => !!ev && (ev.no || CONTACT_BEEP_TYPES.includes(ev.type));
+const contactShouldBeep = (ev, types) => {
+  if (!ev) return false;
+  const list = Array.isArray(types) ? types : [...CONTACT_BEEP_TYPES, 'no'];
+  return list.includes(ev.no ? 'no' : ev.type);
+};
 // 通知音の設定。既定ON。うるさければ連絡タブの設定でOFFにできる。
 const contactSoundOn = (settings) => settings?.contactSound?.enabled !== false;
+// 通知音(軽いビープ)の詳細設定。種類/回数/高さ/音量。
+const CONTACT_SOUND_DEFAULTS = { count: 2, freq: 880, volume: 0.25, types: ['answer', 'internal', 'finish', 'no'] };
+const contactSoundCfg = (settings) => ({ ...CONTACT_SOUND_DEFAULTS, ...(settings?.contactSound || {}) });
+// 画面内トースト(フォアグラウンド受信表示)の設定。緊急とみなす言葉/自動で消える秒数/同時に出す最大数。
+const CONTACT_TOAST_DEFAULTS = { urgentWords: ['修正依頼', '呼出', '社内連絡', '行けない', '至急'], autoHideSec: 10, maxStack: 3 };
+const contactToastCfg = (settings) => ({ ...CONTACT_TOAST_DEFAULTS, ...(settings?.contactToast || {}) });
+const contactToastWords = (cfg) => (Array.isArray(cfg.urgentWords) ? cfg.urgentWords : CONTACT_TOAST_DEFAULTS.urgentWords).map(x => String(x || '').trim()).filter(Boolean);
+// 画面内ティッカー(左下の未読)の設定。表示件数。
+const CONTACT_TICKER_DEFAULTS = { maxShown: 3 };
+const contactTickerCfg = (settings) => ({ ...CONTACT_TICKER_DEFAULTS, ...(settings?.contactTicker || {}) });
 // ============================================================
 // 連絡アラーム(A: 画面を開いている時「確認」を押すまで鳴り続ける)
 //   携帯のアラーム/着信のように、緊急連絡が来たら音+バイブ+全画面で鳴らし続け、確認を押すまで止めない。
@@ -3821,31 +3838,40 @@ const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, li
 // 画面を開いている時の受信表示(閉じている時はService Worker+ブラウザ通知が担当)
 // 緊急かどうかは文面で見る(FCMのpayloadに種類が入っていないため)。誤って緊急にしても「押すまで残る」だけで害は小さく、
 //   取りこぼす方(消えて気づかない)が致命的なので、この向きに倒している。
-const contactToastUrgent = (m) => /修正依頼|呼出|社内連絡|行けない|至急/.test(String(m?.title || '') + String(m?.body || ''));
-const ForegroundPushToast = ({ ready }) => {
+// 緊急とみなす文面か。既定は 修正依頼|呼出|社内連絡|行けない|至急。設定で言葉を足せる。
+const contactToastUrgent = (m, words) => {
+  const list = Array.isArray(words) ? words : CONTACT_TOAST_DEFAULTS.urgentWords;
+  const s = String(m?.title || '') + String(m?.body || '');
+  return list.some(w => w && s.includes(w));
+};
+const ForegroundPushToast = ({ ready, settings }) => {
   // ⚠1件しか持たないと、未読の緊急トーストが後から来た1本(例: 到着予定の回答)で黙って上書きされて消える。
-  //   最大3件まで積み、緊急は押すまで残す。
+  //   最大N件まで積み、緊急は押すまで残す。件数・自動で消える秒数・緊急の言葉は設定で変えられる。
+  const cfg = contactToastCfg(settings);
+  const cfgRef = useRef(cfg); cfgRef.current = cfg;
+  const words = contactToastWords(cfg);
   const [msgs, setMsgs] = useState([]);
   const drop = (key) => setMsgs(ms => ms.filter(x => x.key !== key));
   useEffect(() => {
     if (!ready) return;
     let unsub = null; let dead = false;
-    listenForegroundPush((m) => setMsgs(ms => [...ms, { ...m, at: Date.now(), key: `${Date.now()}-${Math.random()}` }].slice(-3)))
+    listenForegroundPush((m) => setMsgs(ms => [...ms, { ...m, at: Date.now(), key: `${Date.now()}-${Math.random()}` }].slice(-Math.max(1, Math.floor(Number(cfgRef.current.maxStack) || 3)))))
       .then(u => { if (dead) { try { u(); } catch (e) { /* noop */ } } else unsub = u; });
     return () => { dead = true; if (unsub) { try { unsub(); } catch (e) { /* noop */ } } };
-  }, [ready]);
-  // 緊急でないものだけ10秒で自動的に消す
+  }, [ready]); // eslint-disable-line react-hooks/exhaustive-deps
+  // 緊急でないものだけ 指定秒(既定10秒)で自動的に消す
   useEffect(() => {
-    const soft = msgs.filter(m => !contactToastUrgent(m));
+    const hideMs = Math.max(1000, (Number(cfg.autoHideSec) || 10) * 1000);
+    const soft = msgs.filter(m => !contactToastUrgent(m, words));
     if (!soft.length) return;
-    const ts = soft.map(m => setTimeout(() => drop(m.key), Math.max(1000, 10000 - (Date.now() - m.at))));
+    const ts = soft.map(m => setTimeout(() => drop(m.key), Math.max(500, hideMs - (Date.now() - m.at))));
     return () => ts.forEach(t => clearTimeout(t));
-  }, [msgs]);
+  }, [msgs]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!msgs.length) return null;
   return (
     <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[999] max-w-md w-[calc(100%-2rem)] flex flex-col gap-2">
       {msgs.map(msg => {
-        const urgentToast = contactToastUrgent(msg);
+        const urgentToast = contactToastUrgent(msg, words);
         return (
           <div key={msg.key} className="cursor-pointer" onClick={() => drop(msg.key)}>
             <div className={`text-white rounded-xl shadow-2xl px-4 py-3 flex items-start gap-2.5 border-2 ${urgentToast ? 'bg-rose-700 border-rose-300 animate-pulse' : 'bg-slate-800 border-slate-600'}`}>
@@ -4809,6 +4835,62 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   到着予定の回答や会話、こちらから出した連絡では鳴りません（全部鳴らすと必ず無視されるようになるため）。
                 </span>
               </div>
+            );
+          })()}
+          {/* 🔧 画面内の通知（音・トースト・ティッカー）の細かい設定 */}
+          {(() => {
+            const sc = contactSoundCfg(settings);
+            const tc = contactToastCfg(settings);
+            const kc = contactTickerCfg(settings);
+            const setSC = (patch) => saveSettings({ contactSound: { ...(settings?.contactSound || {}), ...patch } });
+            const setTC = (patch) => saveSettings({ contactToast: { ...(settings?.contactToast || {}), ...patch } });
+            const setKC = (patch) => saveSettings({ contactTicker: { ...(settings?.contactTicker || {}), ...patch } });
+            const num = (v, def = 0) => { const n = Number(v); return (isFinite(n) && n >= 0) ? n : def; };
+            const soundTypes = Array.isArray(sc.types) ? sc.types : CONTACT_SOUND_DEFAULTS.types;
+            const TYPE_LABELS = [['answer', '返信'], ['no', '行けない'], ['internal', '社内連絡'], ['finish', 'いつ終わる?'], ['arrival', '到着回答'], ['comment', '会話']];
+            const toggleType = (t) => setSC({ types: soundTypes.includes(t) ? soundTypes.filter(x => x !== t) : [...soundTypes, t] });
+            const toastWords = contactToastWords(tc);
+            return (
+              <details className="border border-slate-200 rounded-lg">
+                <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🔧 画面内の通知（音・トースト・ティッカー）の細かい設定</summary>
+                <div className="p-3 flex flex-col gap-3">
+                  <div className="bg-white rounded-lg border border-amber-200 px-3 py-2 flex flex-col gap-1.5">
+                    <div className="text-xs font-black text-amber-900">🔔 通知音（軽く鳴らす方・アラームとは別）</div>
+                    <div className="flex flex-wrap gap-1.5 items-center">
+                      <span className="text-[11px] font-bold text-slate-500">鳴らす種類:</span>
+                      {TYPE_LABELS.map(([t, lbl]) => (
+                        <button key={t} onClick={() => toggleType(t)} className={`px-2 py-0.5 rounded-lg text-[11px] font-black border ${soundTypes.includes(t) ? 'bg-amber-500 border-amber-600 text-white' : 'bg-white border-slate-300 text-slate-500'}`}>{lbl}</button>
+                      ))}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">回数<input type="number" min="1" defaultValue={sc.count} onBlur={e => setSC({ count: Math.max(1, num(e.target.value, sc.count)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" /></label>
+                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">高さ<input type="number" min="50" defaultValue={sc.freq} onBlur={e => setSC({ freq: Math.max(50, num(e.target.value, sc.freq)) })} className="w-20 border border-slate-300 rounded px-1.5 py-1 text-center" />Hz</label>
+                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">音量<input type="range" min="0" max="1" step="0.05" defaultValue={sc.volume} onChange={e => setSC({ volume: num(e.target.value, sc.volume) })} className="w-24 accent-amber-500" /></label>
+                      <button onClick={() => { contactUnlockAudio(); setTimeout(() => contactBeep(sc.count, sc.freq, sc.volume), 120); }} className="px-2.5 py-1 rounded-lg text-[11px] font-black bg-amber-100 border border-amber-300 text-amber-800">🔊 試す</button>
+                    </div>
+                  </div>
+                  <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-col gap-1.5">
+                    <div className="text-xs font-black text-slate-700">💬 画面内トースト（上に出る通知）</div>
+                    <div className="flex flex-col gap-1">
+                      <span className="text-[11px] font-bold text-slate-500">「緊急」とみなす言葉（含むと自動で消えず残る）</span>
+                      <div className="flex flex-wrap gap-1">
+                        {toastWords.map(w => (
+                          <span key={w} className="inline-flex items-center gap-1 bg-rose-50 border border-rose-200 rounded-full px-2 py-0.5 text-[11px] font-bold text-rose-700">{w}<button onClick={() => setTC({ urgentWords: toastWords.filter(x => x !== w) })} className="text-rose-400 hover:text-rose-700"><X className="w-3 h-3" /></button></span>
+                        ))}
+                        <input placeholder="言葉を追加+Enter" onKeyDown={e => { if (e.key === 'Enter') { const v = e.target.value.trim(); if (v && !toastWords.includes(v)) setTC({ urgentWords: [...toastWords, v] }); e.target.value = ''; } }} className="border border-slate-300 rounded-lg px-2 py-0.5 text-[11px] w-28" />
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">緊急以外が自動で消えるまで<input type="number" min="1" defaultValue={tc.autoHideSec} onBlur={e => setTC({ autoHideSec: Math.max(1, num(e.target.value, tc.autoHideSec)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" />秒</label>
+                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">同時に出す最大<input type="number" min="1" defaultValue={tc.maxStack} onBlur={e => setTC({ maxStack: Math.max(1, num(e.target.value, tc.maxStack)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" />件</label>
+                    </div>
+                  </div>
+                  <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
+                    <div className="text-xs font-black text-slate-700">📋 左下ティッカー（未読の連絡）</div>
+                    <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">表示件数<input type="number" min="1" defaultValue={kc.maxShown} onBlur={e => setKC({ maxShown: Math.max(1, num(e.target.value, kc.maxShown)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" />件</label>
+                  </div>
+                </div>
+              </details>
             );
           })()}
           {/* 🚨 連絡アラーム — 「確認」を押すまで鳴り続ける(携帯のアラーム/着信のように)。全部ここで細かく設定できる。 */}
@@ -31005,10 +31087,11 @@ export default function App() {
    const beepedRef = useRef(new Set());
    useEffect(() => {
      if (RENRAKU_PORTAL || !contactFeatureOn || !contactSoundOn(settings)) return;
-     const fresh = (contactUnseen || []).filter(ev => contactShouldBeep(ev) && !beepedRef.current.has(ev.key));
+     const sc = contactSoundCfg(settings);
+     const fresh = (contactUnseen || []).filter(ev => contactShouldBeep(ev, sc.types) && !beepedRef.current.has(ev.key));
      if (!fresh.length) return;
      // 鳴らせた時だけ「鳴らした」と記録する。解禁前(音が出ない)に記録すると、その連絡は二度と鳴らなくなる。
-     if (contactBeep(2)) fresh.forEach(ev => beepedRef.current.add(ev.key));
+     if (contactBeep(sc.count, sc.freq, sc.volume)) fresh.forEach(ev => beepedRef.current.add(ev.key));
    }, [contactUnseen, contactFeatureOn, settings]); // eslint-disable-line react-hooks/exhaustive-deps
    // 到着回答→検査リスト反映モーダル (ティッカー/連絡タブ詳細のどちらからでも開ける)
    const [arrivalApply, setArrivalApply] = useState(null); // {reqId, itemIdx}
@@ -33524,7 +33607,7 @@ export default function App() {
            </div>
          )}
          <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={contactSettings} pushTokens={pushTokens} notifyPush={notifyContactPush} deleteData={deleteData} templates={templates} />
-         <ForegroundPushToast ready={!!db} />
+         <ForegroundPushToast ready={!!db} settings={contactSettings} />
          {/* 組立が緊急連絡に気づくよう、確認を押すまで鳴り続けるアラーム(設定で細かく調整・既定OFF) */}
          <ContactAlarm ready={!!db} settings={contactSettings} />
        </>
@@ -33554,12 +33637,12 @@ export default function App() {
      <div className="h-screen bg-slate-100 font-sans flex flex-col text-slate-900 overflow-hidden relative">
        <MascotFx lots={lots} settings={settings} onSaveSettings={saveSettings} />
        {/* プッシュ通知のフォアグラウンド表示(画面を開いている時。閉じている時はブラウザ通知) */}
-       <ForegroundPushToast ready={!!db} />
+       <ForegroundPushToast ready={!!db} settings={settings} />
        {/* 連絡アラーム: 緊急連絡は確認を押すまで鳴り続ける(設定で細かく調整・既定OFF) */}
        {contactFeatureOn && <ContactAlarm ready={!!db} settings={settings} extraEvents={contactAlarmEvents} />}
        {/* 返信の画面内通知: どのタブに居ても左下に出る。到着回答は1タップで検査リストへ反映 */}
        {contactFeatureOn && activeTab !== 'contact' && (
-         <ContactReplyTicker events={contactUnseen} onSeen={markContactSeen}
+         <ContactReplyTicker events={contactUnseen} onSeen={markContactSeen} settings={settings}
            onOpenTab={() => { setActiveTab('contact'); markContactSeen(); }}
            onApply={(ev) => setArrivalApply({ reqId: ev.reqId, itemIdx: ev.itemIdx })} />
        )}
