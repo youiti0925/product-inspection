@@ -10628,18 +10628,22 @@ const GESTURE_DEFS = [
     { key: 'Thumb_Down', emoji: '👎', label: '親指下' },
     { key: 'ILoveYou', emoji: '🤟', label: '親指+人差指+小指' },
 ];
-// 製品は一時停止が休憩/中断理由システムと絡むため、試験版の動作は完了/開始系のみ(最終検査は停止/再開もある)
+// 製品は「全台まとめて」と「1台ずつ」の両方があり得るので、どちらで開始するかを**サインごとに割り当てて現場がその場で選べる**ようにする。
+//   (最終検査は項目×全台が基本なので まとめて のみ。製品の一時停止は休憩/中断理由システムと絡むため試験版では扱わない)
 const GESTURE_ACTIONS = [
     { key: 'none', label: '— 使わない —', short: '' },
-    { key: 'complete_next', label: '計測中を完了 → 次を開始', short: '完了→次' },
+    { key: 'complete_next', label: '完了 → 次の工程を【全台まとめて】開始', short: '完了→次(全台)' },
+    { key: 'complete_next_one', label: '完了 → 次の【1台だけ】開始', short: '完了→次(1台)' },
     { key: 'complete_only', label: '計測中を完了(次は開始しない)', short: '完了' },
-    { key: 'start_next', label: '次の未着手を開始(完了しない)', short: '次を開始' },
+    { key: 'start_next', label: '次の工程を【全台まとめて】開始(完了しない)', short: '次(全台)' },
+    { key: 'start_next_one', label: '次の【1台だけ】開始(完了しない)', short: '次(1台)' },
 ];
 const GESTURE_ACTION_SHORT = Object.fromEntries(GESTURE_ACTIONS.map(a => [a.key, a.short]));
 const GESTURE_DEFAULT_CFG = {
     holdMs: 1800, cooldownMs: 4000, minScore: 0.55, res: 640, beep: true,
     flash: true, flashMs: 1600, flashSize: 'huge', // 発火時の全画面表示(離れていても見える)
-    map: { Open_Palm: 'complete_next', Thumb_Up: 'complete_next', Victory: 'none', Closed_Fist: 'none', Pointing_Up: 'none', Thumb_Down: 'none', ILoveYou: 'none' },
+    // 既定=✋で全台まとめて / 👍で1台ずつ。現場はサインの出し分けで切り替えられる(設定で自由に変更可)。
+    map: { Open_Palm: 'complete_next', Thumb_Up: 'complete_next_one', Victory: 'none', Closed_Fist: 'none', Pointing_Up: 'none', Thumb_Down: 'none', ILoveYou: 'none' },
 };
 // 発火した瞬間だけ画面いっぱいに「認識OK＋次にやること」を出す。1.5m離れていても読めるよう vw 単位の特大文字。
 //   操作は一切奪わない(pointer-events-none)。表示時間・文字サイズ・ON/OFFは設定で変えられる。
@@ -10755,7 +10759,10 @@ const GestureConfigModal = ({ cfg, unitWord = '工程', onSave, onClose }) => {
                             <div><b>使い方:</b> カスタムモードの作業画面でヘッダーの✋ボタンでON。カメラに向けて割り当てたサインを<b>設定した秒数キープ</b>すると発火します(左下の小窓に緑のゲージが伸びます)。発火するとピッと鳴って画面に結果が出ます。</div>
                             <div><b>距離の目安:</b> 標準画質で<b>0.5〜1.5m</b>。遠い・反応が悪い時は「高精細」へ。<b>明るい場所</b>ほど強く、<b>手のひらはカメラへ正面向け</b>が一番効きます。</div>
                             <div><b>誤反応する時:</b> ①キープ時間を長く(2.5〜3秒) ②感度を「厳しい」に ③使うサインを普段の作業で出ない形(🤟など)に変える — の順で試してください。</div>
-                            <div><b>「完了→次」の中身:</b> いま計測中の{unitWord}を全部完了(まとめて開始のバッチは合計時間÷台数の按分ルール)→ 次の<b>全台未着手</b>の{unitWord}を<b>全台まとめて開始</b>します(1台だけではありません)。<b>途中まで手が付いている{unitWord}は飛ばして</b>、まだ誰も触っていない次の{unitWord}へ進みます。ロット1回(段取り)工程・分割測定連動・NG・修正中には触りません。厳密モード中の開始はタップのみ(サインでは完了だけ)。</div>
+                            <div><b>⭐ 全台まとめて / 1台だけ は「出すサイン」で選べます:</b> 製品検査は<b>まとめてやる時と1台ずつやる時の両方</b>があるので、動作を分けてあります。既定では <b>✋＝完了→次を全台まとめて</b>、<b>👍＝完了→次を1台だけ</b>。その場の状況でサインを使い分けてください（割り当ては上の表で自由に変えられます）。</div>
+                            <div><b>【全台まとめて】の中身:</b> いま計測中の{unitWord}を全部完了(まとめて開始のバッチは合計時間÷台数の按分)→ <b>まだ誰も触っていない</b>次の{unitWord}を全台まとめて開始。<b>途中まで手が付いている{unitWord}は飛ばします</b>(混ざった状態を壊さないため)。</div>
+                            <div><b>【1台だけ】の中身:</b> 計測中を完了→ {unitWord}順・台順で<b>いちばん最初の未着手の台を1台だけ</b>開始します。<b>途中まで進んだ{unitWord}の"続きの台"もそのまま拾う</b>ので、1台ずつ流していけます。1台計測なので時間は按分せず<b>その台に満額</b>で付きます。</div>
+                            <div>どちらも ロット1回(段取り)工程・分割測定連動・NG・修正中には触りません。厳密モード中の開始はタップのみ(サインでは完了だけ)。</div>
                             <div><b>離れて使う時:</b> 「📺 画面いっぱいに出す」をONにすると、サインが通った瞬間に<b>次にやること</b>が画面全体に特大で出ます。1.5mくらい離れていても読めます。表示時間と文字の大きさも変えられます。</div>
                             <div><b>プライバシー:</b> 映像はこの端末の中で判定するだけで、<b>録画・保存・送信は一切ありません</b>。作業画面を閉じるとカメラは必ず止まります。</div>
                             <div><b>電池:</b> ON中はカメラと認識が動くぶん電池を使います。使う時だけONにしてください。</div>
@@ -12049,7 +12056,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const base = tasksRef.current; const now = Date.now();
     const nt = { ...base };
     const doneTitles = []; let doneN = 0; const doneSIdxs = [];
-    if (mode !== 'start_next') {
+    if (mode === 'complete_next' || mode === 'complete_next_one' || mode === 'complete_only') {
       // バッチ計測中(まとめて開始)の工程: voiceBatchComplete と同じ按分(合計壁時計÷台数・batchStartedAt世代一致)
       const groups = new Map();
       Object.entries(base).forEach(([key, t]) => {
@@ -12079,11 +12086,34 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         }
       });
     }
-    let startedTitle = null; let startedSIdx = null; let strictNote = '';
+    // 開始のしかたは2通り。どちらを使うかは「どのサインを出したか」で現場がその場で選ぶ。
+    //   全台まとめて: まだ誰も触っていない工程を丸ごと開始(途中まで進んだ工程は壊さないよう飛ばす)
+    //   1台だけ     : 工程順→台順で最初の未着手を1台だけ開始(途中まで進んだ工程の"続きの台"もそのまま拾う)
+    const oneUnit = mode === 'complete_next_one' || mode === 'start_next_one';
+    let startedLabel = null; let startedBatchSIdx = null; let strictNote = '';
     if (mode !== 'complete_only') {
       if (optimalNextMove && strictOrderMode) {
         // 厳密モード中の「開始」は推奨順の管理下なのでサインでは行わない(完了だけ有効)
         strictNote = doneN ? '（厳密モード中: 次の開始はタップで）' : '厳密モード中はサインで開始できません（タップで開始してください）';
+      } else if (oneUnit) {
+        let found = false;
+        for (let sIdx = 0; sIdx < localSteps.length && !found; sIdx++) {
+          const st = localSteps[sIdx];
+          if (!st || st.lotOnce) continue;
+          if (rotaryConfig?.enabled && st.rotaryLink && db) continue;
+          for (let u = 0; u < lot.quantity; u++) {
+            const key = getTaskKey(sIdx, u);
+            const t = nt[key];
+            if (!t || t.status === 'waiting') {
+              const cur = t || { status: 'waiting', duration: 0, startTime: null };
+              // 1台計測なので batchOwner は付けない(完了時に満額で記録される=按分しない)
+              nt[key] = { ...cur, status: 'processing', startTime: now, firstStartTime: cur.firstStartTime || now, batchOwner: null, batchStartedAt: null };
+              startedLabel = `${st.title}（${u + 1}台目）`;
+              found = true;
+              break;
+            }
+          }
+        }
       } else {
         for (let sIdx = 0; sIdx < localSteps.length; sIdx++) {
           const st = localSteps[sIdx];
@@ -12100,38 +12130,40 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
               const cur = nt[key] || { status: 'waiting', duration: 0, startTime: null };
               nt[key] = { ...cur, status: 'processing', startTime: now, firstStartTime: cur.firstStartTime || now, batchOwner: sIdx, batchStartedAt: now };
             }
-            startedTitle = st.title; startedSIdx = sIdx;
+            startedLabel = `${st.title}（全${lot.quantity}台）`; startedBatchSIdx = sIdx;
             break;
           }
         }
       }
     }
-    if (!doneN && startedSIdx == null) {
+    if (!doneN && !startedLabel) {
+      const why = strictNote
+        ? '次の工程は画面をタップで開始してください'
+        : (oneUnit ? '計測中の工程も、未着手の台もありません' : '計測中の工程も、まるごと未着手の工程もありません（途中まで進んだ工程は「1台だけ」のサインで続けられます）');
       showGestureToast(strictNote || '操作の対象がありません');
-      showGestureFlash('⚠', strictNote ? '厳密モード中です' : '対象がありません', strictNote ? '次の工程は画面をタップで開始してください' : '計測中の工程も、未着手の工程もありません', 'warn');
+      showGestureFlash('⚠', strictNote ? '厳密モード中です' : '対象がありません', why, 'warn');
       return;
     }
     setTasks(nt);
     setBatchStartTimes(prev => {
       const c = { ...prev };
       doneSIdxs.forEach(s => { delete c[s]; });
-      if (startedSIdx != null) c[startedSIdx] = now;
+      if (startedBatchSIdx != null) c[startedBatchSIdx] = now;
       return c;
     });
     onSave({ tasks: nt, status: 'processing' });
     gestureBeep();
-    showGestureToast(`${doneN ? `✅ 完了: ${doneTitles.join('・') || `${doneN}件`}` : ''}${doneN && startedTitle ? ' → ' : ''}${startedTitle ? `▶ 開始: ${startedTitle}` : ''}${strictNote ? ` ${strictNote}` : ''}`);
-    // 全画面: いちばん大きく出すのは「次に何をやるか」。完了した工程は下に小さく添える。
+    showGestureToast(`${doneN ? `✅ 完了: ${doneTitles.join('・') || `${doneN}件`}` : ''}${doneN && startedLabel ? ' → ' : ''}${startedLabel ? `▶ 開始: ${startedLabel}` : ''}${strictNote ? ` ${strictNote}` : ''}`);
+    // 全画面: いちばん大きく出すのは「次に何をやるか」(全台か1台かも必ず添える)。完了した工程は下に小さく。
     showGestureFlash(
-      startedTitle ? '▶' : '✅',
-      startedTitle ? `次: ${startedTitle}` : '完了しました',
+      startedLabel ? '▶' : '✅',
+      startedLabel ? `次: ${startedLabel}` : '完了しました',
       doneN ? `完了: ${doneTitles.join('・') || `${doneN}件`}${strictNote ? ` ／ ${strictNote}` : ''}` : (strictNote || '次の工程は画面をタップで開始'),
     );
   };
   const gestureDo = (action) => {
-    if (action === 'complete_next') return gestureFire('complete_next');
-    if (action === 'complete_only') return gestureFire('complete_only');
-    if (action === 'start_next') return gestureFire('start_next');
+    if (!action || action === 'none') return;
+    gestureFire(action);
   };
   const gestureDoRef = useRef(gestureDo);
   gestureDoRef.current = gestureDo;
