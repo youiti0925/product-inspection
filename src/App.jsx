@@ -3906,6 +3906,17 @@ const ContactAlarm = ({ ready, settings, extraEvents }) => {
   useEffect(() => {
     if (!active) return;
     startedRef.current = Date.now(); countRef.current = 0;
+    // 鳴っている間、画面を明るいまま保つ(暗転・スリープさせない)。
+    //   ⚠効くのは「アプリを開いている間」だけ。ロック画面が真っ黒の状態を点けることはできない(OSの仕様)。
+    //   そこは通知の重要度を「緊急」にして初めてAndroidが画面を点ける。
+    let wl = null; let released = false;
+    const acquire = async () => {
+      if (released || wl) return;
+      try { if (navigator.wakeLock && document.visibilityState === 'visible') wl = await navigator.wakeLock.request('screen'); } catch (e) { /* 非対応端末は黙って諦める */ }
+    };
+    acquire();
+    const onVis = () => { if (document.visibilityState === 'visible') acquire(); };
+    document.addEventListener('visibilitychange', onVis);
     const ring = () => {
       const c = cfgRef.current;
       contactAlarmRing(c);
@@ -3918,7 +3929,12 @@ const ContactAlarm = ({ ready, settings, extraEvents }) => {
     ring();
     const iv = Math.max(0.2, Number(cfgRef.current.intervalSec) || 3) * 1000;
     timerRef.current = setInterval(ring, iv);
-    return () => { if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; } };
+    return () => {
+      released = true;
+      document.removeEventListener('visibilitychange', onVis);
+      if (wl) { try { wl.release(); } catch (e) { /* noop */ } wl = null; }
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    };
   }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!active) return null;
   return (
