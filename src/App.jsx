@@ -3624,6 +3624,76 @@ const CONTACT_BEEP_TYPES = ['answer', 'internal', 'finish'];
 const contactShouldBeep = (ev) => !!ev && (ev.no || CONTACT_BEEP_TYPES.includes(ev.type));
 // 通知音の設定。既定ON。うるさければ連絡タブの設定でOFFにできる。
 const contactSoundOn = (settings) => settings?.contactSound?.enabled !== false;
+// ============================================================
+// 連絡アラーム(A: 画面を開いている時「確認」を押すまで鳴り続ける)
+//   携帯のアラーム/着信のように、緊急連絡が来たら音+バイブ+全画面で鳴らし続け、確認を押すまで止めない。
+//   ⚠これが効くのは「アプリを開いている間」だけ(閉じている時はOSの通知が担当。B=requireInteraction)。
+//   秒数・回数に上限は設けない(0=無制限=触るまで)。ON/OFF・数値・色まで全部 設定で変えられる。
+// ============================================================
+const CONTACT_ALARM_DEFAULTS = {
+  enabled: false,          // アラーム全体のON/OFF(既定OFF=まず設定で意識して有効化してもらう)
+  triggers: ['修正依頼', '呼出', '社内連絡', '行けない', '至急', '再通知'],
+  sound: true,
+  freq: 880,
+  toneCount: 3,
+  volume: 0.35,
+  intervalSec: 3,
+  maxSec: 0,               // 0=無制限=触るまで
+  maxCount: 0,             // 0=無制限
+  vibrate: true,
+  vibratePattern: '400,150,400',
+  flash: true,
+  flashColor: '#e11d48',
+  quietEnabled: false,
+  quietFrom: '22:00',
+  quietTo: '6:00',
+};
+const contactAlarmCfg = (settings) => ({ ...CONTACT_ALARM_DEFAULTS, ...(settings?.contactAlarm || {}) });
+const contactAlarmTriggers = (cfg) => (Array.isArray(cfg.triggers) ? cfg.triggers : CONTACT_ALARM_DEFAULTS.triggers).map(x => String(x || '').trim()).filter(Boolean);
+const contactAlarmMatches = (cfg, text) => { const s = String(text || ''); return contactAlarmTriggers(cfg).some(w => s.includes(w)); };
+const contactAlarmInQuiet = (cfg, d = new Date()) => {
+  if (!cfg.quietEnabled) return false;
+  const toMin = (hhmm) => { const m = String(hhmm || '').match(/(\d{1,2}):(\d{2})/); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+  const from = toMin(cfg.quietFrom), to = toMin(cfg.quietTo);
+  if (from == null || to == null) return false;
+  const now = d.getHours() * 60 + d.getMinutes();
+  return from <= to ? (now >= from && now < to) : (now >= from || now < to);
+};
+const contactAlarmRing = (cfg) => {
+  try {
+    if (cfg.sound && contactAudioReady()) {
+      const ctx = contactAudioCtx;
+      const n = Math.max(1, Math.floor(Number(cfg.toneCount) || 3));
+      const vol = Math.max(0, Math.min(1, Number(cfg.volume) || 0.35));
+      const freq = Math.max(50, Number(cfg.freq) || 880);
+      for (let i = 0; i < n; i++) {
+        const t0 = ctx.currentTime + i * 0.22;
+        const osc = ctx.createOscillator(); const gain = ctx.createGain();
+        osc.type = 'square'; osc.frequency.setValueAtTime(freq, t0);
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t0 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.16);
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start(t0); osc.stop(t0 + 0.18);
+      }
+    }
+  } catch (e) { /* 音が出せない端末でも画面表示は出る */ }
+  try {
+    if (cfg.vibrate && typeof navigator !== 'undefined' && navigator.vibrate) {
+      const pat = String(cfg.vibratePattern || '400,150,400').split(',').map(x => Math.max(0, Math.round(Number(x.trim()) || 0)));
+      navigator.vibrate(pat.length ? pat : [400, 150, 400]);
+    }
+  } catch (e) { /* noop */ }
+};
+const CONTACT_EVENT_ALARM_LABEL = { internal: '社内連絡', finish: 'いつ終わる？の質問', answer: '返信がありました', arrival: '到着予定の回答', comment: '会話', sent: '送信' };
+const contactEventAlarmText = (ev) => ev?.no ? '⚠ 行けない と返信' : (CONTACT_EVENT_ALARM_LABEL[ev?.type] || '連絡');
+const CONTACT_OSNOTIFY_DEFAULTS = { requireInteraction: true, vibratePattern: '400,150,400' };
+const contactOsNotifyCfg = (settings) => ({ ...CONTACT_OSNOTIFY_DEFAULTS, ...(settings?.contactOsNotify || {}) });
+const contactOsNotifyOpts = (settings) => {
+  const c = contactOsNotifyCfg(settings);
+  const vibrate = String(c.vibratePattern || '').split(',').map(x => Math.max(0, Math.round(Number(x.trim()) || 0))).filter((x, i, a) => a.length > 0);
+  return { requireInteraction: c.requireInteraction !== false, vibrate: vibrate.length ? vibrate : undefined };
+};
 // ---- 検査アプリ共通の連絡設定(宛先グループ・班メンバー) ----
 // 「組立の班」は製品検査でも最終検査でも同じ相手なので、アプリごとの棚(APP_DATA_ID)ではなく共通の棚に1つだけ置く。
 // → どちらの設定画面で直しても両方に効く。班を2つのアプリで別々に管理する必要がなくなる。
@@ -3716,6 +3786,7 @@ const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, li
   try {
     const cfg = pushCfgOf(settings);
     if (!cfg.vapidKey || !cfg.workerUrl) return;
+    const osOpts = contactOsNotifyOpts(settings); // 触るまで消さない/バイブ(閉じている時のOS通知)
     const alive = (pushTokens || []).filter(t => t && t.token && t.enabled !== false);
     const cleanup = (targets) => (res) => {
       if (res && Array.isArray(res.results) && deleteData) {
@@ -3731,7 +3802,7 @@ const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, li
     if (toSide === 'portal' && toGroup) targets = contactFilterByLevel(targets, settings, toGroup, toLevel);
     else if (internal && toSide === 'app') targets = contactInternalTargets(targets); // 社内連絡=検査の職長/工長へ
     if (targets.length) {
-      sendPushViaWorker(cfg.workerUrl, { tokens: [...new Set(targets.map(t => t.token))], title, body, link, tag }).then(cleanup(targets));
+      sendPushViaWorker(cfg.workerUrl, { tokens: [...new Set(targets.map(t => t.token))], title, body, link, tag, ...osOpts }).then(cleanup(targets));
     }
     if (toSide === 'portal') {
       const sent = new Set(targets.map(t => t.token));
@@ -3740,7 +3811,7 @@ const firePushNotify = (settings, pushTokens, { toGroup, toSide, title, body, li
         sendPushViaWorker(cfg.workerUrl, {
           tokens: [...new Set(ccTargets.map(t => t.token))],
           title: `📋 CC(${toGroup || 'あっち'}宛): ${title}`, body,
-          link: (typeof window !== 'undefined' ? `${window.location.origin}/` : link), tag: `${tag || 'cc'}-cc`,
+          link: (typeof window !== 'undefined' ? `${window.location.origin}/` : link), tag: `${tag || 'cc'}-cc`, ...osOpts,
         }).then(cleanup(ccTargets));
       }
     }
@@ -3790,6 +3861,77 @@ const ForegroundPushToast = ({ ready }) => {
           </div>
         );
       })}
+    </div>
+  );
+};
+
+// 連絡アラーム: 画面を開いている間、緊急連絡が来たら「確認」を押すまで 音+バイブ+全画面 で鳴らし続ける。
+//   トリガーは ①フォアグラウンドで受け取ったプッシュ(組立ポータル・検査側 共通) ②画面内フィード(検査側のみ・extraEvents)。
+//   ⚠既に鳴っている時は上書きしない(最初の緊急を優先。確認したら次の緊急へ)。
+const ContactAlarm = ({ ready, settings, extraEvents }) => {
+  const cfg = contactAlarmCfg(settings);
+  const [active, setActive] = useState(null); // { title, body }
+  const timerRef = useRef(null);
+  const startedRef = useRef(0);
+  const countRef = useRef(0);
+  const seenRef = useRef(new Set());
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg; // 鳴っている最中に設定を変えても最新を見る
+  const stop = () => {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    try { if (navigator.vibrate) navigator.vibrate(0); } catch (e) { /* noop */ }
+    setActive(null);
+  };
+  const trigger = (msg) => {
+    const c = cfgRef.current;
+    if (!c.enabled) return;
+    if (contactAlarmInQuiet(c)) return;
+    if (!contactAlarmMatches(c, `${msg.title || ''} ${msg.body || ''}`)) return;
+    setActive(prev => prev || { title: msg.title || '連絡', body: msg.body || '' });
+  };
+  useEffect(() => {
+    if (!ready) return;
+    let unsub = null, dead = false;
+    listenForegroundPush((m) => trigger(m)).then(u => { if (dead) { try { u(); } catch (e) { /* noop */ } } else unsub = u; });
+    return () => { dead = true; if (unsub) { try { unsub(); } catch (e) { /* noop */ } } };
+  }, [ready]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!extraEvents || !extraEvents.length) return;
+    extraEvents.forEach(ev => {
+      if (!ev || seenRef.current.has(ev.key)) return;
+      seenRef.current.add(ev.key);
+      trigger({ title: ev.title || '', body: ev.body || '' });
+    });
+  }, [extraEvents]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!active) return;
+    startedRef.current = Date.now(); countRef.current = 0;
+    const ring = () => {
+      const c = cfgRef.current;
+      contactAlarmRing(c);
+      countRef.current += 1;
+      const maxSec = Math.max(0, Number(c.maxSec) || 0);
+      const maxCount = Math.max(0, Number(c.maxCount) || 0);
+      if (maxSec > 0 && (Date.now() - startedRef.current) / 1000 >= maxSec) { stop(); return; }
+      if (maxCount > 0 && countRef.current >= maxCount) { stop(); return; }
+    };
+    ring();
+    const iv = Math.max(0.2, Number(cfgRef.current.intervalSec) || 3) * 1000;
+    timerRef.current = setInterval(ring, iv);
+    return () => { if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; } };
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!active) return null;
+  return (
+    <div onClick={stop} className="fixed inset-0 z-[1000] flex items-center justify-center cursor-pointer p-4"
+      style={{ background: cfg.flash ? undefined : 'rgba(0,0,0,0.65)' }}>
+      {cfg.flash && <div className="absolute inset-0 animate-pulse" style={{ background: cfg.flashColor || '#e11d48', opacity: 0.85 }} />}
+      <div className="relative bg-white rounded-2xl shadow-2xl border-4 border-rose-400 px-6 py-6 max-w-md w-full text-center flex flex-col gap-3">
+        <div className="text-6xl animate-bounce">🔔</div>
+        <div className="text-lg font-black text-rose-700 break-words">{active.title}</div>
+        {active.body && <div className="text-sm text-slate-600 break-words">{active.body}</div>}
+        <button onClick={(e) => { e.stopPropagation(); stop(); }} className="mt-1 px-6 py-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-lg font-black shadow-lg active:scale-95">確認しました（音を止める）</button>
+        <div className="text-[11px] text-slate-400">画面のどこを触っても止まります</div>
+      </div>
     </div>
   );
 };
@@ -4653,6 +4795,113 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               </div>
             );
           })()}
+          {/* 🚨 連絡アラーム — 「確認」を押すまで鳴り続ける(携帯のアラーム/着信のように)。全部ここで細かく設定できる。 */}
+          {(() => {
+            const a = contactAlarmCfg(settings);
+            const os = contactOsNotifyCfg(settings);
+            const setA = (patch) => saveSettings({ contactAlarm: { ...(settings?.contactAlarm || {}), ...patch } });
+            const setOs = (patch) => saveSettings({ contactOsNotify: { ...(settings?.contactOsNotify || {}), ...patch } });
+            const trigs = contactAlarmTriggers(a);
+            const COMMON_TRIGGERS = ['修正依頼', '呼出', '社内連絡', '行けない', '至急', '再通知', 'いつ終わ', '到着予定', '返信', 'CC'];
+            const toggleTrig = (w) => setA({ triggers: trigs.includes(w) ? trigs.filter(x => x !== w) : [...trigs, w] });
+            const num = (v, def = 0) => { const n = Number(v); return (isFinite(n) && n >= 0) ? n : def; };
+            const Toggle = ({ on, onClick, labelOn = 'ON', labelOff = 'OFF' }) => (
+              <button onClick={onClick} className={`px-2.5 py-1 rounded-full text-xs font-black shrink-0 ${on ? 'bg-rose-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{on ? labelOn : labelOff}</button>
+            );
+            const NumField = ({ label, value, onCommit, suffix, min = 0, step = 1, width = 'w-16' }) => (
+              <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
+                {label}
+                <input type="number" min={min} step={step} defaultValue={value} onBlur={e => onCommit(num(e.target.value, value))} className={`${width} border border-slate-300 rounded px-1.5 py-1 text-center`} />
+                {suffix}
+              </label>
+            );
+            return (
+              <details className="border-2 border-rose-200 bg-rose-50 rounded-lg">
+                <summary className="px-3 py-2 text-sm font-black text-rose-900 cursor-pointer select-none flex items-center gap-2">
+                  🚨 連絡アラーム（確認を押すまで鳴り続ける）
+                  <span className={`ml-1 text-[10px] font-black px-1.5 py-0.5 rounded-full ${a.enabled ? 'bg-rose-600 text-white' : 'bg-slate-300 text-slate-600'}`}>{a.enabled ? '有効' : '停止中'}</span>
+                </summary>
+                <div className="p-3 flex flex-col gap-3">
+                  <div className="text-[11px] text-slate-500 bg-white rounded-lg border border-rose-100 px-2.5 py-1.5">
+                    <b>アプリを開いている間</b>、下の言葉を含む連絡が来たら、<b>「確認」を押すまで音・バイブ・全画面で鳴らし続けます</b>。
+                    閉じている時はOSの通知（下の「B」）が担当します。<b>秒数・回数に上限はありません</b>（0＝無制限＝触るまで）。
+                  </div>
+                  <div className="flex items-center gap-2 bg-white rounded-lg border border-rose-200 px-3 py-2">
+                    <span className="text-sm font-black text-rose-900">アラーム全体</span>
+                    <Toggle on={a.enabled} onClick={() => setA({ enabled: !a.enabled })} labelOn="ON（鳴らす）" labelOff="OFF" />
+                    {a.enabled && (
+                      <button onClick={() => { contactUnlockAudio(); setTimeout(() => contactAlarmRing({ ...a, vibrate: true }), 120); }} className="ml-auto px-2.5 py-1 rounded-lg text-xs font-black bg-rose-100 border border-rose-300 text-rose-700 hover:bg-rose-200">🔊 試しに鳴らす</button>
+                    )}
+                  </div>
+                  {a.enabled && (<>
+                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-col gap-1.5">
+                      <div className="text-xs font-black text-slate-700">何で鳴らすか（この言葉を含む連絡だけ鳴らす）</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {COMMON_TRIGGERS.map(w => (
+                          <button key={w} onClick={() => toggleTrig(w)} className={`px-2 py-1 rounded-lg text-xs font-black border ${trigs.includes(w) ? 'bg-rose-600 border-rose-700 text-white' : 'bg-white border-slate-300 text-slate-500 hover:bg-slate-50'}`}>{w}</button>
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <input placeholder="言葉を追加（例: クレーム）" onKeyDown={e => { if (e.key === 'Enter') { const v = e.target.value.trim(); if (v && !trigs.includes(v)) setA({ triggers: [...trigs, v] }); e.target.value = ''; } }} className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs" />
+                        <span className="text-[10px] text-slate-400">Enterで追加</span>
+                      </div>
+                      {trigs.some(w => !COMMON_TRIGGERS.includes(w)) && (
+                        <div className="flex flex-wrap gap-1">
+                          {trigs.filter(w => !COMMON_TRIGGERS.includes(w)).map(w => (
+                            <span key={w} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-700">{w}<button onClick={() => toggleTrig(w)} className="text-slate-400 hover:text-rose-600"><X className="w-3 h-3" /></button></span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">🔊 音</span><Toggle on={a.sound} onClick={() => setA({ sound: !a.sound })} /></div>
+                      {a.sound && <>
+                        <NumField label="高さ" value={a.freq} onCommit={v => setA({ freq: v })} suffix="Hz" width="w-20" />
+                        <NumField label="回数" value={a.toneCount} onCommit={v => setA({ toneCount: v })} suffix="ピッ" />
+                        <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">音量
+                          <input type="range" min="0" max="1" step="0.05" defaultValue={a.volume} onChange={e => setA({ volume: num(e.target.value, a.volume) })} className="w-24 accent-rose-600" />
+                        </label>
+                      </>}
+                    </div>
+                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
+                      <span className="text-xs font-black text-slate-700 w-full">鳴らし方（上限なし）</span>
+                      <NumField label="間隔" value={a.intervalSec} onCommit={v => setA({ intervalSec: v })} suffix="秒ごと" step="0.5" min={0.2} />
+                      <NumField label="最大" value={a.maxSec} onCommit={v => setA({ maxSec: v })} suffix="秒で自動停止(0=無制限)" width="w-20" />
+                      <NumField label="最大" value={a.maxCount} onCommit={v => setA({ maxCount: v })} suffix="回で自動停止(0=無制限)" width="w-20" />
+                    </div>
+                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">📳 バイブ</span><Toggle on={a.vibrate} onClick={() => setA({ vibrate: !a.vibrate })} /></div>
+                      {a.vibrate && <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">パターン(ms)
+                        <input defaultValue={a.vibratePattern} onBlur={e => setA({ vibratePattern: e.target.value.trim() || '400,150,400' })} placeholder="400,150,400" className="w-32 border border-slate-300 rounded px-1.5 py-1 text-center" />
+                      </label>}
+                      <span className="text-[10px] text-slate-400">「振動,休み,振動…」をmsで。PCは効きません</span>
+                    </div>
+                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">💡 画面を点滅</span><Toggle on={a.flash} onClick={() => setA({ flash: !a.flash })} /></div>
+                      {a.flash && <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">色<input type="color" defaultValue={a.flashColor} onChange={e => setA({ flashColor: e.target.value })} className="w-10 h-7 rounded border border-slate-300" /></label>}
+                    </div>
+                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">🌙 夜間は鳴らさない</span><Toggle on={a.quietEnabled} onClick={() => setA({ quietEnabled: !a.quietEnabled })} /></div>
+                      {a.quietEnabled && <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
+                        <input type="time" defaultValue={a.quietFrom} onChange={e => setA({ quietFrom: e.target.value })} className="border border-slate-300 rounded px-1 py-0.5" /> 〜
+                        <input type="time" defaultValue={a.quietTo} onChange={e => setA({ quietTo: e.target.value })} className="border border-slate-300 rounded px-1 py-0.5" />（日をまたいでもOK）
+                      </label>}
+                    </div>
+                  </>)}
+                  <div className="bg-white rounded-lg border border-indigo-200 px-3 py-2 flex flex-col gap-1.5">
+                    <div className="text-xs font-black text-indigo-800">B. アプリを閉じている時のOS通知</div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-1.5"><span className="text-[11px] font-bold text-slate-600">触るまで通知を消さない</span><Toggle on={os.requireInteraction !== false} onClick={() => setOs({ requireInteraction: os.requireInteraction === false })} /></div>
+                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">通知のバイブ(ms)
+                        <input defaultValue={os.vibratePattern} onBlur={e => setOs({ vibratePattern: e.target.value.trim() })} placeholder="400,150,400" className="w-32 border border-slate-300 rounded px-1.5 py-1 text-center" />
+                      </label>
+                    </div>
+                    <div className="text-[10px] text-slate-400">閉じている時は「鳴らし続ける」はできません（OSの仕様）。代わりに通知を残す＋再通知（下の「通知のルール」）で気づかせます。iPhone/一部端末はバイブ指定が無視されます。</div>
+                  </div>
+                </div>
+              </details>
+            );
+          })()}
           {/* 型式の仕分け(ポータルの「しぼる」ボタン) — その他に落ちた頭文字をワンタップで振り分ける */}
           {(() => {
             const fams = portalModelFamiliesOf(settings);
@@ -4759,9 +5008,9 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                       {rm.on && (
                         <span className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
                           返信がない間、
-                          <input type="number" min="1" max="120" value={rm.min} onChange={e => saveRemind(kind, { min: Math.min(120, Math.max(1, Number(e.target.value) || 1)) })} className="w-12 border border-slate-300 rounded px-1 py-0.5 text-center" />
+                          <input type="number" min="1" value={rm.min} onChange={e => saveRemind(kind, { min: Math.max(1, Number(e.target.value) || 1) })} className="w-14 border border-slate-300 rounded px-1 py-0.5 text-center" />
                           分ごとに もう一度職長へ（最大
-                          <input type="number" min="1" max="10" value={rm.count} onChange={e => saveRemind(kind, { count: Math.min(10, Math.max(1, Number(e.target.value) || 1)) })} className="w-10 border border-slate-300 rounded px-1 py-0.5 text-center" />
+                          <input type="number" min="1" value={rm.count} onChange={e => saveRemind(kind, { count: Math.max(1, Number(e.target.value) || 1) })} className="w-14 border border-slate-300 rounded px-1 py-0.5 text-center" />
                           回）
                         </span>
                       )}
@@ -30725,6 +30974,8 @@ export default function App() {
      return contactFeedEvents(contactRequests, currentUserName).filter(ev => ev.at > contactSeenAt && !(ev.type === 'arrival' && ev.it?.applied));
    }, [contactFeatureOn, contactRequests, contactSeenAt, currentUserName]);
    useEffect(() => { if (activeTab === 'contact' && contactUnseen.length) markContactSeen(); }, [activeTab, contactUnseen.length]); // eslint-disable-line react-hooks/exhaustive-deps
+   // 連絡アラーム(確認を押すまで鳴り続ける)用のイベント。検査側は画面内フィードから拾う(返信はプッシュが飛ばないことがあるため)。
+   const contactAlarmEvents = useMemo(() => (contactUnseen || []).filter(ev => contactShouldBeep(ev)).map(ev => ({ key: ev.key, title: contactEventAlarmText(ev), body: '' })), [contactUnseen]);
    // アプリのアイコン(PCのタスクバー/スマホのホーム画面)に未読件数のバッジを出す。
    //   ⚠これが効くのは「アプリとしてインストール」した時だけ。ブラウザのタブのままだと何も起きない(エラーにもならない)。
    //   数はタブの赤バッジと同じ = 未読の返信。無ければ待ち件数ではなくバッジを消す(赤い丸を出しっぱなしにすると意味が薄れる)。
@@ -33258,6 +33509,8 @@ export default function App() {
          )}
          <ContactPortal lots={lots} contactRequests={contactRequests} arrivalTimes={arrivalTimes} saveData={saveData} settings={contactSettings} pushTokens={pushTokens} notifyPush={notifyContactPush} deleteData={deleteData} templates={templates} />
          <ForegroundPushToast ready={!!db} />
+         {/* 組立が緊急連絡に気づくよう、確認を押すまで鳴り続けるアラーム(設定で細かく調整・既定OFF) */}
+         <ContactAlarm ready={!!db} settings={contactSettings} />
        </>
      );
    }
@@ -33286,6 +33539,8 @@ export default function App() {
        <MascotFx lots={lots} settings={settings} onSaveSettings={saveSettings} />
        {/* プッシュ通知のフォアグラウンド表示(画面を開いている時。閉じている時はブラウザ通知) */}
        <ForegroundPushToast ready={!!db} />
+       {/* 連絡アラーム: 緊急連絡は確認を押すまで鳴り続ける(設定で細かく調整・既定OFF) */}
+       {contactFeatureOn && <ContactAlarm ready={!!db} settings={settings} extraEvents={contactAlarmEvents} />}
        {/* 返信の画面内通知: どのタブに居ても左下に出る。到着回答は1タップで検査リストへ反映 */}
        {contactFeatureOn && activeTab !== 'contact' && (
          <ContactReplyTicker events={contactUnseen} onSeen={markContactSeen}

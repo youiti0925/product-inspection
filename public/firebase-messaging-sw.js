@@ -24,6 +24,8 @@ messaging.onBackgroundMessage((payload) => {
     body: d.body || '',
     icon: '/favicon.svg',
     tag: d.tag || undefined,
+    renotify: d.tag ? true : undefined,          // 同じ用件の再通知でも鳴らし直す
+    requireInteraction: d.requireInteraction === '1', // 触るまで消さない(連絡アプリの設定)
     data: { link: d.link || '/' },
   });
 });

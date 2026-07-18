@@ -89,12 +89,12 @@ export async function listenForegroundPush(handler) {
 }
 
 // Worker経由でFCM送信。業務操作(Firestore書き込み)を止めないよう、失敗してもthrowしない。
-export async function sendPushViaWorker(workerUrl, { tokens, title, body, link, tag }) {
+export async function sendPushViaWorker(workerUrl, { tokens, title, body, link, tag, requireInteraction, vibrate }) {
   try {
     const res = await fetch(String(workerUrl).replace(/\/+$/, '') + '/fcm/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tokens, title, body, link, tag }),
+      body: JSON.stringify({ tokens, title, body, link, tag, requireInteraction, vibrate }),
     });
     return await res.json();
   } catch (e) {
