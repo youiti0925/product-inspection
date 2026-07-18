@@ -4602,7 +4602,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
     return (arrivalTimes || [])
       .filter(a => a && a.id && a.time && !a.viaReq && !viaReqKeys.has(`${a.id}@${a.date || ''}@${a.time}`))
       .map(a => ({
-        id: `self-${a.id}`, _self: true, kind: 'arrival',
+        id: `self-${a.id}`, _self: true, _docId: a.id, kind: 'arrival',
         to: a.group || '', from: a.by || '',
         orderNo: a.orderNo || '', model: a.model || '',
         message: '到着予定（相手が自分から登録）',
@@ -5234,7 +5234,16 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   <td className="px-2 py-2 whitespace-nowrap font-mono text-xs">{waiting ? <span className="text-amber-700 font-bold">{fmtContactElapsed(r.createdAt, nowTick)}</span> : <span className="text-slate-400">{rAt ? fmtContactElapsed(r.createdAt, rAt) : '—'}</span>}</td>
                   <td className="px-2 py-2 whitespace-nowrap font-mono text-xs text-slate-500">{rAt ? fmtContactTime(rAt) : '—'}</td>
                   {/* 返信が「来た」のか「不要なので無い」のかを色でも分ける(緑=返信あり / 灰=返信不要・待ち) */}
-                  <td className="px-3 py-2"><span className={`text-xs font-bold truncate block max-w-[30ch] ${r.answer?.choice === 'no' ? 'text-rose-700' : r.answer ? 'text-emerald-700' : 'text-slate-400 font-normal'}`} title={contactAnswerSummary(r)}>{contactAnswerSummary(r) || '—'}</span></td>
+                  <td className="px-3 py-2">
+                    <div className="flex items-center gap-1.5">
+                      <span className={`text-xs font-bold truncate block max-w-[26ch] ${r.answer?.choice === 'no' ? 'text-rose-700' : r.answer ? 'text-emerald-700' : 'text-slate-400 font-normal'}`} title={contactAnswerSummary(r)}>{contactAnswerSummary(r) || '—'}</span>
+                      {/* 自発の到着予定は行がクリックできない(詳細を開けない)ので、ここに削除ボタンを出す。
+                          実体は arrival_times(ロット単位)。消すとそのロットの🚚バッジも消える。 */}
+                      {r._self && r._docId && (
+                        <button onClick={(e) => { e.stopPropagation(); if (window.confirm('この到着予定を削除しますか？\n（検査リストのこのロットの🚚到着バッジも消えます）')) deleteData('arrival_times', r._docId); }} className="ml-auto p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded shrink-0" title="この到着予定を削除"><Trash2 className="w-3.5 h-3.5" /></button>
+                      )}
+                    </div>
+                  </td>
                   {/* 表から直接消せるように(今までは行→詳細を開く→削除、の2手だった)。行クリックで詳細が開くので伝播を止める。 */}
                   <td className="px-2 py-2 text-right">
                     <button
