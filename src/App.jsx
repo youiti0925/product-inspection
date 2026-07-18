@@ -10638,7 +10638,24 @@ const GESTURE_ACTIONS = [
 const GESTURE_ACTION_SHORT = Object.fromEntries(GESTURE_ACTIONS.map(a => [a.key, a.short]));
 const GESTURE_DEFAULT_CFG = {
     holdMs: 1800, cooldownMs: 4000, minScore: 0.55, res: 640, beep: true,
+    flash: true, flashMs: 1600, flashSize: 'huge', // 発火時の全画面表示(離れていても見える)
     map: { Open_Palm: 'complete_next', Thumb_Up: 'complete_next', Victory: 'none', Closed_Fist: 'none', Pointing_Up: 'none', Thumb_Down: 'none', ILoveYou: 'none' },
+};
+// 発火した瞬間だけ画面いっぱいに「認識OK＋次にやること」を出す。1.5m離れていても読めるよう vw 単位の特大文字。
+//   操作は一切奪わない(pointer-events-none)。表示時間・文字サイズ・ON/OFFは設定で変えられる。
+const GestureFlashOverlay = ({ flash }) => {
+    if (!flash) return null;
+    const warn = flash.tone === 'warn';
+    const huge = flash.size !== 'big';
+    return (
+        <div className="fixed inset-0 z-[90] flex flex-col items-center justify-center pointer-events-none px-6 text-center"
+             style={{ background: warn ? 'rgba(180,83,9,0.93)' : 'rgba(4,120,87,0.93)' }}>
+            <div style={{ fontSize: huge ? '13vw' : '9vw', lineHeight: 1 }} className="font-black text-white">{flash.icon || '✅'}</div>
+            <div style={{ fontSize: huge ? '3.2vw' : '2.4vw' }} className="font-black text-white/80 tracking-widest mt-2">{warn ? '認識しましたが…' : '認識OK'}</div>
+            <div style={{ fontSize: huge ? '6.5vw' : '4.5vw', lineHeight: 1.15 }} className="font-black text-white mt-3 max-w-[92vw] break-words">{flash.main}</div>
+            {flash.sub && <div style={{ fontSize: huge ? '3.4vw' : '2.6vw' }} className="font-bold text-white/85 mt-3 max-w-[90vw] break-words">{flash.sub}</div>}
+        </div>
+    );
 };
 const normalizeGestureCfg = (raw) => {
     const c = raw || {};
@@ -10710,13 +10727,36 @@ const GestureConfigModal = ({ cfg, unitWord = '工程', onSave, onClose }) => {
                             <span className="font-bold text-slate-700 text-xs">発火音を鳴らす</span>
                         </label>
                     </div>
+                    <div className="border-2 border-emerald-200 bg-emerald-50/60 rounded-lg p-3">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" checked={!!d.flash} onChange={e => set({ flash: e.target.checked })} className="w-4 h-4" />
+                            <span className="font-black text-emerald-800">📺 発火したら画面いっぱいに出す（離れていても見える）</span>
+                        </label>
+                        <div className="text-[10px] text-slate-500 mt-1">サインが通った瞬間だけ、画面全体に「認識OK」と<b>次にやること</b>を特大表示します。操作の邪魔はしません（すぐ消えます）。</div>
+                        {d.flash && (
+                            <div className="grid grid-cols-2 gap-3 mt-2">
+                                <label className="block">
+                                    <div className="font-bold text-slate-700 text-xs mb-1">表示時間: <b className="text-emerald-700">{(d.flashMs / 1000).toFixed(1)}秒</b></div>
+                                    <input type="range" min="500" max="4000" step="100" value={d.flashMs} onChange={e => set({ flashMs: Number(e.target.value) })} className="w-full" />
+                                </label>
+                                <label className="block">
+                                    <div className="font-bold text-slate-700 text-xs mb-1">文字の大きさ</div>
+                                    <select value={d.flashSize} onChange={e => set({ flashSize: e.target.value })} className="w-full border border-slate-200 rounded p-1.5 text-xs font-bold">
+                                        <option value="huge">特大(遠くから見る)</option>
+                                        <option value="big">大(近くで見る)</option>
+                                    </select>
+                                </label>
+                            </div>
+                        )}
+                    </div>
                     <details className="bg-sky-50 border border-sky-200 rounded-lg p-3">
                         <summary className="font-bold text-sky-800 cursor-pointer">❔ 使い方・コツ(ヘルプ)</summary>
                         <div className="mt-2 space-y-1.5 text-xs text-slate-700">
                             <div><b>使い方:</b> カスタムモードの作業画面でヘッダーの✋ボタンでON。カメラに向けて割り当てたサインを<b>設定した秒数キープ</b>すると発火します(左下の小窓に緑のゲージが伸びます)。発火するとピッと鳴って画面に結果が出ます。</div>
                             <div><b>距離の目安:</b> 標準画質で<b>0.5〜1.5m</b>。遠い・反応が悪い時は「高精細」へ。<b>明るい場所</b>ほど強く、<b>手のひらはカメラへ正面向け</b>が一番効きます。</div>
                             <div><b>誤反応する時:</b> ①キープ時間を長く(2.5〜3秒) ②感度を「厳しい」に ③使うサインを普段の作業で出ない形(🤟など)に変える — の順で試してください。</div>
-                            <div><b>「完了→次」の中身:</b> いま計測中の{unitWord}を全部完了(まとめて開始のバッチは合計時間÷台数の按分ルール)→ 次の<b>全台未着手</b>の{unitWord}をまとめて開始。ロット1回(段取り)工程・分割測定連動・NG・修正中には触りません。厳密モード中の開始はタップのみ(サインでは完了だけ)。</div>
+                            <div><b>「完了→次」の中身:</b> いま計測中の{unitWord}を全部完了(まとめて開始のバッチは合計時間÷台数の按分ルール)→ 次の<b>全台未着手</b>の{unitWord}を<b>全台まとめて開始</b>します(1台だけではありません)。<b>途中まで手が付いている{unitWord}は飛ばして</b>、まだ誰も触っていない次の{unitWord}へ進みます。ロット1回(段取り)工程・分割測定連動・NG・修正中には触りません。厳密モード中の開始はタップのみ(サインでは完了だけ)。</div>
+                            <div><b>離れて使う時:</b> 「📺 画面いっぱいに出す」をONにすると、サインが通った瞬間に<b>次にやること</b>が画面全体に特大で出ます。1.5mくらい離れていても読めます。表示時間と文字の大きさも変えられます。</div>
                             <div><b>プライバシー:</b> 映像はこの端末の中で判定するだけで、<b>録画・保存・送信は一切ありません</b>。作業画面を閉じるとカメラは必ず止まります。</div>
                             <div><b>電池:</b> ON中はカメラと認識が動くぶん電池を使います。使う時だけONにしてください。</div>
                         </div>
@@ -11981,6 +12021,16 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (gestureToastTimer.current) clearTimeout(gestureToastTimer.current);
     gestureToastTimer.current = setTimeout(() => setGestureToast(null), 5000);
   };
+  // 全画面フラッシュ(離れていても分かる)。設定でOFF/表示時間/文字サイズを変えられる。
+  const [gestureFlash, setGestureFlash] = useState(null);
+  const gestureFlashTimer = useRef(null);
+  const showGestureFlash = (icon, main, sub = '', tone = 'ok') => {
+    const cfg = gcfgRef.current;
+    if (!cfg.flash) return;
+    setGestureFlash({ icon, main, sub, tone, size: cfg.flashSize });
+    if (gestureFlashTimer.current) clearTimeout(gestureFlashTimer.current);
+    gestureFlashTimer.current = setTimeout(() => setGestureFlash(null), Math.max(400, cfg.flashMs));
+  };
   const gestureBeep = () => {
     if (!gcfgRef.current.beep) return;
     try {
@@ -12056,7 +12106,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         }
       }
     }
-    if (!doneN && startedSIdx == null) { showGestureToast(strictNote || '操作の対象がありません'); return; }
+    if (!doneN && startedSIdx == null) {
+      showGestureToast(strictNote || '操作の対象がありません');
+      showGestureFlash('⚠', strictNote ? '厳密モード中です' : '対象がありません', strictNote ? '次の工程は画面をタップで開始してください' : '計測中の工程も、未着手の工程もありません', 'warn');
+      return;
+    }
     setTasks(nt);
     setBatchStartTimes(prev => {
       const c = { ...prev };
@@ -12067,6 +12121,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     onSave({ tasks: nt, status: 'processing' });
     gestureBeep();
     showGestureToast(`${doneN ? `✅ 完了: ${doneTitles.join('・') || `${doneN}件`}` : ''}${doneN && startedTitle ? ' → ' : ''}${startedTitle ? `▶ 開始: ${startedTitle}` : ''}${strictNote ? ` ${strictNote}` : ''}`);
+    // 全画面: いちばん大きく出すのは「次に何をやるか」。完了した工程は下に小さく添える。
+    showGestureFlash(
+      startedTitle ? '▶' : '✅',
+      startedTitle ? `次: ${startedTitle}` : '完了しました',
+      doneN ? `完了: ${doneTitles.join('・') || `${doneN}件`}${strictNote ? ` ／ ${strictNote}` : ''}` : (strictNote || '次の工程は画面をタップで開始'),
+    );
   };
   const gestureDo = (action) => {
     if (action === 'complete_next') return gestureFire('complete_next');
@@ -12163,6 +12223,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (gestureStreamRef.current) { try { gestureStreamRef.current.getTracks().forEach(t => t.stop()); } catch (e) {} }
     if (gestureRecRef.current) { try { gestureRecRef.current.close(); } catch (e) {} }
     if (gestureToastTimer.current) clearTimeout(gestureToastTimer.current);
+    if (gestureFlashTimer.current) clearTimeout(gestureFlashTimer.current);
   }, []);
   // サイン操作の小窓+トースト+設定モーダル(fixed配置なのでどのモードでも安全に出せる)
   const gestureWidget = (
@@ -12209,6 +12270,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       {gestureToast && (
         <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[65] bg-emerald-600 text-white rounded-xl shadow-2xl px-4 py-2 text-sm font-black max-w-[80vw] truncate pointer-events-none">{gestureToast}</div>
       )}
+      <GestureFlashOverlay flash={gestureFlash} />
       {showGestureCfg && (
         <GestureConfigModal
           cfg={gcfg}
