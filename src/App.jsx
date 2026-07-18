@@ -10617,7 +10617,121 @@ const ModelQualityInfoPanel = ({ model, stepTitle, info, open, onToggle }) => {
   );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true, notifyPush = null, contactMembers = {} }) => {
+// ✋ サイン操作(カメラ・試験導入)の共通定義。設定は settings.gestureConfig に共有保存(全端末に効く)。goldenと同型。
+//   認識できるサインは MediaPipe GestureRecognizer の学習済み7種。動作の割り当て・キープ秒数・感度などを設定で調整する。
+const GESTURE_DEFS = [
+    { key: 'Open_Palm', emoji: '✋', label: '手のひら(パー)' },
+    { key: 'Thumb_Up', emoji: '👍', label: 'いいね(親指上)' },
+    { key: 'Victory', emoji: '✌️', label: 'ピース' },
+    { key: 'Closed_Fist', emoji: '✊', label: 'グー' },
+    { key: 'Pointing_Up', emoji: '☝️', label: '指さし(上)' },
+    { key: 'Thumb_Down', emoji: '👎', label: '親指下' },
+    { key: 'ILoveYou', emoji: '🤟', label: '親指+人差指+小指' },
+];
+// 製品は一時停止が休憩/中断理由システムと絡むため、試験版の動作は完了/開始系のみ(最終検査は停止/再開もある)
+const GESTURE_ACTIONS = [
+    { key: 'none', label: '— 使わない —', short: '' },
+    { key: 'complete_next', label: '計測中を完了 → 次を開始', short: '完了→次' },
+    { key: 'complete_only', label: '計測中を完了(次は開始しない)', short: '完了' },
+    { key: 'start_next', label: '次の未着手を開始(完了しない)', short: '次を開始' },
+];
+const GESTURE_ACTION_SHORT = Object.fromEntries(GESTURE_ACTIONS.map(a => [a.key, a.short]));
+const GESTURE_DEFAULT_CFG = {
+    holdMs: 1800, cooldownMs: 4000, minScore: 0.55, res: 640, beep: true,
+    map: { Open_Palm: 'complete_next', Thumb_Up: 'complete_next', Victory: 'none', Closed_Fist: 'none', Pointing_Up: 'none', Thumb_Down: 'none', ILoveYou: 'none' },
+};
+const normalizeGestureCfg = (raw) => {
+    const c = raw || {};
+    const map = { ...GESTURE_DEFAULT_CFG.map };
+    Object.entries(c.map || {}).forEach(([k, v]) => { map[k] = GESTURE_ACTIONS.some(a => a.key === v) ? v : 'none'; }); // 製品に無い動作(停止/再開)はnone扱い
+    return { ...GESTURE_DEFAULT_CFG, ...c, map };
+};
+// サイン操作の設定モーダル(ヘルプ内蔵)
+const GestureConfigModal = ({ cfg, unitWord = '工程', onSave, onClose }) => {
+    const [d, setD] = useState(() => normalizeGestureCfg(cfg));
+    const set = (patch) => setD(prev => ({ ...prev, ...patch }));
+    const setMap = (k, v) => setD(prev => ({ ...prev, map: { ...prev.map, [k]: v } }));
+    return (
+        <div className="fixed inset-0 bg-black/60 z-[70] flex items-center justify-center p-4" onClick={onClose}>
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                <div className="sticky top-0 bg-slate-800 text-white px-4 py-3 flex items-center justify-between rounded-t-2xl z-10">
+                    <div className="font-black">✋ サイン操作の設定</div>
+                    <button onClick={onClose} className="p-1 rounded hover:bg-slate-600"><X className="w-5 h-5" /></button>
+                </div>
+                <div className="p-4 space-y-4 text-sm">
+                    <div className="text-[11px] text-slate-500 bg-slate-50 rounded-lg p-2">ここで保存した設定は<b>全端末で共有</b>されます(この端末だけではありません)。</div>
+                    <div>
+                        <div className="font-bold text-slate-700 mb-1.5">サインと動作の割り当て</div>
+                        <div className="space-y-1.5">
+                            {GESTURE_DEFS.map(g => (
+                                <div key={g.key} className="flex items-center gap-2">
+                                    <span className="text-xl w-8 text-center shrink-0">{g.emoji}</span>
+                                    <span className="text-[11px] text-slate-600 w-28 shrink-0">{g.label}</span>
+                                    <select value={d.map[g.key] || 'none'} onChange={e => setMap(g.key, e.target.value)} className={`flex-1 min-w-0 border rounded p-1.5 text-xs font-bold ${d.map[g.key] && d.map[g.key] !== 'none' ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-200 text-slate-500'}`}>
+                                        {GESTURE_ACTIONS.map(a => <option key={a.key} value={a.key}>{a.label}</option>)}
+                                    </select>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-1">💡 使うサインは1〜2個に絞ると誤反応が減ります。指の形(👍✌️☝️)は素手向き。手袋なら✋(パー)が比較的強いです。</div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                        <label className="block">
+                            <div className="font-bold text-slate-700 text-xs mb-1">キープ時間: <b className="text-blue-600">{(d.holdMs / 1000).toFixed(1)}秒</b></div>
+                            <input type="range" min="500" max="4000" step="100" value={d.holdMs} onChange={e => set({ holdMs: Number(e.target.value) })} className="w-full" />
+                            <div className="flex gap-1 mt-1">{[1000, 1500, 2000, 3000].map(ms => <button key={ms} onClick={() => set({ holdMs: ms })} className={`px-2 py-0.5 rounded text-[10px] font-bold border ${d.holdMs === ms ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-slate-500 border-slate-200'}`}>{ms / 1000}秒</button>)}</div>
+                            <div className="text-[10px] text-slate-400 mt-0.5">短い=素早い(誤反応増) / 長い=確実。</div>
+                        </label>
+                        <label className="block">
+                            <div className="font-bold text-slate-700 text-xs mb-1">発火後の休み: <b className="text-blue-600">{(d.cooldownMs / 1000).toFixed(1)}秒</b></div>
+                            <input type="range" min="1000" max="8000" step="500" value={d.cooldownMs} onChange={e => set({ cooldownMs: Number(e.target.value) })} className="w-full" />
+                            <div className="text-[10px] text-slate-400">連続の二重発火を防ぐ待ち時間。</div>
+                        </label>
+                    </div>
+                    <div className="grid grid-cols-3 gap-3 items-end">
+                        <label className="block">
+                            <div className="font-bold text-slate-700 text-xs mb-1">認識の感度</div>
+                            <select value={String(d.minScore)} onChange={e => set({ minScore: Number(e.target.value) })} className="w-full border border-slate-200 rounded p-1.5 text-xs font-bold">
+                                <option value="0.4">ゆるい(反応しやすい)</option>
+                                <option value="0.55">ふつう</option>
+                                <option value="0.7">厳しい(誤反応最少)</option>
+                            </select>
+                        </label>
+                        <label className="block">
+                            <div className="font-bold text-slate-700 text-xs mb-1">カメラ画質(距離)</div>
+                            <select value={String(d.res)} onChange={e => set({ res: Number(e.target.value) })} className="w-full border border-slate-200 rounded p-1.5 text-xs font-bold">
+                                <option value="640">標準(〜1.5m・省電力)</option>
+                                <option value="1280">高精細(遠くに強い・電池多め)</option>
+                            </select>
+                            <div className="text-[10px] text-slate-400">次にONにした時から有効。</div>
+                        </label>
+                        <label className="flex items-center gap-2 pb-1.5 cursor-pointer">
+                            <input type="checkbox" checked={!!d.beep} onChange={e => set({ beep: e.target.checked })} className="w-4 h-4" />
+                            <span className="font-bold text-slate-700 text-xs">発火音を鳴らす</span>
+                        </label>
+                    </div>
+                    <details className="bg-sky-50 border border-sky-200 rounded-lg p-3">
+                        <summary className="font-bold text-sky-800 cursor-pointer">❔ 使い方・コツ(ヘルプ)</summary>
+                        <div className="mt-2 space-y-1.5 text-xs text-slate-700">
+                            <div><b>使い方:</b> カスタムモードの作業画面でヘッダーの✋ボタンでON。カメラに向けて割り当てたサインを<b>設定した秒数キープ</b>すると発火します(左下の小窓に緑のゲージが伸びます)。発火するとピッと鳴って画面に結果が出ます。</div>
+                            <div><b>距離の目安:</b> 標準画質で<b>0.5〜1.5m</b>。遠い・反応が悪い時は「高精細」へ。<b>明るい場所</b>ほど強く、<b>手のひらはカメラへ正面向け</b>が一番効きます。</div>
+                            <div><b>誤反応する時:</b> ①キープ時間を長く(2.5〜3秒) ②感度を「厳しい」に ③使うサインを普段の作業で出ない形(🤟など)に変える — の順で試してください。</div>
+                            <div><b>「完了→次」の中身:</b> いま計測中の{unitWord}を全部完了(まとめて開始のバッチは合計時間÷台数の按分ルール)→ 次の<b>全台未着手</b>の{unitWord}をまとめて開始。ロット1回(段取り)工程・分割測定連動・NG・修正中には触りません。厳密モード中の開始はタップのみ(サインでは完了だけ)。</div>
+                            <div><b>プライバシー:</b> 映像はこの端末の中で判定するだけで、<b>録画・保存・送信は一切ありません</b>。作業画面を閉じるとカメラは必ず止まります。</div>
+                            <div><b>電池:</b> ON中はカメラと認識が動くぶん電池を使います。使う時だけONにしてください。</div>
+                        </div>
+                    </details>
+                    <div className="flex justify-end gap-2 pt-1">
+                        <button onClick={onClose} className="px-4 py-2 rounded-lg border border-slate-300 text-slate-600 font-bold text-sm">閉じる</button>
+                        <button onClick={() => { onSave(d); onClose(); }} className="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-black text-sm">保存(全端末に反映)</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true, notifyPush = null, contactMembers = {}, gestureConfig = null, onSaveGestureConfig = null }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -11843,6 +11957,268 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     onSave({ tasks: nt, status: 'processing' });
     return { ok: true, count: members.length };
   };
+
+  // ✋ サイン操作(カメラ・試験導入): カメラに手のサインを見せてタップの代わりに操作する(カスタムモード専用)。
+  //   認識=MediaPipe GestureRecognizer(端末内処理・映像は保存/送信しない・実行時CDN読込)。設定=settings.gestureConfig(共有)。
+  //   完了はバッチ(batchOwner)を voiceBatchComplete と同じ按分(合計÷台数・世代一致)で、単独計測は満額で閉じる。
+  const [gestureOn, setGestureOn] = useState(false);
+  const [gestureState, setGestureState] = useState({ phase: 'off', msg: '' }); // off|loading|ready|error
+  const [gestureProgress, setGestureProgress] = useState(0);
+  const [gestureToast, setGestureToast] = useState(null);
+  const [gestureLive, setGestureLive] = useState(null);
+  const [showGestureCfg, setShowGestureCfg] = useState(false);
+  const gestureVideoRef = useRef(null);
+  const gestureStreamRef = useRef(null);
+  const gestureRecRef = useRef(null);
+  const gestureRafRef = useRef(null);
+  const gestureHoldRef = useRef({ name: '', since: 0, lastSeen: 0, cooledUntil: 0, lastTs: 0 });
+  const gestureToastTimer = useRef(null);
+  const gcfg = normalizeGestureCfg(gestureConfig);
+  const gcfgRef = useRef(gcfg);
+  gcfgRef.current = gcfg;
+  const showGestureToast = (msg) => {
+    setGestureToast(msg);
+    if (gestureToastTimer.current) clearTimeout(gestureToastTimer.current);
+    gestureToastTimer.current = setTimeout(() => setGestureToast(null), 5000);
+  };
+  const gestureBeep = () => {
+    if (!gcfgRef.current.beep) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value = 880;
+      g.gain.setValueAtTime(0.15, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
+      o.start(); o.stop(ctx.currentTime + 0.25);
+      setTimeout(() => { try { ctx.close(); } catch (e) {} }, 400);
+    } catch (e) { /* 音が出せない端末でも続行 */ }
+  };
+  // サイン発火の実処理。mode: complete_next | complete_only | start_next
+  const gestureFire = (mode) => {
+    const base = tasksRef.current; const now = Date.now();
+    const nt = { ...base };
+    const doneTitles = []; let doneN = 0; const doneSIdxs = [];
+    if (mode !== 'start_next') {
+      // バッチ計測中(まとめて開始)の工程: voiceBatchComplete と同じ按分(合計壁時計÷台数・batchStartedAt世代一致)
+      const groups = new Map();
+      Object.entries(base).forEach(([key, t]) => {
+        if (t?.status === 'processing' && t.batchOwner != null) {
+          const sIdx = t.batchOwner;
+          const bs = batchStartTimes[sIdx] || null;
+          if (bs == null || t.batchStartedAt == null || t.batchStartedAt === bs) {
+            if (!groups.has(sIdx)) groups.set(sIdx, []);
+            groups.get(sIdx).push({ key, t });
+          }
+        }
+      });
+      groups.forEach((members, sIdx) => {
+        const bs = batchStartTimes[sIdx] || null;
+        const startAt = bs || Math.min(...members.map(m => m.t.batchStartedAt || m.t.startTime || now));
+        const per = Math.floor(Math.max(0, (now - startAt) / 1000) / members.length);
+        members.forEach(({ key, t }) => { nt[key] = { ...t, status: 'completed', duration: (t.duration || 0) + per, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, batchOwner: null, batchStartedAt: null, workerName: inspectorName || t.workerName }; doneN++; });
+        doneSIdxs.push(sIdx);
+        const ti = localSteps[sIdx]?.title; if (ti && !doneTitles.includes(ti)) doneTitles.push(ti);
+      });
+      // 単独で計測中(バッチでない)のタスク: 個別完了と同じく経過を満額で記録
+      Object.entries(base).forEach(([key, t]) => {
+        if (t?.status === 'processing' && t.batchOwner == null) {
+          const raw = t.startTime ? Math.floor((now - t.startTime) / 1000) : 0;
+          nt[key] = { ...t, status: 'completed', duration: (t.duration || 0) + raw, startTime: null, endTime: now, firstStartTime: t.firstStartTime || t.startTime || now, workerName: inspectorName || t.workerName };
+          doneN++;
+        }
+      });
+    }
+    let startedTitle = null; let startedSIdx = null; let strictNote = '';
+    if (mode !== 'complete_only') {
+      if (optimalNextMove && strictOrderMode) {
+        // 厳密モード中の「開始」は推奨順の管理下なのでサインでは行わない(完了だけ有効)
+        strictNote = doneN ? '（厳密モード中: 次の開始はタップで）' : '厳密モード中はサインで開始できません（タップで開始してください）';
+      } else {
+        for (let sIdx = 0; sIdx < localSteps.length; sIdx++) {
+          const st = localSteps[sIdx];
+          if (!st || st.lotOnce) continue;                            // ロット1回(段取り)工程は対象外
+          if (rotaryConfig?.enabled && st.rotaryLink && db) continue; // 分割測定連動工程は台ごとの指令が要る
+          let waiting = 0, touched = 0;
+          for (let u = 0; u < lot.quantity; u++) {
+            const t = nt[getTaskKey(sIdx, u)];
+            if (!t || t.status === 'waiting') waiting++; else touched++;
+          }
+          if (waiting > 0 && touched === 0) {
+            for (let u = 0; u < lot.quantity; u++) {
+              const key = getTaskKey(sIdx, u);
+              const cur = nt[key] || { status: 'waiting', duration: 0, startTime: null };
+              nt[key] = { ...cur, status: 'processing', startTime: now, firstStartTime: cur.firstStartTime || now, batchOwner: sIdx, batchStartedAt: now };
+            }
+            startedTitle = st.title; startedSIdx = sIdx;
+            break;
+          }
+        }
+      }
+    }
+    if (!doneN && startedSIdx == null) { showGestureToast(strictNote || '操作の対象がありません'); return; }
+    setTasks(nt);
+    setBatchStartTimes(prev => {
+      const c = { ...prev };
+      doneSIdxs.forEach(s => { delete c[s]; });
+      if (startedSIdx != null) c[startedSIdx] = now;
+      return c;
+    });
+    onSave({ tasks: nt, status: 'processing' });
+    gestureBeep();
+    showGestureToast(`${doneN ? `✅ 完了: ${doneTitles.join('・') || `${doneN}件`}` : ''}${doneN && startedTitle ? ' → ' : ''}${startedTitle ? `▶ 開始: ${startedTitle}` : ''}${strictNote ? ` ${strictNote}` : ''}`);
+  };
+  const gestureDo = (action) => {
+    if (action === 'complete_next') return gestureFire('complete_next');
+    if (action === 'complete_only') return gestureFire('complete_only');
+    if (action === 'start_next') return gestureFire('start_next');
+  };
+  const gestureDoRef = useRef(gestureDo);
+  gestureDoRef.current = gestureDo;
+  const stopGesture = () => {
+    if (gestureRafRef.current) { cancelAnimationFrame(gestureRafRef.current); gestureRafRef.current = null; }
+    if (gestureStreamRef.current) { try { gestureStreamRef.current.getTracks().forEach(t => t.stop()); } catch (e) {} gestureStreamRef.current = null; }
+    if (gestureRecRef.current) { try { gestureRecRef.current.close(); } catch (e) {} gestureRecRef.current = null; }
+    gestureHoldRef.current = { name: '', since: 0, lastSeen: 0, cooledUntil: 0, lastTs: 0 };
+    setGestureProgress(0);
+    setGestureLive(null);
+    setGestureState({ phase: 'off', msg: '' });
+    setGestureOn(false);
+  };
+  const startGesture = async () => {
+    if (gestureOn) { stopGesture(); return; }
+    if (executionType !== 'custom') { alert('✋サイン操作はカスタムモードで使えます。「カスタム ⇄」で切り替えてください。'); return; }
+    setGestureOn(true);
+    setGestureState({ phase: 'loading', msg: 'AIモデルを読み込み中…（初回は少し時間がかかります）' });
+    try {
+      // 認識部品は必要時だけCDNから読む(アプリ本体を重くしない)。判定はすべてこの端末の中で完結する。
+      const CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+      const importUrl = (u) => new Function('u', 'return import(u)')(u);
+      const mod = await importUrl(`${CDN}/vision_bundle.mjs`);
+      const fileset = await mod.FilesetResolver.forVisionTasks(`${CDN}/wasm`);
+      const MODEL = 'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task';
+      let rec;
+      try {
+        rec = await mod.GestureRecognizer.createFromOptions(fileset, { baseOptions: { modelAssetPath: MODEL, delegate: 'GPU' }, runningMode: 'VIDEO', numHands: 1 });
+      } catch (e) {
+        rec = await mod.GestureRecognizer.createFromOptions(fileset, { baseOptions: { modelAssetPath: MODEL, delegate: 'CPU' }, runningMode: 'VIDEO', numHands: 1 });
+      }
+      gestureRecRef.current = rec;
+      const rw = gcfgRef.current.res === 1280 ? 1280 : 640;
+      const rh = rw === 1280 ? 720 : 480;
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: rw }, height: { ideal: rh } }, audio: false });
+      gestureStreamRef.current = stream;
+      let video = gestureVideoRef.current;
+      for (let i = 0; i < 20 && !video; i++) { await new Promise(r => setTimeout(r, 50)); video = gestureVideoRef.current; }
+      if (!video) throw new Error('カメラ表示の準備に失敗しました');
+      video.srcObject = stream;
+      await video.play();
+      setGestureState({ phase: 'ready', msg: '' });
+      const loop = () => {
+        gestureRafRef.current = requestAnimationFrame(loop);
+        const v = gestureVideoRef.current, r = gestureRecRef.current;
+        if (!v || !r || v.readyState < 2) return;
+        const now2 = performance.now();
+        const H = gestureHoldRef.current;
+        if (now2 - (H.lastTs || 0) < 180) return; // 判定は約5回/秒(電池・発熱を抑える)
+        H.lastTs = now2;
+        let name = '', score = 0;
+        try {
+          const res = r.recognizeForVideo(v, now2);
+          const g = res?.gestures?.[0]?.[0];
+          if (g) { name = g.categoryName; score = g.score || 0; }
+        } catch (e) { return; }
+        const nowMs = Date.now();
+        const cfg = gcfgRef.current;
+        if (nowMs < H.cooledUntil) { setGestureProgress(0); setGestureLive(null); return; }
+        const action = name ? (cfg.map[name] || 'none') : 'none';
+        const isSign = action !== 'none' && score >= cfg.minScore;
+        setGestureLive(isSign ? name : null);
+        if (isSign) {
+          if (H.name !== name) { H.name = name; H.since = nowMs; }
+          H.lastSeen = nowMs;
+          const p = Math.min(1, (nowMs - H.since) / cfg.holdMs);
+          setGestureProgress(p);
+          if (p >= 1) {
+            H.name = ''; H.since = 0; H.lastSeen = 0; H.cooledUntil = nowMs + cfg.cooldownMs;
+            setGestureProgress(0);
+            gestureDoRef.current(action);
+          }
+        } else if (H.since && nowMs - H.lastSeen > 400) {
+          H.name = ''; H.since = 0;
+          setGestureProgress(0);
+        }
+      };
+      loop();
+    } catch (e) {
+      console.error('gesture start failed', e);
+      setGestureState({ phase: 'error', msg: `起動できませんでした: ${e?.message || e}` });
+      if (gestureStreamRef.current) { try { gestureStreamRef.current.getTracks().forEach(t => t.stop()); } catch (e2) {} gestureStreamRef.current = null; }
+      if (gestureRecRef.current) { try { gestureRecRef.current.close(); } catch (e2) {} gestureRecRef.current = null; }
+    }
+  };
+  // 作業画面を閉じたら必ずカメラ・認識・ループを止める
+  useEffect(() => () => {
+    if (gestureRafRef.current) cancelAnimationFrame(gestureRafRef.current);
+    if (gestureStreamRef.current) { try { gestureStreamRef.current.getTracks().forEach(t => t.stop()); } catch (e) {} }
+    if (gestureRecRef.current) { try { gestureRecRef.current.close(); } catch (e) {} }
+    if (gestureToastTimer.current) clearTimeout(gestureToastTimer.current);
+  }, []);
+  // サイン操作の小窓+トースト+設定モーダル(fixed配置なのでどのモードでも安全に出せる)
+  const gestureWidget = (
+    <>
+      {gestureOn && (
+        <div className="fixed bottom-5 left-5 z-[60] w-60 bg-slate-900/95 text-white rounded-2xl shadow-2xl border border-slate-600 overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-1.5 bg-slate-800">
+            <span className="text-[11px] font-black flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${gestureState.phase === 'ready' ? 'bg-emerald-400 animate-pulse' : gestureState.phase === 'error' ? 'bg-red-500' : 'bg-amber-400 animate-pulse'}`} />
+              ✋ サイン操作(試験)
+            </span>
+            <span className="flex items-center gap-1">
+              <button onClick={() => setShowGestureCfg(true)} className="text-[11px] font-bold bg-slate-600 hover:bg-slate-500 rounded px-1.5 py-0.5" title="サイン・キープ時間などの設定">⚙</button>
+              <button onClick={stopGesture} className="text-[11px] font-bold bg-slate-600 hover:bg-slate-500 rounded px-2 py-0.5">OFF</button>
+            </span>
+          </div>
+          <div className="relative">
+            <video ref={gestureVideoRef} muted playsInline className="w-full h-32 object-cover bg-black" style={{ transform: 'scaleX(-1)' }} />
+            {gestureState.phase === 'loading' && <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-[11px] font-bold text-center p-2">{gestureState.msg}</div>}
+            {gestureState.phase === 'error' && <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-[11px] font-bold text-red-300 text-center p-2">{gestureState.msg}</div>}
+            {gestureState.phase === 'ready' && gestureLive && (
+              <div className="absolute top-1 left-1 bg-emerald-500/90 text-white text-[11px] font-black rounded px-1.5 py-0.5">{(GESTURE_DEFS.find(g => g.key === gestureLive) || {}).emoji} 認識中…</div>
+            )}
+            {gestureState.phase === 'ready' && gestureProgress > 0 && (
+              <div className="absolute bottom-0 left-0 right-0 h-2 bg-black/50"><div className="h-full bg-emerald-400" style={{ width: `${Math.round(gestureProgress * 100)}%` }} /></div>
+            )}
+          </div>
+          <div className="px-3 py-1.5 text-[10px] leading-tight text-slate-300">
+            {gestureState.phase === 'ready' ? (
+              gestureProgress > 0
+                ? <b className="text-emerald-300 text-xs">そのままキープ…</b>
+                : (
+                  <span className="flex flex-wrap gap-1 items-center">
+                    {GESTURE_DEFS.filter(g => (gcfg.map[g.key] || 'none') !== 'none').map(g => (
+                      <span key={g.key} className="bg-slate-700 rounded px-1.5 py-0.5 font-bold">{g.emoji}{GESTURE_ACTION_SHORT[gcfg.map[g.key]]}</span>
+                    ))}
+                    <span className="opacity-70">を{(gcfg.holdMs / 1000).toFixed(1)}秒キープ。映像は保存しません。</span>
+                  </span>
+                )
+            ) : gestureState.phase === 'loading' ? '準備中…' : '一度OFFにして再度お試しください'}
+          </div>
+        </div>
+      )}
+      {gestureToast && (
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[65] bg-emerald-600 text-white rounded-xl shadow-2xl px-4 py-2 text-sm font-black max-w-[80vw] truncate pointer-events-none">{gestureToast}</div>
+      )}
+      {showGestureCfg && (
+        <GestureConfigModal
+          cfg={gcfg}
+          unitWord="工程"
+          onClose={() => setShowGestureCfg(false)}
+          onSave={(next) => { if (onSaveGestureConfig) onSaveGestureConfig(next); }}
+        />
+      )}
+    </>
+  );
 
   // 現在の対象タスクを解決 (custom=activeCustomTaskKey / sequential=currentStepIdx,currentUnitIdx)。
   //   custom で対象未確定なら null(誤った台に作用しないよう案内する)。
@@ -14366,6 +14742,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                  <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
                    {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
                  </button>
+                 {/* ✋ サイン操作(カメラ・試験): ONで左下に小窓。長押し的にサインをキープすると発火。⚙は設定 */}
+                 <button onClick={startGesture} className={`p-2 rounded-full transition-all text-sm font-black ${gestureOn ? 'bg-emerald-500 text-white animate-pulse ring-2 ring-emerald-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={gestureOn ? 'サイン操作OFF' : 'サイン操作ON(カメラ・試験)。映像は端末内判定のみで保存しません'}>✋</button>
+                 <button onClick={() => setShowGestureCfg(true)} className="p-1.5 rounded-full bg-white/10 text-white/50 hover:bg-white/20 text-xs" title="サイン操作の設定(サイン割り当て・キープ時間・感度・ヘルプ)">⚙</button>
+                 {gestureWidget}
                  {onSetExecFontScale && (
                    <div className="flex items-center bg-white/10 rounded-lg overflow-hidden shrink-0" title="この作業画面の文字サイズ (即反映・保存)">
                      <button onClick={() => onSetExecFontScale(execFontScale - 10)} className="px-2.5 py-1.5 hover:bg-white/20 font-black" title="文字を小さく">A−</button>
@@ -34202,6 +34582,8 @@ export default function App() {
            contactEnabled={contactFeatureOn}
            notifyPush={notifyContactPush}
            contactMembers={contactMembersOf(contactSettings)}
+           gestureConfig={settings?.gestureConfig || null}
+           onSaveGestureConfig={async (gc) => { await saveSettings({ gestureConfig: gc }); }}
            onClose={() => setExecutionLotId(null)}
            onSave={(updates) => saveData('lots', executionLotId, updates)}
            onFinish={() => { setExecutionLotId(null); setActiveTab('history'); }}
