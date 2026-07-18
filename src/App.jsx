@@ -5224,6 +5224,16 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
       )}
       {showPushHelp && <PushHelpModal onClose={() => setShowPushHelp(false)} sideLabel={sideLabel} />}
       <main className="max-w-3xl mx-auto p-4 flex flex-col gap-5 pb-16">
+        {/* ⚠ここが本命。通知に気づいてほしいのは組立=この画面を見ている人。
+            検査側にだけ置いて「組立には無い」を繰り返したので、ポータルの一番上に必ず出す。
+            入れ終わった端末では「✅入っています」に変わるだけなので邪魔にならない。 */}
+        <section className="bg-white rounded-xl border-2 border-emerald-300 px-3 py-2.5 flex flex-col gap-1.5">
+          <div className="text-sm font-black text-emerald-800">⬇️ この画面をアプリとして入れてください</div>
+          <div className="text-[11px] text-slate-500">
+            入れると、この端末の設定に「連絡ポータル」という項目が現れ、<b>通知の重要度を「緊急」</b>に上げられます。ブラウザで開いているだけだとその設定が存在せず、<b>通知が出ない・後からまとめて来る・画面が黒いまま</b>のままです。<b>入れた後に重要度を上げるまでが1セット</b>（やり方は右上の🔔→「設定方法」）。
+          </div>
+          <InstallAppButton compact />
+        </section>
         <section>
           <h2 className="text-base font-black text-slate-700 mb-2 flex items-center gap-2"><Wrench className="w-5 h-5 text-orange-600" /> 修正・呼出の依頼 {inbox.length > 0 && <span className="bg-orange-600 text-white text-xs font-black rounded-full px-2 py-0.5 animate-pulse">{inbox.length}件</span>}</h2>
           {inbox.length === 0 && <div className="bg-white rounded-xl border border-slate-200 p-4 text-sm text-slate-400">いま対応待ちの依頼はありません</div>}
