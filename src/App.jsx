@@ -76,6 +76,54 @@ try {
 const localYMD = (d) => { const x = (d instanceof Date) ? d : new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`; };
 const localYM = (d) => { const x = (d instanceof Date) ? d : new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}`; };
 
+// ── 納期など「日付だけ」の値を、あらゆる入力形式から1つの正規表現に統一する(最終検査 golden と同一) ──
+//  受理: YYYY-MM-DD / YYYY-M-D / YYYY/M/D / YY/M/D / M/D/YYYY / M/D(年なし) / YYYY年M月D日 / 全角数字 /
+//        括弧の曜日 "7/14 (火)" / Excelシリアル値(数値・5桁文字列) / ミリ秒タイムスタンプ / Date。返り {y,m,d} or null。
+//  ⚠表示(fmtDue)・比較(dueMs)・並び替えの唯一の入口。new Date(lot.dueDate) 直呼び/文字列比較は別形式で化けるので廃止。
+const DOW_JP = ['日', '月', '火', '水', '木', '金', '土'];
+const parseDueParts = (raw) => {
+  if (raw == null || raw === '') return null;
+  if (raw instanceof Date) { return isNaN(raw.getTime()) ? null : { y: raw.getFullYear(), m: raw.getMonth() + 1, d: raw.getDate() }; }
+  if (typeof raw === 'number' && isFinite(raw)) {
+    if (raw > 10 && raw < 100000) { const dt = new Date(Math.round((raw - 25569) * 86400000)); return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() }; }
+    const dt = new Date(raw); return isNaN(dt.getTime()) ? null : { y: dt.getFullYear(), m: dt.getMonth() + 1, d: dt.getDate() };
+  }
+  let s = String(raw).trim();
+  if (!s) return null;
+  s = s.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  if (/^\d{5}$/.test(s)) return parseDueParts(Number(s));
+  s = s.replace(/[（(].*?[)）]/g, ' ').replace(/[（(].*$/, ' ');
+  s = s.replace(/[年月]/g, '/').replace(/日/g, '').replace(/[.\-]/g, '/').trim();
+  s = s.replace(/\/+/g, '/').replace(/\/$/, '');
+  const parts = s.split('/').map(x => x.trim()).filter(x => x !== '');
+  const nums = parts.map(Number);
+  if (!nums.length || nums.some(n => !isFinite(n))) return null;
+  let y, m, d;
+  if (nums.length >= 3) {
+    if (String(parts[2]).length === 4) { y = nums[2]; m = nums[0]; d = nums[1]; }
+    else { y = nums[0] < 100 ? 2000 + nums[0] : nums[0]; m = nums[1]; d = nums[2]; }
+  } else if (nums.length === 2) { m = nums[0]; d = nums[1]; y = null; }
+  else return null;
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  if (y == null) {
+    const now = new Date(); const today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    let cand = new Date(now.getFullYear(), m - 1, d);
+    if ((today0.getTime() - cand.getTime()) > 90 * 86400000) cand = new Date(now.getFullYear() + 1, m - 1, d);
+    y = cand.getFullYear();
+  }
+  return { y, m, d };
+};
+const dueDateObj = (raw) => { const p = parseDueParts(raw); return p ? new Date(p.y, p.m - 1, p.d) : null; };
+const dueMsOf = (raw) => { const dt = dueDateObj(raw); return dt ? dt.getTime() : null; };
+const todayMidnightMs = () => { const t = new Date(); return new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime(); };
+// 表示: 2026/8/15（金）。パース不能値は元文字列をそのまま返す(データを隠さない)。
+const fmtDue = (raw, withDow = true) => {
+  const p = parseDueParts(raw);
+  if (!p) return raw == null ? '' : String(raw);
+  const dt = new Date(p.y, p.m - 1, p.d);
+  return `${p.y}/${p.m}/${p.d}${withDow ? `（${DOW_JP[dt.getDay()]}）` : ''}`;
+};
+
 let _storageInstance = null;
 const getStorageInstance = () => {
   if (_storageInstance) return _storageInstance;
@@ -4437,7 +4485,7 @@ const ContactAskArrivalModal = ({ lots, groups, from, onClose, onSend }) => {
     return (lots || [])
       .filter(l => l && l.status !== 'completed')
       .filter(l => !s || String(l.orderNo || '').toLowerCase().includes(s) || String(l.model || '').toLowerCase().includes(s))
-      .sort((a, b) => String(a.dueDate || '9999').localeCompare(String(b.dueDate || '9999')));
+      .sort((a, b) => (dueMsOf(a.dueDate) ?? Infinity) - (dueMsOf(b.dueDate) ?? Infinity));
   }, [lots, q]);
   const count = Object.values(sel).filter(Boolean).length;
   return (
@@ -4468,7 +4516,7 @@ const ContactAskArrivalModal = ({ lots, groups, from, onClose, onSend }) => {
                 <span className="font-mono text-sm font-bold text-slate-700 w-28 shrink-0 truncate">{l.orderNo}</span>
                 <span className="text-sm font-bold text-slate-800 flex-1 truncate">{l.model}</span>
                 <span className="text-xs text-slate-500 shrink-0">{l.quantity}台</span>
-                <span className="text-xs text-slate-500 shrink-0">納期 {l.dueDate || '—'}</span>
+                <span className="text-xs text-slate-500 shrink-0">納期 {fmtDue(l.dueDate) || '—'}</span>
               </label>
             ))}
             {list.length === 0 && <div className="p-4 text-center text-sm text-slate-400">対象ロットがありません</div>}
@@ -4727,10 +4775,23 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       </div>
       {showCfg && (
         <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-2 max-h-[62vh] overflow-y-auto overscroll-contain">
-          <div className="text-[11px] text-slate-400">設定は4つに分かれています。開きたい所をタップしてください（この枠の中は上下にスクロールできます）。</div>
+          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-500 flex items-center gap-2">
+            <span className="text-lg">👆</span>
+            <span>下のカードを<b className="text-slate-700">1枚タップ</b>すると、その中だけ開きます（ほかは自動で閉じます）。ふだんは閉じたままでOK。</span>
+          </div>
           {/* 検査完了→次工程(組立)への完了連絡 のON/OFFと宛先 */}
           {(() => { const cc = contactCompleteOf(settings); const mg = Object.entries(cc.modelGroups).filter(([, g]) => g); return (
-            <div className="border border-emerald-200 bg-emerald-50 rounded-lg px-3 py-2 flex flex-col gap-1.5">
+            <details name="cfgacc" className="group bg-emerald-50/50 border-2 border-emerald-200 rounded-2xl overflow-hidden">
+              <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-emerald-50">
+                <span className="text-2xl shrink-0">✅</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-black text-slate-800">検査完了を{sideLabel}へ連絡</div>
+                  <div className="text-[11px] text-slate-500 truncate">完了時に「どこへ連絡？」を確認して送る</div>
+                </div>
+                <span className={`shrink-0 text-[11px] font-black px-2 py-0.5 rounded-full ${cc.enabled ? 'bg-emerald-500 text-white' : 'bg-slate-200 text-slate-500'}`}>{cc.enabled ? 'ON' : 'OFF'}</span>
+                <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+              </summary>
+            <div className="px-3.5 pb-3.5 pt-1 flex flex-col gap-1.5">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-sm font-black text-emerald-800">✅ 検査完了を{sideLabel}へ連絡</span>
                 <button onClick={() => saveSettings({ contactComplete: { ...(settings?.contactComplete || {}), enabled: !cc.enabled } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${cc.enabled ? 'bg-emerald-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{cc.enabled ? 'ON' : 'OFF'}</button>
@@ -4766,14 +4827,25 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                 </details>
               )}
             </div>
+            </details>
           ); })()}
           {/* 到着予定 → 入荷時間への自動反映 */}
           {(() => { const ca = contactArrivalOf(settings); return (
-            <div className="border border-teal-200 bg-teal-50 rounded-lg px-3 py-2 flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-black text-teal-800">🚚 到着予定を入荷時間に自動で入れる</span>
-              <button onClick={() => saveSettings({ contactArrival: { ...(settings?.contactArrival || {}), autoEntry: !ca.autoEntry } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${ca.autoEntry ? 'bg-teal-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{ca.autoEntry ? 'ON' : 'OFF'}</button>
-              <span className="text-[11px] text-slate-500">{sideLabel}が登録・回答した到着予定が、そのロットの<b>入荷時間</b>に入ります（検査リストのカード・作業予定・リードタイム集計がこの値を見ます）。<b>後から手で直した入荷時間を上書きし返すことはありません</b>。同じ指図でテンプレが分かれている時は、今までどおり「検査リストへ反映」で選んでください。</span>
-            </div>
+            <details name="cfgacc" className="group bg-teal-50/50 border-2 border-teal-200 rounded-2xl overflow-hidden">
+              <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-teal-50">
+                <span className="text-2xl shrink-0">🚚</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-black text-slate-800">到着予定を入荷時間に入れる</div>
+                  <div className="text-[11px] text-slate-500 truncate">{sideLabel}の到着予定を、そのロットの入荷時間に自動セット</div>
+                </div>
+                <span className={`shrink-0 text-[11px] font-black px-2 py-0.5 rounded-full ${ca.autoEntry ? 'bg-teal-500 text-white' : 'bg-slate-200 text-slate-500'}`}>{ca.autoEntry ? 'ON' : 'OFF'}</span>
+                <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+              </summary>
+              <div className="px-3.5 pb-3.5 pt-1 flex items-center gap-2 flex-wrap">
+                <button onClick={() => saveSettings({ contactArrival: { ...(settings?.contactArrival || {}), autoEntry: !ca.autoEntry } })} className={`px-3 py-1.5 rounded-full text-xs font-black ${ca.autoEntry ? 'bg-teal-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{ca.autoEntry ? 'ON（自動で入れる）' : 'OFF（入れない）'}</button>
+                <span className="text-[11px] text-slate-500 w-full">{sideLabel}が登録・回答した到着予定が、そのロットの<b>入荷時間</b>に入ります（検査リストのカード・作業予定・リードタイム集計がこの値を見ます）。<b>後から手で直した入荷時間を上書きし返すことはありません</b>。同じ指図でテンプレが分かれている時は、今までどおり「検査リストへ反映」で選んでください。</span>
+              </div>
+            </details>
           ); })()}
           {/* 定時おうかがい(自動送信) + 自動お礼 */}
           {(() => {
@@ -4782,7 +4854,17 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             const patch = (p) => saveSettings({ contactArrival: { ...(settings?.contactArrival || {}), ...p } });
             const DOW = [['日', 0], ['月', 1], ['火', 2], ['水', 3], ['木', 4], ['金', 5], ['土', 6]];
             return (
-              <div className="border border-teal-200 bg-teal-50 rounded-lg px-3 py-2 flex flex-col gap-2">
+              <details name="cfgacc" className="group bg-teal-50/40 border-2 border-teal-200 rounded-2xl overflow-hidden">
+                <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-teal-50">
+                  <span className="text-2xl shrink-0">⏰</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-black text-slate-800">決まった時刻に「到着予定」を自動で聞く</div>
+                    <div className="text-[11px] text-slate-500 truncate">毎日の時刻に自動送信＋返信に自動お礼</div>
+                  </div>
+                  <span className={`shrink-0 text-[11px] font-black px-2 py-0.5 rounded-full ${aa.on ? 'bg-teal-500 text-white' : 'bg-slate-200 text-slate-500'}`}>{aa.on ? 'ON' : 'OFF'}</span>
+                  <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+                </summary>
+                <div className="px-3.5 pb-3.5 pt-1 flex flex-col gap-2">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-sm font-black text-teal-800">⏰ 決まった時刻に「到着予定」を自動で聞く</span>
                   <button onClick={() => patch({ autoAsk: { ...(settings?.contactArrival?.autoAsk || {}), on: !aa.on } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${aa.on ? 'bg-teal-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{aa.on ? 'ON' : 'OFF'}</button>
@@ -4814,7 +4896,8 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                   {th.on && <input value={th.text} onChange={e => patch({ thanks: { ...(settings?.contactArrival?.thanks || {}), text: e.target.value } })} className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold flex-1 min-w-[16ch]" placeholder={DEFAULT_CONTACT_THANKS} />}
                   <span className="text-[11px] text-slate-500 w-full">到着予定の回答が届いたら、この一言を相手のポータルに1回だけ出します。<b>相手の携帯は鳴りません</b>（お礼で鳴らすと、本当に急ぎの修正依頼や呼出が埋もれるため）。</span>
                 </div>
-              </div>
+                </div>
+              </details>
             );
           })()}
           {/* 🔔 連絡の知らせ方 — 音/画面/アラーム/OS通知を、子どもでも分かるカード式に。
@@ -4859,13 +4942,18 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               </details>
             );
             return (
-              <div className="flex flex-col gap-2.5">
-                <div className="rounded-2xl bg-gradient-to-br from-sky-50 to-indigo-50 border-2 border-sky-200 px-3.5 py-3 flex flex-col gap-1">
-                  <div className="text-base font-black text-slate-800 flex items-center gap-2">🔔 連絡の知らせ方</div>
-                  <div className="text-xs text-slate-600 leading-relaxed">
-                    ここで決めた鳴らし方は、<b className="text-sky-700">この検査の画面</b>と<b className="text-sky-700">{sideLabel}ポータル</b>の<b>両方</b>に効きます。
-                    {sideLabel}の人は自分で設定できないので、<b>ここで決めてあげてください</b>。
+              <details name="cfgacc" className="group bg-sky-50/40 border-2 border-sky-200 rounded-2xl overflow-hidden">
+                <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-sky-50">
+                  <span className="text-2xl shrink-0">🔔</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-black text-slate-800">連絡の知らせ方（音・画面・アラーム）</div>
+                    <div className="text-[11px] text-slate-500 truncate">来たときの鳴らし方。検査画面と{sideLabel}ポータルの両方に効きます</div>
                   </div>
+                  <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+                </summary>
+                <div className="px-3 pb-3.5 pt-1 flex flex-col gap-2.5">
+                <div className="rounded-xl bg-sky-50 border border-sky-200 px-3 py-2 text-xs text-slate-600 leading-relaxed">
+                  この鳴らし方は<b className="text-sky-700">この検査の画面</b>と<b className="text-sky-700">{sideLabel}ポータル</b>の<b>両方</b>に効きます。{sideLabel}の人は自分で設定できないので、<b>ここで決めてあげてください</b>。
                 </div>
 
                 <div className="rounded-2xl border-2 border-amber-200 bg-amber-50/60 p-3 flex flex-col gap-1.5">
@@ -4977,7 +5065,8 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                     <div className="text-[10px] text-slate-400">閉じている時は「鳴らし続ける」はできません（OSの仕様）。代わりに通知を残す＋再通知（下の「通知のルール」）で気づかせます。iPhone等は振動指定が無視されます。ロック画面を点けるには、端末に<b>アプリを入れて重要度を「緊急」</b>に（右上ヘルプ参照）。</div>
                   </More>
                 </div>
-              </div>
+                </div>
+              </details>
             );
           })()}
           {/* 型式の仕分け(ポータルの「しぼる」ボタン) — その他に落ちた頭文字をワンタップで振り分ける */}
@@ -4995,10 +5084,15 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             const others = prefixes.filter(x => pgroup[x] === 'other' && x !== PORTAL_NO_PREFIX);
             const move = (pre, gid) => (saveShared || saveSettings)({ portalModelPrefixMap: portalModelPrefixMapWith(settings, pre, gid) });
             return (
-              <details className="border border-violet-200 bg-violet-50 rounded-lg">
-                <summary className="px-3 py-2 text-sm font-black text-violet-900 cursor-pointer select-none">
-                  🔎 型式の仕分け（{sideLabel}ポータルの「しぼる」ボタン）
-                  {others.length > 0 && <span className="ml-2 text-[11px] font-bold text-rose-600">その他に {others.length}種類（{others.slice(0, 4).join('・')}{others.length > 4 ? '…' : ''}）— 振り分けてください</span>}
+              <details name="cfgacc" className="group bg-violet-50/50 border-2 border-violet-200 rounded-2xl overflow-hidden">
+                <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-violet-50">
+                  <span className="text-2xl shrink-0">🔎</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-black text-slate-800">型式の仕分け（ポータルの「しぼる」）</div>
+                    <div className="text-[11px] text-slate-500 truncate">{others.length > 0 ? <span className="text-rose-600 font-bold">その他に {others.length}種類（{others.slice(0, 4).join('・')}{others.length > 4 ? '…' : ''}）— 振り分けて</span> : '特注機／標準機に振り分け（済み）'}</div>
+                  </div>
+                  {others.length > 0 && <span className="shrink-0 w-2.5 h-2.5 rounded-full bg-rose-500" title="振り分け待ちあり" />}
+                  <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
                 </summary>
                 <div className="p-3 flex flex-col gap-1.5">
                   <div className="text-[11px] text-slate-500">
@@ -5027,8 +5121,15 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             );
           })()}
           {/* ① グループとメンバー */}
-          <details open className="border border-slate-200 rounded-lg">
-            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">👥 宛先グループと班メンバー</summary>
+          <details name="cfgacc" className="group bg-blue-50/40 border-2 border-blue-200 rounded-2xl overflow-hidden">
+            <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-blue-50">
+              <span className="text-2xl shrink-0">👥</span>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-black text-slate-800">宛先グループと班メンバー</div>
+                <div className="text-[11px] text-slate-500 truncate">{groups.length}班：{groups.slice(0, 3).join('・')}{groups.length > 3 ? '…' : ''}</div>
+              </div>
+              <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+            </summary>
             <div className="p-3 flex flex-col gap-3">
               <div>
                 <div className="text-xs font-black text-slate-500 mb-1">宛先グループ（相手側もこの名前でポータルに入ります）<span className="ml-1 font-bold text-teal-700">🔗 製品検査・最終検査の共通</span></div>
@@ -5066,8 +5167,15 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             </div>
           </details>
           {/* ② 通知の宛先ルールと再通知 */}
-          <details className="border border-slate-200 rounded-lg">
-            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🔔 通知のルール（誰の携帯・再通知・上司へ）</summary>
+          <details name="cfgacc" className="group bg-amber-50/40 border-2 border-amber-200 rounded-2xl overflow-hidden">
+            <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-amber-50">
+              <span className="text-2xl shrink-0">📨</span>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-black text-slate-800">通知の宛先ルール</div>
+                <div className="text-[11px] text-slate-500 truncate">誰の携帯へ・返信ない時の再通知・上司へ自動</div>
+              </div>
+              <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+            </summary>
             <div className="p-3 flex flex-col gap-2">
               <div className="text-[11px] text-slate-400">端末の役職は、{sideLabel}ポータルの🔔（または下の「通知（プッシュ）」の端末一覧）で設定します。役職未設定の端末は「職長」あつかい。上司=工長・グループ長。該当の役職が1台も無い時は 職長→上司→全員 の順に自動で振り替えます（誰にも届かない事態を防ぐ）。</div>
               {groups.map(g => {
@@ -5124,8 +5232,15 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             </div>
           </details>
           {/* ③ ポータル公開とURL */}
-          <details className="border border-slate-200 rounded-lg">
-            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🌐 {sideLabel}ポータル（公開する情報とURL）</summary>
+          <details name="cfgacc" className="group bg-emerald-50/40 border-2 border-emerald-200 rounded-2xl overflow-hidden">
+            <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-emerald-50">
+              <span className="text-2xl shrink-0">🌐</span>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-black text-slate-800">{sideLabel}ポータル（公開情報とURL）</div>
+                <div className="text-[11px] text-slate-500 truncate">相手の呼び名・出す情報・渡すURLのコピー</div>
+              </div>
+              <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+            </summary>
             <div className="p-3 flex flex-col gap-3">
               <div>
                 <div className="text-xs font-black text-slate-500 mb-1">相手側の呼び名 — 画面表示に使います（例: 組立 / 機械 / 前工程）</div>
@@ -5148,8 +5263,15 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             </div>
           </details>
           {/* ④ プッシュ通知(VAPID/端末) */}
-          <details className="border border-slate-200 rounded-lg">
-            <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">📳 通知（プッシュ）— VAPID鍵・この端末の登録・端末一覧</summary>
+          <details name="cfgacc" className="group bg-slate-50 border-2 border-slate-200 rounded-2xl overflow-hidden">
+            <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-slate-100">
+              <span className="text-2xl shrink-0">📳</span>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-black text-slate-800">通知（プッシュ）の設定・端末一覧</div>
+                <div className="text-[11px] text-slate-500 truncate">VAPID鍵・この端末の登録・つながっている端末</div>
+              </div>
+              <span className="shrink-0 text-slate-300 text-xl transition-transform group-open:rotate-90">›</span>
+            </summary>
             <div className="p-3">
               <PushSettingsPanel
                 settings={settings} saveSettings={saveSettings} saveShared={saveShared} saveData={saveData} deleteData={deleteData}
@@ -5443,7 +5565,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
         if (modelPick.type === 'prefix') return (portalModelPrefix(l.model) || PORTAL_NO_PREFIX) === modelPick.p; // 頭文字なしのボタンでも絞れるよう、集計側と同じ言い換えを使う
         return true;
       })
-      .sort((a, b) => String(a.dueDate || '9999').localeCompare(String(b.dueDate || '9999')));
+      .sort((a, b) => (dueMsOf(a.dueDate) ?? Infinity) - (dueMsOf(b.dueDate) ?? Infinity));
   }, [openLots, q, modelPick, modelFams, modelMap]);
   const LOT_LIST_CAP = 200; // 表示上限(これを超えたら件数を出して知らせる=黙って切らない)
   const lotListShown = lotList.slice(0, LOT_LIST_CAP);
@@ -5681,7 +5803,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                         <span className="text-sm font-bold text-slate-600 truncate">{it.model}</span>
                         {tplNameForItem(it) && <span className="text-[11px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 shrink-0">📋 {tplNameForItem(it)}</span>}
                         {showQty && it.quantity ? <span className="text-xs text-slate-400 shrink-0">{it.quantity}台</span> : null}
-                        {showDue && it.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {it.dueDate}</span> : null}
+                        {showDue && it.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {fmtDue(it.dueDate)}</span> : null}
                         {it.time ? (
                           <span className="ml-auto flex flex-col items-end shrink-0">
                             <span className="font-black text-emerald-700">{it.date ? `${String(it.date).slice(5).replace('-', '/')} ` : ''}{it.time} ✓</span>
@@ -5799,7 +5921,7 @@ const ContactPortal = ({ lots, contactRequests, arrivalTimes, saveData, settings
                     <span className="text-sm font-bold text-slate-600 truncate">{l.model}</span>
                     {tplName(l) && <span className="text-[11px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 shrink-0">📋 {tplName(l)}</span>}
                     {showQty ? <span className="text-xs text-slate-400 shrink-0">{l.quantity}台</span> : null}
-                    {showDue && l.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {l.dueDate}</span> : null}
+                    {showDue && l.dueDate ? <span className="text-xs text-slate-400 shrink-0">納期 {fmtDue(l.dueDate)}</span> : null}
                     {cur && cur.time && <span className="text-xs font-black text-teal-700 bg-teal-50 border border-teal-200 rounded px-1.5 py-0.5 shrink-0">登録済 {cur.date ? `${String(cur.date).slice(5).replace('-', '/')} ` : ''}{cur.time}</span>}
                     <span className="ml-auto flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
                       <button onClick={() => askFinish(l)} className="px-2.5 py-1.5 rounded-lg bg-white border border-indigo-300 text-indigo-700 hover:bg-indigo-50 text-xs font-bold" title="この製品の検査がいつ終わるか、検査側に聞きます">🏁 いつ終わる？</button>
@@ -10505,6 +10627,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // この検査を実施している作業者名 = ロットの担当者(lot.workerId)。担当を切替えると以降の完了が新担当で記録される。
   // これを各タスクの workerName に焼き付けることで、台ごとに別の人が作業しても集計が正しくなる。
   const inspectorName = (lot.workerId && workers.find(w => w.id === lot.workerId)?.name) || currentUserName || '';
+  // 作業中の担当者引き継ぎ: 左上のこのセレクタで担当を切替えると lot.workerId を更新 →
+  //   inspectorName が追従し、これ以降に完了する台は新しい担当で記録される(完了済みの台はそのまま=遡及しない)。
+  //   例: 4台のうち1・2台目を A が完了→ここで B に切替→3・4台目は B で記録。
+  const changeInspector = (workerId) => {
+    if (!workerId || workerId === lot.workerId) return;
+    const nm = (workers.find(w => w.id === workerId)?.name) || '';
+    if (!window.confirm(`担当を「${nm}」に切り替えます。\nこれ以降に完了する台は「${nm}」で記録されます（完了済みの台はそのまま）。\nよろしいですか？`)) return;
+    onSave({ workerId });
+  };
+  const inspectorSelector = (
+    <label onClick={(e) => e.stopPropagation()} className="flex items-center gap-1 bg-white/10 rounded px-1.5 py-1 shrink-0" title="この作業の担当者。切り替えると、これ以降に完了する台は新しい担当で記録されます（完了済みの台はそのまま）">
+      <User className="w-3.5 h-3.5 opacity-80 shrink-0" />
+      <select value={lot.workerId || ''} onChange={(e) => changeInspector(e.target.value)} className="bg-slate-700 text-white rounded px-1 py-0.5 text-xs font-bold border border-white/20 max-w-[6.5rem]">
+        <option value="">担当を選択</option>
+        {(workers || []).map(w => <option key={w.id} value={w.id} className="text-black">{w.name}</option>)}
+      </select>
+    </label>
+  );
   // ロットが消えた (削除/置換) 場合は自動でモーダルを閉じる
   useEffect(() => {
     if (!_lotProp && onClose) {
@@ -14221,7 +14361,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
         <div className="bg-white w-full max-w-6xl h-full max-h-full rounded-2xl shadow-2xl flex flex-col overflow-hidden relative">
           <div className="bg-slate-800 text-white px-3 py-1.5 flex justify-between items-center shrink-0 gap-2">
-             <div className="shrink-0"><h2 className="text-sm font-bold flex items-center gap-1.5"><button onClick={switchToSequential} className="bg-emerald-600 hover:bg-blue-600 px-2 py-0.5 rounded text-[11px] transition-colors" title="通常モードに切替">カスタム ⇄</button><span className="truncate max-w-[9rem]">{lot.model}</span> <span className="font-mono opacity-70 text-xs">#{lot.serialNo}</span> {lotTemplate?.name && <span className="text-[11px] bg-white/15 px-1.5 py-0.5 rounded font-bold truncate max-w-[10rem]" title={`テンプレート: ${lotTemplate.name}`}>📋 {lotTemplate.name}</span>} <span className="text-xs opacity-70 shrink-0">({lot.quantity}台)</span></h2></div>
+             <div className="shrink-0 flex items-center gap-2"><h2 className="text-sm font-bold flex items-center gap-1.5"><button onClick={switchToSequential} className="bg-emerald-600 hover:bg-blue-600 px-2 py-0.5 rounded text-[11px] transition-colors" title="通常モードに切替">カスタム ⇄</button><span className="truncate max-w-[9rem]">{lot.model}</span> <span className="font-mono opacity-70 text-xs">#{lot.serialNo}</span> {lotTemplate?.name && <span className="text-[11px] bg-white/15 px-1.5 py-0.5 rounded font-bold truncate max-w-[10rem]" title={`テンプレート: ${lotTemplate.name}`}>📋 {lotTemplate.name}</span>} <span className="text-xs opacity-70 shrink-0">({lot.quantity}台)</span></h2>{inspectorSelector}</div>
              <div className="flex flex-wrap gap-1.5 items-center justify-end">
                  <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
                    {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
@@ -15557,7 +15697,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
       <div className="bg-white w-full max-w-4xl h-[85vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
         <div className="bg-slate-800 text-white p-4 flex justify-between items-center shrink-0">
-          <div><h2 className="text-lg font-bold flex items-center gap-2"><button onClick={switchToCustom} className="bg-blue-600 hover:bg-emerald-600 px-2 py-0.5 rounded text-xs transition-colors" title="カスタムモードに切替">順序実行 ⇄</button>{lot.model} <span className="font-mono opacity-70">#{lot.serialNo}</span></h2><p className="text-xs text-slate-400 mt-1">工程 {currentStepIdx + 1} / {localSteps.length}: {currentStep.title}{totalUnits > 1 ? ` — ${currentUnitIdx + 1}/${totalUnits}台目` : ''}</p></div>
+          <div><h2 className="text-lg font-bold flex items-center gap-2"><button onClick={switchToCustom} className="bg-blue-600 hover:bg-emerald-600 px-2 py-0.5 rounded text-xs transition-colors" title="カスタムモードに切替">順序実行 ⇄</button>{lot.model} <span className="font-mono opacity-70">#{lot.serialNo}</span> {inspectorSelector}</h2><p className="text-xs text-slate-400 mt-1">工程 {currentStepIdx + 1} / {localSteps.length}: {currentStep.title}{totalUnits > 1 ? ` — ${currentUnitIdx + 1}/${totalUnits}台目` : ''}</p></div>
           <div className="flex items-center gap-2">
             {voiceEnabled && voiceStatus && <div className="bg-blue-500/30 text-blue-100 text-xs px-3 py-1 rounded-full max-w-xs truncate animate-pulse">{voiceStatus}</div>}
             <button onClick={toggleVoice} className={`p-2 rounded-full transition-all ${voiceEnabled ? 'bg-blue-500 text-white animate-pulse ring-2 ring-blue-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={voiceEnabled ? '音声OFF' : '音声ON'}>
@@ -19036,7 +19176,7 @@ const ManagerDashboard = ({ lots = [], settings = {} }) => {
       byModel[m] = (byModel[m] || 0) + (l.quantity || 1);
       if (defs.length) defByModel[m] = (defByModel[m] || 0) + defs.length;
       const cm = compMs(l);
-      if (l.dueDate) { withDue++; const dd = new Date(l.dueDate + 'T23:59:59').getTime(); if (cm != null && !isNaN(dd) && cm <= dd) onTime++; }
+      if (l.dueDate) { withDue++; const _dm = dueMsOf(l.dueDate); const dd = _dm != null ? _dm + 86400000 - 1 : NaN; if (cm != null && !isNaN(dd) && cm <= dd) onTime++; }
       const em = toMs(l.entryAt) || toMs(l.createdAt);
       if (em && cm && cm >= em) { leadSum += (cm - em) / 86400000; leadN++; }
     });
@@ -19721,7 +19861,7 @@ const KpiDetailView = ({ lots = [], settings = {}, saveSettings = null, currentU
     const leadByModel = Object.entries(lbm).map(([m, arr]) => ({ m, avg: arr.reduce((a, b) => a + b, 0) / arr.length, n: arr.length })).sort((a, b) => b.avg - a.avg).slice(0, 6);
     const stalled = (lots || []).filter(l => !isCompleted(l)).map(l => { const em = toMs(l.entryAt) || toMs(l.createdAt); return { lot: l, age: em ? (Date.now() - em) / 86400000 : null }; }).filter(x => x.age != null).sort((a, b) => b.age - a.age).slice(0, 8);
     const withDue = comp.filter(l => l.dueDate); let onTime = 0; const late = []; const dbm = {};
-    withDue.forEach(l => { const cm = compMs(l), dd = new Date(l.dueDate + 'T23:59:59').getTime(); const o = dbm[l.model || '不明'] = dbm[l.model || '不明'] || { on: 0, tot: 0 }; o.tot++; if (cm != null && !isNaN(dd)) { if (cm <= dd) { onTime++; o.on++; } else late.push({ lot: l, daysLate: Math.ceil((cm - dd) / 86400000) }); } });
+    withDue.forEach(l => { const cm = compMs(l), _dm = dueMsOf(l.dueDate), dd = _dm != null ? _dm + 86400000 - 1 : NaN; const o = dbm[l.model || '不明'] = dbm[l.model || '不明'] || { on: 0, tot: 0 }; o.tot++; if (cm != null && !isNaN(dd)) { if (cm <= dd) { onTime++; o.on++; } else late.push({ lot: l, daysLate: Math.ceil((cm - dd) / 86400000) }); } });
     const dueByModel = Object.entries(dbm).map(([m, o]) => ({ m, rate: o.on / o.tot * 100, on: o.on, tot: o.tot })).sort((a, b) => a.rate - b.rate).slice(0, 6);
     late.sort((a, b) => b.daysLate - a.daysLate);
     let totalSec = 0; comp.forEach(l => Object.values(l.tasks || {}).forEach(t => { if (t && (t.status === 'completed' || t.status === 'ng') && (t.duration || 0) > 0) totalSec += t.duration; }));
@@ -25840,7 +25980,7 @@ const LotAssignmentModal = ({ lot, workers, mapZones, currentUserName, onClose, 
         <div className="border-b pb-3 mb-4">
           <div className="text-xs text-slate-500 font-bold">作業対象</div>
           <div className="text-xl font-bold text-slate-800">{lot.model} <span className="text-base font-normal text-slate-500">({lot.orderNo})</span></div>
-          <div className="text-xs text-slate-500">{lot.quantity}台 / 入荷: {lot.entryAt ? toDateShort(lot.entryAt) : '-'} / 納期: {lot.dueDate || '-'}</div>
+          <div className="text-xs text-slate-500">{lot.quantity}台 / 入荷: {lot.entryAt ? toDateShort(lot.entryAt) : '-'} / 納期: {fmtDue(lot.dueDate) || '-'}</div>
         </div>
 
         {/* Step 1a: 担当者本人モード - 自分で作業確認 */}
@@ -26114,8 +26254,8 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
       if (sortOrder === 'entry_asc') return (a.entryAt || 0) - (b.entryAt || 0);
       if (sortOrder === 'entry_desc') return (b.entryAt || 0) - (a.entryAt || 0);
       if (sortOrder === 'due_asc') {
-        const aDue = a.dueDate ? new Date(a.dueDate).getTime() : Infinity;
-        const bDue = b.dueDate ? new Date(b.dueDate).getTime() : Infinity;
+        const aDue = dueMsOf(a.dueDate) ?? Infinity;
+        const bDue = dueMsOf(b.dueDate) ?? Infinity;
         return aDue - bDue;
       }
       return 0;
@@ -26474,7 +26614,7 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                     })()}
                     <div className="text-xs text-slate-500">
                       {lot.entryAt && <span>入庫: {toDateShort(lot.entryAt)}</span>}
-                      {lot.dueDate && <span className="ml-2 text-blue-600 font-bold">納期: {lot.dueDate}</span>}
+                      {lot.dueDate && <span className="ml-2 text-blue-600 font-bold">納期: {fmtDue(lot.dueDate)}</span>}
                     </div>
                     {(zoneName || workerName) && (
                       <div className="flex gap-2 text-[10px] items-center">
@@ -26579,7 +26719,7 @@ const InspectionListView = ({ lots, workers, templates, settings, onEditLot, onD
                         <td className="p-3 text-slate-500 text-xs">{lot.entryAt ? `${toDateShort(lot.entryAt)} ${new Date(lot.entryAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}` : '-'}</td>
                         {/* 🚚 到着予定: PCからその場で入れる。組立からの回答も同じ arrival_times に入るので、ここに出る。 */}
                         <td className="p-3"><ArrivalCell lot={lot} arrival={arrivalByLot[lot.id]} saveData={saveData} currentUserName={currentUserName} /></td>
-                        <td className="p-3 text-xs font-bold text-blue-600">{lot.dueDate || '-'}</td>
+                        <td className="p-3 text-xs font-bold text-blue-600">{fmtDue(lot.dueDate) || '-'}</td>
                         {/* 場所 (エリア) */}
                         <td className="p-3 text-xs">
                           {(() => {
@@ -28743,8 +28883,8 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
     };
 
     activeLots.forEach(lot => {
-      if (!lot.dueDate) { noDueCount++; noDueSec += calculateLotEstimatedTime(lot); return; }
-      const due = new Date(lot.dueDate); due.setHours(0,0,0,0);
+      const due = dueDateObj(lot.dueDate);
+      if (!due) { noDueCount++; noDueSec += calculateLotEstimatedTime(lot); return; }
       const sec = calculateLotEstimatedTime(lot);
       const wk = weeks.find(w => due >= w.start && due <= w.end);
       if (wk) pushToWeek(wk, lot, sec);
@@ -28773,8 +28913,8 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
     }
 
     activeLots.forEach(lot => {
-      if (!lot.dueDate) return;
-      const due = new Date(lot.dueDate); due.setHours(0,0,0,0);
+      const due = dueDateObj(lot.dueDate);
+      if (!due) return;
       const sec = calculateLotEstimatedTime(lot);
       const mo = months.find(m => due >= m.start && due <= m.end);
       if (mo) { mo.lots.push(lot); mo.totalSec += sec; }
@@ -29083,8 +29223,7 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
                   ds.setHours(0,0,0,0);
                   const de = new Date(ds); de.setHours(23,59,59,999);
                   const dayLots = wk.lots.filter(l => {
-                    if (!l.dueDate) return false;
-                    const due = new Date(l.dueDate); due.setHours(0,0,0,0);
+                    const due = dueDateObj(l.dueDate); if (!due) return false;
                     return due.getTime() === ds.getTime();
                   });
                   // 月曜セルに以下を集める:
@@ -29093,15 +29232,13 @@ const ProgressOverviewView = ({ lots, workers, settings, templates = [], saveSet
                   if (d === 0) {
                     if (idx === 0 && weeklyWorkload.overdueCount > 0) {
                       wk.lots.forEach(l => {
-                        if (!l.dueDate) return;
-                        const due = new Date(l.dueDate); due.setHours(0,0,0,0);
+                        const due = dueDateObj(l.dueDate); if (!due) return;
                         if (due < wk.start) dayLots.push(l);
                       });
                     }
                     // 土日納期分をこの週の月曜に集約
                     wk.lots.forEach(l => {
-                      if (!l.dueDate) return;
-                      const due = new Date(l.dueDate); due.setHours(0,0,0,0);
+                      const due = dueDateObj(l.dueDate); if (!due) return;
                       const dow = due.getDay();
                       if ((dow === 0 || dow === 6) && due >= wk.start && due <= wk.end) {
                         dayLots.push(l);
@@ -29509,7 +29646,7 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
   const planData = useMemo(() => {
     const mg = modelGroupsOf(settings); // 型式グループ較正を見積もりにも適用(達成率の目標基準と一致させる)
     const activeLots = lots.filter(l => l.status !== 'completed' && l.location !== 'completed');
-    const monthLots = activeLots.filter(l => l.dueDate && inMonth(new Date(l.dueDate).getTime()));
+    const monthLots = activeLots.filter(l => { const dm = dueMsOf(l.dueDate); return dm != null && inMonth(dm); });
     let totalSec = 0, totalQty = 0;
     let noDueInfo = 0; // 当月外だが納期未設定で進行中(参考表示用): ここでは当月集計に含めない
     // 週次バケット
@@ -29525,9 +29662,9 @@ const MonthlyReportView = ({ lots = [], workers = [], settings = {}, customTarge
       const sec = calculateLotEstimatedTime(lot, customTargetTimes, mg);
       const qty = lot.quantity || 1;
       totalSec += sec; totalQty += qty;
-      const dueMs = new Date(lot.dueDate).setHours(0, 0, 0, 0);
-      if (dueMs < todayMs) { overdueCount++; overdueSec += sec; }
-      const wi = weekIndexOf(new Date(lot.dueDate).setHours(12, 0, 0, 0));
+      const dueMs = dueMsOf(lot.dueDate);
+      if (dueMs != null && dueMs < todayMs) { overdueCount++; overdueSec += sec; }
+      const wi = (dueMs != null) ? weekIndexOf(dueMs + 12 * 3600000) : -1;
       if (wi >= 0) {
         const wk = weeks[wi];
         wk.lots++; wk.qty += qty; wk.sec += sec;
@@ -33030,7 +33167,9 @@ export default function App() {
            const t = eYMD ? new Date(`${eYMD}T${hhmm}:00`).getTime() : new Date(entryRaw).getTime();
            entryAt = isNaN(t) ? Date.now() : t;
          } else if (dueDate) {
-           const d = new Date(dueDate + 'T08:30:00'); d.setDate(d.getDate() - 3); entryAt = d.getTime();
+           const d = dueDateObj(dueDate);
+           if (d) { d.setHours(8, 30, 0, 0); d.setDate(d.getDate() - 3); entryAt = d.getTime(); }
+           else entryAt = Date.now();
          } else {
            entryAt = Date.now();
          }
