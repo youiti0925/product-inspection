@@ -4817,62 +4817,95 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               </div>
             );
           })()}
-          {/* 通知音 — 「PCの通知に気づかない」対策。作業中は画面が前面でOS通知が出ないので、音が唯一の合図になる。 */}
+          {/* 🔔 連絡の知らせ方 — 音/画面/アラーム/OS通知を、子どもでも分かるカード式に。
+              既定はスイッチだけ見えて、数字は「くわしく設定」を開いた時だけ出す(=普段はごちゃごちゃしない)。 */}
           {(() => {
-            const on = contactSoundOn(settings);
-            return (
-              <div className="border border-amber-200 bg-amber-50 rounded-lg px-3 py-2 flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-black text-amber-900">🔔 連絡が来たら音を鳴らす</span>
-                <button onClick={() => saveSettings({ contactSound: { ...(settings?.contactSound || {}), enabled: !on } })} className={`px-2.5 py-1 rounded-full text-xs font-black ${on ? 'bg-amber-500 text-white' : 'bg-slate-200 text-slate-500'}`}>{on ? 'ON' : 'OFF'}</button>
-                {on && !audioOk && (
-                  <button onClick={() => { contactUnlockAudio(); setTimeout(() => { contactBeep(2); setAudioOk(contactAudioReady()); }, 150); }} className="px-2.5 py-1 rounded-lg text-xs font-black bg-rose-600 text-white animate-pulse">🔊 この端末で音を有効にする（1回だけ・押すと鳴ります）</button>
-                )}
-                {on && audioOk && (
-                  <button onClick={() => contactBeep(2)} className="px-2.5 py-1 rounded-lg text-xs font-black bg-white border border-amber-300 text-amber-800 hover:bg-amber-100">🔊 音が出るか試す</button>
-                )}
-                <span className="text-[11px] text-slate-500">
-                  鳴るのは<b>手を止めて動く必要があるものだけ</b>（{sideLabel}の返信・「行けない」・現場からの社内連絡・いつ終わる?）。
-                  到着予定の回答や会話、こちらから出した連絡では鳴りません（全部鳴らすと必ず無視されるようになるため）。
-                </span>
-              </div>
-            );
-          })()}
-          {/* 🔧 画面内の通知（音・トースト・ティッカー）の細かい設定 */}
-          {(() => {
+            const soundOn = contactSoundOn(settings);
             const sc = contactSoundCfg(settings);
             const tc = contactToastCfg(settings);
             const kc = contactTickerCfg(settings);
+            const a = contactAlarmCfg(settings);
+            const os = contactOsNotifyCfg(settings);
             const setSC = (patch) => saveSettings({ contactSound: { ...(settings?.contactSound || {}), ...patch } });
             const setTC = (patch) => saveSettings({ contactToast: { ...(settings?.contactToast || {}), ...patch } });
             const setKC = (patch) => saveSettings({ contactTicker: { ...(settings?.contactTicker || {}), ...patch } });
+            const setA = (patch) => saveSettings({ contactAlarm: { ...(settings?.contactAlarm || {}), ...patch } });
+            const setOs = (patch) => saveSettings({ contactOsNotify: { ...(settings?.contactOsNotify || {}), ...patch } });
             const num = (v, def = 0) => { const n = Number(v); return (isFinite(n) && n >= 0) ? n : def; };
             const soundTypes = Array.isArray(sc.types) ? sc.types : CONTACT_SOUND_DEFAULTS.types;
             const TYPE_LABELS = [['answer', '返信'], ['no', '行けない'], ['internal', '社内連絡'], ['finish', 'いつ終わる?'], ['arrival', '到着回答'], ['comment', '会話']];
             const toggleType = (t) => setSC({ types: soundTypes.includes(t) ? soundTypes.filter(x => x !== t) : [...soundTypes, t] });
             const toastWords = contactToastWords(tc);
+            const trigs = contactAlarmTriggers(a);
+            const COMMON_TRIGGERS = ['修正依頼', '呼出', '社内連絡', '行けない', '至急', '再通知', 'いつ終わ', '到着予定', '返信', 'CC'];
+            const toggleTrig = (w) => setA({ triggers: trigs.includes(w) ? trigs.filter(x => x !== w) : [...trigs, w] });
+            const Sw = ({ on, onClick, color = 'emerald' }) => (
+              <button onClick={onClick} className={`shrink-0 w-[52px] h-[30px] rounded-full relative transition-colors ${on ? (color === 'rose' ? 'bg-rose-500' : 'bg-emerald-500') : 'bg-slate-300'}`} title={on ? 'ON' : 'OFF'}>
+                <span className={`absolute top-[3px] left-[3px] w-6 h-6 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-[22px]' : ''}`} />
+              </button>
+            );
+            const Num = ({ label, value, onCommit, suffix, min = 0, step = 1, width = 'w-16' }) => (
+              <label className="text-xs font-bold text-slate-600 flex items-center gap-1">{label}
+                <input type="number" min={min} step={step} defaultValue={value} onBlur={e => onCommit(num(e.target.value, value))} className={`${width} border border-slate-300 rounded-lg px-1.5 py-1 text-center`} />{suffix}
+              </label>
+            );
+            const Chip = ({ on, onClick, children, color = 'slate' }) => (
+              <button onClick={onClick} className={`px-2.5 py-1 rounded-full text-xs font-black border transition-colors ${on ? (color === 'rose' ? 'bg-rose-500 border-rose-600 text-white' : 'bg-amber-500 border-amber-600 text-white') : 'bg-white border-slate-300 text-slate-500 hover:bg-slate-50'}`}>{children}</button>
+            );
+            const More = ({ children }) => (
+              <details className="mt-1 group">
+                <summary className="cursor-pointer select-none text-xs font-black text-slate-400 hover:text-slate-600 list-none flex items-center gap-1"><span className="inline-block transition-transform group-open:rotate-90">▶</span> くわしく設定</summary>
+                <div className="mt-2 flex flex-col gap-2 pl-1">{children}</div>
+              </details>
+            );
             return (
-              <details className="border border-slate-200 rounded-lg">
-                <summary className="px-3 py-2 text-sm font-black text-slate-700 cursor-pointer select-none bg-slate-50 rounded-lg">🔧 画面内の通知（音・トースト・ティッカー）の細かい設定</summary>
-                <div className="p-3 flex flex-col gap-3">
-                  <div className="bg-white rounded-lg border border-amber-200 px-3 py-2 flex flex-col gap-1.5">
-                    <div className="text-xs font-black text-amber-900">🔔 通知音（軽く鳴らす方・アラームとは別）</div>
-                    <div className="flex flex-wrap gap-1.5 items-center">
-                      <span className="text-[11px] font-bold text-slate-500">鳴らす種類:</span>
-                      {TYPE_LABELS.map(([t, lbl]) => (
-                        <button key={t} onClick={() => toggleType(t)} className={`px-2 py-0.5 rounded-lg text-[11px] font-black border ${soundTypes.includes(t) ? 'bg-amber-500 border-amber-600 text-white' : 'bg-white border-slate-300 text-slate-500'}`}>{lbl}</button>
-                      ))}
+              <div className="flex flex-col gap-2.5">
+                <div className="rounded-2xl bg-gradient-to-br from-sky-50 to-indigo-50 border-2 border-sky-200 px-3.5 py-3 flex flex-col gap-1">
+                  <div className="text-base font-black text-slate-800 flex items-center gap-2">🔔 連絡の知らせ方</div>
+                  <div className="text-xs text-slate-600 leading-relaxed">
+                    ここで決めた鳴らし方は、<b className="text-sky-700">この検査の画面</b>と<b className="text-sky-700">{sideLabel}ポータル</b>の<b>両方</b>に効きます。
+                    {sideLabel}の人は自分で設定できないので、<b>ここで決めてあげてください</b>。
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border-2 border-amber-200 bg-amber-50/60 p-3 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-2xl">🔊</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-black text-slate-800">音で知らせる</div>
+                      <div className="text-[11px] text-slate-500">連絡が来たら「ピッ」と鳴らします。</div>
                     </div>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">回数<input type="number" min="1" defaultValue={sc.count} onBlur={e => setSC({ count: Math.max(1, num(e.target.value, sc.count)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" /></label>
-                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">高さ<input type="number" min="50" defaultValue={sc.freq} onBlur={e => setSC({ freq: Math.max(50, num(e.target.value, sc.freq)) })} className="w-20 border border-slate-300 rounded px-1.5 py-1 text-center" />Hz</label>
-                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">音量<input type="range" min="0" max="1" step="0.05" defaultValue={sc.volume} onChange={e => setSC({ volume: num(e.target.value, sc.volume) })} className="w-24 accent-amber-500" /></label>
-                      <button onClick={() => { contactUnlockAudio(); setTimeout(() => contactBeep(sc.count, sc.freq, sc.volume), 120); }} className="px-2.5 py-1 rounded-lg text-[11px] font-black bg-amber-100 border border-amber-300 text-amber-800">🔊 試す</button>
+                    {soundOn && (audioOk
+                      ? <button onClick={() => contactBeep(sc.count, sc.freq, sc.volume)} className="px-2.5 py-1.5 rounded-xl text-xs font-black bg-white border border-amber-300 text-amber-800 hover:bg-amber-100 shrink-0">🔊 試す</button>
+                      : <button onClick={() => { contactUnlockAudio(); setTimeout(() => { contactBeep(sc.count, sc.freq, sc.volume); setAudioOk(contactAudioReady()); }, 150); }} className="px-2.5 py-1.5 rounded-xl text-xs font-black bg-rose-600 text-white animate-pulse shrink-0">🔊 音を有効にする</button>)}
+                    <Sw on={soundOn} onClick={() => saveSettings({ contactSound: { ...(settings?.contactSound || {}), enabled: !soundOn } })} />
+                  </div>
+                  {soundOn && (
+                    <More>
+                      <div className="flex flex-wrap gap-1.5 items-center">
+                        <span className="text-[11px] font-bold text-slate-500 w-full">どの連絡で鳴らす？</span>
+                        {TYPE_LABELS.map(([t, lbl]) => <Chip key={t} on={soundTypes.includes(t)} onClick={() => toggleType(t)}>{lbl}</Chip>)}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Num label="回数" value={sc.count} onCommit={v => setSC({ count: Math.max(1, v) })} suffix="回" width="w-14" min={1} />
+                        <Num label="高さ" value={sc.freq} onCommit={v => setSC({ freq: Math.max(50, v) })} suffix="Hz" width="w-20" min={50} />
+                        <label className="text-xs font-bold text-slate-600 flex items-center gap-1">音量<input type="range" min="0" max="1" step="0.05" defaultValue={sc.volume} onChange={e => setSC({ volume: num(e.target.value, sc.volume) })} className="w-24 accent-amber-500" /></label>
+                      </div>
+                    </More>
+                  )}
+                </div>
+
+                <div className="rounded-2xl border-2 border-slate-200 bg-white p-3 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-2xl">💬</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-black text-slate-800">画面に出す</div>
+                      <div className="text-[11px] text-slate-500">画面の上にお知らせが出ます。左下にも未読が並びます。<span className="text-slate-400">（これは常に出ます）</span></div>
                     </div>
                   </div>
-                  <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-col gap-1.5">
-                    <div className="text-xs font-black text-slate-700">💬 画面内トースト（上に出る通知）</div>
+                  <More>
                     <div className="flex flex-col gap-1">
-                      <span className="text-[11px] font-bold text-slate-500">「緊急」とみなす言葉（含むと自動で消えず残る）</span>
+                      <span className="text-[11px] font-bold text-slate-500">大事な言葉（含むと自動で消えず残る）</span>
                       <div className="flex flex-wrap gap-1">
                         {toastWords.map(w => (
                           <span key={w} className="inline-flex items-center gap-1 bg-rose-50 border border-rose-200 rounded-full px-2 py-0.5 text-[11px] font-bold text-rose-700">{w}<button onClick={() => setTC({ urgentWords: toastWords.filter(x => x !== w) })} className="text-rose-400 hover:text-rose-700"><X className="w-3 h-3" /></button></span>
@@ -4881,123 +4914,70 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-3">
-                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">緊急以外が自動で消えるまで<input type="number" min="1" defaultValue={tc.autoHideSec} onBlur={e => setTC({ autoHideSec: Math.max(1, num(e.target.value, tc.autoHideSec)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" />秒</label>
-                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">同時に出す最大<input type="number" min="1" defaultValue={tc.maxStack} onBlur={e => setTC({ maxStack: Math.max(1, num(e.target.value, tc.maxStack)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" />件</label>
+                      <Num label="大事以外が消えるまで" value={tc.autoHideSec} onCommit={v => setTC({ autoHideSec: Math.max(1, v) })} suffix="秒" width="w-14" min={1} />
+                      <Num label="同時に出す最大" value={tc.maxStack} onCommit={v => setTC({ maxStack: Math.max(1, v) })} suffix="件" width="w-14" min={1} />
+                      <Num label="左下の一覧" value={kc.maxShown} onCommit={v => setKC({ maxShown: Math.max(1, v) })} suffix="件" width="w-14" min={1} />
                     </div>
-                  </div>
-                  <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
-                    <div className="text-xs font-black text-slate-700">📋 左下ティッカー（未読の連絡）</div>
-                    <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">表示件数<input type="number" min="1" defaultValue={kc.maxShown} onBlur={e => setKC({ maxShown: Math.max(1, num(e.target.value, kc.maxShown)) })} className="w-14 border border-slate-300 rounded px-1.5 py-1 text-center" />件</label>
-                  </div>
+                  </More>
                 </div>
-              </details>
-            );
-          })()}
-          {/* 🚨 連絡アラーム — 「確認」を押すまで鳴り続ける(携帯のアラーム/着信のように)。全部ここで細かく設定できる。 */}
-          {(() => {
-            const a = contactAlarmCfg(settings);
-            const os = contactOsNotifyCfg(settings);
-            const setA = (patch) => saveSettings({ contactAlarm: { ...(settings?.contactAlarm || {}), ...patch } });
-            const setOs = (patch) => saveSettings({ contactOsNotify: { ...(settings?.contactOsNotify || {}), ...patch } });
-            const trigs = contactAlarmTriggers(a);
-            const COMMON_TRIGGERS = ['修正依頼', '呼出', '社内連絡', '行けない', '至急', '再通知', 'いつ終わ', '到着予定', '返信', 'CC'];
-            const toggleTrig = (w) => setA({ triggers: trigs.includes(w) ? trigs.filter(x => x !== w) : [...trigs, w] });
-            const num = (v, def = 0) => { const n = Number(v); return (isFinite(n) && n >= 0) ? n : def; };
-            const Toggle = ({ on, onClick, labelOn = 'ON', labelOff = 'OFF' }) => (
-              <button onClick={onClick} className={`px-2.5 py-1 rounded-full text-xs font-black shrink-0 ${on ? 'bg-rose-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{on ? labelOn : labelOff}</button>
-            );
-            const NumField = ({ label, value, onCommit, suffix, min = 0, step = 1, width = 'w-16' }) => (
-              <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
-                {label}
-                <input type="number" min={min} step={step} defaultValue={value} onBlur={e => onCommit(num(e.target.value, value))} className={`${width} border border-slate-300 rounded px-1.5 py-1 text-center`} />
-                {suffix}
-              </label>
-            );
-            return (
-              <details className="border-2 border-rose-200 bg-rose-50 rounded-lg">
-                <summary className="px-3 py-2 text-sm font-black text-rose-900 cursor-pointer select-none flex items-center gap-2">
-                  🚨 連絡アラーム（確認を押すまで鳴り続ける）
-                  <span className={`ml-1 text-[10px] font-black px-1.5 py-0.5 rounded-full ${a.enabled ? 'bg-rose-600 text-white' : 'bg-slate-300 text-slate-600'}`}>{a.enabled ? '有効' : '停止中'}</span>
-                </summary>
-                <div className="p-3 flex flex-col gap-3">
-                  <div className="text-[11px] text-slate-500 bg-white rounded-lg border border-rose-100 px-2.5 py-1.5">
-                    <b>アプリを開いている間</b>、下の言葉を含む連絡が来たら、<b>「確認」を押すまで音・バイブ・全画面で鳴らし続けます</b>。
-                    閉じている時はOSの通知（下の「B」）が担当します。<b>秒数・回数に上限はありません</b>（0＝無制限＝触るまで）。
+
+                <div className="rounded-2xl border-2 border-rose-200 bg-rose-50/60 p-3 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-2xl">🚨</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-black text-slate-800">確認するまで鳴らし続ける</div>
+                      <div className="text-[11px] text-slate-500">大事な連絡は、確認を押すまで<b>音・振動・画面</b>で鳴らし続けます（携帯のアラームみたいに）。</div>
+                    </div>
+                    {a.enabled && <button onClick={() => { contactUnlockAudio(); setTimeout(() => contactAlarmRing({ ...a, vibrate: true }), 120); }} className="px-2.5 py-1.5 rounded-xl text-xs font-black bg-white border border-rose-300 text-rose-700 hover:bg-rose-100 shrink-0">🔊 試す</button>}
+                    <Sw on={a.enabled} color="rose" onClick={() => setA({ enabled: !a.enabled })} />
                   </div>
-                  <div className="flex items-center gap-2 bg-white rounded-lg border border-rose-200 px-3 py-2">
-                    <span className="text-sm font-black text-rose-900">アラーム全体</span>
-                    <Toggle on={a.enabled} onClick={() => setA({ enabled: !a.enabled })} labelOn="ON（鳴らす）" labelOff="OFF" />
-                    {a.enabled && (
-                      <button onClick={() => { contactUnlockAudio(); setTimeout(() => contactAlarmRing({ ...a, vibrate: true }), 120); }} className="ml-auto px-2.5 py-1 rounded-lg text-xs font-black bg-rose-100 border border-rose-300 text-rose-700 hover:bg-rose-200">🔊 試しに鳴らす</button>
-                    )}
-                  </div>
-                  {a.enabled && (<>
-                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-col gap-1.5">
-                      <div className="text-xs font-black text-slate-700">何で鳴らすか（この言葉を含む連絡だけ鳴らす）</div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {COMMON_TRIGGERS.map(w => (
-                          <button key={w} onClick={() => toggleTrig(w)} className={`px-2 py-1 rounded-lg text-xs font-black border ${trigs.includes(w) ? 'bg-rose-600 border-rose-700 text-white' : 'bg-white border-slate-300 text-slate-500 hover:bg-slate-50'}`}>{w}</button>
-                        ))}
+                  {a.enabled && (
+                    <More>
+                      <div className="text-[11px] text-slate-500 bg-white rounded-lg border border-rose-100 px-2.5 py-1.5">アプリを開いている間だけ。<b>秒数・回数に上限なし</b>（0＝無制限＝触るまで）。</div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[11px] font-bold text-slate-500">何で鳴らす？（この言葉を含む連絡だけ）</span>
+                        <div className="flex flex-wrap gap-1.5">{COMMON_TRIGGERS.map(w => <Chip key={w} on={trigs.includes(w)} onClick={() => toggleTrig(w)} color="rose">{w}</Chip>)}</div>
+                        <div className="flex items-center gap-1.5"><input placeholder="言葉を追加（例: クレーム）+Enter" onKeyDown={e => { if (e.key === 'Enter') { const v = e.target.value.trim(); if (v && !trigs.includes(v)) setA({ triggers: [...trigs, v] }); e.target.value = ''; } }} className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs" /></div>
+                        {trigs.some(w => !COMMON_TRIGGERS.includes(w)) && <div className="flex flex-wrap gap-1">{trigs.filter(w => !COMMON_TRIGGERS.includes(w)).map(w => <span key={w} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-700">{w}<button onClick={() => toggleTrig(w)} className="text-slate-400 hover:text-rose-600"><X className="w-3 h-3" /></button></span>)}</div>}
                       </div>
-                      <div className="flex items-center gap-1.5">
-                        <input placeholder="言葉を追加（例: クレーム）" onKeyDown={e => { if (e.key === 'Enter') { const v = e.target.value.trim(); if (v && !trigs.includes(v)) setA({ triggers: [...trigs, v] }); e.target.value = ''; } }} className="flex-1 border border-slate-300 rounded-lg px-2 py-1 text-xs" />
-                        <span className="text-[10px] text-slate-400">Enterで追加</span>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">🔊 音</span><Sw on={a.sound} onClick={() => setA({ sound: !a.sound })} /></div>
+                        {a.sound && <><Num label="高さ" value={a.freq} onCommit={v => setA({ freq: v })} suffix="Hz" width="w-20" /><Num label="回数" value={a.toneCount} onCommit={v => setA({ toneCount: v })} suffix="ピッ" width="w-14" /><label className="text-xs font-bold text-slate-600 flex items-center gap-1">音量<input type="range" min="0" max="1" step="0.05" defaultValue={a.volume} onChange={e => setA({ volume: num(e.target.value, a.volume) })} className="w-24 accent-rose-600" /></label></>}
                       </div>
-                      {trigs.some(w => !COMMON_TRIGGERS.includes(w)) && (
-                        <div className="flex flex-wrap gap-1">
-                          {trigs.filter(w => !COMMON_TRIGGERS.includes(w)).map(w => (
-                            <span key={w} className="inline-flex items-center gap-1 bg-slate-100 border border-slate-300 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-700">{w}<button onClick={() => toggleTrig(w)} className="text-slate-400 hover:text-rose-600"><X className="w-3 h-3" /></button></span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
-                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">🔊 音</span><Toggle on={a.sound} onClick={() => setA({ sound: !a.sound })} /></div>
-                      {a.sound && <>
-                        <NumField label="高さ" value={a.freq} onCommit={v => setA({ freq: v })} suffix="Hz" width="w-20" />
-                        <NumField label="回数" value={a.toneCount} onCommit={v => setA({ toneCount: v })} suffix="ピッ" />
-                        <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">音量
-                          <input type="range" min="0" max="1" step="0.05" defaultValue={a.volume} onChange={e => setA({ volume: num(e.target.value, a.volume) })} className="w-24 accent-rose-600" />
-                        </label>
-                      </>}
-                    </div>
-                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
-                      <span className="text-xs font-black text-slate-700 w-full">鳴らし方（上限なし）</span>
-                      <NumField label="間隔" value={a.intervalSec} onCommit={v => setA({ intervalSec: v })} suffix="秒ごと" step="0.5" min={0.2} />
-                      <NumField label="最大" value={a.maxSec} onCommit={v => setA({ maxSec: v })} suffix="秒で自動停止(0=無制限)" width="w-20" />
-                      <NumField label="最大" value={a.maxCount} onCommit={v => setA({ maxCount: v })} suffix="回で自動停止(0=無制限)" width="w-20" />
-                    </div>
-                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
-                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">📳 バイブ</span><Toggle on={a.vibrate} onClick={() => setA({ vibrate: !a.vibrate })} /></div>
-                      {a.vibrate && <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">パターン(ms)
-                        <input defaultValue={a.vibratePattern} onBlur={e => setA({ vibratePattern: e.target.value.trim() || '400,150,400' })} placeholder="400,150,400" className="w-32 border border-slate-300 rounded px-1.5 py-1 text-center" />
-                      </label>}
-                      <span className="text-[10px] text-slate-400">「振動,休み,振動…」をmsで。PCは効きません</span>
-                    </div>
-                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
-                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">💡 画面を点滅</span><Toggle on={a.flash} onClick={() => setA({ flash: !a.flash })} /></div>
-                      {a.flash && <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">色<input type="color" defaultValue={a.flashColor} onChange={e => setA({ flashColor: e.target.value })} className="w-10 h-7 rounded border border-slate-300" /></label>}
-                    </div>
-                    <div className="bg-white rounded-lg border border-slate-200 px-3 py-2 flex flex-wrap items-center gap-3">
-                      <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">🌙 夜間は鳴らさない</span><Toggle on={a.quietEnabled} onClick={() => setA({ quietEnabled: !a.quietEnabled })} /></div>
-                      {a.quietEnabled && <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
-                        <input type="time" defaultValue={a.quietFrom} onChange={e => setA({ quietFrom: e.target.value })} className="border border-slate-300 rounded px-1 py-0.5" /> 〜
-                        <input type="time" defaultValue={a.quietTo} onChange={e => setA({ quietTo: e.target.value })} className="border border-slate-300 rounded px-1 py-0.5" />（日をまたいでもOK）
-                      </label>}
-                    </div>
-                  </>)}
-                  <div className="bg-white rounded-lg border border-indigo-200 px-3 py-2 flex flex-col gap-1.5">
-                    <div className="text-xs font-black text-indigo-800">B. アプリを閉じている時のOS通知</div>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <div className="flex items-center gap-1.5"><span className="text-[11px] font-bold text-slate-600">触るまで通知を消さない</span><Toggle on={os.requireInteraction !== false} onClick={() => setOs({ requireInteraction: os.requireInteraction === false })} /></div>
-                      <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">通知のバイブ(ms)
-                        <input defaultValue={os.vibratePattern} onBlur={e => setOs({ vibratePattern: e.target.value.trim() })} placeholder="400,150,400" className="w-32 border border-slate-300 rounded px-1.5 py-1 text-center" />
-                      </label>
-                    </div>
-                    <div className="text-[10px] text-slate-400">閉じている時は「鳴らし続ける」はできません（OSの仕様）。代わりに通知を残す＋再通知（下の「通知のルール」）で気づかせます。iPhone/一部端末はバイブ指定が無視されます。</div>
-                  </div>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Num label="間隔" value={a.intervalSec} onCommit={v => setA({ intervalSec: v })} suffix="秒ごと" step="0.5" min={0.2} width="w-16" />
+                        <Num label="最大" value={a.maxSec} onCommit={v => setA({ maxSec: v })} suffix="秒で停止(0=無制限)" width="w-16" />
+                        <Num label="最大" value={a.maxCount} onCommit={v => setA({ maxCount: v })} suffix="回で停止(0=無制限)" width="w-16" />
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">📳 振動</span><Sw on={a.vibrate} onClick={() => setA({ vibrate: !a.vibrate })} /></div>
+                        {a.vibrate && <label className="text-xs font-bold text-slate-600 flex items-center gap-1">パターン(ms)<input defaultValue={a.vibratePattern} onBlur={e => setA({ vibratePattern: e.target.value.trim() || '400,150,400' })} placeholder="400,150,400" className="w-32 border border-slate-300 rounded-lg px-1.5 py-1 text-center" /></label>}
+                        <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">💡 画面点滅</span><Sw on={a.flash} onClick={() => setA({ flash: !a.flash })} /></div>
+                        {a.flash && <input type="color" defaultValue={a.flashColor} onChange={e => setA({ flashColor: e.target.value })} className="w-10 h-7 rounded border border-slate-300" />}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex items-center gap-1.5"><span className="text-xs font-black text-slate-700">🌙 夜は鳴らさない</span><Sw on={a.quietEnabled} onClick={() => setA({ quietEnabled: !a.quietEnabled })} /></div>
+                        {a.quietEnabled && <label className="text-xs font-bold text-slate-600 flex items-center gap-1"><input type="time" defaultValue={a.quietFrom} onChange={e => setA({ quietFrom: e.target.value })} className="border border-slate-300 rounded px-1 py-0.5" /> 〜 <input type="time" defaultValue={a.quietTo} onChange={e => setA({ quietTo: e.target.value })} className="border border-slate-300 rounded px-1 py-0.5" /></label>}
+                      </div>
+                    </More>
+                  )}
                 </div>
-              </details>
+
+                <div className="rounded-2xl border-2 border-indigo-200 bg-indigo-50/50 p-3 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-2xl">📴</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-black text-slate-800">アプリを閉じてる時の通知</div>
+                      <div className="text-[11px] text-slate-500">通知が<b>触るまで消えない</b>ようにします。</div>
+                    </div>
+                    <Sw on={os.requireInteraction !== false} onClick={() => setOs({ requireInteraction: os.requireInteraction === false })} />
+                  </div>
+                  <More>
+                    <label className="text-xs font-bold text-slate-600 flex items-center gap-1">通知の振動(ms)<input defaultValue={os.vibratePattern} onBlur={e => setOs({ vibratePattern: e.target.value.trim() })} placeholder="400,150,400" className="w-32 border border-slate-300 rounded-lg px-1.5 py-1 text-center" /></label>
+                    <div className="text-[10px] text-slate-400">閉じている時は「鳴らし続ける」はできません（OSの仕様）。代わりに通知を残す＋再通知（下の「通知のルール」）で気づかせます。iPhone等は振動指定が無視されます。ロック画面を点けるには、端末に<b>アプリを入れて重要度を「緊急」</b>に（右上ヘルプ参照）。</div>
+                  </More>
+                </div>
+              </div>
             );
           })()}
           {/* 型式の仕分け(ポータルの「しぼる」ボタン) — その他に落ちた頭文字をワンタップで振り分ける */}
