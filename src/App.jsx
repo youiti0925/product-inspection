@@ -25,7 +25,7 @@ import {
 import { initializeApp } from "firebase/app";
 import {
   getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot,
-  serverTimestamp, query, orderBy, limit, where, getDocs, updateDoc,
+  serverTimestamp, query, orderBy, limit, where, getDocs, getDoc, updateDoc,
   deleteField,
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager
 } from "firebase/firestore";
@@ -662,6 +662,284 @@ const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, rateP
   // 全型式合計の年間コスト(=工数の山)が大きい順 = 横断で直すと効果が大きい順
   out.sort((a, b) => b.annualCostSec - a.annualCostSec);
   return { groups: out, rate, reductionPct };
+};
+// ===== 🎯 年間目標レイヤー (会社目標から逆算する装置) =====
+// 会社/グループの年間目標(時間10%削減・改善金額◯円)に対して「確定/実施中見込み/候補在庫」を積み上げ、残りを見える化する。
+// 設定は3アプリ共有の名前空間 goal-shared-v1 (連絡の contact-shared-v1 と同じ方式)。金額 = 時間短縮 × チャージ額(円/h・年度別)。
+const GOAL_SHARED_NS = 'goal-shared-v1';
+const GOAL_DEFAULT_YEAR = { reductionPct: 10, moneyTargetYen: 1000000, chargePerHour: 2800 };
+// 年度: 既定は12月開始〜11月終わり(設定で変更可)。年度キーは「終わる年」(例: 2025/12/1〜2026/11/30 → "2026")。
+const fiscalYearOf = (nowMs, startMonth = 12) => {
+  const d = new Date(nowMs);
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  const sm = Math.min(12, Math.max(1, Number(startMonth) || 12));
+  const startYear = (m >= sm) ? y : y - 1;
+  const startMs = new Date(startYear, sm - 1, 1).getTime();
+  const endMs = new Date(startYear + 1, sm - 1, 1).getTime() - 1;
+  const key = String(sm === 1 ? startYear : startYear + 1);
+  const endMonth = sm === 1 ? 12 : sm - 1;
+  return { key, startMs, endMs, label: `${key}年度（${startYear}/${sm}〜${sm === 1 ? startYear : startYear + 1}/${endMonth}）` };
+};
+// 記録データの開始時刻: 完了タスクの最古 endTime (無ければロット完了時刻)。年間換算の窓決めに使う。
+const dataStartMsOf = (lots) => {
+  let min = Infinity;
+  (lots || []).forEach(l => {
+    const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
+    Object.values(l.tasks || {}).forEach(t => {
+      if (!t || (t.status !== 'completed' && t.status !== 'ng')) return;
+      if ((t.duration || 0) <= 0) return;
+      const ms = toMsAny(t.endTime) || lotMs;
+      if (ms != null && ms > 0 && ms < min) min = ms;
+    });
+  });
+  return isFinite(min) ? min : null;
+};
+// ⚠年間換算の要: 365日窓だと、データがまだ浅い時期(実測: 2026年は5月開始)に「年間◯円」が1/4等に過小化する。
+//   → 直近90日(データがそれより浅ければ有る分だけ)の実測ペース×365で年換算する。登録年間台数(経営分析)があれば最優先(profitRanking側で処理)。
+const goalMeasureWindow = (lots, nowMs) => {
+  const dataStartMs = dataStartMsOf(lots);
+  const start90 = nowMs - 90 * 86400000;
+  const startMs = dataStartMs != null ? Math.max(dataStartMs, start90) : start90;
+  return { startMs, endMs: nowMs, days: Math.max(7, (nowMs - startMs) / 86400000), dataStartMs };
+};
+// 1アプリ分の目標視点サマリ: 既存 profitRanking を「実ペース窓」で呼ぶだけ(数式は重点工程ランキングと同一・検証済み)。
+// excessRatio = 原資÷年間コスト。大きすぎる(>0.3)時は目標時間の未較正を疑う(最終検査で実測57%)。
+const goalAppSummary = (lots, settings, { nowMs, chargePerHour, annualUnitsByModel = null }) => {
+  const win = goalMeasureWindow(lots, nowMs);
+  const ranking = profitRanking(lots, settings, { startMs: win.startMs, endMs: win.endMs, ratePerHour: chargePerHour, lowFreq: 0, annualUnitsByModel });
+  const excessRatio = ranking.totalCostSec > 0 ? ranking.totalSaveSec / ranking.totalCostSec : 0;
+  return { win, ranking, excessRatio };
+};
+// 改善カルテの金額換算: 1台あたり短縮秒 × 年間台数 × チャージ。
+//   確定(effective) = 凍結before/afterの実測差。実施中 = 目標まで詰めた場合の見込み(原資と同じ式)。時間KPI以外のカルテは金額換算しない(捏造しない)。
+const goalCardYen = (card, rows, annualUnitsByModel, chargePerHour) => {
+  if (card.kpi && card.kpi !== 'time') return { kind: 'nonTime', yen: 0, perUnitSec: 0, units: 0 };
+  const row = rows.find(r => r.model === card.model && r.stepKey === card.stepKey) || null;
+  const reg = annualUnitsByModel && Number(annualUnitsByModel[card.model]);
+  const units = (reg > 0) ? reg : (row ? row.annualUnits : 0);
+  if (card.status === 'effective' && card.verdictFrozen && card.baseline) {
+    const b = Number(card.verdictFrozen.beforeVal ?? card.baseline.median) || 0;
+    const a = Number(card.verdictFrozen.afterVal) || 0;
+    const per = Math.max(0, b - a);
+    return { kind: 'fixed', yen: Math.round(units * per / 3600 * chargePerHour), perUnitSec: per, units };
+  }
+  const per = row ? row.reductionPerUnit : 0;
+  return { kind: 'running', yen: Math.round(units * per / 3600 * chargePerHour), perUnitSec: per, units };
+};
+// 10%レンズ②「台あたり時間」: 年度内でデータがある最初の4週(基準) vs 直近4週。同じ型式×工程で両窓 n>=3 の行だけを直近台数で加重平均(型式ミックスの変化に歪まされない)。
+const goalPerUnitLens = (lots, settings, { fiscalStartMs, nowMs }) => {
+  const ds = dataStartMsOf(lots);
+  const baseStart = Math.max(fiscalStartMs, ds ?? fiscalStartMs);
+  const baseEnd = baseStart + 28 * 86400000;
+  const curStart = nowMs - 28 * 86400000;
+  if (curStart <= baseEnd) return { ok: false, reason: 'データがまだ8週未満（基準4週と直近4週が分離できるまでお待ちください）' };
+  const ctt = settings?.customTargetTimes || {};
+  const groups = modelGroupsOf(settings);
+  let wSum = 0, wBase = 0, rows = 0;
+  enumerateModelSteps(lots).forEach(msr => {
+    const b = measureWindow(lots, { model: msr.model, stepKey: msr.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: baseStart, endMs: baseEnd });
+    const c = measureWindow(lots, { model: msr.model, stepKey: msr.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: curStart, endMs: nowMs });
+    if (b.n < 3 || c.n < 3) return;
+    rows++;
+    wBase += b.median * c.n;
+    wSum += c.median * c.n;
+  });
+  if (!rows || wBase <= 0) return { ok: false, reason: '基準期間と直近の両方に3台以上ある工程がまだ無い' };
+  return { ok: true, pct: Math.round((1 - wSum / wBase) * 1000) / 10, rows, baseStart, baseEnd, curStart };
+};
+// 貯金箱の集計 (🎯タブと週次ブリーフの両方がこの1関数を使う=数字が食い違わない)。
+const goalBankOf = ({ improvements, prodRows, goldenTotalSaveYen = 0, includeGolden = true, annualUnitsByModel, charge }) => {
+  const fixed = [], running = [];
+  (improvements || []).forEach(c => {
+    if (!c || !c.model || !c.stepKey) return;
+    if (c.status === 'effective') { const m = goalCardYen(c, prodRows, annualUnitsByModel, charge); if (m.kind === 'fixed') fixed.push({ c, m }); }
+    else if (['plan', 'doing', 'measuring'].includes(c.status)) { const m = goalCardYen(c, prodRows, annualUnitsByModel, charge); if (m.kind === 'running') running.push({ c, m }); }
+  });
+  const openKeys = new Set(running.map(x => `${x.c.model}||${x.c.stepKey}`));
+  const stockProdYen = prodRows.filter(r => !openKeys.has(`${r.model}||${r.stepKey}`)).reduce((s, r) => s + r.annualSaveYen, 0);
+  const stockGoldenYen = includeGolden ? goldenTotalSaveYen : 0;
+  return {
+    fixed, running, openKeys,
+    fixedYen: fixed.reduce((s, x) => s + x.m.yen, 0),
+    runningYen: running.reduce((s, x) => s + x.m.yen, 0),
+    stockProdYen, stockGoldenYen, stockYen: stockProdYen + stockGoldenYen,
+  };
+};
+// ===== 🔔 改善エンジン: 週次ブリーフ (自動巡回 → 発見 → 催促 → プッシュ) =====
+// 週1回、その週最初にアプリを開いた端末が1回だけ生成する。docId=週の月曜日付で決め打ち
+//   (多端末の二重生成/二重送信を物理的に防ぐ・完了連絡の教訓と同方式)。生成物は共有docなので全端末で同じ物が見える。
+// カルテ化/却下の「人の判断」も brief doc の decisions(map) に共有保存する(端末ローカルに置かない・配列にしない)。
+const goalWeekKey = (nowMs) => {
+  const d = new Date(nowMs);
+  const dow = (d.getDay() + 6) % 7; // 月曜=0
+  const mon = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
+  return `${mon.getFullYear()}-${String(mon.getMonth() + 1).padStart(2, '0')}-${String(mon.getDate()).padStart(2, '0')}`;
+};
+const GOAL_STALL_DAYS = 10;        // カルテがこの日数動かなければ催促
+const GOAL_MINE_MIN_YEN = 20000;   // 発見(山)の価値下限: 年2万円未満は出さない(目標に効かないカードで埋めない)
+const GOAL_BREAK_TOL = 1.05;       // 維持見張り: 定着後の中央値がこの倍率を超えて悪化したら「崩れ」
+const goalCardLastMs = (c) => {
+  const logs = Array.isArray(c?.log) ? c.log : [];
+  const lastLog = logs.length ? (logs[logs.length - 1]?.ts || 0) : 0;
+  return Math.max(toMsAny(c?.updatedAt) || 0, lastLog || 0, c?.createdAt || 0);
+};
+// 「何をもって減らすか」の手段ヒント(決定論)。決め手が無い時も「なぜ良いポイントか」を必ず言う(清水の指示:
+//   減らし方が無いなら無いで良いが、"ここは全部に効く良いポイントだから工夫を考えて"と伝わる形にする)。
+const goalMethodHint = ({ stepTitle = '', cv = null }) => {
+  const t = stepTitle || '';
+  if (/測定|自動|分割/.test(t)) return '💡 減らし方: この時間の多くは機械が回っている時間＋待ちの疑いです。作業を急ぐのではなく、待っている間に他の台・他の工程を進める(並行作業)のが本命です。';
+  if (cv != null && cv >= 0.4) return '💡 減らし方: 回によって時間がバラバラ＝やり方が揃っていません。一番速い回のやり方をエース動画に撮って標準にするのが近道です。';
+  if (cv != null && cv > 0) return '💡 減らし方: 毎回同じだけ時間がかかる＝やり方そのものか目標の問題。じっと見る(要素分割)で中身を測るか、治具・置き場・手順の見直しを。';
+  return '💡 決まった手はまだありません。ただし年間の時間が大きい山なので、ここに効く工夫は何でもそのまま利益になります。まず現場で「なぜ時間がかかるか」を1回観察するところから。';
+};
+// ブリーフ本体を組み立てる純関数。findings は fid キーの map。
+const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel }) => {
+  const charge = Number(yearCfg.chargePerHour) || GOAL_DEFAULT_YEAR.chargePerHour;
+  const moneyTarget = Number(yearCfg.moneyTargetYen) || 0;
+  const ctt = settings?.customTargetTimes || {};
+  const groups = modelGroupsOf(settings);
+  const sumProd = goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel });
+  const sumGolden = golden ? goalAppSummary(golden.lots, golden.settings, { nowMs, chargePerHour: charge }) : null;
+  const goldenSuspect = !!(sumGolden && sumGolden.excessRatio > 0.3);
+  const bank = goalBankOf({ improvements, prodRows: sumProd.ranking.rows, goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0, includeGolden: true, annualUnitsByModel, charge });
+  const findings = {};
+  // ⏰ 停滞カルテ(催促)
+  (improvements || []).forEach(c => {
+    if (!c || !['plan', 'doing', 'measuring'].includes(c.status)) return;
+    const days = Math.floor((nowMs - goalCardLastMs(c)) / 86400000);
+    if (days < GOAL_STALL_DAYS) return;
+    findings[`stall-${c.id}`] = {
+      type: 'stall', model: c.model || '', stepKey: c.stepKey || '', yen: 0,
+      title: `⏰ カルテ「${c.model || ''} ${c.stepTitle || ''}」が ${days}日 止まっています`,
+      detail: `状態: ${c.status === 'plan' ? '計画のまま' : c.status === 'doing' ? '実施中' : '効果測定中'} / 担当: ${c.owner || '未定'} / 起票: ${new Date(c.createdAt || 0).toLocaleDateString('ja-JP')}。改善PDCAタブで進めるか、やらないなら「効果なし→完了」で閉じてください(放置が一番もったいない)。`,
+    };
+  });
+  // 🧱 維持の見張り(効果あり定着後の悪化=崩れ)
+  (improvements || []).forEach(c => {
+    if (!c || c.status !== 'effective' || !c.verdictFrozen || (c.kpi && c.kpi !== 'time')) return;
+    const after = Number(c.verdictFrozen.afterVal) || 0;
+    if (after <= 0) return;
+    const recent = measureWindow(lots, { model: c.model, stepKey: c.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
+    if (recent.n < 3 || recent.median <= after * GOAL_BREAK_TOL) return;
+    const m = goalCardYen({ ...c, status: 'running' }, sumProd.ranking.rows, annualUnitsByModel, charge);
+    const lossYen = Math.round((m.units || 0) * Math.max(0, recent.median - after) / 3600 * charge);
+    findings[`break-${c.id}`] = {
+      type: 'break', model: c.model || '', stepKey: c.stepKey || '', yen: lossYen,
+      title: `🧱 定着したはずの「${c.model || ''} ${c.stepTitle || ''}」が崩れています`,
+      detail: `定着時 ${pdcaFmtSec(after)} → 直近4週 ${pdcaFmtSec(recent.median)}（${recent.n}台）。戻りっぱなしだと年 約¥${lossYen.toLocaleString()} を失います。現場で標準が守られているか確認を。`,
+    };
+  });
+  // ⛰ 山(まだカルテ化していない原資の上位・価値下限つき・製品のみ=goldenは目標未較正のため出さない)
+  sumProd.ranking.rows
+    .filter(r => r.annualSaveYen >= GOAL_MINE_MIN_YEN && !bank.openKeys.has(`${r.model}||${r.stepKey}`))
+    .slice(0, 3)
+    .forEach(r => {
+      findings[`mine-${r.model}||${r.stepKey}`] = {
+        type: 'mine', model: r.model, stepKey: r.stepKey, stepTitle: r.stepTitle, yen: r.annualSaveYen,
+        median: r.median, target: r.target, cv: r.cv ?? null,
+        title: `⛰ ${r.model} ${r.stepTitle}: 効けば 年 約¥${r.annualSaveYen.toLocaleString()}`,
+        detail: `実績中央値 ${pdcaFmtSec(r.median)} / 目標 ${pdcaFmtSec(r.target)}（1台${pdcaFmtSec(r.reductionPerUnit)}の詰め代）× 年${r.annualUnits}台${r.annualUnitsSource === 'estimated' ? '(実測ペース推定)' : '(登録値)'}。`,
+        hint: goalMethodHint({ stepTitle: r.stepTitle, cv: r.cv }),
+      };
+    });
+  // 🔗 全部に効く共通ポイント(工程横断: 3型式以上に共通で年間コストが大きい工程の先頭1件)
+  try {
+    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: 0.1, annualUnitsByModel });
+    const g0 = (cross.groups || []).filter(g => g.modelCount >= 3)[0];
+    if (g0 && g0.annualCostYen >= GOAL_MINE_MIN_YEN) {
+      findings[`common-${g0.title}`] = {
+        type: 'common', model: '', stepKey: '', stepTitle: g0.title, yen: g0.saveByPctYen,
+        title: `🔗 「${g0.title}」は${g0.modelCount}型式に共通 — 1つの改善が全部に効く良いポイント`,
+        detail: `全型式合計で年 約${Math.round(g0.annualCostSec / 3600)}時間（¥${g0.annualCostYen.toLocaleString()}）かかっています。ここを10%削るだけで年 約¥${g0.saveByPctYen.toLocaleString()}。`,
+        hint: '💡 型式ごとではなく「この工程そのもの」への改善(共通の治具・置き場・手順書・段取りの工夫)を1つ考えれば、全部の型式で時間を稼げます。お金と時間を稼ぐ良いポイントです。',
+      };
+    }
+  } catch (e) { /* 横断計算が落ちてもブリーフ自体は出す */ }
+  // 📈 兆し(コスト上位工程で直近4週が前4週より15%以上悪化)
+  sumProd.ranking.rows
+    .slice()
+    .sort((a, b) => b.annualCostYen - a.annualCostYen)
+    .slice(0, 15)
+    .forEach(r => {
+      const prev = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 56 * 86400000, endMs: nowMs - 28 * 86400000 });
+      const cur = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
+      if (prev.n < 3 || cur.n < 3 || cur.median <= prev.median * 1.15) return;
+      if (Object.values(findings).filter(f => f.type === 'trend').length >= 3) return;
+      findings[`trend-${r.model}||${r.stepKey}`] = {
+        type: 'trend', model: r.model, stepKey: r.stepKey, yen: 0,
+        title: `📈 ${r.model} ${r.stepTitle} がじわじわ遅くなっています`,
+        detail: `前4週 ${pdcaFmtSec(prev.median)}（${prev.n}台）→ 直近4週 ${pdcaFmtSec(cur.median)}（${cur.n}台）= +${Math.round((cur.median / Math.max(1, prev.median) - 1) * 100)}%。原因が分かる人に一声かけてください。`,
+      };
+    });
+  // 🩺 データ品質の注意(捏造しないための正直な注記)
+  const notices = [];
+  const annualInputCount = Object.values(annualUnitsByModel || {}).filter(v => Number(v) > 0).length;
+  if (annualInputCount === 0) notices.push('年間生産台数が未登録(0型式)のため金額は実測ペース推定です。経営分析タブで登録すると精度が上がります。');
+  if (goldenSuspect) notices.push(`最終検査は実績が目標を${Math.round(sumGolden.excessRatio * 100)}%超過(目標未較正の疑い)のため、在庫金額は参考値・発見カードからは除外しています。`);
+  if (golden == null) notices.push('最終検査のデータが読めなかったため、今回は製品のみで集計しています。');
+  const stallN = Object.values(findings).filter(f => f.type === 'stall').length;
+  return {
+    fy: { key: fy.key, label: fy.label }, charge,
+    goal: {
+      moneyTargetYen: moneyTarget,
+      fixedYen: bank.fixedYen, runningYen: bank.runningYen, stockYen: bank.stockYen,
+      remainYen: Math.max(0, moneyTarget - bank.fixedYen),
+      elapsedPct: Math.max(0, Math.min(100, Math.round((nowMs - fy.startMs) / (fy.endMs - fy.startMs) * 100))),
+    },
+    findings, notices,
+    counts: { total: Object.keys(findings).length, stall: stallN },
+  };
+};
+// 週次ブリーフの生成(claim→組立→保存→任意でプッシュ)。force=既存があっても作り直す(手動ボタン用・プッシュはしない)。
+const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUserName = '', force = false, push = false, pushTokens = [], deleteData = null }) => {
+  const nowMs = Date.now();
+  const wk = goalWeekKey(nowMs);
+  const ref = doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'weekly_briefs', wk);
+  const claim = `${currentUserName || 'x'}-${Math.random().toString(36).slice(2, 10)}`;
+  if (!force) {
+    const ex = await getDoc(ref);
+    if (ex.exists()) return { ok: false, reason: 'exists' };
+    // claim を先に書き、読み返して自分が勝ったか確認(同時起動の二重送信をほぼ潰す)
+    await setDoc(ref, { weekKey: wk, building: claim, createdAt: nowMs }, { merge: true });
+    const chk = await getDoc(ref);
+    if ((chk.data() || {}).building !== claim) return { ok: false, reason: 'lost-claim' };
+  }
+  const gSnap = await getDoc(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'settings', 'config'));
+  const goalCfg = gSnap.exists() ? gSnap.data() : {};
+  if (!force && goalCfg.briefEnabled === false) return { ok: false, reason: 'disabled' };
+  const fy = fiscalYearOf(nowMs, Number(goalCfg.fiscalStartMonth) || 12);
+  const yearCfg = { ...GOAL_DEFAULT_YEAR, chargePerHour: Number(settings?.laborCostPerHour) || GOAL_DEFAULT_YEAR.chargePerHour, ...((goalCfg.years || {})[fy.key] || {}) };
+  let golden = null;
+  try {
+    const [gs, gl] = await Promise.all([
+      getDoc(doc(db, 'artifacts', 'final-inspection-v1', 'public', 'data', 'settings', 'config')),
+      getDocs(collection(db, 'artifacts', 'final-inspection-v1', 'public', 'data', 'lots')),
+    ]);
+    golden = { settings: gs.exists() ? gs.data() : {}, lots: gl.docs.map(d => ({ id: d.id, ...d.data() })) };
+  } catch (e) { /* goldenが読めなくても製品だけで作る */ }
+  const annualUnitsByModel = (settings?.annualProduction && settings.annualProduction[fy.key]) || {};
+  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel });
+  await setDoc(ref, { weekKey: wk, createdAt: nowMs, createdBy: currentUserName || '', building: deleteField(), ...brief }, { merge: true });
+  if (push) {
+    try {
+      const cfg = pushCfgOf(settings);
+      const targets = (pushTokens || []).filter(t => t && t.token && t.enabled !== false && t.admin === true);
+      if (cfg.vapidKey && cfg.workerUrl && targets.length) {
+        const man = (n) => `${Math.round(n / 10000)}万`;
+        await sendPushViaWorker(cfg.workerUrl, {
+          tokens: [...new Set(targets.map(t => t.token))],
+          title: `🎯 今週の工場: 目標まであと ¥${man(brief.goal.remainYen)}`,
+          body: `発見 ${brief.counts.total}件(うち催促 ${brief.counts.stall}件)。分析 → 🎯年間目標 で確認`,
+          link: (typeof window !== 'undefined' ? `${window.location.origin}/` : undefined), tag: `weekly-brief-${wk}`,
+        });
+        await setDoc(ref, { push: { sentAt: Date.now(), to: targets.length } }, { merge: true });
+      } else {
+        await setDoc(ref, { push: { sentAt: null, reason: !cfg.workerUrl ? 'push未設定' : '管理者端末の登録なし' } }, { merge: true });
+      }
+    } catch (e) { console.warn('週次ブリーフのプッシュに失敗(ブリーフ自体は作成済み)', e); }
+  }
+  return { ok: true, weekKey: wk };
 };
 // 改善スコアボード(SQDC型の見える化): 重点工程の「今月 vs 先月」の中央値トレンド(速/横/遅)と、
 //   今月 実際に浮いた時間/¥ を出す純関数。リサーチの結論=1点集中×結果で評価×正直なお金 を実装。
@@ -22351,6 +22629,452 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
 
 // 分析サブタブを5グループに整理 (フラットな13タブ→グループ→サブタブの2段ナビ)。機能は消さず位置だけ整理。
 // 分析タブを「データを正す→見る→計画→実行→定着」のPDCAの流れ順に並べる(2段ナビ)。番号で順番を明示。
+// ===== 🎯 年間目標タブ本体: 目標登録(3アプリ共有)+貯金箱ボード+実ペース換算+10%三レンズ =====
+const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null, currentUserName = '', saveData = null }) => {
+  const isAdmin = currentUserName === '管理者';
+  const nowMs = Date.now();
+  const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
+  const man = (n) => `${(n / 10000).toFixed(n >= 1000000 ? 0 : 1)}万`;
+  const hrs0 = (sec) => `${Math.round(sec / 3600).toLocaleString()}h`;
+  const dstr = (ms) => ms ? new Date(ms).toLocaleDateString('ja-JP', { year: 'numeric', month: 'numeric', day: 'numeric' }) : '—';
+
+  const [goalCfg, setGoalCfg] = useState(null);          // goal-shared-v1 の共有設定
+  const [ext, setExt] = useState(null);                  // {golden:{lots,settings}, parts:{...}} 読み取り専用スナップショット
+  const [extErr, setExtErr] = useState('');
+  const [includeGolden, setIncludeGolden] = useState(true);
+  const [edit, setEdit] = useState(false);
+  const [draft, setDraft] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!db) return;
+    const unsub = onSnapshot(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'settings', 'config'),
+      (s) => setGoalCfg(s.exists() ? s.data() : {}), () => setGoalCfg({}));
+    return unsub;
+  }, [db]);
+  useEffect(() => {
+    if (!db) return;
+    let dead = false;
+    (async () => {
+      try {
+        const load = async (ns) => {
+          const st = await getDoc(doc(db, 'artifacts', ns, 'public', 'data', 'settings', 'config'));
+          const ls = await getDocs(collection(db, 'artifacts', ns, 'public', 'data', 'lots'));
+          return { settings: st.exists() ? st.data() : {}, lots: ls.docs.map(d => ({ id: d.id, ...d.data() })) };
+        };
+        const [golden, parts] = await Promise.all([load('final-inspection-v1'), load('parts-inspection-v1')]);
+        if (!dead) setExt({ golden, parts });
+      } catch (e) { if (!dead) setExtErr(String(e?.message || e)); }
+    })();
+    return () => { dead = true; };
+  }, [db]);
+
+  // 📬 今週のブリーフ (共有doc購読・決定=カルテ化/却下も共有に書く)
+  const [brief, setBrief] = useState(null);
+  const [genBusy, setGenBusy] = useState(false);
+  const weekKey = goalWeekKey(nowMs);
+  useEffect(() => {
+    if (!db) return;
+    const unsub = onSnapshot(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'weekly_briefs', weekKey),
+      (s) => setBrief(s.exists() ? s.data() : null), () => {});
+    return unsub;
+  }, [db, weekKey]);
+  const makeBriefNow = async () => {
+    if (!db || genBusy) return;
+    setGenBusy(true);
+    try { await generateWeeklyBrief(db, { lots, settings, improvements, currentUserName, force: true, push: false }); }
+    catch (e) { alert('ブリーフ作成に失敗しました: ' + (e?.message || e)); }
+    setGenBusy(false);
+  };
+  const decide = async (fid, action) => {
+    if (!db) return;
+    await setDoc(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'weekly_briefs', weekKey),
+      { decisions: { [fid]: { action, by: currentUserName || '', at: Date.now() } } }, { merge: true });
+  };
+  const cardifyFinding = async (fid, f) => {
+    if (!saveData) { alert('この画面ではカルテ化できません'); return; }
+    if (!window.confirm(`「${f.model} ${f.stepTitle || ''}」を改善カルテにしますか？\n(改善PDCAタブに「計画」で作られます)`)) return;
+    const startMs = nowMs - 90 * 86400000;
+    const baseStat = measureWindow(lots, { model: f.model, stepKey: f.stepKey, customTargetTimes: settings?.customTargetTimes || {}, modelGroups: modelGroupsOf(settings), startMs, endMs: nowMs });
+    const id = generateId();
+    await saveData('improvements', id, {
+      id, createdAt: Date.now(), createdBy: currentUserName || '?', status: 'plan',
+      model: f.model, stepKey: f.stepKey, stepTitle: f.stepTitle || (f.stepKey.includes('_') ? f.stepKey.slice(f.stepKey.indexOf('_') + 1) : f.stepKey), category: '',
+      kpi: 'time', source: { kind: 'brief', label: '週次ブリーフ' }, baseline: { ...baseStat, startMs, endMs: nowMs },
+      problem: `${(f.title || '').replace(/^[^ ]+ /, '')} — ${f.detail || ''}`, hypothesis: '', action: '', owner: '', dueDate: '',
+      log: [{ ts: Date.now(), by: currentUserName || '?', type: 'create', note: 'カルテ作成 (由来: 週次ブリーフ)' }],
+    });
+    await decide(fid, 'carded');
+  };
+
+  const fiscalStartMonth = Number(goalCfg?.fiscalStartMonth) || 12;
+  const fy = fiscalYearOf(nowMs, fiscalStartMonth);
+  const yearCfg = useMemo(() => ({
+    ...GOAL_DEFAULT_YEAR,
+    chargePerHour: Number(settings?.laborCostPerHour) || GOAL_DEFAULT_YEAR.chargePerHour,
+    ...((goalCfg?.years || {})[fy.key] || {}),
+  }), [goalCfg, fy.key, settings?.laborCostPerHour]);
+  const charge = Number(yearCfg.chargePerHour) || GOAL_DEFAULT_YEAR.chargePerHour;
+  const moneyTarget = Number(yearCfg.moneyTargetYen) || 0;
+  const reductionPct = Number(yearCfg.reductionPct) || 10;
+  const annualUnitsByModel = useMemo(() => (settings?.annualProduction && settings.annualProduction[fy.key]) || {}, [settings, fy.key]);
+  const annualInputCount = useMemo(() => Object.values(annualUnitsByModel).filter(v => Number(v) > 0).length, [annualUnitsByModel]);
+
+  // 各アプリのサマリ (実ペース窓・重点工程ランキングと同一数式)
+  const sumProd = useMemo(() => goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel }), [lots, settings, charge, annualUnitsByModel]); // eslint-disable-line
+  const sumGolden = useMemo(() => ext?.golden ? goalAppSummary(ext.golden.lots, ext.golden.settings, { nowMs, chargePerHour: charge }) : null, [ext, charge]); // eslint-disable-line
+  const partsLotCount = ext?.parts?.lots?.length || 0;
+  const goldenSuspect = !!(sumGolden && sumGolden.excessRatio > 0.3);
+
+  // 貯金箱: 確定(効果あり実測) / 実施中見込み / 候補在庫。週次ブリーフと同じ goalBankOf を使う(数字の食い違い防止)。
+  const bank = useMemo(() => goalBankOf({
+    improvements, prodRows: sumProd.ranking.rows,
+    goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0,
+    includeGolden: includeGolden && !!sumGolden, annualUnitsByModel, charge,
+  }), [improvements, sumProd, sumGolden, includeGolden, annualUnitsByModel, charge]);
+
+  // 🔗 全部に効く共通ポイント(工程横断・3型式以上に共通・実ペース窓)
+  const commonTop = useMemo(() => {
+    try {
+      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: 0.1, annualUnitsByModel });
+      return (cr.groups || []).filter(g => g.modelCount >= 3 && g.annualCostSec > 0).slice(0, 3);
+    } catch (e) { return []; }
+  }, [lots, settings, sumProd, charge, annualUnitsByModel]); // eslint-disable-line
+
+  // 年度の経過とペース
+  const elapsedPct = Math.max(0, Math.min(100, Math.round((nowMs - fy.startMs) / (fy.endMs - fy.startMs) * 100)));
+  const fixedPct = moneyTarget > 0 ? Math.round(bank.fixedYen / moneyTarget * 100) : 0;
+
+  // 10% 三レンズ (どれかを満たせばOK・清水確認済み)
+  const cttP = settings?.customTargetTimes || {};
+  const fiscalAggProd = useMemo(() => measureWindow(lots, { customTargetTimes: cttP, modelGroups: modelGroupsOf(settings), startMs: fy.startMs, endMs: nowMs }), [lots, settings, fy.startMs]); // eslint-disable-line
+  const fiscalAggGolden = useMemo(() => ext?.golden ? measureWindow(ext.golden.lots, { customTargetTimes: ext.golden.settings?.customTargetTimes || {}, modelGroups: modelGroupsOf(ext.golden.settings), startMs: fy.startMs, endMs: nowMs }) : null, [ext, fy.startMs]); // eslint-disable-line
+  const lens2 = useMemo(() => goalPerUnitLens(lots, settings, { fiscalStartMs: fy.startMs, nowMs }), [lots, settings, fy.startMs]); // eslint-disable-line
+  const prodDataStart = sumProd.win.dataStartMs;
+  const lens1Available = prodDataStart != null && prodDataStart < fy.startMs;
+  const lens3 = useMemo(() => {
+    const sumAct = (fiscalAggProd?.sumAct || 0) + (includeGolden ? (fiscalAggGolden?.sumAct || 0) : 0);
+    const sumTgt = (fiscalAggProd?.sumTgt || 0) + (includeGolden ? (fiscalAggGolden?.sumTgt || 0) : 0);
+    if (sumAct <= 0 || sumTgt <= 0) return { ok: false, reason: '年度内の実績または目標がまだ無い' };
+    return { ok: true, achievement: Math.round(sumTgt / sumAct * 1000) / 10, excessPct: Math.round((sumAct / sumTgt - 1) * 1000) / 10 };
+  }, [fiscalAggProd, fiscalAggGolden, includeGolden]);
+
+  const openEdit = () => { setDraft({ fiscalStartMonth, moneyTargetYen: moneyTarget, reductionPct, chargePerHour: charge }); setEdit(true); };
+  const saveGoal = async () => {
+    if (!db || !draft) return;
+    setSaving(true);
+    try {
+      await setDoc(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'settings', 'config'), {
+        fiscalStartMonth: Math.min(12, Math.max(1, Number(draft.fiscalStartMonth) || 12)),
+        years: { ...(goalCfg?.years || {}), [fy.key]: {
+          moneyTargetYen: Math.max(0, Number(draft.moneyTargetYen) || 0),
+          reductionPct: Math.max(0, Number(draft.reductionPct) || 0),
+          chargePerHour: Math.max(0, Number(draft.chargePerHour) || 0),
+        } },
+        updatedAt: Date.now(), updatedBy: currentUserName || '',
+      }, { merge: true });
+      setEdit(false);
+    } catch (e) { alert('保存に失敗しました: ' + (e?.message || e)); }
+    setSaving(false);
+  };
+
+  const seg = (v) => moneyTarget > 0 ? Math.max(0, Math.min(100, v / moneyTarget * 100)) : 0;
+  const remainYen = Math.max(0, moneyTarget - bank.fixedYen);
+
+  // 📗 Excel出力: 分析された数字を全部そのまま渡せる形で(目標/貯金箱/ブリーフ/共通ポイント/原資明細)
+  const goalExcel = async () => {
+    try {
+      const ExcelJS = await loadExcelJS();
+      const wb = new ExcelJS.Workbook();
+      const s1 = wb.addWorksheet('目標と貯金箱');
+      s1.addRows([
+        ['年度', fy.label], ['改善金額目標(円)', moneyTarget], ['時間削減目標(%)', reductionPct], ['チャージ(円per時)', charge], ['年度経過(%)', elapsedPct], [],
+        ['確定=効果あり実測(円)', bank.fixedYen], ['実施中見込み(円)', bank.runningYen], ['候補在庫(円)', bank.stockYen], ['  うち製品(円)', bank.stockProdYen], ['  うち最終(円)', bank.stockGoldenYen], ['目標まで残り(円)', remainYen],
+      ]);
+      s1.getColumn(1).width = 26; s1.getColumn(2).width = 30;
+      const typeLabel = { stall: '催促', break: '崩れ', common: '共通ポイント', mine: '原資', trend: '悪化の兆し' };
+      const s2 = wb.addWorksheet('今週のブリーフ');
+      s2.addRow(['種類', 'タイトル', '内容', '減らし方のヒント', '金額(円per年)', '判断']);
+      Object.entries(brief?.findings || {}).forEach(([fid, f]) => {
+        const dec = (brief?.decisions || {})[fid];
+        s2.addRow([typeLabel[f.type] || f.type, f.title, f.detail, f.hint || '', f.yen || 0, dec ? (dec.action === 'carded' ? 'カルテ化済' : '却下') : '']);
+      });
+      s2.columns.forEach((c, i) => { c.width = [12, 45, 60, 60, 14, 10][i] || 14; });
+      const s3 = wb.addWorksheet('全部に効く共通ポイント');
+      s3.addRow(['工程', '共通する型式数', '年間時間(h)', '年間人件費(円)', '10%削った場合の価値(円per年)']);
+      commonTop.forEach(g => s3.addRow([g.title, g.modelCount, Math.round(g.annualCostSec / 3600), g.annualCostYen, g.saveByPctYen]));
+      s3.columns.forEach(c => { c.width = 22; });
+      const s4 = wb.addWorksheet('原資の中身(明細)');
+      s4.addRow(['型式', '工程', '標本数', '実績中央値', '目標', '年間台数', '台数の出どころ', '年間削減見込(円)', '年間人件費(円)']);
+      sumProd.ranking.rows.slice(0, 50).forEach(r => s4.addRow([r.model, r.stepTitle, r.n, pdcaFmtSec(r.median), pdcaFmtSec(r.target), r.annualUnits, r.annualUnitsSource === 'actual' ? '登録値' : '実測ペース推定', r.annualSaveYen, r.annualCostYen]));
+      s4.columns.forEach(c => { c.width = 16; });
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `年間目標_${fy.key}年度_${new Date().toISOString().slice(0, 10)}.xlsx`; a.click();
+    } catch (e) { alert('Excel出力に失敗しました: ' + (e?.message || e)); }
+  };
+  // 🖨 A4印刷: 会議・掲示用に1枚で(貯金箱バー/ブリーフ/共通ポイント/原資TOP10)
+  const goalPrint = () => {
+    const pw = window.open('', '_blank'); if (!pw) { alert('ポップアップを許可してください'); return; }
+    const esc = (s) => String(s ?? '').replace(/</g, '&lt;');
+    const typeOrder = ['stall', 'break', 'common', 'mine', 'trend'];
+    let h = `<h1 style="font-size:20px;margin:0 0 4px">🎯 年間目標レポート ${esc(fy.label)}</h1>`;
+    h += `<div style="font-size:12px">改善金額目標 <b>${man(moneyTarget)}円</b> ・ 時間 <b>${reductionPct}%削減</b> ・ チャージ ${charge.toLocaleString()}円/h ・ 年度経過 ${elapsedPct}% ・ 作成 ${new Date().toLocaleString('ja-JP')}</div>`;
+    h += `<h2>🏦 改善金額の貯金箱（目標 ${man(moneyTarget)}円）</h2>` +
+      `<div style="display:flex;height:26px;border:1px solid #999;border-radius:4px;overflow:hidden;max-width:640px;background:#f1f5f9">` +
+      `<div style="width:${seg(bank.fixedYen)}%;background:#10b981"></div><div style="width:${seg(bank.runningYen)}%;background:#38bdf8"></div><div style="width:${seg(bank.stockYen)}%;background:#fcd34d"></div></div>` +
+      `<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;margin-top:6px;font-size:12px"><tr>` +
+      `<td>✅ 確定</td><td><b>${yen(bank.fixedYen)}</b></td><td>🔧 実施中見込み</td><td>${yen(bank.runningYen)}</td><td>⛏ 候補在庫</td><td>${yen(bank.stockYen)}</td><td><b>目標まで残り</b></td><td><b>${yen(remainYen)}</b></td></tr></table>`;
+    if (brief?.findings && Object.keys(brief.findings).length) {
+      h += `<h2>📬 今週のブリーフ（発見 ${Object.keys(brief.findings).length}件）</h2>`;
+      typeOrder.forEach(tp => Object.entries(brief.findings).filter(([, f]) => f.type === tp).forEach(([fid, f]) => {
+        const dec = (brief.decisions || {})[fid];
+        h += `<div style="border:1px solid #ddd;border-radius:6px;padding:6px 8px;margin:6px 0;font-size:12px"><b>${esc(f.title)}</b>${dec ? ` <span style="color:#888">[${dec.action === 'carded' ? 'カルテ化済' : '却下'}]</span>` : ''}<br>${esc(f.detail)}${f.hint ? `<br><span style="color:#4338ca">${esc(f.hint)}</span>` : ''}</div>`;
+      }));
+    }
+    if (commonTop.length) {
+      h += `<h2>🔗 全部に効く共通ポイント（1つの改善が全型式に効く）</h2><table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-size:12px"><tr><th>工程</th><th>共通型式数</th><th>年間時間</th><th>年間人件費</th><th>10%削った価値/年</th></tr>`;
+      commonTop.forEach(g => { h += `<tr><td>${esc(g.title)}</td><td>${g.modelCount}型式</td><td>${Math.round(g.annualCostSec / 3600)}h</td><td>${yen(g.annualCostYen)}</td><td><b>${yen(g.saveByPctYen)}</b></td></tr>`; });
+      h += `</table>`;
+    }
+    h += `<h2>⛏ 原資の中身 TOP10（実績と目標の差 × 年間台数 × チャージ）</h2><table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-size:12px"><tr><th>型式</th><th>工程</th><th>今(中央値)</th><th>目標</th><th>年間台数</th><th>効けば/年</th></tr>`;
+    sumProd.ranking.rows.slice(0, 10).forEach(r => { h += `<tr><td>${esc(r.model)}</td><td>${esc(r.stepTitle)}</td><td>${pdcaFmtSec(r.median)}</td><td>${pdcaFmtSec(r.target)}</td><td>${r.annualUnits}</td><td><b>${yen(r.annualSaveYen)}</b></td></tr>`; });
+    h += `</table><div style="font-size:10px;color:#888;margin-top:8px">計算: チャージ${charge.toLocaleString()}円/h・直近${Math.round(sumProd.win.days)}日の実ペース×365日換算。年間台数${annualInputCount === 0 ? 'は未登録のため実測ペース推定' : `は登録${annualInputCount}型式を優先`}。最終検査の在庫は目標未較正のため参考値。</div>`;
+    pw.document.write(`<!DOCTYPE html><html><head><title>年間目標レポート</title><style>@media print{body{margin:0}} h2{font-size:15px;margin:14px 0 4px}</style></head><body style="font-family:'Segoe UI',sans-serif;padding:20px;max-width:900px;margin:0 auto">${h}</body></html>`);
+    pw.document.close();
+    setTimeout(() => pw.print(), 400);
+  };
+
+  return (
+    <div className="p-4 md:p-6 space-y-4 max-w-[1100px] mx-auto">
+      {/* ヘッダー: 年度と目標 */}
+      <div className="bg-gradient-to-r from-rose-50 to-amber-50 border border-rose-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+        <div className="flex-1 min-w-[240px]">
+          <div className="text-xs text-slate-500 font-bold">{fy.label}・グループ目標（3アプリ合算）</div>
+          <div className="text-2xl font-black text-slate-800 mt-0.5">改善金額 {man(moneyTarget)}円 ・ 時間 {reductionPct}%削減</div>
+          <div className="text-[11px] text-slate-500 mt-1">チャージ {charge.toLocaleString()}円/h（金額 = 短縮時間 × チャージ）・年度は{fiscalStartMonth}月はじまり</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={goalPrint} className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm font-bold text-slate-700 hover:bg-slate-50">🖨 印刷</button>
+          <button onClick={goalExcel} className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm font-bold text-emerald-700 hover:bg-emerald-50">📗 Excel</button>
+          {isAdmin && <button onClick={openEdit} className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm font-bold text-slate-700 hover:bg-slate-50">⚙ 目標の設定</button>}
+        </div>
+      </div>
+
+      {/* ⚙ 編集 (管理者・3アプリ共有保存) */}
+      {edit && draft && (
+        <div className="bg-white border-2 border-rose-300 rounded-xl p-4 space-y-3">
+          <div className="text-sm font-bold text-slate-700">🎯 {fy.key}年度の目標を設定（保存すると3アプリ共通・全端末に反映）</div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <label className="text-xs text-slate-600">改善金額目標（円/年）
+              <input type="number" min="0" step="10000" value={draft.moneyTargetYen} onChange={e => setDraft(d => ({ ...d, moneyTargetYen: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+            </label>
+            <label className="text-xs text-slate-600">時間削減目標（%）
+              <input type="number" min="0" max="100" step="1" value={draft.reductionPct} onChange={e => setDraft(d => ({ ...d, reductionPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+            </label>
+            <label className="text-xs text-slate-600">チャージ額（円/h・年度で変わったらここを更新）
+              <input type="number" min="0" step="100" value={draft.chargePerHour} onChange={e => setDraft(d => ({ ...d, chargePerHour: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+            </label>
+            <label className="text-xs text-slate-600">年度のはじまり月
+              <select value={draft.fiscalStartMonth} onChange={e => setDraft(d => ({ ...d, fiscalStartMonth: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm">
+                {Array.from({ length: 12 }, (_, i) => i + 1).map(m => <option key={m} value={m}>{m}月（〜翌{m === 1 ? 12 : m - 1}月）</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button onClick={() => setEdit(false)} className="px-3 py-1.5 text-sm text-slate-500">キャンセル</button>
+            <button onClick={saveGoal} disabled={saving} className="px-4 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-sm font-bold rounded-lg disabled:opacity-50">{saving ? '保存中…' : '保存'}</button>
+          </div>
+        </div>
+      )}
+
+      {/* 📬 今週のブリーフ (アプリが自分から言ってくる欄・週1自動生成+管理者プッシュ) */}
+      <div className="bg-white border-2 border-indigo-200 rounded-xl p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="text-sm font-bold text-indigo-800">📬 今週のブリーフ <span className="text-[10px] font-normal text-slate-400">週の最初にアプリを開いた時に自動作成 → 管理者の端末へプッシュ</span></div>
+          <div className="flex items-center gap-2">
+            {brief?.push?.sentAt ? <span className="text-[10px] text-emerald-600">🔔 プッシュ送信済({brief.push.to}台)</span> : brief?.push?.reason ? <span className="text-[10px] text-slate-400">🔕 {brief.push.reason}</span> : null}
+            {isAdmin && <button onClick={makeBriefNow} disabled={genBusy} className="text-[11px] px-2.5 py-1 bg-indigo-50 border border-indigo-200 rounded-lg font-bold text-indigo-700 hover:bg-indigo-100 disabled:opacity-50">{genBusy ? '作成中…' : brief ? '🔄 今すぐ作り直す' : '▶ 今すぐ作る'}</button>}
+          </div>
+        </div>
+        {!brief || !brief.goal ? (
+          <div className="mt-2 text-xs text-slate-500">今週分はまだありません。週の最初にアプリを開いた時に自動で作られます{isAdmin ? '（右上のボタンで今すぐ作れます）' : ''}。</div>
+        ) : (
+          <div className="mt-2 space-y-2">
+            <div className="text-lg font-black text-slate-800">🎯 目標まであと {yen(brief.goal.remainYen)} <span className="text-xs font-bold text-slate-500">・発見 {brief.counts?.total || 0}件（うち催促 {brief.counts?.stall || 0}件）・{new Date(brief.createdAt).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 作成</span></div>
+            {Object.keys(brief.findings || {}).length === 0 && <div className="text-xs text-emerald-600">今週の指摘はありません ✅</div>}
+            {['stall', 'break', 'common', 'mine', 'trend'].map(tp =>
+              Object.entries(brief.findings || {}).filter(([, f]) => f.type === tp).sort((a, b) => (b[1].yen || 0) - (a[1].yen || 0)).map(([fid, f]) => {
+                const dec = (brief.decisions || {})[fid];
+                const tone = { stall: 'bg-rose-50 border-rose-200', break: 'bg-amber-50 border-amber-200', common: 'bg-violet-50 border-violet-200', mine: 'bg-emerald-50 border-emerald-200', trend: 'bg-sky-50 border-sky-200' }[tp];
+                return (
+                  <div key={fid} className={`rounded-lg p-2.5 border ${tone} ${dec?.action === 'dismissed' ? 'opacity-50' : ''}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-bold text-slate-800">{f.title}</div>
+                        <div className="text-[11px] text-slate-600 mt-0.5 leading-relaxed">{f.detail}</div>
+                        {(f.median > 0 && f.target > 0) && (
+                          <div className="mt-1.5" style={{ maxWidth: 300 }}>
+                            <div className="flex items-center gap-1.5"><span className="text-[9px] w-6 text-slate-500 shrink-0">今</span><div className="flex-1 bg-white rounded"><div className="h-3.5 bg-rose-400 rounded" style={{ width: '100%' }} /></div><span className="text-[10px] font-bold text-rose-600 w-12 text-right">{pdcaFmtSec(f.median)}</span></div>
+                            <div className="flex items-center gap-1.5 mt-0.5"><span className="text-[9px] w-6 text-slate-500 shrink-0">目標</span><div className="flex-1 bg-white rounded"><div className="h-3.5 bg-emerald-500 rounded" style={{ width: `${Math.max(3, Math.min(100, Math.round(f.target / Math.max(1, f.median) * 100)))}%` }} /></div><span className="text-[10px] font-bold text-emerald-700 w-12 text-right">{pdcaFmtSec(f.target)}</span></div>
+                            <div className="text-[9px] text-slate-400 mt-0.5">赤い棒(今)を緑の棒(目標)まで縮めるのがゴール</div>
+                          </div>
+                        )}
+                        {f.hint && <div className="text-[11px] text-indigo-800 bg-indigo-50/80 rounded px-2 py-1 mt-1.5 leading-relaxed">{f.hint}</div>}
+                      </div>
+                      <div className="shrink-0 flex flex-col items-end gap-1">
+                        {dec ? (
+                          <span className="text-[10px] font-bold text-slate-500">{dec.action === 'carded' ? '📋 カルテ化済' : '❌ 却下'}（{dec.by}）</span>
+                        ) : tp === 'mine' ? (
+                          <div className="flex gap-1">
+                            <button onClick={() => cardifyFinding(fid, f)} className="text-[11px] px-2 py-1 bg-emerald-600 text-white rounded font-bold hover:bg-emerald-700">📋 カルテ化</button>
+                            <button onClick={() => decide(fid, 'dismissed')} className="text-[11px] px-2 py-1 bg-white border border-slate-300 rounded text-slate-500">却下</button>
+                          </div>
+                        ) : tp !== 'stall' ? (
+                          <button onClick={() => decide(fid, 'dismissed')} className="text-[11px] px-2 py-1 bg-white border border-slate-300 rounded text-slate-500">確認した</button>
+                        ) : (
+                          <span className="text-[10px] text-rose-500 font-bold">改善PDCAタブで進める</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+            {(brief.notices || []).map((n, i) => <div key={i} className="text-[10px] text-slate-400">※ {n}</div>)}
+          </div>
+        )}
+      </div>
+
+      {/* 貯金箱ボード */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <div className="flex items-baseline justify-between flex-wrap gap-2">
+          <div className="text-sm font-bold text-slate-700">🏦 改善金額の貯金箱 — 目標 {man(moneyTarget)}円 に対して</div>
+          <div className="text-[11px] text-slate-400">年度経過 {elapsedPct}%（ペースの目安）</div>
+        </div>
+        <div className="mt-3 relative h-9 bg-slate-100 rounded-lg overflow-hidden border border-slate-200">
+          <div className="absolute inset-y-0 left-0 bg-emerald-500" style={{ width: `${seg(bank.fixedYen)}%` }} title={`確定 ${yen(bank.fixedYen)}`}></div>
+          <div className="absolute inset-y-0 bg-sky-400/80" style={{ left: `${seg(bank.fixedYen)}%`, width: `${seg(bank.runningYen)}%` }} title={`実施中見込み ${yen(bank.runningYen)}`}></div>
+          <div className="absolute inset-y-0 bg-amber-300/70" style={{ left: `${seg(bank.fixedYen + bank.runningYen)}%`, width: `${seg(bank.stockYen)}%` }} title={`候補在庫 ${yen(bank.stockYen)}`}></div>
+          <div className="absolute inset-y-0 border-l-2 border-dashed border-slate-500" style={{ left: `${elapsedPct}%` }} title={`年度経過 ${elapsedPct}%`}></div>
+        </div>
+        <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+            <div className="text-[11px] text-emerald-700 font-bold">✅ 確定（効果あり判定の実測短縮）</div>
+            <div className="text-xl font-black text-emerald-700">{yen(bank.fixedYen)}<span className="text-xs font-bold text-emerald-600 ml-1">/ 目標の{fixedPct}%</span></div>
+            <div className="text-[10px] text-slate-500 mt-0.5">{bank.fixed.length}件のカルテ。凍結before/after × 年間台数 × チャージ。</div>
+          </div>
+          <div className="bg-sky-50 border border-sky-200 rounded-lg p-3">
+            <div className="text-[11px] text-sky-700 font-bold">🔧 実施中の見込み（カルテ進行中）</div>
+            <div className="text-xl font-black text-sky-700">{yen(bank.runningYen)}</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">{bank.running.length}件。目標まで詰められた場合の見込み。判定が出ると「確定」へ移動。</div>
+          </div>
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+            <div className="text-[11px] text-amber-700 font-bold">⛏ 候補在庫（まだ手を付けていない原資）</div>
+            <div className="text-xl font-black text-amber-700">{yen(bank.stockYen)}</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">製品 {yen(bank.stockProdYen)} ＋ 最終 {includeGolden ? yen(bank.stockGoldenYen) : '除外中'}。全工程を目標時間まで詰め切った場合の理論上限。</div>
+          </div>
+        </div>
+        <div className="mt-2 text-sm font-bold text-slate-700">目標まであと <span className="text-rose-600 text-lg">{yen(remainYen)}</span>（確定ベース）
+          {moneyTarget > 0 && (bank.fixedYen + bank.runningYen + bank.stockYen) < moneyTarget && <span className="ml-2 text-[11px] text-rose-500 font-normal">⚠ 確定＋見込み＋在庫を全部足しても目標に届きません。不良・手直しの金額算入や対象拡大の検討が必要です。</span>}
+        </div>
+      </div>
+
+      {/* 🔗 全部に効く共通ポイント */}
+      {commonTop.length > 0 && (
+        <div className="bg-white border border-violet-200 rounded-xl p-4">
+          <div className="text-sm font-bold text-violet-800">🔗 全部に効く共通ポイント — 1つの改善が全型式に効く「時間とお金を稼ぐ場所」</div>
+          <div className="text-[11px] text-slate-500 mt-0.5 mb-2">いろんな型式に共通する工程は、共通の治具・置き場・手順を1つ変えるだけで全部の型式が速くなります。棒が長い＝1年でかかっている時間が大きい場所。</div>
+          <div className="space-y-2">
+            {commonTop.map((g, i) => {
+              const maxSec = commonTop[0].annualCostSec || 1;
+              return (
+                <div key={g.title} className="bg-violet-50/60 rounded-lg p-2.5">
+                  <div className="flex items-baseline justify-between flex-wrap gap-1">
+                    <div className="text-sm font-bold text-slate-800">{i + 1}. {g.title} <span className="text-[10px] font-normal text-slate-500">（{g.modelCount}型式に共通）</span></div>
+                    <div className="text-[11px] text-slate-600">年 約{Math.round(g.annualCostSec / 3600)}時間 ＝ {yen(g.annualCostYen)}</div>
+                  </div>
+                  <div className="mt-1 h-4 bg-white rounded overflow-hidden" style={{ maxWidth: 420 }}>
+                    <div className="h-full bg-violet-400" style={{ width: `${Math.max(4, Math.round(g.annualCostSec / maxSec * 100))}%` }} />
+                  </div>
+                  <div className="text-[11px] text-violet-800 mt-1">💰 ここを<b>10%削るだけで 年 約{yen(g.saveByPctYen)}</b>。決まった手が無くても、この工程への工夫は何でも全部の型式に効きます。</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* 10% 三レンズ */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <div className="text-sm font-bold text-slate-700 mb-2">⏱ 時間{reductionPct}%削減 — 3つの測り方（どれかを満たせばOK）</div>
+        <div className="space-y-2 text-sm">
+          <div className="flex items-start gap-2 bg-slate-50 rounded-lg p-2.5">
+            <span className="text-xs font-bold bg-slate-200 text-slate-600 rounded px-1.5 py-0.5 shrink-0 mt-0.5">① 前年比</span>
+            <div className="text-slate-600 text-xs leading-relaxed">{lens1Available ? '前年データあり（計算対応は次段で実装）' : <span>まだ使えません — 時間データは <b>{dstr(prodDataStart)}</b> 開始のため前年度の実績がありません。<b>{Number(fy.key) + 1}年度から自動で使えるようになります</b>。</span>}</div>
+          </div>
+          <div className="flex items-start gap-2 bg-slate-50 rounded-lg p-2.5">
+            <span className="text-xs font-bold bg-slate-200 text-slate-600 rounded px-1.5 py-0.5 shrink-0 mt-0.5">② 台あたり</span>
+            <div className="text-xs leading-relaxed flex-1">{lens2.ok
+              ? <span className={lens2.pct >= reductionPct ? 'text-emerald-700 font-bold' : 'text-slate-700'}>年度はじめの4週間と直近4週間を同じ型式×工程で比べると <b className="text-base">{lens2.pct > 0 ? '−' : '+'}{Math.abs(lens2.pct)}%</b>（対象{lens2.rows}工程・目標 −{reductionPct}%）{lens2.pct >= reductionPct ? ' ✅ 達成中' : ''}
+                <span className="block mt-1 h-3 bg-slate-200 rounded overflow-hidden" style={{ maxWidth: 240 }}><span className={`block h-full ${lens2.pct >= reductionPct ? 'bg-emerald-500' : lens2.pct > 0 ? 'bg-emerald-300' : 'bg-rose-300'}`} style={{ width: `${Math.max(2, Math.min(100, Math.abs(lens2.pct) / Math.max(1, reductionPct) * 100))}%` }} /></span>
+                <span className="text-[9px] text-slate-400">緑の棒が右端に届いたら{reductionPct}%達成（赤=今は逆に増えている）</span></span>
+              : <span className="text-slate-500">{lens2.reason}</span>}</div>
+          </div>
+          <div className="flex items-start gap-2 bg-slate-50 rounded-lg p-2.5">
+            <span className="text-xs font-bold bg-slate-200 text-slate-600 rounded px-1.5 py-0.5 shrink-0 mt-0.5">③ 目標比</span>
+            <div className="text-xs leading-relaxed flex-1">{lens3.ok
+              ? <span className="text-slate-700">年度内の実績は目標時間の合計に対し達成率 <b className="text-base">{lens3.achievement}%</b>{lens3.excessPct > 0 ? <span>（実績が目標より <b>{lens3.excessPct}%</b> 多い＝ここが詰め代）</span> : '（目標内で回れています ✅）'}
+                <span className="relative block mt-1 h-3 bg-slate-200 rounded overflow-hidden" style={{ maxWidth: 240 }}><span className={`block h-full ${lens3.achievement >= 100 ? 'bg-emerald-500' : 'bg-amber-400'}`} style={{ width: `${Math.max(2, Math.min(100, lens3.achievement / 120 * 100))}%` }} /><span className="absolute top-0 bottom-0 border-l-2 border-slate-500" style={{ left: `${100 / 120 * 100}%` }} /></span>
+                <span className="text-[9px] text-slate-400">線＝100%。棒が線を超えたら「目標より速い」</span></span>
+              : <span className="text-slate-500">{lens3.reason}</span>}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* データの健康状態 (数字の信頼度を正直に出す) */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <div className="text-sm font-bold text-slate-700 mb-2">🩺 数字の信頼度（正直な注意書き）</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+          <div className="bg-slate-50 rounded-lg p-2.5 text-slate-600">
+            📅 時間データの開始: 製品 <b>{dstr(prodDataStart)}</b> / 最終 <b>{sumGolden ? dstr(sumGolden.win.dataStartMs) : '読込中…'}</b>。年間の金額は<b>直近{Math.round(sumProd.win.days)}日の実ペース×365日</b>で換算しています（365日窓の過小表示をここで補正）。
+          </div>
+          <div className={`rounded-lg p-2.5 ${annualInputCount === 0 ? 'bg-rose-50 border border-rose-200 text-rose-700' : 'bg-emerald-50 text-emerald-700'}`}>
+            {annualInputCount === 0
+              ? <span>⚠ <b>年間生産台数が未登録（0型式）</b>。今は測定ペースからの推定です。分析→経営分析タブで登録（Excel一括あり）すると金額の精度が大きく上がります。</span>
+              : <span>✅ 年間生産台数 {annualInputCount}型式 登録済み（登録値を優先して計算）。</span>}
+          </div>
+          {goldenSuspect && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-amber-800">
+              ⚠ <b>最終検査の原資は信頼度低</b>: 実績が目標時間を{Math.round((sumGolden?.excessRatio || 0) * 100)}%上回っています。目標時間の未較正か、まとめ計測の按分の影響が濃厚。目標時間を整えるまで参考値です。
+              <label className="ml-2 inline-flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={includeGolden} onChange={e => setIncludeGolden(e.target.checked)} />合算に含める</label>
+            </div>
+          )}
+          <div className="bg-slate-50 rounded-lg p-2.5 text-slate-500">
+            🔩 部品検査: {partsLotCount === 0 ? 'まだ稼働前（データ0件）。稼働開始すると自動で合算に入ります。' : `${partsLotCount}ロットのデータあり（合算対象）。`}
+            {extErr && <span className="text-rose-600 ml-1">読込エラー: {extErr}</span>}
+          </div>
+        </div>
+        <div className="mt-2 text-[11px] text-slate-400">年度内の記録時間: 製品 {hrs0(fiscalAggProd?.sumAct || 0)} / 最終 {fiscalAggGolden ? hrs0(fiscalAggGolden.sumAct) : '…'}（完了ロットのみ・チャージ換算 {yen(((fiscalAggProd?.sumAct || 0) + (fiscalAggGolden?.sumAct || 0)) / 3600 * charge)}）</div>
+      </div>
+
+      {/* ヘルプ */}
+      <details className="bg-white border border-slate-200 rounded-xl p-4 text-sm text-slate-600">
+        <summary className="font-bold text-slate-700 cursor-pointer">❔ このタブのしくみ（会社目標から逆算する装置）</summary>
+        <div className="mt-3 space-y-2 text-xs leading-relaxed">
+          <p><b>何のためのタブ？</b> — 会社/グループの年間目標「改善金額{man(moneyTarget)}円・時間{reductionPct}%削減」に対し、<b>今いくら貯まっていて、あといくら足りず、その原資がどこに埋まっているか</b>を1画面で見るためのタブです。分析の各機能（重点工程ランキング・改善PDCA）は「見つける道具」、ここは「目標との距離を測る計器」です。</p>
+          <p><b>金額の式</b> — 短縮時間 × チャージ額（{charge.toLocaleString()}円/h）。会社の改善提案の計算と同じ式です。<b>確定</b>＝改善カルテで「効果あり」判定された実測の短縮だけ（勝手に盛りません）。<b>実施中見込み</b>＝進行中カルテが目標まで詰められた場合の値。<b>候補在庫</b>＝まだ誰も手を付けていない全工程の「実績中央値−目標時間」の合計（理論上限であり、全部は取り切れない前提で見てください）。</p>
+          <p><b>なぜ「実ペース換算」？</b> — 時間データは2026年5月に始まったばかりです。1年分の窓で単純に年換算すると空白の9ヶ月に薄められて約1/4に過小表示されるため、このタブだけは<b>直近90日の実ペース×365日</b>で換算しています。経営分析タブで年間生産台数を登録すると、推定ではなく登録値で計算します（最優先のおすすめ）。</p>
+          <p><b>10%の3つの測り方</b> — ①前年比（前年データが貯まる来年度から）②台あたり（年度はじめ4週 vs 直近4週を同じ型式×工程で比較）③目標比（目標時間合計に対する達成率）。会社の定義が固まっていないため3つとも測り、<b>どれかを満たせば達成</b>と考えます。</p>
+          <p><b>3アプリ合算</b> — この目標設定は製品・最終・部品の共有です（宛先グループと同じ方式）。部品は稼働開始すると自動で数字に入ります。</p>
+          <p><b>📬 週次ブリーフ</b> — 週の最初にアプリを開いた時、アプリが自動で1回だけ「今週のブリーフ」を作り、管理者の端末にプッシュを送ります（連絡タブ→通知で端末登録し「📋管理者CC: ON」にした端末）。中身は ⏰止まっているカルテの催促 / 🧱定着した改善の崩れ / 🔗全部に効く共通ポイント / ⛰まだ手つかずの大きい原資（年2万円以上のみ・カルテ化ボタンつき） / 📈じわじわ悪化している工程。各カードには<b>「💡減らし方」のヒント</b>（並行作業/エース動画/じっと見る等、この工程の型に合った手段）が付きます。決まった手が無い時も「なぜここが良いポイントか」を必ず書きます。カルテ化・却下の判断は全端末で共有されます。どの端末が開いても作られるのは週1回だけです。</p>
+          <p><b>🖨 印刷・📗 Excel</b> — 右上のボタンから、この画面の中身（目標・貯金箱・今週のブリーフ・共通ポイント・原資の明細）をいつでもA4印刷/Excelに出せます。会議や会社への報告にそのまま使えます。</p>
+        </div>
+      </details>
+    </div>
+  );
+};
+
 const ANALYSIS_GROUPS = [
   { key: 'fix', label: '① データを正す', tabs: [
     { k: 'anomaly', l: '要確認（異常値・該当なし）', color: 'text-amber-600' },
@@ -22364,6 +23088,7 @@ const ANALYSIS_GROUPS = [
     { k: 'kpi', l: '経営分析', color: 'text-indigo-600' },
   ] },
   { key: 'kaizen', label: '③④ 改善（計画→実行→効果）', tabs: [
+    { k: 'goal', l: '🎯 年間目標（10%・改善金額）', color: 'text-rose-600' },
     { k: 'pdca', l: '改善PDCA（重点工程→対策→効果）', color: 'text-indigo-600' },
     { k: 'improvement', l: 'AI洞察・乖離アラート', color: 'text-indigo-600' },
   ] },
@@ -22908,6 +23633,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
               {activeMode === 'anomaly' && (<><AlertTriangle className="w-6 h-6 text-amber-600"/> ① データを正す（要確認）</>)}
               {activeMode === 'standardize' && (<><ShieldCheck className="w-6 h-6 text-indigo-600"/> ⑤ 基準を固める（定着）</>)}
               {activeMode === 'pdca' && (<><ClipboardList className="w-6 h-6 text-indigo-600"/> 改善PDCA (改善カルテ)</>)}
+              {activeMode === 'goal' && (<><Target className="w-6 h-6 text-rose-600"/> 🎯 年間目標（会社目標から逆算）</>)}
               {activeMode === 'monthly' && (<><FileText className="w-6 h-6 text-slate-700"/> 月次レポート</>)}
             </h2>
             <div className="flex items-center gap-3">
@@ -22928,7 +23654,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    ))}
                  </div>
               </div>
-              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca', 'process-analysis', 'anomaly', 'standardize'].includes(activeMode) && (
+              {!['monthly', 'dashboard', 'export', 'kpi', 'audit', 'achievement', 'rotary', 'pdca', 'process-analysis', 'anomaly', 'standardize', 'goal'].includes(activeMode) && (
               <div className="flex gap-1 border rounded-lg overflow-hidden">
                 {/* Excel エクスポート: 現在のタブのデータを出力する。タブ別に列・データを切替 */}
                 <button onClick={async ()=>{
@@ -24352,6 +25078,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
            {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} improvements={improvements} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onGoToPdca={() => setActiveMode('pdca')} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
+           {activeMode === 'goal' && <GoalLayerView lots={lots} settings={settings} improvements={improvements} db={db} currentUserName={currentUserName} saveData={saveData} />}
            {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} notes={notes} announcements={announcements} logs={logs} strictModeHistory={strictModeHistory} currentUserName={currentUserName} onRestore={onRestore} db={db} />}
            {/* ① データを正す: 要確認(異常値・該当なし)。ヘッダーの浮いたバッジと同じ中身を流れの先頭に置く。 */}
            {activeMode === 'anomaly' && (
@@ -32009,6 +32736,23 @@ export default function App() {
    // State: Indirect Work (間接作業)
    const [indirectWork, setIndirectWork] = useState([]);
    const [improvementCards, setImprovementCards] = useState([]); // 改善PDCAカルテ (improvements コレクション)
+
+   // 🎯 週次ブリーフ自動生成: 週の最初にアプリを開いた端末が1回だけ作って管理者へプッシュ。
+   //   docId=週の月曜で決め打ち(既にあれば何もしない)=多端末でも二重生成/二重送信しない。起動8秒後に静かに実行。
+   //   ⚠この位置に置くこと: deps の improvementCards は 直前の useState で宣言済みである必要がある(宣言前参照はTDZで白画面)。
+   const weeklyBriefTriedRef = useRef(false);
+   useEffect(() => {
+     if (weeklyBriefTriedRef.current) return;
+     if (!db || !lots.length || !settings || !Object.keys(settings).length) return;
+     // ⚠refはタイマー発火時に立てる(スケジュール時に立てると、直後のdeps変化のcleanupでタイマーが消えたきり二度と組まれない)
+     const t = setTimeout(() => {
+       if (weeklyBriefTriedRef.current) return;
+       weeklyBriefTriedRef.current = true;
+       generateWeeklyBrief(db, { lots, settings, improvements: improvementCards, currentUserName, push: true, pushTokens, deleteData })
+         .catch(e => console.warn('週次ブリーフ自動生成に失敗', e));
+     }, 8000);
+     return () => clearTimeout(t);
+   }, [db, lots, settings, improvementCards, pushTokens, currentUserName]); // eslint-disable-line
    const [observationPlans, setObservationPlans] = useState([]); // じっと見るモード=要素作業分割の観測プラン (observationPlans コレクション)
    const [videoRecipes, setVideoRecipes] = useState([]); // エース動画の再生レシピ (video_recipes コレクション, docId=DriveのfileId)
    const [showIndirectModal, setShowIndirectModal] = useState(false);
