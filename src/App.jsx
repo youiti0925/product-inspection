@@ -776,9 +776,22 @@ const goalWeekKey = (nowMs) => {
   const mon = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
   return `${mon.getFullYear()}-${String(mon.getMonth() + 1).padStart(2, '0')}-${String(mon.getDate()).padStart(2, '0')}`;
 };
-const GOAL_STALL_DAYS = 10;        // カルテがこの日数動かなければ催促
-const GOAL_MINE_MIN_YEN = 20000;   // 発見(山)の価値下限: 年2万円未満は出さない(目標に効かないカードで埋めない)
-const GOAL_BREAK_TOL = 1.05;       // 維持見張り: 定着後の中央値がこの倍率を超えて悪化したら「崩れ」
+// エンジンの細かい設定(3アプリ共有 goal-shared-v1 の engine map・⚙目標の設定から変更可)。ここは既定値。
+const GOAL_ENGINE_DEFAULTS = {
+  stallDays: 10,        // ⏰催促: カルテがこの日数動かなければ催促
+  mineMinYen: 20000,    // ⛰価値下限: 年この金額未満の原資は出さない(目標に効かないカードで埋めない)
+  mineCount: 3,         // ⛰山の件数: 1回のブリーフに出す原資カードの数
+  breakTolPct: 5,       // 🧱崩れ: 定着後の中央値が+この%を超えて悪化したら警告
+  trendPct: 15,         // 📈兆し: 直近4週が前4週より+この%以上遅くなったら警告
+  commonMinModels: 3,   // 🔗共通ポイント: 何型式以上に共通する工程を対象にするか
+  commonPct: 10,        // 🔗共通ポイント: 「◯%削ったら」の仮定%
+  briefEnabled: true,   // 📬週次ブリーフの自動生成
+  pushEnabled: true,    // 🔔管理者へのプッシュ
+};
+const goalEngineOf = (goalCfg) => ({ ...GOAL_ENGINE_DEFAULTS, ...((goalCfg && goalCfg.engine) || {}) });
+const GOAL_STALL_DAYS = GOAL_ENGINE_DEFAULTS.stallDays;
+const GOAL_MINE_MIN_YEN = GOAL_ENGINE_DEFAULTS.mineMinYen;
+const GOAL_BREAK_TOL = 1 + GOAL_ENGINE_DEFAULTS.breakTolPct / 100;
 const goalCardLastMs = (c) => {
   const logs = Array.isArray(c?.log) ? c.log : [];
   const lastLog = logs.length ? (logs[logs.length - 1]?.ts || 0) : 0;
@@ -794,7 +807,7 @@ const goalMethodHint = ({ stepTitle = '', cv = null }) => {
   return '💡 決まった手はまだありません。ただし年間の時間が大きい山なので、ここに効く工夫は何でもそのまま利益になります。まず現場で「なぜ時間がかかるか」を1回観察するところから。';
 };
 // ブリーフ本体を組み立てる純関数。findings は fid キーの map。
-const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel }) => {
+const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, engine = GOAL_ENGINE_DEFAULTS }) => {
   const charge = Number(yearCfg.chargePerHour) || GOAL_DEFAULT_YEAR.chargePerHour;
   const moneyTarget = Number(yearCfg.moneyTargetYen) || 0;
   const ctt = settings?.customTargetTimes || {};
@@ -808,7 +821,7 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
   (improvements || []).forEach(c => {
     if (!c || !['plan', 'doing', 'measuring'].includes(c.status)) return;
     const days = Math.floor((nowMs - goalCardLastMs(c)) / 86400000);
-    if (days < GOAL_STALL_DAYS) return;
+    if (days < (engine.stallDays || 10)) return;
     findings[`stall-${c.id}`] = {
       type: 'stall', model: c.model || '', stepKey: c.stepKey || '', yen: 0,
       title: `⏰ カルテ「${c.model || ''} ${c.stepTitle || ''}」が ${days}日 止まっています`,
@@ -821,7 +834,7 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     const after = Number(c.verdictFrozen.afterVal) || 0;
     if (after <= 0) return;
     const recent = measureWindow(lots, { model: c.model, stepKey: c.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
-    if (recent.n < 3 || recent.median <= after * GOAL_BREAK_TOL) return;
+    if (recent.n < 3 || recent.median <= after * (1 + (engine.breakTolPct || 5) / 100)) return;
     const m = goalCardYen({ ...c, status: 'running' }, sumProd.ranking.rows, annualUnitsByModel, charge);
     const lossYen = Math.round((m.units || 0) * Math.max(0, recent.median - after) / 3600 * charge);
     findings[`break-${c.id}`] = {
@@ -832,8 +845,8 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
   });
   // ⛰ 山(まだカルテ化していない原資の上位・価値下限つき・製品のみ=goldenは目標未較正のため出さない)
   sumProd.ranking.rows
-    .filter(r => r.annualSaveYen >= GOAL_MINE_MIN_YEN && !bank.openKeys.has(`${r.model}||${r.stepKey}`))
-    .slice(0, 3)
+    .filter(r => r.annualSaveYen >= (engine.mineMinYen ?? 20000) && !bank.openKeys.has(`${r.model}||${r.stepKey}`))
+    .slice(0, Math.max(1, engine.mineCount || 3))
     .forEach(r => {
       findings[`mine-${r.model}||${r.stepKey}`] = {
         type: 'mine', model: r.model, stepKey: r.stepKey, stepTitle: r.stepTitle, yen: r.annualSaveYen,
@@ -845,13 +858,13 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     });
   // 🔗 全部に効く共通ポイント(工程横断: 3型式以上に共通で年間コストが大きい工程の先頭1件)
   try {
-    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: 0.1, annualUnitsByModel });
-    const g0 = (cross.groups || []).filter(g => g.modelCount >= 3)[0];
-    if (g0 && g0.annualCostYen >= GOAL_MINE_MIN_YEN) {
+    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel });
+    const g0 = (cross.groups || []).filter(g => g.modelCount >= (engine.commonMinModels || 3))[0];
+    if (g0 && g0.annualCostYen >= (engine.mineMinYen ?? 20000)) {
       findings[`common-${g0.title}`] = {
         type: 'common', model: '', stepKey: '', stepTitle: g0.title, yen: g0.saveByPctYen,
         title: `🔗 「${g0.title}」は${g0.modelCount}型式に共通 — 1つの改善が全部に効く良いポイント`,
-        detail: `全型式合計で年 約${Math.round(g0.annualCostSec / 3600)}時間（¥${g0.annualCostYen.toLocaleString()}）かかっています。ここを10%削るだけで年 約¥${g0.saveByPctYen.toLocaleString()}。`,
+        detail: `全型式合計で年 約${Math.round(g0.annualCostSec / 3600)}時間（¥${g0.annualCostYen.toLocaleString()}）かかっています。ここを${engine.commonPct || 10}%削るだけで年 約¥${g0.saveByPctYen.toLocaleString()}。`,
         hint: '💡 型式ごとではなく「この工程そのもの」への改善(共通の治具・置き場・手順書・段取りの工夫)を1つ考えれば、全部の型式で時間を稼げます。お金と時間を稼ぐ良いポイントです。',
       };
     }
@@ -864,7 +877,7 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     .forEach(r => {
       const prev = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 56 * 86400000, endMs: nowMs - 28 * 86400000 });
       const cur = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
-      if (prev.n < 3 || cur.n < 3 || cur.median <= prev.median * 1.15) return;
+      if (prev.n < 3 || cur.n < 3 || cur.median <= prev.median * (1 + (engine.trendPct || 15) / 100)) return;
       if (Object.values(findings).filter(f => f.type === 'trend').length >= 3) return;
       findings[`trend-${r.model}||${r.stepKey}`] = {
         type: 'trend', model: r.model, stepKey: r.stepKey, yen: 0,
@@ -907,7 +920,8 @@ const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUs
   }
   const gSnap = await getDoc(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'settings', 'config'));
   const goalCfg = gSnap.exists() ? gSnap.data() : {};
-  if (!force && goalCfg.briefEnabled === false) return { ok: false, reason: 'disabled' };
+  const engine = goalEngineOf(goalCfg);
+  if (!force && !engine.briefEnabled) return { ok: false, reason: 'disabled' };
   const fy = fiscalYearOf(nowMs, Number(goalCfg.fiscalStartMonth) || 12);
   const yearCfg = { ...GOAL_DEFAULT_YEAR, chargePerHour: Number(settings?.laborCostPerHour) || GOAL_DEFAULT_YEAR.chargePerHour, ...((goalCfg.years || {})[fy.key] || {}) };
   let golden = null;
@@ -919,9 +933,11 @@ const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUs
     golden = { settings: gs.exists() ? gs.data() : {}, lots: gl.docs.map(d => ({ id: d.id, ...d.data() })) };
   } catch (e) { /* goldenが読めなくても製品だけで作る */ }
   const annualUnitsByModel = (settings?.annualProduction && settings.annualProduction[fy.key]) || {};
-  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel });
+  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, engine });
   await setDoc(ref, { weekKey: wk, createdAt: nowMs, createdBy: currentUserName || '', building: deleteField(), ...brief }, { merge: true });
-  if (push) {
+  if (push && !engine.pushEnabled) {
+    try { await setDoc(ref, { push: { sentAt: null, reason: '設定でプッシュOFF' } }, { merge: true }); } catch (e) { /* noop */ }
+  } else if (push) {
     try {
       const cfg = pushCfgOf(settings);
       const targets = (pushTokens || []).filter(t => t && t.token && t.enabled !== false && t.admin === true);
@@ -14853,7 +14869,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                       </div>
                       <div>
                         <label className="block text-xs font-bold text-slate-500 mb-1">詳細内容</label>
-                        <textarea className="w-full border rounded-lg p-2" rows={3} placeholder="不良の内容を入力（工程改善の提案は「気づき・改善」へ）..." value={complaintLabel} onChange={e=>setComplaintLabel(e.target.value)}/>
+                        <textarea className="w-full border rounded-lg p-2" rows={4} placeholder="状況: 何があったか / 対処: どうしたか / 判断: 最後どうなったか（工程改善の提案は「気づき・改善」へ）" value={complaintLabel} onChange={e=>setComplaintLabel(e.target.value)}/>
+                        <SjhGuide onInsert={() => setComplaintLabel(v => sjhInsert(v))} />
                       </div>
                     </div>
                     <div className="mt-4 p-2 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-500">
@@ -20010,7 +20027,24 @@ const ManagerDashboard = ({ lots = [], settings = {} }) => {
 //    - 分析「軽微不良・改善提案」にそのまま合流(complaintStats / improvementStats が読む)
 //    - sample:true は「【サンプル】」表示＋一括削除できる=本物の記録と混ざらない
 // =============================================================================
-const MINOR_KINDS = [['complaint', '軽微不良'], ['improvement', '気づき・改善']];
+const MINOR_KINDS = [['complaint', '軽微不良'], ['improvement', '気づき・改善'], ['defect', '不良(不具合)']];
+// 「状況→対処→判断」記載ガイド(両アプリ共通の型・強制しない誘導)。
+//   内容欄が自由記述で「最後どうなったか」が分からない問題への対策: 3点セットの型+記入例を見せて記載を促す。
+const SJH_TEMPLATE = '状況: \n対処: \n判断: ';
+const sjhInsert = (v) => (v && v.includes('状況:')) ? v : (SJH_TEMPLATE.slice(0, 4) + (v || '') + SJH_TEMPLATE.slice(4));
+const SjhGuide = ({ onInsert = null }) => (
+  <div className="text-[10px] bg-indigo-50/70 border border-indigo-100 rounded-lg p-2 leading-relaxed text-slate-600 mt-1">
+    <div className="flex items-center justify-between gap-2 flex-wrap">
+      <span>💡 <b>状況→対処→判断</b> の3つを書くと、後から見て「最後どうなったか」が分かります。</span>
+      {onInsert && <button type="button" onClick={onInsert} className="shrink-0 text-[10px] px-2 py-0.5 bg-white border border-indigo-200 rounded font-bold text-indigo-700 hover:bg-indigo-100">✏ 型を挿入</button>}
+    </div>
+    <details className="mt-1">
+      <summary className="cursor-pointer text-slate-500">記入例を見る</summary>
+      <div className="mt-1 bg-white border border-slate-200 rounded p-1.5 whitespace-pre-wrap">状況: 2台目の外観にキズ発見(約2mm・カバー右上)。{'\n'}対処: バフ研磨で除去し、再検査で確認。{'\n'}判断: 合格(手直しで対応済み。持ち方を朝礼で周知)</div>
+      <div className="mt-1 text-slate-400">「判断」の書き方例: 合格(手直し済) / NG→修正待ち / 様子見(次ロットで再確認) / 上長へ相談中</div>
+    </details>
+  </div>
+);
 // 台帳の出所: minor=いつでも登録した単独記録 / interruption=検査中に付けた軽微不良・改善 / ng=カスタムのNG判定理由
 const MINOR_SRC_BADGE = { minor: ['台帳', 'bg-purple-100 text-purple-700'], interruption: ['検査中', 'bg-emerald-100 text-emerald-700'], ng: ['NG判定', 'bg-rose-100 text-rose-700'] };
 const MinorReportLedgerModal = ({ reports = [], lots = [], workers = [], currentUserName = '', saveData, deleteData, onClose }) => {
@@ -20114,7 +20148,8 @@ const MinorReportLedgerModal = ({ reports = [], lots = [], workers = [], current
               <input value={form.stepTitle} onChange={e => setForm({ ...form, stepTitle: e.target.value })} disabled={editing && editRow._src === 'ng'} placeholder="例: 分割精度 / 全体" className={editing && editRow._src === 'ng' ? lockCls : inputCls} />
             </label>
             <label className="flex flex-col gap-0.5 col-span-2 md:col-span-3"><span className="text-[10px] font-bold text-slate-400">内容</span>
-              <textarea value={form.content} onChange={e => setForm({ ...form, content: e.target.value })} rows={2} placeholder="何があったか / どう変えたいか" className={inputCls} />
+              <textarea value={form.content} onChange={e => setForm({ ...form, content: e.target.value })} rows={3} placeholder="状況: 何があったか / 対処: どうしたか / 判断: 最後どうなったか" className={inputCls} />
+              <SjhGuide onInsert={() => setForm(f => ({ ...f, content: sjhInsert(f.content) }))} />
             </label>
           </div>
           <div className="flex justify-end gap-2 mt-2">
@@ -20151,7 +20186,7 @@ const MinorReportLedgerModal = ({ reports = [], lots = [], workers = [], current
                 <tr key={r.id} className={`hover:bg-purple-50/40 ${r.sample ? 'bg-amber-50/40' : ''} ${editRow && editRow.id === r.id ? 'ring-2 ring-purple-300' : ''}`}>
                   <td className="px-3 py-2 text-xs text-slate-500 whitespace-nowrap">{r.timestamp ? new Date(r.timestamp).toLocaleString('ja-JP', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'}</td>
                   <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${MINOR_SRC_BADGE[r._src][1]}`}>{MINOR_SRC_BADGE[r._src][0]}</span></td>
-                  <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${r.type === 'improvement' ? 'bg-sky-100 text-sky-700' : 'bg-purple-100 text-purple-700'}`}>{r.type === 'improvement' ? '改善' : '軽微'}</span>{r.sample && <span className="ml-1 text-[10px] font-black px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">サンプル</span>}</td>
+                  <td className="px-2 py-2 whitespace-nowrap"><span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${r.type === 'improvement' ? 'bg-sky-100 text-sky-700' : r.type === 'defect' ? 'bg-rose-100 text-rose-700' : 'bg-purple-100 text-purple-700'}`}>{r.type === 'improvement' ? '改善' : r.type === 'defect' ? '不良' : '軽微'}</span>{r.sample && <span className="ml-1 text-[10px] font-black px-1 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">サンプル</span>}</td>
                   <td className="px-2 py-2"><div className="font-bold text-slate-700">{r.model || '—'}</div><div className="text-[10px] text-slate-400 font-mono">{r.orderNo || ''}</div></td>
                   <td className="px-2 py-2 text-xs text-slate-600">{r.stepTitle || '全体'}</td>
                   <td className="px-3 py-2 text-slate-800 whitespace-pre-wrap max-w-[28ch]">{r.content || ''}</td>
@@ -22719,6 +22754,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   const reductionPct = Number(yearCfg.reductionPct) || 10;
   const annualUnitsByModel = useMemo(() => (settings?.annualProduction && settings.annualProduction[fy.key]) || {}, [settings, fy.key]);
   const annualInputCount = useMemo(() => Object.values(annualUnitsByModel).filter(v => Number(v) > 0).length, [annualUnitsByModel]);
+  const engine = useMemo(() => goalEngineOf(goalCfg), [goalCfg]);
 
   // 各アプリのサマリ (実ペース窓・重点工程ランキングと同一数式)
   const sumProd = useMemo(() => goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel }), [lots, settings, charge, annualUnitsByModel]); // eslint-disable-line
@@ -22736,10 +22772,10 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   // 🔗 全部に効く共通ポイント(工程横断・3型式以上に共通・実ペース窓)
   const commonTop = useMemo(() => {
     try {
-      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: 0.1, annualUnitsByModel });
-      return (cr.groups || []).filter(g => g.modelCount >= 3 && g.annualCostSec > 0).slice(0, 3);
+      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel });
+      return (cr.groups || []).filter(g => g.modelCount >= (engine.commonMinModels || 3) && g.annualCostSec > 0).slice(0, 3);
     } catch (e) { return []; }
-  }, [lots, settings, sumProd, charge, annualUnitsByModel]); // eslint-disable-line
+  }, [lots, settings, sumProd, charge, annualUnitsByModel, engine]); // eslint-disable-line
 
   // 年度の経過とペース
   const elapsedPct = Math.max(0, Math.min(100, Math.round((nowMs - fy.startMs) / (fy.endMs - fy.startMs) * 100)));
@@ -22759,11 +22795,12 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
     return { ok: true, achievement: Math.round(sumTgt / sumAct * 1000) / 10, excessPct: Math.round((sumAct / sumTgt - 1) * 1000) / 10 };
   }, [fiscalAggProd, fiscalAggGolden, includeGolden]);
 
-  const openEdit = () => { setDraft({ fiscalStartMonth, moneyTargetYen: moneyTarget, reductionPct, chargePerHour: charge }); setEdit(true); };
+  const openEdit = () => { setDraft({ fiscalStartMonth, moneyTargetYen: moneyTarget, reductionPct, chargePerHour: charge, ...engine }); setEdit(true); };
   const saveGoal = async () => {
     if (!db || !draft) return;
     setSaving(true);
     try {
+      const num = (v, def, min, max) => Math.min(max, Math.max(min, Number(v) || def));
       await setDoc(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'settings', 'config'), {
         fiscalStartMonth: Math.min(12, Math.max(1, Number(draft.fiscalStartMonth) || 12)),
         years: { ...(goalCfg?.years || {}), [fy.key]: {
@@ -22771,6 +22808,18 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           reductionPct: Math.max(0, Number(draft.reductionPct) || 0),
           chargePerHour: Math.max(0, Number(draft.chargePerHour) || 0),
         } },
+        // 📬 エンジンの細かい設定(3アプリ共有)
+        engine: {
+          stallDays: num(draft.stallDays, 10, 1, 60),
+          mineMinYen: num(draft.mineMinYen, 20000, 0, 10000000),
+          mineCount: num(draft.mineCount, 3, 1, 10),
+          breakTolPct: num(draft.breakTolPct, 5, 1, 50),
+          trendPct: num(draft.trendPct, 15, 3, 100),
+          commonMinModels: num(draft.commonMinModels, 3, 2, 50),
+          commonPct: num(draft.commonPct, 10, 1, 50),
+          briefEnabled: !!draft.briefEnabled,
+          pushEnabled: !!draft.pushEnabled,
+        },
         updatedAt: Date.now(), updatedBy: currentUserName || '',
       }, { merge: true });
       setEdit(false);
@@ -22880,6 +22929,43 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
                 {Array.from({ length: 12 }, (_, i) => i + 1).map(m => <option key={m} value={m}>{m}月（〜翌{m === 1 ? 12 : m - 1}月）</option>)}
               </select>
             </label>
+          </div>
+          <div className="border-t border-slate-200 pt-3">
+            <div className="text-xs font-bold text-slate-700 mb-2">📬 エンジンの細かい設定（週次ブリーフ・発見カードの出し方。3アプリ共有）</div>
+            <div className="flex flex-wrap gap-4 mb-3">
+              <label className="text-xs text-slate-700 flex items-center gap-1.5 cursor-pointer"><input type="checkbox" checked={!!draft.briefEnabled} onChange={e => setDraft(d => ({ ...d, briefEnabled: e.target.checked }))} /> 📬 週次ブリーフを自動作成する</label>
+              <label className="text-xs text-slate-700 flex items-center gap-1.5 cursor-pointer"><input type="checkbox" checked={!!draft.pushEnabled} onChange={e => setDraft(d => ({ ...d, pushEnabled: e.target.checked }))} /> 🔔 管理者の端末へプッシュを送る</label>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <label className="text-xs text-slate-600">⏰ 催促までの停滞日数
+                <input type="number" min="1" max="60" value={draft.stallDays} onChange={e => setDraft(d => ({ ...d, stallDays: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">カルテがこの日数動かないと催促</span>
+              </label>
+              <label className="text-xs text-slate-600">⛰ 原資の価値下限（円/年）
+                <input type="number" min="0" step="5000" value={draft.mineMinYen} onChange={e => setDraft(d => ({ ...d, mineMinYen: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">これ未満の小さい話は出さない</span>
+              </label>
+              <label className="text-xs text-slate-600">⛰ 原資カードの件数
+                <input type="number" min="1" max="10" value={draft.mineCount} onChange={e => setDraft(d => ({ ...d, mineCount: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">1回のブリーフに出す数</span>
+              </label>
+              <label className="text-xs text-slate-600">🧱 崩れ判定（定着後 +%）
+                <input type="number" min="1" max="50" value={draft.breakTolPct} onChange={e => setDraft(d => ({ ...d, breakTolPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">定着した時間よりこの%悪化で警告</span>
+              </label>
+              <label className="text-xs text-slate-600">📈 兆し判定（前4週比 +%）
+                <input type="number" min="3" max="100" value={draft.trendPct} onChange={e => setDraft(d => ({ ...d, trendPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">直近4週がこの%遅くなったら警告</span>
+              </label>
+              <label className="text-xs text-slate-600">🔗 共通ポイント（型式数以上）
+                <input type="number" min="2" max="50" value={draft.commonMinModels} onChange={e => setDraft(d => ({ ...d, commonMinModels: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">何型式以上に共通する工程を出すか</span>
+              </label>
+              <label className="text-xs text-slate-600">🔗 共通ポイント（削減仮定 %）
+                <input type="number" min="1" max="50" value={draft.commonPct} onChange={e => setDraft(d => ({ ...d, commonPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">「◯%削ったら年いくら」の◯</span>
+              </label>
+            </div>
           </div>
           <div className="flex gap-2 justify-end">
             <button onClick={() => setEdit(false)} className="px-3 py-1.5 text-sm text-slate-500">キャンセル</button>
@@ -22997,7 +23083,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
                   <div className="mt-1 h-4 bg-white rounded overflow-hidden" style={{ maxWidth: 420 }}>
                     <div className="h-full bg-violet-400" style={{ width: `${Math.max(4, Math.round(g.annualCostSec / maxSec * 100))}%` }} />
                   </div>
-                  <div className="text-[11px] text-violet-800 mt-1">💰 ここを<b>10%削るだけで 年 約{yen(g.saveByPctYen)}</b>。決まった手が無くても、この工程への工夫は何でも全部の型式に効きます。</div>
+                  <div className="text-[11px] text-violet-800 mt-1">💰 ここを<b>{engine.commonPct || 10}%削るだけで 年 約{yen(g.saveByPctYen)}</b>。決まった手が無くても、この工程への工夫は何でも全部の型式に効きます。</div>
                 </div>
               );
             })}
@@ -23317,6 +23403,26 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
       }
     });
 
+    // 台帳(minor_reports)の「不良」も合流(どこでも登録できる単独記録・ロット非依存)。
+    //   ⚠不良集計は interruptions + task.ngReason + 台帳defect の3ソース(2026-07-15の集計漏れ教訓: ソースを増やしたら必ず全集計に足す)。
+    //   別コレクションで id 重複なし。ロット非依存なので不具合率(分母=完了ロット)には入れない。
+    (minorReports || []).filter(r => r && r.type === 'defect').forEach(r => {
+      const ts = toMsAny(r.timestamp);
+      if (ts) { const dd = new Date(ts); const ym = `${dd.getFullYear()}-${String(dd.getMonth() + 1).padStart(2, '0')}`; monthlyCountsAll[ym] = (monthlyCountsAll[ym] || 0) + 1; }
+      if (isInPrev(ts)) prevCount++;
+      if (!isInDefectPeriod(ts)) return;
+      const wname = (workers.find(x => x.id === r.workerName)?.name) || r.workerName || '不明';
+      defects.push({ id: r.id, type: 'defect', source: '台帳', label: r.content || '', timestamp: ts, stepInfo: r.stepTitle ? { title: r.stepTitle } : null, causeProcess: r.causeProcess || '', workerName: wname, lot: { model: r.model || '不明', orderNo: r.orderNo || '' } });
+      const m = r.model || '不明';
+      modelCounts[m] = (modelCounts[m] || 0) + 1;
+      const st = r.stepTitle || '全体';
+      stepCounts[st] = (stepCounts[st] || 0) + 1;
+      workerCounts[wname] = (workerCounts[wname] || 0) + 1;
+      const cp = r.causeProcess || '未指定';
+      processCounts[cp] = (processCounts[cp] || 0) + 1;
+      if (ts) { const dd = new Date(ts); const ym = `${dd.getFullYear()}-${String(dd.getMonth() + 1).padStart(2, '0')}`; monthlyCounts[ym] = (monthlyCounts[ym] || 0) + 1; }
+    });
+
     const defectRate = totalCompletedLots > 0 ? ((defectLotCount / totalCompletedLots) * 100).toFixed(1) : 0;
     const sortObj = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
     // 月別推移: 直近 12ヶ月
@@ -23330,9 +23436,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
       }
     }
     const diff = defects.length - prevCount;
-    const diffRate = prevCount > 0 ? ((diff / prevCount) * 100) : (defects.length > 0 ? 100 : 0);
+    const diffRate = prevCount > 0 ? ((diff / prevCount) * 100) : (defects.length > 0 ? 100 : 0); // eslint-disable-line
     return { totalCompletedLots, defectLotCount, totalDefects: defects.length, defectRate, defects: defects.sort((a, b) => b.timestamp - a.timestamp), models: sortObj(modelCounts), steps: sortObj(stepCounts), workers: sortObj(workerCounts), processes: sortObj(processCounts), trendMonths, prevCount, diff, diffRate };
-  }, [lots, workers, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]);
+  }, [lots, workers, minorReports, defectFilterMonth, defectFilterMode, defectFilterStart, defectFilterEnd]); // eslint-disable-line
 
   const complaintStats = useMemo(() => {
     const complaints = [];
@@ -32157,6 +32263,7 @@ export default function App() {
    const [arrivalsLoaded, setArrivalsLoaded] = useState(false); // arrival_times が1回でも読めたか(未ロードと『本当に0件』を区別して地ならしする)
    const [settingsLoaded, setSettingsLoaded] = useState(false); // 設定がFirestoreから1回でも読めたか(空の設定で移行処理を走らせないため)
    const [minorReports, setMinorReports] = useState([]); // 軽微不良・改善 台帳 (単独記録・ロット非依存。分析に合流)
+   const [showQuickLedger, setShowQuickLedger] = useState(false); // 🚨ヘッダーからのどこでも登録(台帳を開く)
    const [pushTokens, setPushTokens] = useState([]); // プッシュ通知の受信端末 (docId=端末ID, side:'app'/'portal')
    const [logs, setLogs] = useState([]);
    const [settings, setSettings] = useState({ mapImage: null, mapZones: INITIAL_MAP_ZONES, defectProcessOptions: DEFAULT_DEFECT_PROCESS_OPTIONS, breakAlerts: [], complaintOptions: DEFAULT_COMPLAINT_OPTIONS, customTargetTimes: {}, targetTimeHistory: [], customLayouts: {}, measurementOverrides: {} });
@@ -35143,6 +35250,10 @@ export default function App() {
               ))}
            </div>
            <div className="flex items-center gap-1">
+             {/* 🚨 不良・軽微不良のどこでも登録(台帳): どのタブからでも1タップで登録できる(goldenの検査外登録と同思想) */}
+             <button onClick={() => setShowQuickLedger(true)} className="bg-rose-700 hover:bg-rose-600 text-white p-2 rounded-md shadow-sm" title="不良・軽微不良・気づきの登録 (どこでもすぐ登録できます)">
+               <AlertTriangle className="w-4 h-4" />
+             </button>
              <button onClick={(e) => openHdrMenu('docs', e)} className="relative bg-slate-600 hover:bg-slate-500 text-white px-2 py-1.5 rounded-md shadow-sm flex items-center gap-0.5" title="資料 (作業標準 / ノート)">
                <BookOpen className="w-4 h-4" /><ChevronDown className="w-3 h-3" />
                {notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length > 0 && <span className="absolute -top-1 -right-1 bg-amber-400 text-[9px] text-white rounded-full w-4 h-4 flex items-center justify-center font-black">{notes.filter(n => n.isPersonal && n.author === selectedWorker?.name).length}</span>}
@@ -35232,6 +35343,8 @@ export default function App() {
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
          {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={contactSettings} saveSettings={saveSettings} saveShared={saveContactShared} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} onApplyArrival={(reqId, itemIdx) => setArrivalApply({ reqId, itemIdx })} templates={templates} />}
          {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} minorReports={minorReports} />}
+         {/* 🚨 どこでも登録: ヘッダーの赤ボタンから台帳(不良/軽微不良/気づき)を全タブで開ける */}
+         {showQuickLedger && <MinorReportLedgerModal reports={minorReports} lots={lots} workers={workers} currentUserName={currentUserName} saveData={saveData} deleteData={deleteData} onClose={() => setShowQuickLedger(false)} />}
          {activeTab === 'optimize' && (
            <div className="h-full flex flex-col gap-3 max-w-[1100px] mx-auto">
              <div className="shrink-0 flex items-center gap-3 flex-wrap">
