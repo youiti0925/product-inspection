@@ -874,6 +874,7 @@ const GOAL_ENGINE_DEFAULTS = {
   commonPct: 10,        // 🔗共通ポイント: 「◯%削ったら」の仮定%
   autoLaborPct: 100,    // 🤖自動運転中の人拘束率%: 100=全額人件費(従来・上限値)。現場実態に合わせて下げると純自動時間が人件費から外れる
   successRatePct: 70,   // 🧮改善の成功率%: 必要計画在庫=残り÷成功率 (全候補は成功しない前提の割増・仕様2)
+  maxActive: 3,         // 🚦同時進行カルテの上限: 超えたら新規より停滞解消を優先(仕様5.2)
   briefEnabled: true,   // 📬週次ブリーフの自動生成
   pushEnabled: true,    // 🔔管理者へのプッシュ
 };
@@ -981,6 +982,39 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
         detail: `前4週 ${pdcaFmtSec(prev.median)}（${prev.n}台）→ 直近4週 ${pdcaFmtSec(cur.median)}（${cur.n}台）= +${Math.round((cur.median / Math.max(1, prev.median) - 1) * 100)}%。原因が分かる人に一声かけてください。`,
       };
     });
+  // 🥇 今週の最優先(原則1件) + 🧮逆算サマリ (Phase 2: 候補の大量表示でなく、目標不足から今週やる1件を決める)
+  const gap = goalGapOf({
+    moneyTargetYen: moneyTarget, chargePerHour: charge,
+    baselineAnnualLaborSec: (sumProd.ranking.totalCostSec || 0) + (sumGolden ? sumGolden.ranking.totalCostSec : 0) + (sumParts ? sumParts.ranking.totalCostSec : 0),
+    reductionPct: Number(yearCfg.reductionPct) || 10, verifiedFixedYen: bank.fixedYen,
+  });
+  const pfCands = [
+    ...sumProd.ranking.rows.map(r => candidateOf(r, { appId: 'product' })),
+    ...(sumGolden ? sumGolden.ranking.rows.map(r => candidateOf(r, { appId: 'golden', targetSuspect: goldenSuspect })) : []),
+    ...(sumParts ? sumParts.ranking.rows.map(r => candidateOf(r, { appId: 'parts' })) : []),
+  ];
+  const pfOpen = new Set((improvements || []).filter(c => c && ['plan', 'doing', 'measuring'].includes(c.status)).map(c => `product||${c.model}||${c.templateId || ''}||${c.stepKey}`));
+  const pf = planPortfolio({ candidates: pfCands, remainingHours: gap.remainingHours, successRatePct: engine.successRatePct, openKeys: pfOpen });
+  const pick = pf.picked[0] || null;
+  if (pick && pick.appId === 'product') {
+    const row = sumProd.ranking.rows.find(r => r.model === pick.model && (r.templateId || '') === pick.templateId && r.stepKey === pick.stepKey) || null;
+    findings[`pick-${pick.key}`] = {
+      type: 'pick', model: pick.model, stepKey: pick.stepKey, templateId: pick.templateId, templateName: pick.templateName, stepTitle: pick.stepTitle,
+      yen: pick.saveYen, grade: pick.grade, expectedHours: Math.round(pick.expectedHours), median: row?.median || 0, target: row?.target || 0, cv: row?.cv ?? null,
+      title: `🥇 今週の最優先: ${pick.model}${pick.templateName ? `〔${pick.templateName}〕` : ''} ${pick.stepTitle}`,
+      detail: `選定理由: 信頼度${pick.grade}の候補で期待効果が最大（年${Math.round(pick.saveHours)}h＝¥${pick.saveYen.toLocaleString()}・期待値${Math.round(pick.expectedHours)}h）。まだ不明: 遅い原因は未特定・目標時間が現場で妥当かは未確認。次の行動: 担当と期限を決めてカルテ化 → まず現場観察を1回。`,
+      hint: goalMethodHint({ stepTitle: pick.stepTitle, cv: row?.cv }),
+    };
+  }
+  // 🔁 定着崩れ(broken)は「要再計画」として催促に出す (Phase 3: 崩れっぱなしを放置しない)
+  (improvements || []).forEach(c => {
+    if (!c || c.status !== 'effective' || c.verifiedStage !== 'broken') return;
+    findings[`replan-${c.id}`] = {
+      type: 'stall', model: c.model || '', stepKey: c.stepKey || '', yen: 0,
+      title: `🔁 要再計画: 「${c.model || ''}${c.templateName ? `〔${c.templateName}〕` : ''} ${c.stepTitle || ''}」の定着が崩れています`,
+      detail: '30日確認で崩れが確定し、貯金箱の「確定」から外れています。対策をやり直して再度定着確認するか、効果なしで閉じてください。',
+    };
+  });
   // 🩺 データ品質の注意(捏造しないための正直な注記)
   const notices = [];
   const annualInputCount = Object.values(annualUnitsByModel || {}).filter(v => Number(v) > 0).length;
@@ -1002,6 +1036,13 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
       elapsedPct: Math.max(0, Math.min(100, Math.round((nowMs - fy.startMs) / (fy.endMs - fy.startMs) * 100))),
     },
     findings, notices,
+    // 🧮 逆算サマリ(週次凍結): 必要削減→残り→必要計画在庫→在庫の充足。golden側の表示にも使う。
+    gap: {
+      requiredHours: Math.round(gap.requiredHours), fixedHours: Math.round(gap.fixedHours), remainingHours: Math.round(gap.remainingHours),
+      pipelineRequiredHours: Math.round(pf.pipelineRequiredHours), usableHours: Math.round(pf.totalUsableHours),
+      sufficient: pf.sufficient, shortfallHours: Math.round(pf.shortfallHours), needsObservationCount: pf.needsObservation.length,
+      successRatePct: Math.round(pf.successRatePct),
+    },
     counts: { total: Object.keys(findings).length, stall: stallN },
   };
 };
@@ -21359,6 +21400,8 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
       verifiedStage: sv.result === 'sustained' ? 'verified' : 'broken',
       sustainedAt: Date.now(), sustainStat: { ...recent, startMs: Date.now() - 28 * 86400000, endMs: Date.now() },
     }, { type: 'sustain', note: sv.result === 'sustained' ? '30日定着確認OK → 確定' : `30日定着確認NG(${sv.reason}) → 要再確認` });
+    // 定着チェックリスト(仕様7): 確定にしたら標準側も揃える(カルテと標準更新を切り離さない)
+    if (sv.result === 'sustained') alert('✅ 確定にしました。仕上げの3点を忘れずに:\n① 目標時間をこの実測に更新（分析→目標時間・厳密モードへ）\n② テンプレ・工程手順を新しいやり方に更新\n③ 対象の作業者へ共有・教育');
   };
   const reopen = () => patch({ status: 'measuring', closedAt: null, closedBy: null, afterFrozen: null, verdictFrozen: null }, { type: 'status', note: '再オープン(効果測定中へ)' });
   const doDelete = async () => { if (!deleteData) return; if (!confirm('このカルテを削除しますか？(元に戻せません)')) return; await deleteData('improvements', card.id); onClose(); };
@@ -22888,7 +22931,18 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   };
   const cardifyFinding = async (fid, f) => {
     if (!saveData) { alert('この画面ではカルテ化できません'); return; }
-    if (!window.confirm(`「${f.model}${f.templateName ? `〔${f.templateName}〕` : ''} ${f.stepTitle || ''}」を改善カルテにしますか？\n(改善PDCAタブに「計画」で作られます)`)) return;
+    // 🚦同時進行上限(仕様5.2): 上限超なら新規より停滞解消を優先
+    const active = (improvements || []).filter(c => c && ['plan', 'doing', 'measuring'].includes(c.status)).length;
+    const maxActive = engine.maxActive || 3;
+    if (active >= maxActive) { alert(`進行中のカルテが ${active}件 で上限(${maxActive}件・⚙で変更)です。\n新しく始めるより、止まっているカルテを先に進めるか閉じてください(改善PDCAタブ)。`); return; }
+    // 🥇今週の最優先は 担当と期限が決まらないとカルテ化できない(実施中に進めない決まり・仕様5.2)
+    let pickOwner = '', pickDue = '';
+    if (f.type === 'pick') {
+      pickOwner = (window.prompt(`「${f.stepTitle || ''}」の担当者名(必須): 誰がこの改善を進めますか？`, '') || '').trim();
+      if (!pickOwner) { alert('担当が決まらないままカルテ化はできません。'); return; }
+      pickDue = (window.prompt('期限(必須・例 2026-08-10): いつまでに対策を実施しますか？', '') || '').trim();
+      if (!pickDue) { alert('期限が決まらないままカルテ化はできません。'); return; }
+    } else if (!window.confirm(`「${f.model}${f.templateName ? `〔${f.templateName}〕` : ''} ${f.stepTitle || ''}」を改善カルテにしますか？\n(改善PDCAタブに「計画」で作られます)`)) return;
     const startMs = nowMs - 90 * 86400000;
     const baseStat = measureWindow(lots, { model: f.model, stepKey: f.stepKey, templateId: f.templateId || undefined, customTargetTimes: settings?.customTargetTimes || {}, modelGroups: modelGroupsOf(settings), startMs, endMs: nowMs });
     const id = generateId();
@@ -22897,7 +22951,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
       model: f.model, stepKey: f.stepKey, templateId: f.templateId || '', templateName: f.templateName || '',
       stepTitle: f.stepTitle || (f.stepKey.includes('_') ? f.stepKey.slice(f.stepKey.indexOf('_') + 1) : f.stepKey), category: '',
       kpi: 'time', source: { kind: 'brief', label: '週次ブリーフ' }, baseline: { ...baseStat, startMs, endMs: nowMs },
-      problem: `${(f.title || '').replace(/^[^ ]+ /, '')} — ${f.detail || ''}`, hypothesis: '', action: '', owner: '', dueDate: '',
+      problem: `${(f.title || '').replace(/^[^ ]+ /, '')} — ${f.detail || ''}`, hypothesis: '', action: '', owner: pickOwner || '', dueDate: pickDue || '',
       log: [{ ts: Date.now(), by: currentUserName || '?', type: 'create', note: 'カルテ作成 (由来: 週次ブリーフ)' }],
     });
     await decide(fid, 'carded');
@@ -23026,6 +23080,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           commonPct: num(draft.commonPct, 10, 1, 50),
           autoLaborPct: num(draft.autoLaborPct, 100, 0, 100),
           successRatePct: num(draft.successRatePct, 70, 30, 95),
+          maxActive: num(draft.maxActive, 3, 1, 10),
           briefEnabled: !!draft.briefEnabled,
           pushEnabled: !!draft.pushEnabled,
         },
@@ -23050,7 +23105,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
         ['確定=30日定着済(円)', bank.fixedYen], ['暫定=効果あり・定着待ち(円)', bank.provisionalYen], ['実施中見込み(円)', bank.runningYen], ['候補在庫(円)', bank.stockYen], ['  うち製品(円)', bank.stockProdYen], ['  うち最終(円)', bank.stockGoldenYen], ['目標まで残り(円)', remainYen],
       ]);
       s1.getColumn(1).width = 26; s1.getColumn(2).width = 30;
-      const typeLabel = { stall: '催促', break: '崩れ', common: '共通ポイント', mine: '原資', trend: '悪化の兆し' };
+      const typeLabel = { pick: '今週の最優先', stall: '催促', break: '崩れ', common: '共通ポイント', mine: '原資', trend: '悪化の兆し' };
       const s2 = wb.addWorksheet('今週のブリーフ');
       s2.addRow(['種類', 'タイトル', '内容', '減らし方のヒント', '金額(円per年)', '判断']);
       Object.entries(brief?.findings || {}).forEach(([fid, f]) => {
@@ -23075,7 +23130,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   const goalPrint = () => {
     const pw = window.open('', '_blank'); if (!pw) { alert('ポップアップを許可してください'); return; }
     const esc = (s) => String(s ?? '').replace(/</g, '&lt;');
-    const typeOrder = ['stall', 'break', 'common', 'mine', 'trend'];
+    const typeOrder = ['pick', 'stall', 'break', 'common', 'mine', 'trend'];
     let h = `<h1 style="font-size:20px;margin:0 0 4px">🎯 年間目標レポート ${esc(fy.label)}</h1>`;
     h += `<div style="font-size:12px">改善金額目標 <b>${man(moneyTarget)}円</b> ・ 時間 <b>${reductionPct}%削減</b> ・ チャージ ${charge.toLocaleString()}円/h ・ 年度経過 ${elapsedPct}% ・ 作成 ${new Date().toLocaleString('ja-JP')}</div>`;
     h += `<h2>🏦 改善金額の貯金箱（目標 ${man(moneyTarget)}円）</h2>` +
@@ -23182,6 +23237,10 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
                 <input type="number" min="1" max="50" value={draft.commonPct} onChange={e => setDraft(d => ({ ...d, commonPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
                 <span className="text-[9px] text-slate-400">「◯%削ったら年いくら」の◯</span>
               </label>
+              <label className="text-xs text-slate-600">🚦 同時進行カルテの上限
+                <input type="number" min="1" max="10" value={draft.maxActive ?? 3} onChange={e => setDraft(d => ({ ...d, maxActive: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">超えたら新規カルテ化より停滞解消を優先</span>
+              </label>
               <label className="text-xs text-slate-600">🧮 改善の成功率（%）
                 <input type="number" min="30" max="95" value={draft.successRatePct ?? 70} onChange={e => setDraft(d => ({ ...d, successRatePct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
                 <span className="text-[9px] text-slate-400">必要計画在庫=残り÷成功率(全候補は成功しない前提の割増)</span>
@@ -23214,10 +23273,10 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           <div className="mt-2 space-y-2">
             <div className="text-lg font-black text-slate-800">🎯 目標まであと {yen(brief.goal.remainYen)} <span className="text-xs font-bold text-slate-500">・発見 {brief.counts?.total || 0}件（うち催促 {brief.counts?.stall || 0}件）・{new Date(brief.createdAt).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 作成</span></div>
             {Object.keys(brief.findings || {}).length === 0 && <div className="text-xs text-emerald-600">今週の指摘はありません ✅</div>}
-            {['stall', 'break', 'common', 'mine', 'trend'].map(tp =>
+            {['pick', 'stall', 'break', 'common', 'mine', 'trend'].map(tp =>
               Object.entries(brief.findings || {}).filter(([, f]) => f.type === tp).sort((a, b) => (b[1].yen || 0) - (a[1].yen || 0)).map(([fid, f]) => {
                 const dec = (brief.decisions || {})[fid];
-                const tone = { stall: 'bg-rose-50 border-rose-200', break: 'bg-amber-50 border-amber-200', common: 'bg-violet-50 border-violet-200', mine: 'bg-emerald-50 border-emerald-200', trend: 'bg-sky-50 border-sky-200' }[tp];
+                const tone = { pick: 'bg-yellow-50 border-yellow-400 border-2', stall: 'bg-rose-50 border-rose-200', break: 'bg-amber-50 border-amber-200', common: 'bg-violet-50 border-violet-200', mine: 'bg-emerald-50 border-emerald-200', trend: 'bg-sky-50 border-sky-200' }[tp];
                 return (
                   <div key={fid} className={`rounded-lg p-2.5 border ${tone} ${dec?.action === 'dismissed' ? 'opacity-50' : ''}`}>
                     <div className="flex items-start justify-between gap-2">
@@ -23236,6 +23295,11 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
                       <div className="shrink-0 flex flex-col items-end gap-1">
                         {dec ? (
                           <span className="text-[10px] font-bold text-slate-500">{dec.action === 'carded' ? '📋 カルテ化済' : '❌ 却下'}（{dec.by}）</span>
+                        ) : tp === 'pick' ? (
+                          <div className="flex flex-col gap-1 items-end">
+                            <button onClick={() => cardifyFinding(fid, f)} className="text-[11px] px-2 py-1 bg-yellow-600 text-white rounded font-bold hover:bg-yellow-700">📋 担当と期限を決めてカルテ化</button>
+                            <button onClick={() => decide(fid, 'dismissed')} className="text-[10px] px-2 py-0.5 bg-white border border-slate-300 rounded text-slate-500">別候補にする(下の🧮から)</button>
+                          </div>
                         ) : tp === 'mine' ? (
                           <div className="flex gap-1">
                             <button onClick={() => cardifyFinding(fid, f)} className="text-[11px] px-2 py-1 bg-emerald-600 text-white rounded font-bold hover:bg-emerald-700">📋 カルテ化</button>
