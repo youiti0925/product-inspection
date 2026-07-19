@@ -55,6 +55,7 @@ import {
 import { isAutoStep, annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occurrence.js';
 import { fetchAllPaged, mergeLotsById } from './domain/goal/pager.js';
 import { fiscalRealizedOf, GOAL_PRIMARY_METRICS } from './domain/goal/fiscalMath.js';
+import { goalGapOf, candidateOf, planPortfolio } from './domain/goal/portfolioPlanner.js';
 import {
   getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken
 } from "firebase/auth";
@@ -872,6 +873,7 @@ const GOAL_ENGINE_DEFAULTS = {
   commonMinModels: 3,   // 🔗共通ポイント: 何型式以上に共通する工程を対象にするか
   commonPct: 10,        // 🔗共通ポイント: 「◯%削ったら」の仮定%
   autoLaborPct: 100,    // 🤖自動運転中の人拘束率%: 100=全額人件費(従来・上限値)。現場実態に合わせて下げると純自動時間が人件費から外れる
+  successRatePct: 70,   // 🧮改善の成功率%: 必要計画在庫=残り÷成功率 (全候補は成功しない前提の割増・仕様2)
   briefEnabled: true,   // 📬週次ブリーフの自動生成
   pushEnabled: true,    // 🔔管理者へのプッシュ
 };
@@ -22957,6 +22959,21 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   }, [bank, ext, lots, settings, charge, fy.startMs, fy.endMs]); // eslint-disable-line
   const primaryMetric = ['annualized', 'fiscalForecast', 'fiscalRealized'].includes(goalCfg?.primaryMetric) ? goalCfg.primaryMetric : 'annualized';
   const primaryFixedYen = primaryMetric === 'fiscalForecast' ? fiscalAgg.forecast : primaryMetric === 'fiscalRealized' ? fiscalAgg.realized : bank.fixedYen;
+  // 🧮 Phase 1: 目標からの逆算 (必要削減時間→残り→必要計画在庫→候補の組み合わせ。足りなければ「不足」と正直に出す)
+  const gap = useMemo(() => goalGapOf({
+    moneyTargetYen: moneyTarget, chargePerHour: charge,
+    baselineAnnualLaborSec: (sumProd.ranking.totalCostSec || 0) + (includeGolden && sumGolden ? sumGolden.ranking.totalCostSec : 0) + (sumParts ? sumParts.ranking.totalCostSec : 0),
+    reductionPct, verifiedFixedYen: bank.fixedYen,
+  }), [moneyTarget, charge, sumProd, sumGolden, sumParts, includeGolden, reductionPct, bank.fixedYen]);
+  const portfolio = useMemo(() => {
+    const cands = [
+      ...sumProd.ranking.rows.map(r => candidateOf(r, { appId: 'product' })),
+      ...(sumGolden ? sumGolden.ranking.rows.map(r => candidateOf(r, { appId: 'golden', targetSuspect: goldenSuspect })) : []),
+      ...(sumParts ? sumParts.ranking.rows.map(r => candidateOf(r, { appId: 'parts' })) : []),
+    ];
+    const open = new Set(bank.running.map(x => `product||${x.c.model}||${x.c.templateId || ''}||${x.c.stepKey}`));
+    return planPortfolio({ candidates: cands, remainingHours: gap.remainingHours, successRatePct: engine.successRatePct, openKeys: open });
+  }, [sumProd, sumGolden, sumParts, gap.remainingHours, bank, engine.successRatePct, goldenSuspect]);
 
   // 🔗 全部に効く共通ポイント(工程横断・3型式以上に共通・実ペース窓)
   const commonTop = useMemo(() => {
@@ -23008,6 +23025,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           commonMinModels: num(draft.commonMinModels, 3, 2, 50),
           commonPct: num(draft.commonPct, 10, 1, 50),
           autoLaborPct: num(draft.autoLaborPct, 100, 0, 100),
+          successRatePct: num(draft.successRatePct, 70, 30, 95),
           briefEnabled: !!draft.briefEnabled,
           pushEnabled: !!draft.pushEnabled,
         },
@@ -23164,6 +23182,10 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
                 <input type="number" min="1" max="50" value={draft.commonPct} onChange={e => setDraft(d => ({ ...d, commonPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
                 <span className="text-[9px] text-slate-400">「◯%削ったら年いくら」の◯</span>
               </label>
+              <label className="text-xs text-slate-600">🧮 改善の成功率（%）
+                <input type="number" min="30" max="95" value={draft.successRatePct ?? 70} onChange={e => setDraft(d => ({ ...d, successRatePct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">必要計画在庫=残り÷成功率(全候補は成功しない前提の割増)</span>
+              </label>
               <label className="text-xs text-slate-600">🤖 自動運転中の人拘束率（%）
                 <input type="number" min="0" max="100" value={draft.autoLaborPct ?? 100} onChange={e => setDraft(d => ({ ...d, autoLaborPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
                 <span className="text-[9px] text-slate-400">自動測定中に人が離れられない割合。100=全額人件費(従来)・0=純自動は人件費に入れない。機械時間は別枠で表示</span>
@@ -23273,6 +23295,36 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
         <div className="mt-2 text-[11px] text-slate-600 bg-slate-50 rounded-lg p-2">📐 確定分の3つの数え方（主目標: <b>{GOAL_PRIMARY_METRICS[primaryMetric]}</b>・⚙で切替）: 年間換算 <b>{yen(bank.fixedYen)}</b> ・ 今年度実現見込み <b>{yen(fiscalAgg.forecast)}</b> ・ 今年度実績(実施日からの実測回数分) <b>{yen(fiscalAgg.realized)}</b>。混ぜて「達成」とは数えません。</div>
         <div className="mt-2 text-sm font-bold text-slate-700">目標まであと <span className="text-rose-600 text-lg">{yen(remainYen)}</span>（{GOAL_PRIMARY_METRICS[primaryMetric]}・確定ベース）
           {moneyTarget > 0 && (bank.fixedYen + bank.runningYen + bank.stockYen) < moneyTarget && <span className="ml-2 text-[11px] text-rose-500 font-normal">⚠ 確定＋見込み＋在庫を全部足しても目標に届きません。不良・手直しの金額算入や対象拡大の検討が必要です。</span>}
+        </div>
+      </div>
+
+      {/* 🧮 目標からの逆算 (Phase 1エンジン) */}
+      <div className="bg-white border-2 border-rose-200 rounded-xl p-4">
+        <div className="text-sm font-bold text-rose-800">🧮 目標からの逆算 — 何時間分の改善を仕込めば届くか</div>
+        <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+          <div className="bg-slate-50 rounded-lg p-2"><div className="text-slate-500">必要削減（大きい方）</div><div className="text-lg font-black text-slate-800">{Math.round(gap.requiredHours).toLocaleString()}h<span className="text-[10px] font-normal">/年</span></div><div className="text-[9px] text-slate-400">金額{Math.round(gap.moneyRequiredHours)}h vs 10%={Math.round(gap.timeRequiredHours)}h</div></div>
+          <div className="bg-emerald-50 rounded-lg p-2"><div className="text-slate-500">確定済み</div><div className="text-lg font-black text-emerald-700">{Math.round(gap.fixedHours)}h</div><div className="text-[9px] text-slate-400">30日定着済カルテ分</div></div>
+          <div className="bg-rose-50 rounded-lg p-2"><div className="text-slate-500">残り → 必要計画在庫</div><div className="text-lg font-black text-rose-700">{Math.round(gap.remainingHours)}h → {Math.round(portfolio.pipelineRequiredHours)}h</div><div className="text-[9px] text-slate-400">成功率{Math.round(portfolio.successRatePct)}%で割増（⚙で変更）</div></div>
+          <div className={`rounded-lg p-2 ${portfolio.sufficient ? 'bg-emerald-50' : 'bg-amber-50 border border-amber-300'}`}><div className="text-slate-500">使える候補在庫（A/B・期待値）</div><div className={`text-lg font-black ${portfolio.sufficient ? 'text-emerald-700' : 'text-amber-700'}`}>{Math.round(portfolio.totalUsableHours)}h</div><div className="text-[9px] text-slate-500">{portfolio.sufficient ? '✅ 組み合わせで届く見込み' : `⚠ 不足: あと約${Math.round(portfolio.shortfallHours)}h分の候補が必要`}</div></div>
+        </div>
+        {portfolio.picked.length > 0 && (
+          <div className="mt-2">
+            <div className="text-[11px] font-bold text-slate-600 mb-1">この組み合わせで埋める提案（期待値=短縮余地×信頼度の大きい順・確実ではなく候補です）:</div>
+            <div className="space-y-1">
+              {portfolio.picked.slice(0, 6).map(c => (
+                <div key={c.key} className="flex items-center gap-2 text-[11px] bg-slate-50 rounded px-2 py-1">
+                  <span className={`px-1.5 py-0.5 rounded text-white font-bold text-[9px] ${c.grade === 'A' ? 'bg-emerald-600' : 'bg-sky-500'}`}>{c.grade}</span>
+                  <span className="truncate flex-1">{c.appId === 'golden' ? '【最終】' : c.appId === 'parts' ? '【部品】' : ''}{c.model}{c.templateName ? `〔${c.templateName}〕` : ''} {c.stepTitle}</span>
+                  <span className="font-bold text-slate-700 shrink-0">期待 {Math.round(c.expectedHours)}h/年（{yen(c.saveYen)}）</span>
+                </div>
+              ))}
+              {portfolio.picked.length > 6 && <div className="text-[10px] text-slate-400">…ほか{portfolio.picked.length - 6}件（📗Excelに全件）</div>}
+            </div>
+          </div>
+        )}
+        <div className="mt-2 text-[10px] text-slate-500">
+          🔬 C評価（標本少・目標未較正）が {portfolio.needsObservation.length}件 — 自動採用しません。まず現場観察・目標較正が次の行動です{portfolio.needsObservation.length > 0 ? `（最大: ${portfolio.needsObservation[0].stepTitle} ${Math.round(portfolio.needsObservation[0].saveHours)}h/年）` : ''}。
+          最終検査の候補は目標較正が済むまで全てC扱いです。
         </div>
       </div>
 
