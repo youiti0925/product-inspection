@@ -522,13 +522,15 @@ const csvCell = (v) => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? 
 const PDCA_MIN_N = 5;            // 効果判定に必要な片側の最小標本数
 const PDCA_THRESHOLD_PCT = 5;    // 改善/悪化と判定する変化率しきい値(%)
 const PDCA_STALE_DAYS = 14;      // 対策実施から効果が出ない/悪化を「放置」と見なす日数
-const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGroups = [], startMs = 0, endMs = Infinity } = {}) => {
+const measureWindow = (lots, { model, stepKey, templateId, customTargetTimes = {}, modelGroups = [], startMs = 0, endMs = Infinity } = {}) => {
   const samples = []; // {d, tgt}
   let defectCount = 0;
   const titlePart = stepKey ? (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey) : null;
   (lots || []).forEach(l => {
     if (!l) return;
     if (model && l.model !== model) return;
+    // テンプレ指定時はそのテンプレのロットだけに絞る (同名工程でも検査の種類が違えば別作業=混ぜると中央値が嘘になる)
+    if (templateId && l.templateId !== templateId) return;
     // 不具合件数: 不具合自身の timestamp で窓を切る。完了/作業中に関係なく数える
     // (defectStatsと対称=saveDataがupdatedAtを更新する作業中ロットの不具合を落とさない。完了ゲートより前で数える)
     (l.interruptions || []).filter(i => i.type === 'defect').forEach(dft => {
@@ -579,20 +581,32 @@ const measureWindow = (lots, { model, stepKey, customTargetTimes = {}, modelGrou
 };
 // 儲けどころランキング: 型式×工程ごとに「年間台数 × 実績中央値 × 時給」で年間人件費・年間削減見込(円)を出す純関数。
 // reductionPerUnit = max(0, 実績中央値 − 目標)。年間台数は窓内標本を365日換算。低頻度(年lowFreq台未満)は flag。
-const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, lowFreq = 10, annualUnitsByModel = null } = {}) => {
+const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, lowFreq = 10, annualUnitsByModel = null, byTemplate = false, templates = null } = {}) => {
   const customTargetTimes = settings?.customTargetTimes || {};
   const modelGroups = modelGroupsOf(settings);
   const rate = ratePerHour || settings?.laborCostPerHour || 0;
+  const tplNameOf = (id) => (id && (templates || []).find(t => t.id === id)?.name) || '';
   const rows = [];
-  enumerateModelSteps(lots).forEach(ms => {
-    const stat = measureWindow(lots, { model: ms.model, stepKey: ms.stepKey, customTargetTimes, modelGroups, startMs, endMs });
+  // byTemplate: 集計単位を「型式×テンプレ×工程」に分ける。同じ型式でも検査の種類(テンプレ)が違えば
+  //   同名工程の中身は別作業(実測: RTT-311,ZD 傾斜分割測定はテンプレ間で中央値8.2倍差) — 混ぜると中央値も目標乖離も嘘になる。
+  const pre = [];
+  const items = byTemplate ? enumerateModelTplSteps(lots) : enumerateModelSteps(lots);
+  items.forEach(ms => {
+    const stat = measureWindow(lots, { model: ms.model, stepKey: ms.stepKey, templateId: byTemplate ? ms.templateId : undefined, customTargetTimes, modelGroups, startMs, endMs });
     if (stat.n < 1) return;
+    pre.push({ ms, stat });
+  });
+  // 登録年間台数(型式単位)は、テンプレ分割時は測定標本数の比で各テンプレ行に按分する(そのまま使うと台数が二重計上になる)
+  const nByModelStep = {};
+  if (byTemplate) pre.forEach(p => { const k = `${p.ms.model}||${p.ms.stepKey}`; nByModelStep[k] = (nByModelStep[k] || 0) + p.stat.n; });
+  pre.forEach(({ ms, stat }) => {
     const days = pdcaWindowDays(stat) || 365;
     // 年間台数: ユーザーが入力した実際の年間生産台数を優先。無ければ測定台数を365日換算した推定。
     const measuredAnnual = Math.round(stat.n * (365 / days));
     const inputAnnual = annualUnitsByModel ? annualUnitsByModel[ms.model] : null;
     const useActual = typeof inputAnnual === 'number' && inputAnnual > 0;
-    const annualUnits = useActual ? inputAnnual : measuredAnnual;
+    const tplShare = byTemplate ? stat.n / Math.max(1, nByModelStep[`${ms.model}||${ms.stepKey}`]) : 1;
+    const annualUnits = useActual ? Math.max(1, Math.round(inputAnnual * tplShare)) : measuredAnnual;
     const annualUnitsSource = useActual ? 'actual' : 'estimated';
     const median = stat.median || 0;
     const target = stat.avgTarget || 0;
@@ -600,7 +614,8 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
     const annualCostYen = Math.round(annualUnits * median / 3600 * rate);
     const annualSaveYen = Math.round(annualUnits * reductionPerUnit / 3600 * rate);
     rows.push({
-      ...ms, n: stat.n, annualUnits, measuredAnnual, annualUnitsSource, median, target, sigma: stat.sigma, cv: stat.cv,
+      ...ms, templateId: ms.templateId || '', templateName: tplNameOf(ms.templateId),
+      n: stat.n, annualUnits, measuredAnnual, annualUnitsSource, median, target, sigma: stat.sigma, cv: stat.cv,
       reductionPerUnit, annualCostSec: annualUnits * median, annualSaveSec: annualUnits * reductionPerUnit,
       annualCostYen, annualSaveYen, hasTarget: target > 0, lowFreq: annualUnits < lowFreq,
     });
@@ -624,8 +639,8 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
 //   「この工程は何型式に共通か」「全型式合計で年いくらかかっているか」と、3つの改善余地を出す:
 //   ① 最速の型式に揃える(実証済み=現に一番速い型式の中央値まで全型式を揃えたら) ② ◯%短縮の仮定(レイアウト改善等の大改善)
 //   ③ 目標まで詰める(堅実な下限)。狙い=共通ポイントを1つ直すと全型式に効く=大きい、を可視化する。
-const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, reductionPct = 0.5, annualUnitsByModel = null } = {}) => {
-  const base = profitRanking(lots, settings, { startMs, endMs, ratePerHour, lowFreq: 0, annualUnitsByModel });
+const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, reductionPct = 0.5, annualUnitsByModel = null, byTemplate = false, templates = null } = {}) => {
+  const base = profitRanking(lots, settings, { startMs, endMs, ratePerHour, lowFreq: 0, annualUnitsByModel, byTemplate, templates });
   const rate = base.rate;
   const groups = {};
   base.rows.forEach(r => {
@@ -635,7 +650,7 @@ const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, rateP
   });
   const out = Object.values(groups).map(g => {
     const rows = g.rows.slice().sort((a, b) => a.median - b.median); // 速い順(先頭=最速型式)
-    const modelCount = rows.length;
+    const modelCount = new Set(rows.map(r => r.model)).size; // byTemplate時は同型式が複数行になるためユニーク型式数で数える
     const actualModels = rows.filter(r => r.annualUnitsSource === 'actual').length; // 実際の年間台数を入力済の型式数
     const annualUnits = rows.reduce((s, r) => s + r.annualUnits, 0);
     const annualCostSec = rows.reduce((s, r) => s + r.annualCostSec, 0);
@@ -705,9 +720,10 @@ const goalMeasureWindow = (lots, nowMs) => {
 };
 // 1アプリ分の目標視点サマリ: 既存 profitRanking を「実ペース窓」で呼ぶだけ(数式は重点工程ランキングと同一・検証済み)。
 // excessRatio = 原資÷年間コスト。大きすぎる(>0.3)時は目標時間の未較正を疑う(最終検査で実測57%)。
-const goalAppSummary = (lots, settings, { nowMs, chargePerHour, annualUnitsByModel = null }) => {
+const goalAppSummary = (lots, settings, { nowMs, chargePerHour, annualUnitsByModel = null, templates = null }) => {
   const win = goalMeasureWindow(lots, nowMs);
-  const ranking = profitRanking(lots, settings, { startMs: win.startMs, endMs: win.endMs, ratePerHour: chargePerHour, lowFreq: 0, annualUnitsByModel });
+  // byTemplate: 型式×テンプレ×工程 単位で集計 (テンプレ概念の無いアプリ=最終検査はtemplateId空で従来と同じ束になる)
+  const ranking = profitRanking(lots, settings, { startMs: win.startMs, endMs: win.endMs, ratePerHour: chargePerHour, lowFreq: 0, annualUnitsByModel, byTemplate: true, templates });
   const excessRatio = ranking.totalCostSec > 0 ? ranking.totalSaveSec / ranking.totalCostSec : 0;
   return { win, ranking, excessRatio };
 };
@@ -715,16 +731,21 @@ const goalAppSummary = (lots, settings, { nowMs, chargePerHour, annualUnitsByMod
 //   確定(effective) = 凍結before/afterの実測差。実施中 = 目標まで詰めた場合の見込み(原資と同じ式)。時間KPI以外のカルテは金額換算しない(捏造しない)。
 const goalCardYen = (card, rows, annualUnitsByModel, chargePerHour) => {
   if (card.kpi && card.kpi !== 'time') return { kind: 'nonTime', yen: 0, perUnitSec: 0, units: 0 };
-  const row = rows.find(r => r.model === card.model && r.stepKey === card.stepKey) || null;
+  // rows は 型式×テンプレ×工程 単位。カルテにテンプレがあればその行だけ、無ければ(旧カルテ)全テンプレ行の合算。
+  const all = rows.filter(r => r.model === card.model && r.stepKey === card.stepKey);
+  const tplRows = card.templateId ? all.filter(r => (r.templateId || '') === card.templateId) : all;
+  const rowsM = tplRows.length ? tplRows : all;
+  const sumUnits = rowsM.reduce((s, r) => s + r.annualUnits, 0);
   const reg = annualUnitsByModel && Number(annualUnitsByModel[card.model]);
-  const units = (reg > 0) ? reg : (row ? row.annualUnits : 0);
+  // 行の annualUnits は登録台数を按分済み。行が無い時だけ登録台数を直接使う(旧挙動の温存)。
+  const units = sumUnits > 0 ? sumUnits : ((reg > 0) ? reg : 0);
   if (card.status === 'effective' && card.verdictFrozen && card.baseline) {
     const b = Number(card.verdictFrozen.beforeVal ?? card.baseline.median) || 0;
     const a = Number(card.verdictFrozen.afterVal) || 0;
     const per = Math.max(0, b - a);
     return { kind: 'fixed', yen: Math.round(units * per / 3600 * chargePerHour), perUnitSec: per, units };
   }
-  const per = row ? row.reductionPerUnit : 0;
+  const per = sumUnits > 0 ? rowsM.reduce((s, r) => s + r.annualSaveSec, 0) / sumUnits : 0;
   return { kind: 'running', yen: Math.round(units * per / 3600 * chargePerHour), perUnitSec: per, units };
 };
 // 10%レンズ②「台あたり時間」: 年度内でデータがある最初の4週(基準) vs 直近4週。同じ型式×工程で両窓 n>=3 の行だけを直近台数で加重平均(型式ミックスの変化に歪まされない)。
@@ -737,9 +758,10 @@ const goalPerUnitLens = (lots, settings, { fiscalStartMs, nowMs }) => {
   const ctt = settings?.customTargetTimes || {};
   const groups = modelGroupsOf(settings);
   let wSum = 0, wBase = 0, rows = 0;
-  enumerateModelSteps(lots).forEach(msr => {
-    const b = measureWindow(lots, { model: msr.model, stepKey: msr.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: baseStart, endMs: baseEnd });
-    const c = measureWindow(lots, { model: msr.model, stepKey: msr.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: curStart, endMs: nowMs });
+  // 型式×テンプレ×工程 単位で比較 (テンプレ構成が月で変わっても、同じ作業同士の比較になる)
+  enumerateModelTplSteps(lots).forEach(msr => {
+    const b = measureWindow(lots, { model: msr.model, stepKey: msr.stepKey, templateId: msr.templateId || undefined, customTargetTimes: ctt, modelGroups: groups, startMs: baseStart, endMs: baseEnd });
+    const c = measureWindow(lots, { model: msr.model, stepKey: msr.stepKey, templateId: msr.templateId || undefined, customTargetTimes: ctt, modelGroups: groups, startMs: curStart, endMs: nowMs });
     if (b.n < 3 || c.n < 3) return;
     rows++;
     wBase += b.median * c.n;
@@ -749,19 +771,24 @@ const goalPerUnitLens = (lots, settings, { fiscalStartMs, nowMs }) => {
   return { ok: true, pct: Math.round((1 - wSum / wBase) * 1000) / 10, rows, baseStart, baseEnd, curStart };
 };
 // 貯金箱の集計 (🎯タブと週次ブリーフの両方がこの1関数を使う=数字が食い違わない)。
-const goalBankOf = ({ improvements, prodRows, goldenTotalSaveYen = 0, includeGolden = true, annualUnitsByModel, charge }) => {
+const goalBankOf = ({ improvements, prodRows, goldenTotalSaveYen = 0, includeGolden = true, annualUnitsByModel, charge, goldenFixedYen = 0 }) => {
   const fixed = [], running = [];
   (improvements || []).forEach(c => {
     if (!c || !c.model || !c.stepKey) return;
     if (c.status === 'effective') { const m = goalCardYen(c, prodRows, annualUnitsByModel, charge); if (m.kind === 'fixed') fixed.push({ c, m }); }
     else if (['plan', 'doing', 'measuring'].includes(c.status)) { const m = goalCardYen(c, prodRows, annualUnitsByModel, charge); if (m.kind === 'running') running.push({ c, m }); }
   });
-  const openKeys = new Set(running.map(x => `${x.c.model}||${x.c.stepKey}`));
-  const stockProdYen = prodRows.filter(r => !openKeys.has(`${r.model}||${r.stepKey}`)).reduce((s, r) => s + r.annualSaveYen, 0);
+  // 進行中カルテと同じ場所の在庫は二重計上しない。テンプレ付きカルテはそのテンプレ行だけ、旧カルテ(テンプレ無し)は全テンプレ行を塞ぐ。
+  const openKeys = new Set(running.map(x => x.c.templateId ? `${x.c.model}||${x.c.templateId}||${x.c.stepKey}` : `${x.c.model}||${x.c.stepKey}`));
+  const rowBlocked = (r) => openKeys.has(`${r.model}||${r.stepKey}`) || openKeys.has(`${r.model}||${r.templateId || ''}||${r.stepKey}`);
+  const stockProdYen = prodRows.filter(r => !rowBlocked(r)).reduce((s, r) => s + r.annualSaveYen, 0);
   const stockGoldenYen = includeGolden ? goldenTotalSaveYen : 0;
+  // 確定 = 製品の効果ありカルテ(凍結実測) + 最終検査の効果ありカルテ(golden improvements の verdictFrozen.yenPerYear 合計)
+  const fixedProdYen = fixed.reduce((s, x) => s + x.m.yen, 0);
   return {
-    fixed, running, openKeys,
-    fixedYen: fixed.reduce((s, x) => s + x.m.yen, 0),
+    fixed, running, openKeys, rowBlocked,
+    fixedProdYen, fixedGoldenYen: goldenFixedYen,
+    fixedYen: fixedProdYen + (goldenFixedYen || 0),
     runningYen: running.reduce((s, x) => s + x.m.yen, 0),
     stockProdYen, stockGoldenYen, stockYen: stockProdYen + stockGoldenYen,
   };
@@ -807,15 +834,16 @@ const goalMethodHint = ({ stepTitle = '', cv = null }) => {
   return '💡 決まった手はまだありません。ただし年間の時間が大きい山なので、ここに効く工夫は何でもそのまま利益になります。まず現場で「なぜ時間がかかるか」を1回観察するところから。';
 };
 // ブリーフ本体を組み立てる純関数。findings は fid キーの map。
-const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, engine = GOAL_ENGINE_DEFAULTS }) => {
+const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, templates = null, engine = GOAL_ENGINE_DEFAULTS }) => {
   const charge = Number(yearCfg.chargePerHour) || GOAL_DEFAULT_YEAR.chargePerHour;
   const moneyTarget = Number(yearCfg.moneyTargetYen) || 0;
   const ctt = settings?.customTargetTimes || {};
   const groups = modelGroupsOf(settings);
-  const sumProd = goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel });
+  const sumProd = goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel, templates });
   const sumGolden = golden ? goalAppSummary(golden.lots, golden.settings, { nowMs, chargePerHour: charge }) : null;
   const goldenSuspect = !!(sumGolden && sumGolden.excessRatio > 0.3);
-  const bank = goalBankOf({ improvements, prodRows: sumProd.ranking.rows, goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0, includeGolden: true, annualUnitsByModel, charge });
+  const goldenFixedYen = golden ? (golden.improvements || []).filter(c => c && c.status === 'effective' && c.verdictFrozen?.yenPerYear > 0).reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0) : 0;
+  const bank = goalBankOf({ improvements, prodRows: sumProd.ranking.rows, goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0, includeGolden: true, annualUnitsByModel, charge, goldenFixedYen });
   const findings = {};
   // ⏰ 停滞カルテ(催促)
   (improvements || []).forEach(c => {
@@ -824,7 +852,7 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     if (days < (engine.stallDays || 10)) return;
     findings[`stall-${c.id}`] = {
       type: 'stall', model: c.model || '', stepKey: c.stepKey || '', yen: 0,
-      title: `⏰ カルテ「${c.model || ''} ${c.stepTitle || ''}」が ${days}日 止まっています`,
+      title: `⏰ カルテ「${c.model || ''}${c.templateName ? `〔${c.templateName}〕` : ''} ${c.stepTitle || ''}」が ${days}日 止まっています`,
       detail: `状態: ${c.status === 'plan' ? '計画のまま' : c.status === 'doing' ? '実施中' : '効果測定中'} / 担当: ${c.owner || '未定'} / 起票: ${new Date(c.createdAt || 0).toLocaleDateString('ja-JP')}。改善PDCAタブで進めるか、やらないなら「効果なし→完了」で閉じてください(放置が一番もったいない)。`,
     };
   });
@@ -833,32 +861,33 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     if (!c || c.status !== 'effective' || !c.verdictFrozen || (c.kpi && c.kpi !== 'time')) return;
     const after = Number(c.verdictFrozen.afterVal) || 0;
     if (after <= 0) return;
-    const recent = measureWindow(lots, { model: c.model, stepKey: c.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
+    const recent = measureWindow(lots, { model: c.model, stepKey: c.stepKey, templateId: c.templateId || undefined, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
     if (recent.n < 3 || recent.median <= after * (1 + (engine.breakTolPct || 5) / 100)) return;
     const m = goalCardYen({ ...c, status: 'running' }, sumProd.ranking.rows, annualUnitsByModel, charge);
     const lossYen = Math.round((m.units || 0) * Math.max(0, recent.median - after) / 3600 * charge);
     findings[`break-${c.id}`] = {
       type: 'break', model: c.model || '', stepKey: c.stepKey || '', yen: lossYen,
-      title: `🧱 定着したはずの「${c.model || ''} ${c.stepTitle || ''}」が崩れています`,
+      title: `🧱 定着したはずの「${c.model || ''}${c.templateName ? `〔${c.templateName}〕` : ''} ${c.stepTitle || ''}」が崩れています`,
       detail: `定着時 ${pdcaFmtSec(after)} → 直近4週 ${pdcaFmtSec(recent.median)}（${recent.n}台）。戻りっぱなしだと年 約¥${lossYen.toLocaleString()} を失います。現場で標準が守られているか確認を。`,
     };
   });
   // ⛰ 山(まだカルテ化していない原資の上位・価値下限つき・製品のみ=goldenは目標未較正のため出さない)
   sumProd.ranking.rows
-    .filter(r => r.annualSaveYen >= (engine.mineMinYen ?? 20000) && !bank.openKeys.has(`${r.model}||${r.stepKey}`))
+    .filter(r => r.annualSaveYen >= (engine.mineMinYen ?? 20000) && !bank.rowBlocked(r))
     .slice(0, Math.max(1, engine.mineCount || 3))
     .forEach(r => {
-      findings[`mine-${r.model}||${r.stepKey}`] = {
+      findings[`mine-${r.model}||${r.templateId || ''}||${r.stepKey}`] = {
         type: 'mine', model: r.model, stepKey: r.stepKey, stepTitle: r.stepTitle, yen: r.annualSaveYen,
+        templateId: r.templateId || '', templateName: r.templateName || '',
         median: r.median, target: r.target, cv: r.cv ?? null,
-        title: `⛰ ${r.model} ${r.stepTitle}: 効けば 年 約¥${r.annualSaveYen.toLocaleString()}`,
+        title: `⛰ ${r.model}${r.templateName ? `〔${r.templateName}〕` : ''} ${r.stepTitle}: 効けば 年 約¥${r.annualSaveYen.toLocaleString()}`,
         detail: `実績中央値 ${pdcaFmtSec(r.median)} / 目標 ${pdcaFmtSec(r.target)}（1台${pdcaFmtSec(r.reductionPerUnit)}の詰め代）× 年${r.annualUnits}台${r.annualUnitsSource === 'estimated' ? '(実測ペース推定)' : '(登録値)'}。`,
         hint: goalMethodHint({ stepTitle: r.stepTitle, cv: r.cv }),
       };
     });
   // 🔗 全部に効く共通ポイント(工程横断: 3型式以上に共通で年間コストが大きい工程の先頭1件)
   try {
-    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel });
+    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel, byTemplate: true, templates });
     const g0 = (cross.groups || []).filter(g => g.modelCount >= (engine.commonMinModels || 3))[0];
     if (g0 && g0.annualCostYen >= (engine.mineMinYen ?? 20000)) {
       findings[`common-${g0.title}`] = {
@@ -875,13 +904,13 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     .sort((a, b) => b.annualCostYen - a.annualCostYen)
     .slice(0, 15)
     .forEach(r => {
-      const prev = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 56 * 86400000, endMs: nowMs - 28 * 86400000 });
-      const cur = measureWindow(lots, { model: r.model, stepKey: r.stepKey, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
+      const prev = measureWindow(lots, { model: r.model, stepKey: r.stepKey, templateId: r.templateId || undefined, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 56 * 86400000, endMs: nowMs - 28 * 86400000 });
+      const cur = measureWindow(lots, { model: r.model, stepKey: r.stepKey, templateId: r.templateId || undefined, customTargetTimes: ctt, modelGroups: groups, startMs: nowMs - 28 * 86400000, endMs: nowMs });
       if (prev.n < 3 || cur.n < 3 || cur.median <= prev.median * (1 + (engine.trendPct || 15) / 100)) return;
       if (Object.values(findings).filter(f => f.type === 'trend').length >= 3) return;
-      findings[`trend-${r.model}||${r.stepKey}`] = {
-        type: 'trend', model: r.model, stepKey: r.stepKey, yen: 0,
-        title: `📈 ${r.model} ${r.stepTitle} がじわじわ遅くなっています`,
+      findings[`trend-${r.model}||${r.templateId || ''}||${r.stepKey}`] = {
+        type: 'trend', model: r.model, stepKey: r.stepKey, templateId: r.templateId || '', templateName: r.templateName || '', yen: 0,
+        title: `📈 ${r.model}${r.templateName ? `〔${r.templateName}〕` : ''} ${r.stepTitle} がじわじわ遅くなっています`,
         detail: `前4週 ${pdcaFmtSec(prev.median)}（${prev.n}台）→ 直近4週 ${pdcaFmtSec(cur.median)}（${cur.n}台）= +${Math.round((cur.median / Math.max(1, prev.median) - 1) * 100)}%。原因が分かる人に一声かけてください。`,
       };
     });
@@ -912,7 +941,8 @@ const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUs
   const claim = `${currentUserName || 'x'}-${Math.random().toString(36).slice(2, 10)}`;
   if (!force) {
     const ex = await getDoc(ref);
-    if (ex.exists()) return { ok: false, reason: 'exists' };
+    // ⚠doc存在ではなく中身(goal)で判定: 最終検査アプリが先に decisions だけ書いてdocを作ることがある(発見の確認共有)
+    if (ex.exists() && (ex.data() || {}).goal) return { ok: false, reason: 'exists' };
     // claim を先に書き、読み返して自分が勝ったか確認(同時起動の二重送信をほぼ潰す)
     await setDoc(ref, { weekKey: wk, building: claim, createdAt: nowMs }, { merge: true });
     const chk = await getDoc(ref);
@@ -926,15 +956,24 @@ const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUs
   const yearCfg = { ...GOAL_DEFAULT_YEAR, chargePerHour: Number(settings?.laborCostPerHour) || GOAL_DEFAULT_YEAR.chargePerHour, ...((goalCfg.years || {})[fy.key] || {}) };
   let golden = null;
   try {
-    const [gs, gl] = await Promise.all([
+    const [gs, gl, gi] = await Promise.all([
       getDoc(doc(db, 'artifacts', 'final-inspection-v1', 'public', 'data', 'settings', 'config')),
       getDocs(collection(db, 'artifacts', 'final-inspection-v1', 'public', 'data', 'lots')),
+      getDocs(collection(db, 'artifacts', 'final-inspection-v1', 'public', 'data', 'improvements')),
     ]);
-    golden = { settings: gs.exists() ? gs.data() : {}, lots: gl.docs.map(d => ({ id: d.id, ...d.data() })) };
+    golden = { settings: gs.exists() ? gs.data() : {}, lots: gl.docs.map(d => ({ id: d.id, ...d.data() })), improvements: gi.docs.map(d => ({ id: d.id, ...d.data() })) };
   } catch (e) { /* goldenが読めなくても製品だけで作る */ }
   const annualUnitsByModel = (settings?.annualProduction && settings.annualProduction[fy.key]) || {};
-  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, engine });
-  await setDoc(ref, { weekKey: wk, createdAt: nowMs, createdBy: currentUserName || '', building: deleteField(), ...brief }, { merge: true });
+  // テンプレ一覧(名前解決用)。読めなくてもブリーフは作る(テンプレ名が空になるだけ)。
+  let templates = null;
+  try {
+    const tSnap = await getDocs(collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'templates'));
+    templates = tSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (e) { /* noop */ }
+  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, templates, engine });
+  // ⚠merge:true だと findings(map) の旧キーが残って重複する(setDoc merge の教訓)。mergeFields で該当フィールドを丸ごと置換し、decisions/push だけ温存する。
+  await setDoc(ref, { weekKey: wk, createdAt: nowMs, createdBy: currentUserName || '', building: deleteField(), ...brief },
+    { mergeFields: ['weekKey', 'createdAt', 'createdBy', 'building', 'fy', 'charge', 'goal', 'findings', 'notices', 'counts'] });
   if (push && !engine.pushEnabled) {
     try { await setDoc(ref, { push: { sentAt: null, reason: '設定でプッシュOFF' } }, { merge: true }); } catch (e) { /* noop */ }
   } else if (push) {
@@ -1185,6 +1224,21 @@ const enumerateModelSteps = (lots) => {
       const sk = targetTimeStepKey(step);
       const key = `${l.model}||${sk}`;
       if (!map.has(key)) map.set(key, { model: l.model, stepKey: sk, stepTitle: step.title, category: step.category || '' });
+    });
+  });
+  return [...map.values()];
+};
+// 型式×テンプレ×工程 の列挙 (🎯目標レイヤー用)。実測: 68型式中23型式が複数テンプレで流れており、
+// 型式×工程だけで束ねると検査種類の違う作業が混ざる(混在の実害16件・中央値差 最大15.6倍)。
+const enumerateModelTplSteps = (lots) => {
+  const map = new Map();
+  (lots || []).forEach(l => {
+    if (l.status !== 'completed' && l.location !== 'completed') return;
+    const tpl = l.templateId || '';
+    (l.steps || []).forEach(step => {
+      const sk = targetTimeStepKey(step);
+      const key = `${l.model}||${tpl}||${sk}`;
+      if (!map.has(key)) map.set(key, { model: l.model, templateId: tpl, stepKey: sk, stepTitle: step.title, category: step.category || '' });
     });
   });
   return [...map.values()];
@@ -20447,7 +20501,7 @@ const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [], 
       if (im.status !== 'measuring' || !im.actionDate || !im.baseline) return;
       const days = Math.floor((now - im.actionDate) / 86400000);
       if (days < PDCA_STALE_DAYS) return;
-      const a = measureWindow(lots, { model: im.model, stepKey: im.stepKey, customTargetTimes, modelGroups, startMs: im.actionDate, endMs: now });
+      const a = measureWindow(lots, { model: im.model, stepKey: im.stepKey, templateId: im.templateId || undefined, customTargetTimes, modelGroups, startMs: im.actionDate, endMs: now });
       const v = computeVerdict(im.baseline, a, im.kpi || 'time');
       if (v.result === 'improved') return; // 効いていれば放置ではない
       stales.push({ id: im.id, model: im.model, title: im.stepTitle || im.stepKey, days, verdict: v });
@@ -21140,18 +21194,18 @@ const PdcaVerdictBadge = ({ v }) => {
 };
 
 // 改善カルテ 月次推移ミニグラフ: 主指標の月次値を棒で描き、対策実施月を境に色分け(実施前=灰/実施後=緑)
-const PdcaMiniTrend = ({ lots, model, stepKey, kpi, customTargetTimes, modelGroups, actionDate, months = 6 }) => {
+const PdcaMiniTrend = ({ lots, model, stepKey, templateId = '', kpi, customTargetTimes, modelGroups, actionDate, months = 6 }) => {
   const data = useMemo(() => {
     const out = []; const now = new Date();
     for (let i = months - 1; i >= 0; i--) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const start = d.getTime();
       const end = new Date(now.getFullYear(), now.getMonth() - i + 1, 1).getTime() - 1;
-      const stat = measureWindow(lots, { model, stepKey, customTargetTimes, modelGroups, startMs: start, endMs: end });
+      const stat = measureWindow(lots, { model, stepKey, templateId: templateId || undefined, customTargetTimes, modelGroups, startMs: start, endMs: end });
       out.push({ label: `${d.getMonth() + 1}月`, monthStart: start, val: pdcaKpiValue(stat, kpi), n: stat.n });
     }
     return out;
-  }, [lots, model, stepKey, kpi, customTargetTimes, modelGroups, months]);
+  }, [lots, model, stepKey, templateId, kpi, customTargetTimes, modelGroups, months]);
   const vals = data.filter(x => x.val != null).map(x => x.val);
   if (vals.length === 0) return <div className="text-[10px] text-slate-400 py-2">推移データなし</div>;
   const max = Math.max(...vals, 1);
@@ -21187,7 +21241,7 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
   const [busy, setBusy] = useState(false);
   const isClosed = ['effective', 'noeffect', 'worse', 'rolledback'].includes(card.status);
   // 実施後の統計: 閉じたカルテは凍結値、それ以外はライブ計算
-  const afterLive = useMemo(() => card.actionDate ? measureWindow(lots, { model: card.model, stepKey: card.stepKey, customTargetTimes, modelGroups, startMs: card.actionDate, endMs: Date.now() }) : null, [lots, card.actionDate, card.model, card.stepKey, customTargetTimes, modelGroups]);
+  const afterLive = useMemo(() => card.actionDate ? measureWindow(lots, { model: card.model, stepKey: card.stepKey, templateId: card.templateId || undefined, customTargetTimes, modelGroups, startMs: card.actionDate, endMs: Date.now() }) : null, [lots, card.actionDate, card.model, card.stepKey, card.templateId, customTargetTimes, modelGroups]);
   const after = (isClosed && card.afterFrozen) ? card.afterFrozen : afterLive;
   const verdict = useMemo(() => (card.actionDate && card.baseline) ? ((isClosed && card.verdictFrozen) ? card.verdictFrozen : computeVerdict(card.baseline, after, edit.kpi)) : null, [card, after, edit.kpi, isClosed]);
 
@@ -21247,7 +21301,7 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
       <div className="bg-white w-full max-w-3xl max-h-[92vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
         <div className="bg-indigo-600 text-white px-4 py-3 flex items-center justify-between shrink-0">
           <div className="min-w-0">
-            <div className="font-bold flex items-center gap-2 truncate"><ClipboardList className="w-5 h-5 shrink-0" /> {card.model || '型式?'} ／ {card.stepTitle || card.stepKey || '工程?'}</div>
+            <div className="font-bold flex items-center gap-2 truncate"><ClipboardList className="w-5 h-5 shrink-0" /> {card.model || '型式?'}{card.templateName ? <span className="text-xs font-normal opacity-80">〔{card.templateName}〕</span> : null} ／ {card.stepTitle || card.stepKey || '工程?'}</div>
             <div className="text-[11px] opacity-80">主指標: {PDCA_KPIS[card.kpi] || PDCA_KPIS.time}{card.source?.label ? ` ・由来: ${card.source.label}` : ''}</div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -21296,7 +21350,7 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
             <StatRows b={card.baseline} a={after} kpi={edit.kpi} />
             <div className="pt-1">
               <div className="text-[10px] text-slate-400 mb-0.5">月次推移 ({PDCA_KPIS[edit.kpi] || PDCA_KPIS.time}) — 対策実施を境に色が変わります</div>
-              <PdcaMiniTrend lots={lots} model={card.model} stepKey={card.stepKey} kpi={edit.kpi} customTargetTimes={customTargetTimes} modelGroups={modelGroups} actionDate={card.actionDate} />
+              <PdcaMiniTrend lots={lots} model={card.model} stepKey={card.stepKey} templateId={card.templateId || ''} kpi={edit.kpi} customTargetTimes={customTargetTimes} modelGroups={modelGroups} actionDate={card.actionDate} />
             </div>
             {verdict && (
               <div className="flex items-center gap-2 text-xs bg-slate-50 border rounded p-2">
@@ -21542,7 +21596,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
   const liveVerdict = (c) => {
     if (!c.actionDate || !c.baseline) return null;
     if (['effective', 'noeffect', 'worse', 'rolledback'].includes(c.status) && c.verdictFrozen) return c.verdictFrozen;
-    const a = measureWindow(lots, { model: c.model, stepKey: c.stepKey, customTargetTimes, modelGroups, startMs: c.actionDate, endMs: nowMs });
+    const a = measureWindow(lots, { model: c.model, stepKey: c.stepKey, templateId: c.templateId || undefined, customTargetTimes, modelGroups, startMs: c.actionDate, endMs: nowMs });
     return computeVerdict(c.baseline, a, c.kpi || 'time');
   };
 
@@ -21655,7 +21709,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
         <div className="px-3 py-1.5 bg-white text-[11px] text-slate-500 border-b">
           {rankingView === 'cross'
             ? <><b className="text-slate-700">読み方：</b>同じ工程（例: 測定準備）を<b>型式をまたいで合計</b>しています。「N型式に共通・年◯時間」の大きい所ほど、<b>その1工程を直すと全型式に効いて大きい</b>。行クリックで型式別の内訳が見られます。</>
-            : <><b className="text-slate-700">読み方：</b>1年でその工程に合計どれだけ時間がかかっているかの大きい順です。<b>行をクリック</b>すると「年間◯台 × 1台◯分 = 年◯時間」の計算の内訳と、集計に使った指図一覧（確認用）が見られます。</>}
+            : <><b className="text-slate-700">読み方：</b>1年でその工程に合計どれだけ時間がかかっているかの大きい順です。<b>行をクリック</b>すると「年間◯台 × 1台◯分 = 年◯時間」の計算の内訳と、集計に使った指図一覧（確認用）が見られます。<span className="text-amber-700">※この表は型式×工程単位で、複数テンプレの実績が混ざります。テンプレ別に分けた正確な集計は 🎯年間目標 タブへ。</span></>}
         </div>
         {/* 生産台数の年: 金額計算の台数をどの年の実生産台数で出すか。未入力型式は測定台数ベースの推定にフォールバック。 */}
         <div className="px-3 py-1.5 bg-indigo-50/40 border-b border-indigo-100 flex items-center gap-2 flex-wrap text-[11px]">
@@ -21854,7 +21908,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
                 return (
                   <button key={c.id} onClick={() => setOpenId(c.id)} className="w-full text-left bg-white border rounded-lg p-2 hover:border-indigo-300 transition">
                     <div className="flex items-center gap-1.5 mb-0.5"><span className={`w-2 h-2 rounded-full shrink-0 ${meta.dot}`} /><span className="text-xs font-bold text-slate-800 truncate">{c.model}</span></div>
-                    <div className="text-[11px] text-slate-600 truncate">{c.stepTitle || c.stepKey}</div>
+                    <div className="text-[11px] text-slate-600 truncate">{c.templateName ? `〔${c.templateName}〕` : ''}{c.stepTitle || c.stepKey}</div>
                     <div className="flex items-center gap-1 mt-1 flex-wrap">
                       <span className="text-[9px] px-1 py-0.5 rounded bg-slate-100 text-slate-500">{PDCA_KPIS[c.kpi] || PDCA_KPIS.time}</span>
                       {v && <PdcaVerdictBadge v={v} />}
@@ -22665,7 +22719,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
 // 分析サブタブを5グループに整理 (フラットな13タブ→グループ→サブタブの2段ナビ)。機能は消さず位置だけ整理。
 // 分析タブを「データを正す→見る→計画→実行→定着」のPDCAの流れ順に並べる(2段ナビ)。番号で順番を明示。
 // ===== 🎯 年間目標タブ本体: 目標登録(3アプリ共有)+貯金箱ボード+実ペース換算+10%三レンズ =====
-const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null, currentUserName = '', saveData = null }) => {
+const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null, currentUserName = '', saveData = null, templates = [] }) => {
   const isAdmin = currentUserName === '管理者';
   const nowMs = Date.now();
   const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
@@ -22695,7 +22749,9 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
         const load = async (ns) => {
           const st = await getDoc(doc(db, 'artifacts', ns, 'public', 'data', 'settings', 'config'));
           const ls = await getDocs(collection(db, 'artifacts', ns, 'public', 'data', 'lots'));
-          return { settings: st.exists() ? st.data() : {}, lots: ls.docs.map(d => ({ id: d.id, ...d.data() })) };
+          let improvements = [];
+          try { const gi = await getDocs(collection(db, 'artifacts', ns, 'public', 'data', 'improvements')); improvements = gi.docs.map(d => ({ id: d.id, ...d.data() })); } catch (e) { /* noop */ }
+          return { settings: st.exists() ? st.data() : {}, lots: ls.docs.map(d => ({ id: d.id, ...d.data() })), improvements };
         };
         const [golden, parts] = await Promise.all([load('final-inspection-v1'), load('parts-inspection-v1')]);
         if (!dead) setExt({ golden, parts });
@@ -22728,13 +22784,14 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   };
   const cardifyFinding = async (fid, f) => {
     if (!saveData) { alert('この画面ではカルテ化できません'); return; }
-    if (!window.confirm(`「${f.model} ${f.stepTitle || ''}」を改善カルテにしますか？\n(改善PDCAタブに「計画」で作られます)`)) return;
+    if (!window.confirm(`「${f.model}${f.templateName ? `〔${f.templateName}〕` : ''} ${f.stepTitle || ''}」を改善カルテにしますか？\n(改善PDCAタブに「計画」で作られます)`)) return;
     const startMs = nowMs - 90 * 86400000;
-    const baseStat = measureWindow(lots, { model: f.model, stepKey: f.stepKey, customTargetTimes: settings?.customTargetTimes || {}, modelGroups: modelGroupsOf(settings), startMs, endMs: nowMs });
+    const baseStat = measureWindow(lots, { model: f.model, stepKey: f.stepKey, templateId: f.templateId || undefined, customTargetTimes: settings?.customTargetTimes || {}, modelGroups: modelGroupsOf(settings), startMs, endMs: nowMs });
     const id = generateId();
     await saveData('improvements', id, {
       id, createdAt: Date.now(), createdBy: currentUserName || '?', status: 'plan',
-      model: f.model, stepKey: f.stepKey, stepTitle: f.stepTitle || (f.stepKey.includes('_') ? f.stepKey.slice(f.stepKey.indexOf('_') + 1) : f.stepKey), category: '',
+      model: f.model, stepKey: f.stepKey, templateId: f.templateId || '', templateName: f.templateName || '',
+      stepTitle: f.stepTitle || (f.stepKey.includes('_') ? f.stepKey.slice(f.stepKey.indexOf('_') + 1) : f.stepKey), category: '',
       kpi: 'time', source: { kind: 'brief', label: '週次ブリーフ' }, baseline: { ...baseStat, startMs, endMs: nowMs },
       problem: `${(f.title || '').replace(/^[^ ]+ /, '')} — ${f.detail || ''}`, hypothesis: '', action: '', owner: '', dueDate: '',
       log: [{ ts: Date.now(), by: currentUserName || '?', type: 'create', note: 'カルテ作成 (由来: 週次ブリーフ)' }],
@@ -22757,22 +22814,24 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   const engine = useMemo(() => goalEngineOf(goalCfg), [goalCfg]);
 
   // 各アプリのサマリ (実ペース窓・重点工程ランキングと同一数式)
-  const sumProd = useMemo(() => goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel }), [lots, settings, charge, annualUnitsByModel]); // eslint-disable-line
+  const sumProd = useMemo(() => goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel, templates }), [lots, settings, charge, annualUnitsByModel, templates]); // eslint-disable-line
   const sumGolden = useMemo(() => ext?.golden ? goalAppSummary(ext.golden.lots, ext.golden.settings, { nowMs, chargePerHour: charge }) : null, [ext, charge]); // eslint-disable-line
   const partsLotCount = ext?.parts?.lots?.length || 0;
   const goldenSuspect = !!(sumGolden && sumGolden.excessRatio > 0.3);
 
   // 貯金箱: 確定(効果あり実測) / 実施中見込み / 候補在庫。週次ブリーフと同じ goalBankOf を使う(数字の食い違い防止)。
+  //   確定には最終検査の改善カルテ(効果あり・凍結¥)も合算する。
+  const goldenFixedYen = useMemo(() => (ext?.golden?.improvements || []).filter(c => c && c.status === 'effective' && c.verdictFrozen?.yenPerYear > 0).reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0), [ext]);
   const bank = useMemo(() => goalBankOf({
     improvements, prodRows: sumProd.ranking.rows,
     goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0,
-    includeGolden: includeGolden && !!sumGolden, annualUnitsByModel, charge,
-  }), [improvements, sumProd, sumGolden, includeGolden, annualUnitsByModel, charge]);
+    includeGolden: includeGolden && !!sumGolden, annualUnitsByModel, charge, goldenFixedYen,
+  }), [improvements, sumProd, sumGolden, includeGolden, annualUnitsByModel, charge, goldenFixedYen]);
 
   // 🔗 全部に効く共通ポイント(工程横断・3型式以上に共通・実ペース窓)
   const commonTop = useMemo(() => {
     try {
-      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel });
+      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel, byTemplate: true, templates });
       return (cr.groups || []).filter(g => g.modelCount >= (engine.commonMinModels || 3) && g.annualCostSec > 0).slice(0, 3);
     } catch (e) { return []; }
   }, [lots, settings, sumProd, charge, annualUnitsByModel, engine]); // eslint-disable-line
@@ -22854,8 +22913,8 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
       commonTop.forEach(g => s3.addRow([g.title, g.modelCount, Math.round(g.annualCostSec / 3600), g.annualCostYen, g.saveByPctYen]));
       s3.columns.forEach(c => { c.width = 22; });
       const s4 = wb.addWorksheet('原資の中身(明細)');
-      s4.addRow(['型式', '工程', '標本数', '実績中央値', '目標', '年間台数', '台数の出どころ', '年間削減見込(円)', '年間人件費(円)']);
-      sumProd.ranking.rows.slice(0, 50).forEach(r => s4.addRow([r.model, r.stepTitle, r.n, pdcaFmtSec(r.median), pdcaFmtSec(r.target), r.annualUnits, r.annualUnitsSource === 'actual' ? '登録値' : '実測ペース推定', r.annualSaveYen, r.annualCostYen]));
+      s4.addRow(['型式', 'テンプレート', '工程', '標本数', '実績中央値', '目標', '年間台数', '台数の出どころ', '年間削減見込(円)', '年間人件費(円)']);
+      sumProd.ranking.rows.slice(0, 50).forEach(r => s4.addRow([r.model, r.templateName || '', r.stepTitle, r.n, pdcaFmtSec(r.median), pdcaFmtSec(r.target), r.annualUnits, r.annualUnitsSource === 'actual' ? '登録値' : '実測ペース推定', r.annualSaveYen, r.annualCostYen]));
       s4.columns.forEach(c => { c.width = 16; });
       const buf = await wb.xlsx.writeBuffer();
       const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
@@ -22886,8 +22945,8 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
       commonTop.forEach(g => { h += `<tr><td>${esc(g.title)}</td><td>${g.modelCount}型式</td><td>${Math.round(g.annualCostSec / 3600)}h</td><td>${yen(g.annualCostYen)}</td><td><b>${yen(g.saveByPctYen)}</b></td></tr>`; });
       h += `</table>`;
     }
-    h += `<h2>⛏ 原資の中身 TOP10（実績と目標の差 × 年間台数 × チャージ）</h2><table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-size:12px"><tr><th>型式</th><th>工程</th><th>今(中央値)</th><th>目標</th><th>年間台数</th><th>効けば/年</th></tr>`;
-    sumProd.ranking.rows.slice(0, 10).forEach(r => { h += `<tr><td>${esc(r.model)}</td><td>${esc(r.stepTitle)}</td><td>${pdcaFmtSec(r.median)}</td><td>${pdcaFmtSec(r.target)}</td><td>${r.annualUnits}</td><td><b>${yen(r.annualSaveYen)}</b></td></tr>`; });
+    h += `<h2>⛏ 原資の中身 TOP10（実績と目標の差 × 年間台数 × チャージ）</h2><table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-size:12px"><tr><th>型式</th><th>テンプレート</th><th>工程</th><th>今(中央値)</th><th>目標</th><th>年間台数</th><th>効けば/年</th></tr>`;
+    sumProd.ranking.rows.slice(0, 10).forEach(r => { h += `<tr><td>${esc(r.model)}</td><td>${esc(r.templateName || '')}</td><td>${esc(r.stepTitle)}</td><td>${pdcaFmtSec(r.median)}</td><td>${pdcaFmtSec(r.target)}</td><td>${r.annualUnits}</td><td><b>${yen(r.annualSaveYen)}</b></td></tr>`; });
     h += `</table><div style="font-size:10px;color:#888;margin-top:8px">計算: チャージ${charge.toLocaleString()}円/h・直近${Math.round(sumProd.win.days)}日の実ペース×365日換算。年間台数${annualInputCount === 0 ? 'は未登録のため実測ペース推定' : `は登録${annualInputCount}型式を優先`}。最終検査の在庫は目標未較正のため参考値。</div>`;
     pw.document.write(`<!DOCTYPE html><html><head><title>年間目標レポート</title><style>@media print{body{margin:0}} h2{font-size:15px;margin:14px 0 4px}</style></head><body style="font-family:'Segoe UI',sans-serif;padding:20px;max-width:900px;margin:0 auto">${h}</body></html>`);
     pw.document.close();
@@ -23048,7 +23107,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
             <div className="text-[11px] text-emerald-700 font-bold">✅ 確定（効果あり判定の実測短縮）</div>
             <div className="text-xl font-black text-emerald-700">{yen(bank.fixedYen)}<span className="text-xs font-bold text-emerald-600 ml-1">/ 目標の{fixedPct}%</span></div>
-            <div className="text-[10px] text-slate-500 mt-0.5">{bank.fixed.length}件のカルテ。凍結before/after × 年間台数 × チャージ。</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">製品 {bank.fixed.length}件{bank.fixedGoldenYen > 0 ? ` ${yen(bank.fixedProdYen)} ＋ 最終検査のカルテ ${yen(bank.fixedGoldenYen)}` : 'のカルテ'}。凍結before/after × 年間台数 × チャージ。</div>
           </div>
           <div className="bg-sky-50 border border-sky-200 rounded-lg p-3">
             <div className="text-[11px] text-sky-700 font-bold">🔧 実施中の見込み（カルテ進行中）</div>
@@ -23150,6 +23209,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
         <div className="mt-3 space-y-2 text-xs leading-relaxed">
           <p><b>何のためのタブ？</b> — 会社/グループの年間目標「改善金額{man(moneyTarget)}円・時間{reductionPct}%削減」に対し、<b>今いくら貯まっていて、あといくら足りず、その原資がどこに埋まっているか</b>を1画面で見るためのタブです。分析の各機能（重点工程ランキング・改善PDCA）は「見つける道具」、ここは「目標との距離を測る計器」です。</p>
           <p><b>金額の式</b> — 短縮時間 × チャージ額（{charge.toLocaleString()}円/h）。会社の改善提案の計算と同じ式です。<b>確定</b>＝改善カルテで「効果あり」判定された実測の短縮だけ（勝手に盛りません）。<b>実施中見込み</b>＝進行中カルテが目標まで詰められた場合の値。<b>候補在庫</b>＝まだ誰も手を付けていない全工程の「実績中央値−目標時間」の合計（理論上限であり、全部は取り切れない前提で見てください）。</p>
+          <p><b>集計の単位は「型式×テンプレート×工程」</b> — 同じ型式でも検査の種類（テンプレート）が違えば、同じ名前の工程（準備・片付け等）でも中身は別作業です（実測: 同じ型式・同じ工程名でテンプレが違うと中央値が最大8倍違いました）。そのため、この画面の中央値・詰め代・発見カードはすべてテンプレートまで分けて計算しています。〔〕がテンプレート名です。目標時間の較正値だけは今も型式×工程で共通です（テンプレ別に目標を分けたい場合は目標時間最適化で該当テンプレの実測を見ながら設定してください）。</p>
           <p><b>なぜ「実ペース換算」？</b> — 時間データは2026年5月に始まったばかりです。1年分の窓で単純に年換算すると空白の9ヶ月に薄められて約1/4に過小表示されるため、このタブだけは<b>直近90日の実ペース×365日</b>で換算しています。経営分析タブで年間生産台数を登録すると、推定ではなく登録値で計算します（最優先のおすすめ）。</p>
           <p><b>10%の3つの測り方</b> — ①前年比（前年データが貯まる来年度から）②台あたり（年度はじめ4週 vs 直近4週を同じ型式×工程で比較）③目標比（目標時間合計に対する達成率）。会社の定義が固まっていないため3つとも測り、<b>どれかを満たせば達成</b>と考えます。</p>
           <p><b>3アプリ合算</b> — この目標設定は製品・最終・部品の共有です（宛先グループと同じ方式）。部品は稼働開始すると自動で数字に入ります。</p>
@@ -25184,7 +25244,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
            {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} improvements={improvements} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onGoToPdca={() => setActiveMode('pdca')} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
-           {activeMode === 'goal' && <GoalLayerView lots={lots} settings={settings} improvements={improvements} db={db} currentUserName={currentUserName} saveData={saveData} />}
+           {activeMode === 'goal' && <GoalLayerView lots={lots} settings={settings} improvements={improvements} db={db} currentUserName={currentUserName} saveData={saveData} templates={templates} />}
            {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} notes={notes} announcements={announcements} logs={logs} strictModeHistory={strictModeHistory} currentUserName={currentUserName} onRestore={onRestore} db={db} />}
            {/* ① データを正す: 要確認(異常値・該当なし)。ヘッダーの浮いたバッジと同じ中身を流れの先頭に置く。 */}
            {activeMode === 'anomaly' && (
