@@ -26,7 +26,7 @@ import { initializeApp } from "firebase/app";
 import {
   getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot,
   serverTimestamp, query, orderBy, limit, where, getDocs, getDoc, updateDoc,
-  deleteField,
+  deleteField, startAfter,
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager
 } from "firebase/firestore";
 import {
@@ -44,6 +44,17 @@ import {
   evaluateFormula, evalArith, BLOCK_GAUGE_PRESETS, CALCULATION_METHODS,
   MAX_CALCULATIONS, groupKeyFor
 } from './measurement-utils';
+// 🎯 目標達成/PDCAの純関数 (src/domain/goal/ — node --test でテスト可能。UI/Firebase非依存)
+import {
+  PDCA_KPIS, PDCA_MIN_N, PDCA_THRESHOLD_PCT, PDCA_STALE_DAYS,
+  pdcaWindowDays, pdcaKpiValue, computeVerdict
+} from './domain/goal/verdictEngine.js';
+import {
+  SUSTAIN_DAYS, qualityGuardOf, canCloseEffective, sustainCheckDue, sustainVerdict, cardStageOf
+} from './domain/goal/effectiveGate.js';
+import { isAutoStep, annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occurrence.js';
+import { fetchAllPaged, mergeLotsById } from './domain/goal/pager.js';
+import { fiscalRealizedOf, GOAL_PRIMARY_METRICS } from './domain/goal/fiscalMath.js';
 import {
   getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken
 } from "firebase/auth";
@@ -519,12 +530,10 @@ const toMsAny = (raw) => {
 // CSVセルのエスケープ。カンマ/引用符/改行を含む値(型式名・指図名のユーザー入力や toLocaleString のカンマ)を
 // 正しく引用し、列ずれ・破損を防ぐ。RFC4180準拠(" は "" にエスケープ)。
 const csvCell = (v) => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-const PDCA_MIN_N = 5;            // 効果判定に必要な片側の最小標本数
-const PDCA_THRESHOLD_PCT = 5;    // 改善/悪化と判定する変化率しきい値(%)
-const PDCA_STALE_DAYS = 14;      // 対策実施から効果が出ない/悪化を「放置」と見なす日数
+// PDCA_MIN_N / PDCA_THRESHOLD_PCT / PDCA_STALE_DAYS は src/domain/goal/verdictEngine.js に移動 (import済)
 const measureWindow = (lots, { model, stepKey, templateId, customTargetTimes = {}, modelGroups = [], startMs = 0, endMs = Infinity } = {}) => {
   const samples = []; // {d, tgt}
-  let defectCount = 0;
+  let defectCount = 0, unitsSeen = 0, lotsSeen = 0;
   const titlePart = stepKey ? (stepKey.includes('_') ? stepKey.slice(stepKey.indexOf('_') + 1) : stepKey) : null;
   (lots || []).forEach(l => {
     if (!l) return;
@@ -542,8 +551,10 @@ const measureWindow = (lots, { model, stepKey, templateId, customTargetTimes = {
     // 時間統計の標本は完了ロットのみ (作業中の途中durationを混ぜない)
     if (l.status !== 'completed' && l.location !== 'completed') return;
     const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
+    let lotHasStep = !stepKey; // 検査機会(unitsSeen)の分母: この窓・このフィルタに該当するロットの台数
     (l.steps || []).forEach((step, idx) => {
       if (stepKey && targetTimeStepKey(step) !== stepKey) return;
+      lotHasStep = true;
       const effTarget = getEffectiveTargetTime(step, l.model, customTargetTimes, modelGroups);
       const keys = step.lotOnce
         ? lotOnceKeysOf(l.tasks || {}, step)
@@ -559,6 +570,8 @@ const measureWindow = (lots, { model, stepKey, templateId, customTargetTimes = {
         samples.push({ d, tgt: effTarget });
       });
     });
+    // 検査機会: 窓内に完了した該当ロットの台数(抜取でスキップした台も分母に入る=実施率の分母)
+    if (lotHasStep && lotMs != null && lotMs >= startMs && lotMs <= endMs) { lotsSeen++; unitsSeen += (l.quantity || 1); }
   });
   const ds = samples.map(x => x.d).sort((a, b) => a - b);
   const n = ds.length;
@@ -574,14 +587,14 @@ const measureWindow = (lots, { model, stepKey, templateId, customTargetTimes = {
     cv: mean > 0 ? Math.round((sigma / mean) * 1000) / 1000 : 0,
     min: n ? ds[0] : 0, max: n ? ds[n - 1] : 0,
     achievementRate: sum > 0 && sumTgt > 0 ? Math.round((sumTgt / sum) * 1000) / 10 : null,
-    within, sumTgt, sumAct: sum, defectCount,
+    within, sumTgt, sumAct: sum, defectCount, unitsSeen, lotsSeen,
     avgTarget: n ? Math.round(sumTgt / n) : 0, // 1台(1回)あたりの実効目標秒 (儲けどころの短縮余地算出に使う)
     startMs, endMs, days: (isFinite(endMs) && startMs > 0) ? Math.max(1, (endMs - startMs) / 86400000) : null,
   };
 };
 // 儲けどころランキング: 型式×工程ごとに「年間台数 × 実績中央値 × 時給」で年間人件費・年間削減見込(円)を出す純関数。
 // reductionPerUnit = max(0, 実績中央値 − 目標)。年間台数は窓内標本を365日換算。低頻度(年lowFreq台未満)は flag。
-const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, lowFreq = 10, annualUnitsByModel = null, byTemplate = false, templates = null } = {}) => {
+const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, lowFreq = 10, annualUnitsByModel = null, byTemplate = false, templates = null, autoLaborPct = 100 } = {}) => {
   const customTargetTimes = settings?.customTargetTimes || {};
   const modelGroups = modelGroupsOf(settings);
   const rate = ratePerHour || settings?.laborCostPerHour || 0;
@@ -596,28 +609,36 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
     if (stat.n < 1) return;
     pre.push({ ms, stat });
   });
-  // 登録年間台数(型式単位)は、テンプレ分割時は測定標本数の比で各テンプレ行に按分する(そのまま使うと台数が二重計上になる)
-  const nByModelStep = {};
-  if (byTemplate) pre.forEach(p => { const k = `${p.ms.model}||${p.ms.stepKey}`; nByModelStep[k] = (nByModelStep[k] || 0) + p.stat.n; });
+  // 登録年間台数(型式単位)の扱い(仕様4.3): 台数をそのまま回数にしない。
+  //   年間実施回数 = 登録台数 × 窓内実施率(実施回数÷対象台数)。抜取1/10なら1/10回、ロット1回工程はロット回数になる。
+  //   テンプレ分割時は同じ型式×工程の全テンプレ行の対象台数合計で割る=二重計上の物理的防止。
+  const unitsByModelStep = {};
+  if (byTemplate) pre.forEach(p => { const k = `${p.ms.model}||${p.ms.stepKey}`; unitsByModelStep[k] = (unitsByModelStep[k] || 0) + (p.stat.unitsSeen || 0); });
   pre.forEach(({ ms, stat }) => {
     const days = pdcaWindowDays(stat) || 365;
-    // 年間台数: ユーザーが入力した実際の年間生産台数を優先。無ければ測定台数を365日換算した推定。
-    const measuredAnnual = Math.round(stat.n * (365 / days));
+    const measuredAnnual = Math.round(stat.n * (365 / days)); // 実測回数の年換算(未登録時の既定・回数ベースなので工程タイプに依らず正しい)
     const inputAnnual = annualUnitsByModel ? annualUnitsByModel[ms.model] : null;
     const useActual = typeof inputAnnual === 'number' && inputAnnual > 0;
-    const tplShare = byTemplate ? stat.n / Math.max(1, nByModelStep[`${ms.model}||${ms.stepKey}`]) : 1;
-    const annualUnits = useActual ? Math.max(1, Math.round(inputAnnual * tplShare)) : measuredAnnual;
-    const annualUnitsSource = useActual ? 'actual' : 'estimated';
+    const windowUnits = byTemplate ? (unitsByModelStep[`${ms.model}||${ms.stepKey}`] || 0) : (stat.unitsSeen || 0);
+    const { occ, source: occSource } = annualOccurrencesOf({ useActual, inputAnnualUnits: inputAnnual || 0, windowExecs: stat.n, windowUnits, measuredAnnualExecs: measuredAnnual });
+    const annualUnits = occ; // フィールド名は互換のため維持(意味は「年間実施回数」)
+    const annualUnitsSource = occSource;
     const median = stat.median || 0;
     const target = stat.avgTarget || 0;
     const reductionPerUnit = target > 0 ? Math.max(0, median - target) : 0; // 目標未設定は削減見込0(過大評価しない)
-    const annualCostYen = Math.round(annualUnits * median / 3600 * rate);
-    const annualSaveYen = Math.round(annualUnits * reductionPerUnit / 3600 * rate);
+    // 🤖自動運転の分離: 自動工程は拘束率(autoLaborPct%)分だけ人件費、全時間は機械時間として別集計(混ぜない)。
+    const workKind = ms.auto ? 'auto' : 'manual';
+    const costSecRaw = annualUnits * median, saveSecRaw = annualUnits * reductionPerUnit;
+    const annualCostSec = Math.round(laborSecOf({ workKind, sec: costSecRaw, autoLaborPct }));
+    const annualSaveSec = Math.round(laborSecOf({ workKind, sec: saveSecRaw, autoLaborPct }));
+    const machineCostSec = Math.round(machineSecOf({ workKind, sec: costSecRaw }));
+    const machineSaveSec = Math.round(machineSecOf({ workKind, sec: saveSecRaw }));
     rows.push({
       ...ms, templateId: ms.templateId || '', templateName: tplNameOf(ms.templateId),
       n: stat.n, annualUnits, measuredAnnual, annualUnitsSource, median, target, sigma: stat.sigma, cv: stat.cv,
-      reductionPerUnit, annualCostSec: annualUnits * median, annualSaveSec: annualUnits * reductionPerUnit,
-      annualCostYen, annualSaveYen, hasTarget: target > 0, lowFreq: annualUnits < lowFreq,
+      reductionPerUnit, workKind, annualCostSec, annualSaveSec, machineCostSec, machineSaveSec,
+      annualCostYen: Math.round(annualCostSec / 3600 * rate), annualSaveYen: Math.round(annualSaveSec / 3600 * rate),
+      hasTarget: target > 0, lowFreq: annualUnits < lowFreq,
     });
   });
   // 削減見込(¥)優先、同値や時給未設定なら年間コスト(=工数の山=割合が多い所)でソート
@@ -633,14 +654,18 @@ const profitRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerH
     totalSaveSec: rows.reduce((s, r) => s + r.annualSaveSec, 0),
     totalCostYen: rows.reduce((s, r) => s + r.annualCostYen, 0),
     totalCostSec: totalCost,
+    // 🤖機械時間(設備能力・納期効果): 人件費とは別枠で報告する(混ぜない)
+    totalMachineSec: rows.reduce((s, r) => s + (r.machineCostSec || 0), 0),
+    totalMachineSaveSec: rows.reduce((s, r) => s + (r.machineSaveSec || 0), 0),
+    autoLaborPct,
   };
 };
 // 共通工程 横断改善: profitRanking の「型式×工程」行を、工程タイトルで型式横断にまとめ直す純関数。
 //   「この工程は何型式に共通か」「全型式合計で年いくらかかっているか」と、3つの改善余地を出す:
 //   ① 最速の型式に揃える(実証済み=現に一番速い型式の中央値まで全型式を揃えたら) ② ◯%短縮の仮定(レイアウト改善等の大改善)
 //   ③ 目標まで詰める(堅実な下限)。狙い=共通ポイントを1つ直すと全型式に効く=大きい、を可視化する。
-const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, reductionPct = 0.5, annualUnitsByModel = null, byTemplate = false, templates = null } = {}) => {
-  const base = profitRanking(lots, settings, { startMs, endMs, ratePerHour, lowFreq: 0, annualUnitsByModel, byTemplate, templates });
+const crossStepRanking = (lots, settings, { startMs = 0, endMs = Infinity, ratePerHour = 0, reductionPct = 0.5, annualUnitsByModel = null, byTemplate = false, templates = null, autoLaborPct = 100 } = {}) => {
+  const base = profitRanking(lots, settings, { startMs, endMs, ratePerHour, lowFreq: 0, annualUnitsByModel, byTemplate, templates, autoLaborPct });
   const rate = base.rate;
   const groups = {};
   base.rows.forEach(r => {
@@ -720,10 +745,10 @@ const goalMeasureWindow = (lots, nowMs) => {
 };
 // 1アプリ分の目標視点サマリ: 既存 profitRanking を「実ペース窓」で呼ぶだけ(数式は重点工程ランキングと同一・検証済み)。
 // excessRatio = 原資÷年間コスト。大きすぎる(>0.3)時は目標時間の未較正を疑う(最終検査で実測57%)。
-const goalAppSummary = (lots, settings, { nowMs, chargePerHour, annualUnitsByModel = null, templates = null }) => {
+const goalAppSummary = (lots, settings, { nowMs, chargePerHour, annualUnitsByModel = null, templates = null, autoLaborPct = 100 }) => {
   const win = goalMeasureWindow(lots, nowMs);
   // byTemplate: 型式×テンプレ×工程 単位で集計 (テンプレ概念の無いアプリ=最終検査はtemplateId空で従来と同じ束になる)
-  const ranking = profitRanking(lots, settings, { startMs: win.startMs, endMs: win.endMs, ratePerHour: chargePerHour, lowFreq: 0, annualUnitsByModel, byTemplate: true, templates });
+  const ranking = profitRanking(lots, settings, { startMs: win.startMs, endMs: win.endMs, ratePerHour: chargePerHour, lowFreq: 0, annualUnitsByModel, byTemplate: true, templates, autoLaborPct });
   const excessRatio = ranking.totalCostSec > 0 ? ranking.totalSaveSec / ranking.totalCostSec : 0;
   return { win, ranking, excessRatio };
 };
@@ -771,11 +796,41 @@ const goalPerUnitLens = (lots, settings, { fiscalStartMs, nowMs }) => {
   return { ok: true, pct: Math.round((1 - wSum / wBase) * 1000) / 10, rows, baseStart, baseEnd, curStart };
 };
 // 貯金箱の集計 (🎯タブと週次ブリーフの両方がこの1関数を使う=数字が食い違わない)。
-const goalBankOf = ({ improvements, prodRows, goldenTotalSaveYen = 0, includeGolden = true, annualUnitsByModel, charge, goldenFixedYen = 0 }) => {
-  const fixed = [], running = [];
+// 最終検査カルテの「今年度 実実施回数」: golden lots を項目キーで数える(実測=推定でない今年度実績のため)
+const goldenExecCountFI = (goldenLots, { itemKey, model = '', startMs, endMs }) => {
+  let execs = 0;
+  (goldenLots || []).forEach(l => {
+    if (model && l.model !== model) return;
+    const tasks = l.tasks || {}; const qty = l.quantity || 1;
+    const lotMs = toMsAny(l.completedAt) || toMsAny(l.updatedAt);
+    (l.steps || []).forEach((step, idx) => {
+      if (`${step.category || ''}_${step.title || ''}` !== itemKey) return;
+      for (let u = 0; u < qty; u++) {
+        const k = tasks[`${step.id}-${u}`] !== undefined ? `${step.id}-${u}` : `${idx}-${u}`;
+        const t = tasks[k];
+        if (!t || (t.status !== 'completed' && t.status !== 'ng')) continue;
+        if ((t.duration || 0) <= 0) continue;
+        const ms = toMsAny(t.endTime) || lotMs;
+        if (ms == null || ms < startMs || ms > endMs) continue;
+        execs++;
+      }
+    });
+  });
+  return execs;
+};
+const goalBankOf = ({ improvements, prodRows, goldenTotalSaveYen = 0, includeGolden = true, annualUnitsByModel, charge, goldenFixedYen = 0, goldenProvisionalYen = 0, partsTotalSaveYen = 0 }) => {
+  // 確定(verified)=効果あり判定+30日定着確認済みだけ。効果あり直後は暫定(provisional)。定着崩れ(broken)はどちらにも入れない。
+  const fixed = [], provisional = [], broken = [], running = [];
   (improvements || []).forEach(c => {
     if (!c || !c.model || !c.stepKey) return;
-    if (c.status === 'effective') { const m = goalCardYen(c, prodRows, annualUnitsByModel, charge); if (m.kind === 'fixed') fixed.push({ c, m }); }
+    if (c.status === 'effective') {
+      const m = goalCardYen(c, prodRows, annualUnitsByModel, charge);
+      if (m.kind !== 'fixed') return;
+      const stage = cardStageOf(c);
+      if (stage === 'verified') fixed.push({ c, m });
+      else if (stage === 'broken') broken.push({ c, m });
+      else provisional.push({ c, m });
+    }
     else if (['plan', 'doing', 'measuring'].includes(c.status)) { const m = goalCardYen(c, prodRows, annualUnitsByModel, charge); if (m.kind === 'running') running.push({ c, m }); }
   });
   // 進行中カルテと同じ場所の在庫は二重計上しない。テンプレ付きカルテはそのテンプレ行だけ、旧カルテ(テンプレ無し)は全テンプレ行を塞ぐ。
@@ -783,14 +838,18 @@ const goalBankOf = ({ improvements, prodRows, goldenTotalSaveYen = 0, includeGol
   const rowBlocked = (r) => openKeys.has(`${r.model}||${r.stepKey}`) || openKeys.has(`${r.model}||${r.templateId || ''}||${r.stepKey}`);
   const stockProdYen = prodRows.filter(r => !rowBlocked(r)).reduce((s, r) => s + r.annualSaveYen, 0);
   const stockGoldenYen = includeGolden ? goldenTotalSaveYen : 0;
-  // 確定 = 製品の効果ありカルテ(凍結実測) + 最終検査の効果ありカルテ(golden improvements の verdictFrozen.yenPerYear 合計)
+  // 確定 = 製品のverifiedカルテ + 最終検査のverifiedカルテ。暫定は別バケツ(混ぜて「達成」と呼ばない)。
   const fixedProdYen = fixed.reduce((s, x) => s + x.m.yen, 0);
+  const provisionalProdYen = provisional.reduce((s, x) => s + x.m.yen, 0);
   return {
-    fixed, running, openKeys, rowBlocked,
+    fixed, provisional, broken, running, openKeys, rowBlocked,
     fixedProdYen, fixedGoldenYen: goldenFixedYen,
     fixedYen: fixedProdYen + (goldenFixedYen || 0),
+    provisionalProdYen, provisionalGoldenYen: goldenProvisionalYen,
+    provisionalYen: provisionalProdYen + (goldenProvisionalYen || 0),
     runningYen: running.reduce((s, x) => s + x.m.yen, 0),
-    stockProdYen, stockGoldenYen, stockYen: stockProdYen + stockGoldenYen,
+    stockProdYen, stockGoldenYen, stockPartsYen: partsTotalSaveYen || 0,
+    stockYen: stockProdYen + stockGoldenYen + (partsTotalSaveYen || 0),
   };
 };
 // ===== 🔔 改善エンジン: 週次ブリーフ (自動巡回 → 発見 → 催促 → プッシュ) =====
@@ -812,6 +871,7 @@ const GOAL_ENGINE_DEFAULTS = {
   trendPct: 15,         // 📈兆し: 直近4週が前4週より+この%以上遅くなったら警告
   commonMinModels: 3,   // 🔗共通ポイント: 何型式以上に共通する工程を対象にするか
   commonPct: 10,        // 🔗共通ポイント: 「◯%削ったら」の仮定%
+  autoLaborPct: 100,    // 🤖自動運転中の人拘束率%: 100=全額人件費(従来・上限値)。現場実態に合わせて下げると純自動時間が人件費から外れる
   briefEnabled: true,   // 📬週次ブリーフの自動生成
   pushEnabled: true,    // 🔔管理者へのプッシュ
 };
@@ -834,16 +894,21 @@ const goalMethodHint = ({ stepTitle = '', cv = null }) => {
   return '💡 決まった手はまだありません。ただし年間の時間が大きい山なので、ここに効く工夫は何でもそのまま利益になります。まず現場で「なぜ時間がかかるか」を1回観察するところから。';
 };
 // ブリーフ本体を組み立てる純関数。findings は fid キーの map。
-const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, templates = null, engine = GOAL_ENGINE_DEFAULTS }) => {
+const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, golden, parts = null, annualUnitsByModel, templates = null, engine = GOAL_ENGINE_DEFAULTS }) => {
   const charge = Number(yearCfg.chargePerHour) || GOAL_DEFAULT_YEAR.chargePerHour;
   const moneyTarget = Number(yearCfg.moneyTargetYen) || 0;
   const ctt = settings?.customTargetTimes || {};
   const groups = modelGroupsOf(settings);
-  const sumProd = goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel, templates });
-  const sumGolden = golden ? goalAppSummary(golden.lots, golden.settings, { nowMs, chargePerHour: charge }) : null;
+  const sumProd = goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel, templates, autoLaborPct: engine.autoLaborPct });
+  const sumGolden = golden ? goalAppSummary(golden.lots, golden.settings, { nowMs, chargePerHour: charge, autoLaborPct: engine.autoLaborPct }) : null;
   const goldenSuspect = !!(sumGolden && sumGolden.excessRatio > 0.3);
-  const goldenFixedYen = golden ? (golden.improvements || []).filter(c => c && c.status === 'effective' && c.verdictFrozen?.yenPerYear > 0).reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0) : 0;
-  const bank = goalBankOf({ improvements, prodRows: sumProd.ranking.rows, goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0, includeGolden: true, annualUnitsByModel, charge, goldenFixedYen });
+  // 最終検査カルテ: verified(30日定着済)だけが確定。効果あり直後は暫定。
+  const gEff = golden ? (golden.improvements || []).filter(c => c && c.status === 'effective' && c.verdictFrozen?.yenPerYear > 0) : [];
+  const goldenFixedYen = gEff.filter(c => (c.verifiedStage || 'provisional') === 'verified').reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0);
+  const goldenProvisionalYen = gEff.filter(c => (c.verifiedStage || 'provisional') === 'provisional').reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0);
+  // 部品検査も実合算(仕様4.6): 表示だけでなく候補在庫に入れる(稼働前=0のまま自動追従)
+  const sumParts = parts ? goalAppSummary(parts.lots, parts.settings, { nowMs, chargePerHour: charge, autoLaborPct: engine.autoLaborPct }) : null;
+  const bank = goalBankOf({ improvements, prodRows: sumProd.ranking.rows, goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0, includeGolden: true, annualUnitsByModel, charge, goldenFixedYen, goldenProvisionalYen, partsTotalSaveYen: sumParts ? sumParts.ranking.totalSaveYen : 0 });
   const findings = {};
   // ⏰ 停滞カルテ(催促)
   (improvements || []).forEach(c => {
@@ -887,7 +952,7 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     });
   // 🔗 全部に効く共通ポイント(工程横断: 3型式以上に共通で年間コストが大きい工程の先頭1件)
   try {
-    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel, byTemplate: true, templates });
+    const cross = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel, byTemplate: true, templates, autoLaborPct: engine.autoLaborPct });
     const g0 = (cross.groups || []).filter(g => g.modelCount >= (engine.commonMinModels || 3))[0];
     if (g0 && g0.annualCostYen >= (engine.mineMinYen ?? 20000)) {
       findings[`common-${g0.title}`] = {
@@ -925,7 +990,12 @@ const buildWeeklyBrief = ({ nowMs, fy, yearCfg, lots, settings, improvements, go
     fy: { key: fy.key, label: fy.label }, charge,
     goal: {
       moneyTargetYen: moneyTarget,
-      fixedYen: bank.fixedYen, runningYen: bank.runningYen, stockYen: bank.stockYen,
+      fixedYen: bank.fixedYen, provisionalYen: bank.provisionalYen, runningYen: bank.runningYen, stockYen: bank.stockYen,
+      byApp: {
+        product: { fixedYen: bank.fixedProdYen, provisionalYen: bank.provisionalProdYen, stockYen: bank.stockProdYen },
+        golden: { fixedYen: bank.fixedGoldenYen, provisionalYen: bank.provisionalGoldenYen, stockYen: bank.stockGoldenYen },
+        parts: { fixedYen: 0, provisionalYen: 0, stockYen: bank.stockPartsYen },
+      },
       remainYen: Math.max(0, moneyTarget - bank.fixedYen),
       elapsedPct: Math.max(0, Math.min(100, Math.round((nowMs - fy.startMs) / (fy.endMs - fy.startMs) * 100))),
     },
@@ -963,6 +1033,14 @@ const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUs
     ]);
     golden = { settings: gs.exists() ? gs.data() : {}, lots: gl.docs.map(d => ({ id: d.id, ...d.data() })), improvements: gi.docs.map(d => ({ id: d.id, ...d.data() })) };
   } catch (e) { /* goldenが読めなくても製品だけで作る */ }
+  let parts = null;
+  try {
+    const [ps, pl] = await Promise.all([
+      getDoc(doc(db, 'artifacts', 'parts-inspection-v1', 'public', 'data', 'settings', 'config')),
+      getDocs(collection(db, 'artifacts', 'parts-inspection-v1', 'public', 'data', 'lots')),
+    ]);
+    parts = { settings: ps.exists() ? ps.data() : {}, lots: pl.docs.map(d => ({ id: d.id, ...d.data() })) };
+  } catch (e) { /* 部品が読めなくても続行 */ }
   const annualUnitsByModel = (settings?.annualProduction && settings.annualProduction[fy.key]) || {};
   // テンプレ一覧(名前解決用)。読めなくてもブリーフは作る(テンプレ名が空になるだけ)。
   let templates = null;
@@ -970,7 +1048,18 @@ const generateWeeklyBrief = async (db, { lots, settings, improvements, currentUs
     const tSnap = await getDocs(collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'templates'));
     templates = tSnap.docs.map(d => ({ id: d.id, ...d.data() }));
   } catch (e) { /* noop */ }
-  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots, settings, improvements, golden, annualUnitsByModel, templates, engine });
+  // 📚全件で計算(仕様4.2): 呼び出し元の購読はlimit(500)のため、ここで全件をページング取得。失敗時は渡された分で続行。
+  let fullLots = lots;
+  try {
+    const col = collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'lots');
+    const r = await fetchAllPaged(async ({ cursor, pageSize }) => {
+      const q = cursor ? query(col, orderBy('createdAt', 'desc'), startAfter(cursor), limit(pageSize)) : query(col, orderBy('createdAt', 'desc'), limit(pageSize));
+      const snap = await getDocs(q);
+      return { items: snap.docs.map(d => ({ id: d.id, ...d.data() })), nextCursor: snap.docs.length ? snap.docs[snap.docs.length - 1] : null };
+    });
+    if (r.items.length >= (lots || []).length) fullLots = r.items;
+  } catch (e) { /* 500件で続行 */ }
+  const brief = buildWeeklyBrief({ nowMs, fy, yearCfg, lots: fullLots, settings, improvements, golden, parts, annualUnitsByModel, templates, engine });
   // ⚠merge:true だと findings(map) の旧キーが残って重複する(setDoc merge の教訓)。mergeFields で該当フィールドを丸ごと置換し、decisions/push だけ温存する。
   await setDoc(ref, { weekKey: wk, createdAt: nowMs, createdBy: currentUserName || '', building: deleteField(), ...brief },
     { mergeFields: ['weekKey', 'createdAt', 'createdBy', 'building', 'fy', 'charge', 'goal', 'findings', 'notices', 'counts'] });
@@ -1172,49 +1261,7 @@ const histogramOf = (durations, bins = 8) => {
   durations.forEach(d => { let bi = Math.floor((d - min) / width); if (bi >= bins) bi = bins - 1; if (bi < 0) bi = 0; buckets[bi].count++; });
   return { buckets, min, max, width };
 };
-// 統計オブジェクトの窓日数 (古いカルテ等で days 欠落時は startMs/endMs から復元)
-const pdcaWindowDays = (stat) => {
-  if (!stat) return 1;
-  if (stat.days) return stat.days;
-  if (stat.startMs != null && stat.endMs != null && isFinite(stat.endMs)) return Math.max(1, (stat.endMs - stat.startMs) / 86400000);
-  return 1;
-};
-// 効果判定: KPIに応じて 改善/悪化/横ばい/標本不足 を返す。時間/σ/不具合=小さいほど良い、達成率=大きいほど良い。
-const PDCA_KPIS = { time: '工程時間(中央値)', sigma: 'ばらつき(σ)', achievement: '達成率', defectRate: '不具合件数' };
-const pdcaKpiValue = (stat, kpi) => {
-  if (!stat) return null;
-  if (kpi === 'achievement') return stat.achievementRate;
-  if (kpi === 'sigma') return stat.sigma;
-  if (kpi === 'defectRate') return stat.defectCount;
-  return stat.median || stat.mean;
-};
-const computeVerdict = (baseline, after, kpi = 'time') => {
-  const label = PDCA_KPIS[kpi] || PDCA_KPIS.time;
-  const higherBetter = kpi === 'achievement';
-  if (!baseline || !after) return { result: 'insufficient', reason: '測定データなし', label };
-  const nB = baseline.n || 0, nA = after.n || 0;
-  const bv = pdcaKpiValue(baseline, kpi), av = pdcaKpiValue(after, kpi);
-  // 件数系(不具合)以外は片側5標本以上を要求
-  if (kpi !== 'defectRate' && (nB < PDCA_MIN_N || nA < PDCA_MIN_N)) {
-    return { result: 'insufficient', reason: `標本不足(前${nB}/後${nA}件・各${PDCA_MIN_N}件以上必要)`, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
-  }
-  // 不具合件数: 窓長(日数)が違う前後を「1日あたり件数」で比較する(90日 vs 14日 を生比較しない)。ベースライン0件でも増加(0→N)は悪化と判定。
-  if (kpi === 'defectRate') {
-    if (bv == null || av == null) return { result: 'insufficient', reason: '比較値が不足', label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
-    const bRate = bv / pdcaWindowDays(baseline), aRate = av / pdcaWindowDays(after);
-    const deltaPct = bRate > 0 ? Math.round(((aRate - bRate) / bRate) * 1000) / 10 : null;
-    let r;
-    if (deltaPct == null) r = aRate > 0 ? 'worse' : 'flat';
-    else r = deltaPct <= -PDCA_THRESHOLD_PCT ? 'improved' : (deltaPct >= PDCA_THRESHOLD_PCT ? 'worse' : 'flat');
-    return { result: r, deltaPct, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
-  }
-  if (bv == null || av == null || bv === 0) return { result: 'insufficient', reason: '比較値が不足', label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
-  const deltaPct = ((av - bv) / Math.abs(bv)) * 100;
-  let result;
-  if (higherBetter) result = deltaPct >= PDCA_THRESHOLD_PCT ? 'improved' : (deltaPct <= -PDCA_THRESHOLD_PCT ? 'worse' : 'flat');
-  else result = deltaPct <= -PDCA_THRESHOLD_PCT ? 'improved' : (deltaPct >= PDCA_THRESHOLD_PCT ? 'worse' : 'flat');
-  return { result, deltaPct: Math.round(deltaPct * 10) / 10, label, nBefore: nB, nAfter: nA, beforeVal: bv, afterVal: av, higherBetter };
-};
+// pdcaWindowDays / PDCA_KPIS / pdcaKpiValue / computeVerdict は src/domain/goal/verdictEngine.js に移動 (import済)。
 // 改善テーマ候補: 完了ロットに現れる 型式×工程 を列挙 (カルテ化の入口・乖離候補算出に使う)
 const enumerateModelSteps = (lots) => {
   const map = new Map();
@@ -1223,7 +1270,7 @@ const enumerateModelSteps = (lots) => {
     (l.steps || []).forEach(step => {
       const sk = targetTimeStepKey(step);
       const key = `${l.model}||${sk}`;
-      if (!map.has(key)) map.set(key, { model: l.model, stepKey: sk, stepTitle: step.title, category: step.category || '' });
+      if (!map.has(key)) map.set(key, { model: l.model, stepKey: sk, stepTitle: step.title, category: step.category || '', auto: isAutoStep(step) });
     });
   });
   return [...map.values()];
@@ -1238,7 +1285,7 @@ const enumerateModelTplSteps = (lots) => {
     (l.steps || []).forEach(step => {
       const sk = targetTimeStepKey(step);
       const key = `${l.model}||${tpl}||${sk}`;
-      if (!map.has(key)) map.set(key, { model: l.model, templateId: tpl, stepKey: sk, stepTitle: step.title, category: step.category || '' });
+      if (!map.has(key)) map.set(key, { model: l.model, templateId: tpl, stepKey: sk, stepTitle: step.title, category: step.category || '', auto: isAutoStep(step) });
     });
   });
   return [...map.values()];
@@ -20502,7 +20549,7 @@ const AdminLiveAlerts = ({ lots = [], customTargetTimes = {}, modelGroups = [], 
       const days = Math.floor((now - im.actionDate) / 86400000);
       if (days < PDCA_STALE_DAYS) return;
       const a = measureWindow(lots, { model: im.model, stepKey: im.stepKey, templateId: im.templateId || undefined, customTargetTimes, modelGroups, startMs: im.actionDate, endMs: now });
-      const v = computeVerdict(im.baseline, a, im.kpi || 'time');
+      const v = computeVerdict(im.actionBaseline || im.baseline, a, im.kpi || 'time');
       if (v.result === 'improved') return; // 効いていれば放置ではない
       stales.push({ id: im.id, model: im.model, title: im.stepTitle || im.stepKey, days, verdict: v });
     });
@@ -21243,7 +21290,7 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
   // 実施後の統計: 閉じたカルテは凍結値、それ以外はライブ計算
   const afterLive = useMemo(() => card.actionDate ? measureWindow(lots, { model: card.model, stepKey: card.stepKey, templateId: card.templateId || undefined, customTargetTimes, modelGroups, startMs: card.actionDate, endMs: Date.now() }) : null, [lots, card.actionDate, card.model, card.stepKey, card.templateId, customTargetTimes, modelGroups]);
   const after = (isClosed && card.afterFrozen) ? card.afterFrozen : afterLive;
-  const verdict = useMemo(() => (card.actionDate && card.baseline) ? ((isClosed && card.verdictFrozen) ? card.verdictFrozen : computeVerdict(card.baseline, after, edit.kpi)) : null, [card, after, edit.kpi, isClosed]);
+  const verdict = useMemo(() => (card.actionDate && (card.actionBaseline || card.baseline)) ? ((isClosed && card.verdictFrozen) ? card.verdictFrozen : computeVerdict(card.actionBaseline || card.baseline, after, edit.kpi)) : null, [card, after, edit.kpi, isClosed]);
 
   const patch = async (p, logEntry) => {
     setBusy(true);
@@ -21258,7 +21305,15 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
     // 既に実施日があるのに再度押すと効果測定がリセットされるため確認 (初回=actionDate無しは確認なし)
     if (card.actionDate && !confirm('対策実施日を今日に変更すると、これまでの効果測定がリセットされます。よろしいですか？')) return;
     const now = Date.now();
-    patch({ status: 'measuring', actionDate: now, kpi: edit.kpi, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew }, { type: 'do', note: `対策を実施 (${edit.changeNote || '内容未記入'})` });
+    // ⚠実施時ベースライン再凍結: 起票から実施まで日が空くと起票時の90日窓は「対策直前の状態」とズレる。
+    //   効果判定は actionBaseline(実施直前90日) を使い、起票時の値は discoverySnapshot として証拠に残す(仕様4.7)。
+    const abStart = now - 90 * 86400000;
+    const abStat = measureWindow(lots, { model: card.model, stepKey: card.stepKey, templateId: card.templateId || undefined, customTargetTimes, modelGroups, startMs: abStart, endMs: now });
+    const actionBaseline = { ...abStat, startMs: abStart, endMs: now };
+    patch({
+      status: 'measuring', actionDate: now, kpi: edit.kpi, changeNote: edit.changeNote, changeOld: edit.changeOld, changeNew: edit.changeNew,
+      actionBaseline, discoverySnapshot: card.discoverySnapshot || card.baseline || null,
+    }, { type: 'do', note: `対策を実施 (${edit.changeNote || '内容未記入'})・実施直前90日をベースラインに再凍結(中央値${pdcaFmtSec(actionBaseline.median)}・${actionBaseline.n}台)` });
   };
   const closeWith = (status) => {
     // 「効果あり/悪化」は実施後の標本が一定数たまるまで判定させない (無意味な0台凍結を防ぐ。defectRateは件数ベースなので除外)
@@ -21266,11 +21321,42 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
       alert(`実施後の標本が ${afterLive?.n || 0}台 です。${PDCA_MIN_N}台たまってから「効果あり／悪化」を判定してください。（「効果なし」「元に戻す」での完了は可能です）`);
       return;
     }
-    // 実施後統計と判定を凍結して恒久エビデンス化 (窓情報も保存=後で日あたり率の再計算が可能)。kpiも永続化して凍結判定と一致させる。
+    // 実施後統計と判定を凍結して恒久エビデンス化 (窓情報も保存=後で率の再計算が可能)。kpiも永続化して凍結判定と一致させる。
+    // ベースラインは実施時再凍結(actionBaseline)を最優先 (起票から実施まで空くと直前の状態とズレるため)。
+    const before = card.actionBaseline || card.baseline;
     const frozen = afterLive ? { ...afterLive, startMs: card.actionDate, endMs: Date.now() } : null;
-    const v = (card.baseline && frozen) ? computeVerdict(card.baseline, frozen, edit.kpi) : null;
+    const v = (before && frozen) ? computeVerdict(before, frozen, edit.kpi) : null;
+    // 🚦効果確定ゲート: 「効果あり」は 自動判定improved+前後標本+品質ガード+必須項目 を全部通過した時だけ。
+    //   (5%未満の小改善=flat が正の金額のまま確定へ入る抜け道と、前標本不足の抜け道をここで塞ぐ)
+    let quality = null;
+    if (status === 'effective') {
+      quality = qualityGuardOf({
+        beforeDefects: before?.defectCount || 0, beforeUnits: before?.unitsSeen ?? before?.n ?? 0,
+        afterDefects: frozen?.defectCount || 0, afterUnits: frozen?.unitsSeen ?? frozen?.n ?? 0,
+      });
+      const gate = canCloseEffective({ verdict: v, before, after: frozen, quality, kpi: edit.kpi, action: card.action || edit.changeNote || card.changeNote || '', owner: card.owner || '', actionDate: card.actionDate });
+      if (!gate.ok) {
+        alert(`「効果あり」にはまだできません:\n・${gate.reasons.join('\n・')}\n\n(「効果なし」「悪化」「元に戻す」での完了は可能です)`);
+        return;
+      }
+    }
     const label = PDCA_STATUS_META[status]?.label || status;
-    patch({ status, kpi: edit.kpi, afterFrozen: frozen, verdictFrozen: v, closedAt: Date.now(), closedBy: currentUserName || '?' }, { type: 'close', note: `判定: ${label}` });
+    patch({
+      status, kpi: edit.kpi, afterFrozen: frozen, verdictFrozen: v, closedAt: Date.now(), closedBy: currentUserName || '?',
+      ...(status === 'effective' ? { verifiedStage: 'provisional', qualityFrozen: quality } : {}),
+    }, { type: 'close', note: `判定: ${label}${status === 'effective' ? '（暫定・30日定着確認待ち）' : ''}` });
+  };
+  // 🔁 30日定着確認: 効果あり(暫定)から30日後、直近4週の実測で定着していれば「確定」へ。崩れていたら「要再確認」。
+  const sustainCheck = () => {
+    const recent = measureWindow(lots, { model: card.model, stepKey: card.stepKey, templateId: card.templateId || undefined, customTargetTimes, modelGroups, startMs: Date.now() - 28 * 86400000, endMs: Date.now() });
+    const sv = sustainVerdict({ afterVal: Number(card.verdictFrozen?.afterVal) || 0, recentMedian: recent.median, recentN: recent.n });
+    if (sv.result === 'unknown') { alert(`まだ判定できません: ${sv.reason}`); return; }
+    const label = sv.result === 'sustained' ? '✅ 定着を確認 → 確定に入ります' : `⚠ 崩れています: ${sv.reason}\n「要再確認」になり、確定から外れます`;
+    if (!window.confirm(`30日定着確認\n定着時 ${pdcaFmtSec(Number(card.verdictFrozen?.afterVal) || 0)} → 直近4週 ${pdcaFmtSec(recent.median)}（${recent.n}台）\n\n${label}\nよろしいですか？`)) return;
+    patch({
+      verifiedStage: sv.result === 'sustained' ? 'verified' : 'broken',
+      sustainedAt: Date.now(), sustainStat: { ...recent, startMs: Date.now() - 28 * 86400000, endMs: Date.now() },
+    }, { type: 'sustain', note: sv.result === 'sustained' ? '30日定着確認OK → 確定' : `30日定着確認NG(${sv.reason}) → 要再確認` });
   };
   const reopen = () => patch({ status: 'measuring', closedAt: null, closedBy: null, afterFrozen: null, verdictFrozen: null }, { type: 'status', note: '再オープン(効果測定中へ)' });
   const doDelete = async () => { if (!deleteData) return; if (!confirm('このカルテを削除しますか？(元に戻せません)')) return; await deleteData('improvements', card.id); onClose(); };
@@ -21347,7 +21433,8 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
               ベースライン期間: {card.baseline ? `${pdcaFmtDate(card.baseline.startMs)} 〜 ${pdcaFmtDate(card.baseline.endMs)}` : '—'}
               {card.actionDate ? ` ／ 実施後: ${pdcaFmtDate(card.actionDate)} 〜 ${isClosed && card.closedAt ? pdcaFmtDate(card.closedAt) : '現在'}` : ' ／ 実施後: 未実施'}
             </div>
-            <StatRows b={card.baseline} a={after} kpi={edit.kpi} />
+            {card.actionBaseline && <div className="text-[10px] text-slate-400 mb-1">改善前=対策実施直前の90日（起票時の値は監査ログに保存）</div>}
+            <StatRows b={card.actionBaseline || card.baseline} a={after} kpi={edit.kpi} />
             <div className="pt-1">
               <div className="text-[10px] text-slate-400 mb-0.5">月次推移 ({PDCA_KPIS[edit.kpi] || PDCA_KPIS.time}) — 対策実施を境に色が変わります</div>
               <PdcaMiniTrend lots={lots} model={card.model} stepKey={card.stepKey} templateId={card.templateId || ''} kpi={edit.kpi} customTargetTimes={customTargetTimes} modelGroups={modelGroups} actionDate={card.actionDate} />
@@ -21391,9 +21478,24 @@ const ImprovementCardModal = ({ card, lots = [], customTargetTimes = {}, modelGr
             </div>
           )}
           {isClosed && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-slate-500">判定: {pdcaFmtDateTime(card.closedAt)} ・ {card.closedBy}</span>
-              {!busy && <button onClick={reopen} className="text-[11px] px-2 py-1 border rounded text-slate-600 hover:bg-slate-50">再オープン</button>}
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-slate-500">判定: {pdcaFmtDateTime(card.closedAt)} ・ {card.closedBy}</span>
+                {card.status === 'effective' && (
+                  cardStageOf(card) === 'verified' ? <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-600 text-white font-bold">✅ 確定（30日定着済）</span>
+                  : cardStageOf(card) === 'broken' ? <span className="text-[10px] px-2 py-0.5 rounded bg-rose-500 text-white font-bold">⚠ 要再確認（定着崩れ）</span>
+                  : <span className="text-[10px] px-2 py-0.5 rounded bg-teal-500 text-white font-bold">⏳ 暫定（30日定着確認待ち）</span>
+                )}
+                {!busy && <button onClick={reopen} className="text-[11px] px-2 py-1 border rounded text-slate-600 hover:bg-slate-50">再オープン</button>}
+              </div>
+              {card.status === 'effective' && cardStageOf(card) === 'provisional' && (
+                sustainCheckDue(card, Date.now())
+                  ? <button onClick={sustainCheck} disabled={busy} className="text-xs px-3 py-1.5 bg-emerald-600 text-white rounded font-bold">🔁 30日定着確認をする（直近4週の実測で判定）</button>
+                  : <div className="text-[10px] text-slate-400">判定から{SUSTAIN_DAYS}日たつと「30日定着確認」ができます（確認して定着していれば貯金箱の「確定」に入ります）。</div>
+              )}
+              {card.status === 'effective' && cardStageOf(card) === 'broken' && (
+                <button onClick={sustainCheck} disabled={busy} className="text-xs px-3 py-1.5 bg-amber-500 text-white rounded font-bold">🔁 再度 定着確認をする</button>
+              )}
             </div>
           )}
 
@@ -21597,7 +21699,7 @@ const ImprovementCardsPanel = ({ improvements = [], lots = [], settings = {}, sa
     if (!c.actionDate || !c.baseline) return null;
     if (['effective', 'noeffect', 'worse', 'rolledback'].includes(c.status) && c.verdictFrozen) return c.verdictFrozen;
     const a = measureWindow(lots, { model: c.model, stepKey: c.stepKey, templateId: c.templateId || undefined, customTargetTimes, modelGroups, startMs: c.actionDate, endMs: nowMs });
-    return computeVerdict(c.baseline, a, c.kpi || 'time');
+    return computeVerdict(c.actionBaseline || c.baseline, a, c.kpi || 'time');
   };
 
   const filtered = useMemo(() => {
@@ -22719,7 +22821,7 @@ const ProcessAnalysisView = ({ lots = [], settings = {}, workers = [], templates
 // 分析サブタブを5グループに整理 (フラットな13タブ→グループ→サブタブの2段ナビ)。機能は消さず位置だけ整理。
 // 分析タブを「データを正す→見る→計画→実行→定着」のPDCAの流れ順に並べる(2段ナビ)。番号で順番を明示。
 // ===== 🎯 年間目標タブ本体: 目標登録(3アプリ共有)+貯金箱ボード+実ペース換算+10%三レンズ =====
-const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null, currentUserName = '', saveData = null, templates = [] }) => {
+const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null, currentUserName = '', saveData = null, templates = [], analysisInfo = null }) => {
   const isAdmin = currentUserName === '管理者';
   const nowMs = Date.now();
   const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
@@ -22814,24 +22916,52 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   const engine = useMemo(() => goalEngineOf(goalCfg), [goalCfg]);
 
   // 各アプリのサマリ (実ペース窓・重点工程ランキングと同一数式)
-  const sumProd = useMemo(() => goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel, templates }), [lots, settings, charge, annualUnitsByModel, templates]); // eslint-disable-line
-  const sumGolden = useMemo(() => ext?.golden ? goalAppSummary(ext.golden.lots, ext.golden.settings, { nowMs, chargePerHour: charge }) : null, [ext, charge]); // eslint-disable-line
+  const sumProd = useMemo(() => goalAppSummary(lots, settings, { nowMs, chargePerHour: charge, annualUnitsByModel, templates, autoLaborPct: engine.autoLaborPct }), [lots, settings, charge, annualUnitsByModel, templates, engine.autoLaborPct]); // eslint-disable-line
+  const sumGolden = useMemo(() => ext?.golden ? goalAppSummary(ext.golden.lots, ext.golden.settings, { nowMs, chargePerHour: charge, autoLaborPct: engine.autoLaborPct }) : null, [ext, charge, engine.autoLaborPct]); // eslint-disable-line
   const partsLotCount = ext?.parts?.lots?.length || 0;
   const goldenSuspect = !!(sumGolden && sumGolden.excessRatio > 0.3);
 
   // 貯金箱: 確定(効果あり実測) / 実施中見込み / 候補在庫。週次ブリーフと同じ goalBankOf を使う(数字の食い違い防止)。
   //   確定には最終検査の改善カルテ(効果あり・凍結¥)も合算する。
-  const goldenFixedYen = useMemo(() => (ext?.golden?.improvements || []).filter(c => c && c.status === 'effective' && c.verdictFrozen?.yenPerYear > 0).reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0), [ext]);
+  const goldenEffSplit = useMemo(() => {
+    const eff = (ext?.golden?.improvements || []).filter(c => c && c.status === 'effective' && c.verdictFrozen?.yenPerYear > 0);
+    return {
+      fixed: eff.filter(c => (c.verifiedStage || 'provisional') === 'verified').reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0),
+      provisional: eff.filter(c => (c.verifiedStage || 'provisional') === 'provisional').reduce((s, c) => s + c.verdictFrozen.yenPerYear, 0),
+    };
+  }, [ext]);
+  const sumParts = useMemo(() => ext?.parts ? goalAppSummary(ext.parts.lots, ext.parts.settings, { nowMs, chargePerHour: charge, autoLaborPct: engine.autoLaborPct }) : null, [ext, charge, engine.autoLaborPct]); // eslint-disable-line
   const bank = useMemo(() => goalBankOf({
     improvements, prodRows: sumProd.ranking.rows,
     goldenTotalSaveYen: sumGolden ? sumGolden.ranking.totalSaveYen : 0,
-    includeGolden: includeGolden && !!sumGolden, annualUnitsByModel, charge, goldenFixedYen,
-  }), [improvements, sumProd, sumGolden, includeGolden, annualUnitsByModel, charge, goldenFixedYen]);
+    includeGolden: includeGolden && !!sumGolden, annualUnitsByModel, charge,
+    goldenFixedYen: goldenEffSplit.fixed, goldenProvisionalYen: goldenEffSplit.provisional,
+    partsTotalSaveYen: sumParts ? sumParts.ranking.totalSaveYen : 0,
+  }), [improvements, sumProd, sumGolden, sumParts, includeGolden, annualUnitsByModel, charge, goldenEffSplit]);
+  // 📐 確定(verified)分の「今年度実現/実績」(清水の決定1: 年間換算と別計算・別表示。実績は実測回数ベース=推定でない)
+  const fiscalAgg = useMemo(() => {
+    let realized = 0, forecast = 0;
+    const untilMs = Math.min(nowMs, fy.endMs);
+    bank.fixed.forEach(({ c, m }) => {
+      const aStat = c.actionDate ? measureWindow(lots, { model: c.model, stepKey: c.stepKey, templateId: c.templateId || undefined, customTargetTimes: settings?.customTargetTimes || {}, modelGroups: modelGroupsOf(settings), startMs: c.actionDate, endMs: untilMs }) : null;
+      const f = fiscalRealizedOf({ perUnitSec: m.perUnitSec, occAnnual: m.units, actionMs: c.actionDate || 0, nowMs, fyStartMs: fy.startMs, fyEndMs: fy.endMs, charge, realizedExecs: aStat ? aStat.n : null });
+      realized += f.realizedYen; forecast += f.forecastYen;
+    });
+    (ext?.golden?.improvements || []).filter(c => c && c.status === 'effective' && (c.verifiedStage || 'provisional') === 'verified' && c.verdictFrozen?.yenPerYear > 0).forEach(c => {
+      const per = Math.max(0, (Number(c.verdictFrozen.beforeVal) || 0) - (Number(c.verdictFrozen.afterVal) || 0));
+      const execs = c.actionDate ? goldenExecCountFI(ext.golden.lots, { itemKey: c.itemKey, model: c.model || '', startMs: c.actionDate, endMs: untilMs }) : null;
+      const f = fiscalRealizedOf({ perUnitSec: per, occAnnual: c.verdictFrozen.annualN || 0, actionMs: c.actionDate || 0, nowMs, fyStartMs: fy.startMs, fyEndMs: fy.endMs, charge, realizedExecs: execs });
+      realized += f.realizedYen; forecast += f.forecastYen;
+    });
+    return { realized, forecast };
+  }, [bank, ext, lots, settings, charge, fy.startMs, fy.endMs]); // eslint-disable-line
+  const primaryMetric = ['annualized', 'fiscalForecast', 'fiscalRealized'].includes(goalCfg?.primaryMetric) ? goalCfg.primaryMetric : 'annualized';
+  const primaryFixedYen = primaryMetric === 'fiscalForecast' ? fiscalAgg.forecast : primaryMetric === 'fiscalRealized' ? fiscalAgg.realized : bank.fixedYen;
 
   // 🔗 全部に効く共通ポイント(工程横断・3型式以上に共通・実ペース窓)
   const commonTop = useMemo(() => {
     try {
-      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel, byTemplate: true, templates });
+      const cr = crossStepRanking(lots, settings, { startMs: sumProd.win.startMs, endMs: nowMs, ratePerHour: charge, reductionPct: (engine.commonPct || 10) / 100, annualUnitsByModel, byTemplate: true, templates, autoLaborPct: engine.autoLaborPct });
       return (cr.groups || []).filter(g => g.modelCount >= (engine.commonMinModels || 3) && g.annualCostSec > 0).slice(0, 3);
     } catch (e) { return []; }
   }, [lots, settings, sumProd, charge, annualUnitsByModel, engine]); // eslint-disable-line
@@ -22854,7 +22984,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
     return { ok: true, achievement: Math.round(sumTgt / sumAct * 1000) / 10, excessPct: Math.round((sumAct / sumTgt - 1) * 1000) / 10 };
   }, [fiscalAggProd, fiscalAggGolden, includeGolden]);
 
-  const openEdit = () => { setDraft({ fiscalStartMonth, moneyTargetYen: moneyTarget, reductionPct, chargePerHour: charge, ...engine }); setEdit(true); };
+  const openEdit = () => { setDraft({ fiscalStartMonth, moneyTargetYen: moneyTarget, reductionPct, chargePerHour: charge, primaryMetric, ...engine }); setEdit(true); };
   const saveGoal = async () => {
     if (!db || !draft) return;
     setSaving(true);
@@ -22862,6 +22992,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
       const num = (v, def, min, max) => Math.min(max, Math.max(min, Number(v) || def));
       await setDoc(doc(db, 'artifacts', GOAL_SHARED_NS, 'public', 'data', 'settings', 'config'), {
         fiscalStartMonth: Math.min(12, Math.max(1, Number(draft.fiscalStartMonth) || 12)),
+        primaryMetric: ['annualized', 'fiscalForecast', 'fiscalRealized'].includes(draft.primaryMetric) ? draft.primaryMetric : 'annualized',
         years: { ...(goalCfg?.years || {}), [fy.key]: {
           moneyTargetYen: Math.max(0, Number(draft.moneyTargetYen) || 0),
           reductionPct: Math.max(0, Number(draft.reductionPct) || 0),
@@ -22876,6 +23007,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           trendPct: num(draft.trendPct, 15, 3, 100),
           commonMinModels: num(draft.commonMinModels, 3, 2, 50),
           commonPct: num(draft.commonPct, 10, 1, 50),
+          autoLaborPct: num(draft.autoLaborPct, 100, 0, 100),
           briefEnabled: !!draft.briefEnabled,
           pushEnabled: !!draft.pushEnabled,
         },
@@ -22887,7 +23019,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
   };
 
   const seg = (v) => moneyTarget > 0 ? Math.max(0, Math.min(100, v / moneyTarget * 100)) : 0;
-  const remainYen = Math.max(0, moneyTarget - bank.fixedYen);
+  const remainYen = Math.max(0, moneyTarget - primaryFixedYen); // 主目標(⚙で切替)ベースの残り
 
   // 📗 Excel出力: 分析された数字を全部そのまま渡せる形で(目標/貯金箱/ブリーフ/共通ポイント/原資明細)
   const goalExcel = async () => {
@@ -22897,7 +23029,7 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
       const s1 = wb.addWorksheet('目標と貯金箱');
       s1.addRows([
         ['年度', fy.label], ['改善金額目標(円)', moneyTarget], ['時間削減目標(%)', reductionPct], ['チャージ(円per時)', charge], ['年度経過(%)', elapsedPct], [],
-        ['確定=効果あり実測(円)', bank.fixedYen], ['実施中見込み(円)', bank.runningYen], ['候補在庫(円)', bank.stockYen], ['  うち製品(円)', bank.stockProdYen], ['  うち最終(円)', bank.stockGoldenYen], ['目標まで残り(円)', remainYen],
+        ['確定=30日定着済(円)', bank.fixedYen], ['暫定=効果あり・定着待ち(円)', bank.provisionalYen], ['実施中見込み(円)', bank.runningYen], ['候補在庫(円)', bank.stockYen], ['  うち製品(円)', bank.stockProdYen], ['  うち最終(円)', bank.stockGoldenYen], ['目標まで残り(円)', remainYen],
       ]);
       s1.getColumn(1).width = 26; s1.getColumn(2).width = 30;
       const typeLabel = { stall: '催促', break: '崩れ', common: '共通ポイント', mine: '原資', trend: '悪化の兆し' };
@@ -22930,9 +23062,9 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
     h += `<div style="font-size:12px">改善金額目標 <b>${man(moneyTarget)}円</b> ・ 時間 <b>${reductionPct}%削減</b> ・ チャージ ${charge.toLocaleString()}円/h ・ 年度経過 ${elapsedPct}% ・ 作成 ${new Date().toLocaleString('ja-JP')}</div>`;
     h += `<h2>🏦 改善金額の貯金箱（目標 ${man(moneyTarget)}円）</h2>` +
       `<div style="display:flex;height:26px;border:1px solid #999;border-radius:4px;overflow:hidden;max-width:640px;background:#f1f5f9">` +
-      `<div style="width:${seg(bank.fixedYen)}%;background:#10b981"></div><div style="width:${seg(bank.runningYen)}%;background:#38bdf8"></div><div style="width:${seg(bank.stockYen)}%;background:#fcd34d"></div></div>` +
+      `<div style="width:${seg(bank.fixedYen)}%;background:#10b981"></div><div style="width:${seg(bank.provisionalYen)}%;background:#2dd4bf"></div><div style="width:${seg(bank.runningYen)}%;background:#38bdf8"></div><div style="width:${seg(bank.stockYen)}%;background:#fcd34d"></div></div>` +
       `<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;margin-top:6px;font-size:12px"><tr>` +
-      `<td>✅ 確定</td><td><b>${yen(bank.fixedYen)}</b></td><td>🔧 実施中見込み</td><td>${yen(bank.runningYen)}</td><td>⛏ 候補在庫</td><td>${yen(bank.stockYen)}</td><td><b>目標まで残り</b></td><td><b>${yen(remainYen)}</b></td></tr></table>`;
+      `<td>✅ 確定(30日定着済)</td><td><b>${yen(bank.fixedYen)}</b></td><td>⏳ 暫定</td><td>${yen(bank.provisionalYen)}</td><td>🔧 実施中見込み</td><td>${yen(bank.runningYen)}</td><td>⛏ 候補在庫</td><td>${yen(bank.stockYen)}</td><td><b>目標まで残り</b></td><td><b>${yen(remainYen)}</b></td></tr></table>`;
     if (brief?.findings && Object.keys(brief.findings).length) {
       h += `<h2>📬 今週のブリーフ（発見 ${Object.keys(brief.findings).length}件）</h2>`;
       typeOrder.forEach(tp => Object.entries(brief.findings).filter(([, f]) => f.type === tp).forEach(([fid, f]) => {
@@ -22988,6 +23120,14 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
                 {Array.from({ length: 12 }, (_, i) => i + 1).map(m => <option key={m} value={m}>{m}月（〜翌{m === 1 ? 12 : m - 1}月）</option>)}
               </select>
             </label>
+            <label className="text-xs text-slate-600">📐 主目標の数え方（会社報告の定義）
+              <select value={draft.primaryMetric || 'annualized'} onChange={e => setDraft(d => ({ ...d, primaryMetric: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm">
+                <option value="annualized">年間換算効果（ペースの価値・既定）</option>
+                <option value="fiscalForecast">今年度実現見込み</option>
+                <option value="fiscalRealized">今年度実績（実測回数分のみ）</option>
+              </select>
+              <span className="text-[9px] text-slate-400">3つとも常に併記表示。ここは「目標まで残り」の基準だけ切替</span>
+            </label>
           </div>
           <div className="border-t border-slate-200 pt-3">
             <div className="text-xs font-bold text-slate-700 mb-2">📬 エンジンの細かい設定（週次ブリーフ・発見カードの出し方。3アプリ共有）</div>
@@ -23023,6 +23163,10 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
               <label className="text-xs text-slate-600">🔗 共通ポイント（削減仮定 %）
                 <input type="number" min="1" max="50" value={draft.commonPct} onChange={e => setDraft(d => ({ ...d, commonPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
                 <span className="text-[9px] text-slate-400">「◯%削ったら年いくら」の◯</span>
+              </label>
+              <label className="text-xs text-slate-600">🤖 自動運転中の人拘束率（%）
+                <input type="number" min="0" max="100" value={draft.autoLaborPct ?? 100} onChange={e => setDraft(d => ({ ...d, autoLaborPct: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-sm" />
+                <span className="text-[9px] text-slate-400">自動測定中に人が離れられない割合。100=全額人件費(従来)・0=純自動は人件費に入れない。機械時間は別枠で表示</span>
               </label>
             </div>
           </div>
@@ -23099,28 +23243,35 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
         </div>
         <div className="mt-3 relative h-9 bg-slate-100 rounded-lg overflow-hidden border border-slate-200">
           <div className="absolute inset-y-0 left-0 bg-emerald-500" style={{ width: `${seg(bank.fixedYen)}%` }} title={`確定 ${yen(bank.fixedYen)}`}></div>
-          <div className="absolute inset-y-0 bg-sky-400/80" style={{ left: `${seg(bank.fixedYen)}%`, width: `${seg(bank.runningYen)}%` }} title={`実施中見込み ${yen(bank.runningYen)}`}></div>
-          <div className="absolute inset-y-0 bg-amber-300/70" style={{ left: `${seg(bank.fixedYen + bank.runningYen)}%`, width: `${seg(bank.stockYen)}%` }} title={`候補在庫 ${yen(bank.stockYen)}`}></div>
+          <div className="absolute inset-y-0 bg-teal-400/80" style={{ left: `${seg(bank.fixedYen)}%`, width: `${seg(bank.provisionalYen)}%` }} title={`暫定 ${yen(bank.provisionalYen)}`}></div>
+          <div className="absolute inset-y-0 bg-sky-400/80" style={{ left: `${seg(bank.fixedYen + bank.provisionalYen)}%`, width: `${seg(bank.runningYen)}%` }} title={`実施中見込み ${yen(bank.runningYen)}`}></div>
+          <div className="absolute inset-y-0 bg-amber-300/70" style={{ left: `${seg(bank.fixedYen + bank.provisionalYen + bank.runningYen)}%`, width: `${seg(bank.stockYen)}%` }} title={`候補在庫 ${yen(bank.stockYen)}`}></div>
           <div className="absolute inset-y-0 border-l-2 border-dashed border-slate-500" style={{ left: `${elapsedPct}%` }} title={`年度経過 ${elapsedPct}%`}></div>
         </div>
-        <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
           <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
-            <div className="text-[11px] text-emerald-700 font-bold">✅ 確定（効果あり判定の実測短縮）</div>
+            <div className="text-[11px] text-emerald-700 font-bold">✅ 確定（30日定着まで確認済み）</div>
             <div className="text-xl font-black text-emerald-700">{yen(bank.fixedYen)}<span className="text-xs font-bold text-emerald-600 ml-1">/ 目標の{fixedPct}%</span></div>
-            <div className="text-[10px] text-slate-500 mt-0.5">製品 {bank.fixed.length}件{bank.fixedGoldenYen > 0 ? ` ${yen(bank.fixedProdYen)} ＋ 最終検査のカルテ ${yen(bank.fixedGoldenYen)}` : 'のカルテ'}。凍結before/after × 年間台数 × チャージ。</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">製品 {bank.fixed.length}件{bank.fixedGoldenYen > 0 ? ` ${yen(bank.fixedProdYen)} ＋ 最終 ${yen(bank.fixedGoldenYen)}` : ''}。効果あり判定＋30日定着確認を通ったものだけ。{bank.broken.length > 0 && <span className="text-rose-600 font-bold">⚠ 定着崩れ(要再確認) {bank.broken.length}件は除外中。</span>}</div>
+          </div>
+          <div className="bg-teal-50 border border-teal-200 rounded-lg p-3">
+            <div className="text-[11px] text-teal-700 font-bold">⏳ 暫定（効果あり・定着確認待ち）</div>
+            <div className="text-xl font-black text-teal-700">{yen(bank.provisionalYen)}</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">判定直後のもの。30日後の定着確認を通ると「確定」へ。確定と混ぜて「達成」とは数えません。</div>
           </div>
           <div className="bg-sky-50 border border-sky-200 rounded-lg p-3">
             <div className="text-[11px] text-sky-700 font-bold">🔧 実施中の見込み（カルテ進行中）</div>
             <div className="text-xl font-black text-sky-700">{yen(bank.runningYen)}</div>
-            <div className="text-[10px] text-slate-500 mt-0.5">{bank.running.length}件。目標まで詰められた場合の見込み。判定が出ると「確定」へ移動。</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">{bank.running.length}件。目標まで詰められた場合の見込み。判定が出ると「暫定」へ移動。</div>
           </div>
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
             <div className="text-[11px] text-amber-700 font-bold">⛏ 候補在庫（まだ手を付けていない原資）</div>
             <div className="text-xl font-black text-amber-700">{yen(bank.stockYen)}</div>
-            <div className="text-[10px] text-slate-500 mt-0.5">製品 {yen(bank.stockProdYen)} ＋ 最終 {includeGolden ? yen(bank.stockGoldenYen) : '除外中'}。全工程を目標時間まで詰め切った場合の理論上限。</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">製品 {yen(bank.stockProdYen)} ＋ 最終 {includeGolden ? yen(bank.stockGoldenYen) : '除外中'} ＋ 部品 {yen(bank.stockPartsYen)}。全工程を目標時間まで詰め切った場合の理論上限。</div>
           </div>
         </div>
-        <div className="mt-2 text-sm font-bold text-slate-700">目標まであと <span className="text-rose-600 text-lg">{yen(remainYen)}</span>（確定ベース）
+        <div className="mt-2 text-[11px] text-slate-600 bg-slate-50 rounded-lg p-2">📐 確定分の3つの数え方（主目標: <b>{GOAL_PRIMARY_METRICS[primaryMetric]}</b>・⚙で切替）: 年間換算 <b>{yen(bank.fixedYen)}</b> ・ 今年度実現見込み <b>{yen(fiscalAgg.forecast)}</b> ・ 今年度実績(実施日からの実測回数分) <b>{yen(fiscalAgg.realized)}</b>。混ぜて「達成」とは数えません。</div>
+        <div className="mt-2 text-sm font-bold text-slate-700">目標まであと <span className="text-rose-600 text-lg">{yen(remainYen)}</span>（{GOAL_PRIMARY_METRICS[primaryMetric]}・確定ベース）
           {moneyTarget > 0 && (bank.fixedYen + bank.runningYen + bank.stockYen) < moneyTarget && <span className="ml-2 text-[11px] text-rose-500 font-normal">⚠ 確定＋見込み＋在庫を全部足しても目標に届きません。不良・手直しの金額算入や対象拡大の検討が必要です。</span>}
         </div>
       </div>
@@ -23184,6 +23335,13 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           <div className="bg-slate-50 rounded-lg p-2.5 text-slate-600">
             📅 時間データの開始: 製品 <b>{dstr(prodDataStart)}</b> / 最終 <b>{sumGolden ? dstr(sumGolden.win.dataStartMs) : '読込中…'}</b>。年間の金額は<b>直近{Math.round(sumProd.win.days)}日の実ペース×365日</b>で換算しています（365日窓の過小表示をここで補正）。
           </div>
+          <div className={`rounded-lg p-2.5 ${analysisInfo && analysisInfo.loaded && analysisInfo.complete ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 border border-amber-200 text-amber-800'}`}>
+            {analysisInfo && analysisInfo.loaded
+              ? (analysisInfo.complete
+                ? <span>📚 集計対象: <b>全{analysisInfo.count}ロット（全件）</b>を読み込んで計算しています。</span>
+                : <span>⚠ 集計対象: {analysisInfo.count}ロット（<b>一部のみ</b>・件数が多すぎて全件読み切れていません）。この状態の金額は参考値です。</span>)
+              : <span>⚠ 集計対象: 直近500ロットのみ（全件読み込み中/失敗）。総ロットが500件を超えている場合、この画面の金額は不完全です。</span>}
+          </div>
           <div className={`rounded-lg p-2.5 ${annualInputCount === 0 ? 'bg-rose-50 border border-rose-200 text-rose-700' : 'bg-emerald-50 text-emerald-700'}`}>
             {annualInputCount === 0
               ? <span>⚠ <b>年間生産台数が未登録（0型式）</b>。今は測定ペースからの推定です。分析→経営分析タブで登録（Excel一括あり）すると金額の精度が大きく上がります。</span>
@@ -23198,6 +23356,12 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
           <div className="bg-slate-50 rounded-lg p-2.5 text-slate-500">
             🔩 部品検査: {partsLotCount === 0 ? 'まだ稼働前（データ0件）。稼働開始すると自動で合算に入ります。' : `${partsLotCount}ロットのデータあり（合算対象）。`}
             {extErr && <span className="text-rose-600 ml-1">読込エラー: {extErr}</span>}
+          </div>
+          <div className={`rounded-lg p-2.5 ${(engine.autoLaborPct ?? 100) >= 100 ? 'bg-amber-50 border border-amber-200 text-amber-800' : 'bg-slate-50 text-slate-600'}`}>
+            🤖 自動運転の扱い: 機械が回っている時間 年 約<b>{Math.round((sumProd.ranking.totalMachineSec || 0) / 3600).toLocaleString()}h</b>{sumGolden ? `＋最終 ${Math.round((sumGolden.ranking.totalMachineSec || 0) / 3600)}h` : ''}。
+            {(engine.autoLaborPct ?? 100) >= 100
+              ? <span> 現在は拘束率100%＝<b>全額を人件費に入れています(上限値)</b>。実際は離れられる時間があるなら ⚙目標の設定→🤖拘束率 を下げると、純自動時間が人件費から外れて金額が実態に近づきます。</span>
+              : <span> 拘束率{engine.autoLaborPct}%で人件費を計算中(残りは設備能力・納期の話として別枠)。</span>}
           </div>
         </div>
         <div className="mt-2 text-[11px] text-slate-400">年度内の記録時間: 製品 {hrs0(fiscalAggProd?.sumAct || 0)} / 最終 {fiscalAggGolden ? hrs0(fiscalAggGolden.sumAct) : '…'}（完了ロットのみ・チャージ換算 {yen(((fiscalAggProd?.sumAct || 0) + (fiscalAggGolden?.sumAct || 0)) / 3600 * charge)}）</div>
@@ -23252,7 +23416,7 @@ const ANALYSIS_GROUPS = [
     { k: 'rotary', l: '分割測定', color: 'text-cyan-600' },
   ] },
 ];
-const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], notes = [], announcements = [], strictModeHistory = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null, minorReports = [] }) => {
+const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settings, saveSettings, currentUserName = '', indirectWork = [], improvements = [], observationPlans = [], templates = [], notes = [], announcements = [], strictModeHistory = [], onRestore = null, db = null, anomalies = [], onGoOptimize = null, minorReports = [], analysisInfo = null }) => {
   const [showMinorLedger, setShowMinorLedger] = useState(false);
   // デフォルトは process (工程改善分析)。旧 'daily' は全体進捗タブと重複していたため削除済み
   const [activeMode, setActiveMode] = useState('process-analysis'); // 既定=工程分析(データを見る土台)。グループは activeMode から導出
@@ -25244,7 +25408,7 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
            {activeMode === 'rotary' && <RotaryMeasurementsPanel db={db} />}
            {activeMode === 'process-analysis' && <ProcessAnalysisView lots={lots} settings={settings} workers={workers} templates={templates} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} observationPlans={observationPlans} improvements={improvements} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} onGoToPdca={() => setActiveMode('pdca')} />}
            {activeMode === 'pdca' && <ImprovementCardsPanel improvements={improvements} lots={lots} settings={settings} saveData={saveData} deleteData={deleteData} customTargetTimes={settings.customTargetTimes || {}} modelGroups={modelGroupsOf(settings)} currentUserName={currentUserName} templates={templates} />}
-           {activeMode === 'goal' && <GoalLayerView lots={lots} settings={settings} improvements={improvements} db={db} currentUserName={currentUserName} saveData={saveData} templates={templates} />}
+           {activeMode === 'goal' && <GoalLayerView lots={lots} settings={settings} improvements={improvements} db={db} currentUserName={currentUserName} saveData={saveData} templates={templates} analysisInfo={analysisInfo} />}
            {activeMode === 'audit' && <AuditBackupPanel lots={lots} templates={templates} workers={workers} settings={settings} indirectWork={indirectWork} improvements={improvements} observationPlans={observationPlans} notes={notes} announcements={announcements} logs={logs} strictModeHistory={strictModeHistory} currentUserName={currentUserName} onRestore={onRestore} db={db} />}
            {/* ① データを正す: 要確認(異常値・該当なし)。ヘッダーの浮いたバッジと同じ中身を流れの先頭に置く。 */}
            {activeMode === 'anomaly' && (
@@ -32485,6 +32649,37 @@ export default function App() {
    // State: UI
    const [viewMode, setViewMode] = useState(EMBED_MAP ? 'map-only' : 'dashboard'); // 埋め込みは「マップだけ」画面(現場マップの地図そのもの)
    const [activeTab, setActiveTab] = useState('main');
+   // 📚 分析用の全件ロット(仕様4.2): 作業画面の常時購読はlimit(500)のまま軽さを維持し、
+   //   分析タブを開いた時に全件をページング取得してライブ購読と合成する(同idはライブ優先)。
+   //   総ロットが500件を超えても分析・年間目標の数字が黙って欠けないようにするための土台。
+   const [allLotsSnap, setAllLotsSnap] = useState(null);
+   useEffect(() => {
+     if (activeTab !== 'analysis' || !db || allLotsSnap) return;
+     let dead = false;
+     (async () => {
+       try {
+         const col = collection(db, 'artifacts', APP_DATA_ID, 'public', 'data', 'lots');
+         const r = await fetchAllPaged(async ({ cursor, pageSize }) => {
+           const q = cursor
+             ? query(col, orderBy('createdAt', 'desc'), startAfter(cursor), limit(pageSize))
+             : query(col, orderBy('createdAt', 'desc'), limit(pageSize));
+           const snap = await getDocs(q);
+           return { items: snap.docs.map(d => ({ id: d.id, ...d.data() })), nextCursor: snap.docs.length ? snap.docs[snap.docs.length - 1] : null };
+         });
+         if (!dead) setAllLotsSnap({ ...r, at: Date.now() });
+       } catch (e) {
+         console.warn('全件ロット取得に失敗(分析は直近500件で継続)', e);
+         if (!dead) setAllLotsSnap({ items: [], complete: false, failed: true, at: Date.now() });
+       }
+     })();
+     return () => { dead = true; };
+   }, [activeTab, db, allLotsSnap]); // eslint-disable-line
+   const analysisLots = useMemo(() => (allLotsSnap && !allLotsSnap.failed) ? mergeLotsById(allLotsSnap.items, lots) : lots, [allLotsSnap, lots]);
+   const analysisInfo = useMemo(() => ({
+     loaded: !!allLotsSnap && !allLotsSnap.failed,
+     complete: !!(allLotsSnap && allLotsSnap.complete),
+     count: analysisLots.length,
+   }), [allLotsSnap, analysisLots]);
    // 司令塔からの深掘りリンク(?q=指図)で来たら、検査リストタブを開く(検索欄への反映は上の searchQuery effect)。
    useEffect(() => { try { if (new URLSearchParams(window.location.search).get('q')) setActiveTab('inspection'); } catch (e) { /* noop */ } }, []);
    // タブ集約: 親タブの下にサブタブをぶら下げる。activeTab は子の値('history'等)も取りうる。
@@ -35402,7 +35597,7 @@ export default function App() {
          {activeTab === 'progress' && <ProgressOverviewView lots={lots} workers={workers} settings={settings} templates={templates} saveSettings={saveSettings} indirectWork={indirectWork} />}
          {activeTab === 'inspection' && <InspectionListView lots={lots} workers={workers} templates={templates} settings={settings} onEditLot={onEditLot} onDeleteLot={onDeleteLot} setExecutionLotId={setExecutionLotId} currentUserName={currentUserName} saveData={saveData} cdByOrder={cdByOrder} arrivalByLot={contactFeatureOn ? arrivalByLot : {}} />}
          {activeTab === 'contact' && contactFeatureOn && <ContactView contactRequests={contactRequests} arrivalTimes={arrivalTimes} lots={lots} settings={contactSettings} saveSettings={saveSettings} saveShared={saveContactShared} saveData={saveData} deleteData={deleteData} currentUserName={currentUserName} pushTokens={pushTokens} notifyPush={notifyContactPush} onApplyArrival={(reqId, itemIdx) => setArrivalApply({ reqId, itemIdx })} templates={templates} />}
-         {activeTab === 'analysis' && <AnalysisView lots={lots} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} minorReports={minorReports} />}
+         {activeTab === 'analysis' && <AnalysisView lots={analysisLots} analysisInfo={analysisInfo} logs={logs} workers={workers} saveData={saveData} deleteData={deleteData} settings={settings} saveSettings={saveSettings} currentUserName={currentUserName} indirectWork={indirectWork} improvements={improvementCards} observationPlans={observationPlans} templates={templates} notes={notes} announcements={announcements} strictModeHistory={strictModeHistory} onRestore={restoreAllFromBackup} db={db} anomalies={anomalies} onGoOptimize={(view) => { setOptimizeView(view); setActiveTab('optimize'); }} minorReports={minorReports} />}
          {/* 🚨 どこでも登録: ヘッダーの赤ボタンから台帳(不良/軽微不良/気づき)を全タブで開ける */}
          {showQuickLedger && <MinorReportLedgerModal reports={minorReports} lots={lots} workers={workers} currentUserName={currentUserName} saveData={saveData} deleteData={deleteData} onClose={() => setShowQuickLedger(false)} />}
          {activeTab === 'optimize' && (
