@@ -55,7 +55,7 @@ import {
 import { annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occurrence.js';
 // 🔧 自動工程判定と開始可否は src/domain/workExecution.js が唯一の正 (2026-07-20統一)。
 //   ⚠App.jsx内にローカルの isAutoStep を作り直さないこと。実測で10箇所に散在し、目標計算側と結果が食い違っていた。
-import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, buildStepMasterIndex } from './domain/workExecution.js';
+import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, startGuard as startGuardShared, buildStepMasterIndex } from './domain/workExecution.js';
 import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
 // 現行マスタ索引(案②): templates購読で更新する。module-levelの純関数からも参照できるようにするため
 //   Reactのstateではなくモジュール変数に置く(読み取り専用・判定のためだけに使う)。
@@ -65,6 +65,8 @@ const refreshStepMasterIndex = (templates) => { try { STEP_MASTER_INDEX = buildS
 const isAutoStep = (step) => isAutoStepShared(step, STEP_MASTER_INDEX);
 const isManualStep = (step) => isManualStepShared(step, STEP_MASTER_INDEX);
 const canStartTask = (args) => canStartTaskShared({ ...args, masterIndex: STEP_MASTER_INDEX });
+// 🚦開始経路はこの1本だけを呼ぶ (A.1)。カード/コンパクト/ロット1回/音声/サイン/まとめて開始 すべて共通。
+const startGuard = (args) => startGuardShared({ ...args, masterIndex: STEP_MASTER_INDEX });
 import { fetchAllPaged, mergeLotsById } from './domain/goal/pager.js';
 import { fiscalRealizedOf, GOAL_PRIMARY_METRICS } from './domain/goal/fiscalMath.js';
 import { goalGapOf, candidateOf, planPortfolio } from './domain/goal/portfolioPlanner.js';
@@ -7281,7 +7283,7 @@ const computeEnforcedSchedule = (steps, quantity, analysis, opts = {}) => {
 // 目的: 各ロットが実際どう動いたかを並べて、揃い具合・逸脱・改善シグナルを“見えるように”する。
 // 何も書き換えない。判断材料を出すだけ。
 const analyzeLotsForReview = (steps = [], completedLots = []) => {
-  const isAuto = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
+  const isAuto = (s) => isAutoStep(s); // 共通判定(A.1)。ローカル定義に戻さないこと
   const lotMaps = completedLots.map(lot => {
     const idByTitle = {}, idxByTitle = {}; (lot.steps || []).forEach((s, i) => { const t = (s?.title || '').trim(); if (t && !(t in idByTitle)) { idByTitle[t] = s?.id || null; idxByTitle[t] = i; } });
     return { lot, idByTitle, idxByTitle, qty: lot.quantity || 1 };
@@ -9181,7 +9183,9 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     setImages(s.images || []);
     setPdfData(s.pdfData || null);
     setMeasurementConfig(s.measurementConfig || null);
-    setExecutionMode(s.executionMode || (s.title?.includes('自動') ? 'batch' : 'manual'));
+    // 未設定の旧工程を編集で開いたときの初期値。共通判定と同じ結論にする(A.1)
+    //   = 画面の表示・開始ガード・目標計算と、編集画面の初期値が食い違わない。
+    setExecutionMode(s.executionMode || (isAutoStep(s) ? 'batch' : 'manual'));
     setWorkResource(s.workResource || '');
     setAutoEndEnabled(!!s.autoEndEnabled);
     setAutoEndSec(s.autoEndSec || 0);
@@ -9267,7 +9271,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
           </button>
           <div className="text-[11px] font-bold text-slate-400 mb-1 px-1">工程一覧</div>
           <div className="space-y-2">{steps.map((s, i) => {
-            const isAuto = s.executionMode === 'batch' || (s.title || '').includes('自動');
+            const isAuto = isAutoStep(s); // 共通判定(A.1)
             const resTag = s.workResource;
             const resLabel = resTag === 'measurement-machine' ? '🔒 測定機占有' :
                              resTag === 'jig-shared' ? '🔧 治具占有' :
@@ -12314,11 +12318,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     if (curNow.status === 'waiting' || curNow.status === 'paused') {
       const stepObj = (localSteps || [])[sIdx];
       // 🚦開始可否ガード(Phase A): 画面と同じ共通判定。音声/サインだけが手動2件同時開始の抜け道にならないようにする。
-      const vGate = canStartTask({
-        workerId: lot?.workerId || '__self__', targetStep: stepObj,
+      const vGate = startGuard({
+        workerId: lot?.workerId || '__self__', targetStep: stepObj, excludeKey: key,
         runningTasks: Object.entries(tasksRef.current || {})
-          .filter(([k, t]) => t?.status === 'processing' && k !== key)
-          .map(([k]) => ({ workerId: lot?.workerId || '__self__', step: findStepByTaskKey(k) }))
+          .filter(([, t]) => t?.status === 'processing')
+          .map(([k]) => ({ workerId: lot?.workerId || '__self__', step: findStepByTaskKey(k), key: k }))
           .filter(x => x.step),
       });
       if (!vGate.ok) return { ok: false, reason: 'parallel', hint: vGate.message };
@@ -13307,7 +13311,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const autoTaskRunning = Object.keys(tasks).some(key => {
       if (tasks[key]?.status !== 'processing') return false;
       const step = findStepByTaskKey(key);
-      return step && step.title.includes('自動');
+      return step && isAutoStep(step); // 共通判定(A.1)。名称だけで見ると executionMode='batch' の工程を取りこぼす
     });
     const monitoringActive = (interruptions || []).some(i => i.type === 'monitoring' && i.status === 'active');
     return autoTaskRunning || monitoringActive;
@@ -13335,7 +13339,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
       // ① 自動工程の task が processing 状態
       otherSteps.forEach((step, sIdx) => {
-        if (!step?.title?.includes('自動')) return;
+        if (!isAutoStep(step)) return; // 共通判定(A.1)
         for (let u = 0; u < (otherLot.quantity || 1); u++) {
           const key = `${step.id}-${u}`;
           const numKey = `${sIdx}-${u}`;
@@ -13738,10 +13742,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       // 🚦開始可否ガード(Phase A): 同じ作業者の手動+手動を禁止する。自動が動いているかは無関係。
       //   ⚠UIのdisabledだけに頼らず「書込み直前」でも必ず通す。カード/コンパクト/ロット1回など
       //     toggleTask を呼ぶ全経路がここを通るため、経路ごとに違う判定が生まれない。
-      const startGate = canStartTask({
+      const startGate = startGuard({
         workerId: lot?.workerId || '__self__',
         targetStep: (localSteps || [])[stepIdx],
-        runningTasks: runningTaskList.filter(t => t.key !== key),
+        runningTasks: runningTaskList, excludeKey: key,
       });
       if (!startGate.ok) { alert('🚫 ' + startGate.message); return; }
       // 分割測定アプリ連携: 連動工程の開始はステーション選択を挟む (マスタON時のみ)。選択後にこの開始処理を skipRotary で再実行する。
@@ -14193,9 +14197,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
 
     if (!isBatchStarted) {
         // 🚦開始可否ガード(Phase A): まとめて開始も同じ規則を通す(手動工程のバッチを、別の手動が走っている最中に始めない)
-        const bGate = canStartTask({
+        const bGate = startGuard({
           workerId: lot?.workerId || '__self__', targetStep: (localSteps || [])[stepIdx],
-          runningTasks: runningTaskList,
+          runningTasks: runningTaskList, // まとめて開始は自分自身が進行中でないので除外キーなし
         });
         if (!bGate.ok) { alert('🚫 ' + bGate.message); return; }
         const previousTasks = { ...tasks };
@@ -15738,7 +15742,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                )}
                <div className="grid gap-6" style={{ display: customViewMode === 'compact' ? 'none' : 'grid' }}>
                  {localSteps.map((step, sIdx) => {
-                   const isAuto = step.title.includes('自動');
+                   // ⚠実害があった箇所(A.1で是正): 名称だけで見ていたため executionMode='batch' でも
+                   //   タイトルに「自動」が無い工程が画面上は手動扱いになり、別の手動作業中に
+                   //   blockParallel でボタンが無効化され、本来許可すべき「自動+手動」が開始できなかった。
+                   const isAuto = isAutoStep(step);
                    const isBatch = !!batchStartTimes[sIdx];
                    const isMonitoring = interruptions.some(i => i.type === 'monitoring' && i.status === 'active' && i.label === step.title);
                    const stepSpecificNotes = getStepNotes(step.title).filter(n => n.stepTitle);
@@ -18795,7 +18802,7 @@ const QualityStandardsPanel = ({ templates, lots, qualityStandards, modelStandar
                                         const enabled = prof.enabled !== false;
                                         const pkey = `${entryIdx}_${step.id}`;
                                         const open = !!profileStepOpen[pkey];
-                                        const isAuto = step.executionMode === 'batch' || (step.title||'').includes('自動');
+                                        const isAuto = isAutoStep(step); // 共通判定(A.1)
                                         const hasOv = !!(prof.description || prof.pdfData || (prof.images && prof.images.length) || prof.targetTime);
                                         return (
                                           <div key={step.id} className={`rounded border ${enabled ? 'border-slate-200 bg-white' : 'border-slate-300 bg-slate-100'}`}>
@@ -23512,6 +23519,8 @@ const GoalLayerView = ({ lots = [], settings = {}, improvements = [], db = null,
             {(engine.autoLaborPct ?? 100) >= 100
               ? <span> 現在は拘束率100%＝<b>全額を人件費に入れています(上限値)</b>。実際は離れられる時間があるなら ⚙目標の設定→🤖拘束率 を下げると、純自動時間が人件費から外れて金額が実態に近づきます。</span>
               : <span> 拘束率{engine.autoLaborPct}%で人件費を計算中(残りは設備能力・納期の話として別枠)。</span>}
+            {/* A.1: 設定値であって実測ではないことを明示 (autoLaborPctLabel が唯一の文言) */}
+            <div className="text-[10px] text-slate-500 mt-1">※ {autoLaborPctLabel(engine.autoLaborPct ?? 100)}</div>
           </div>
         </div>
         <div className="mt-2 text-[11px] text-slate-400">年度内の記録時間: 製品 {hrs0(fiscalAggProd?.sumAct || 0)} / 最終 {fiscalAggGolden ? hrs0(fiscalAggGolden.sumAct) : '…'}（完了ロットのみ・チャージ換算 {yen(((fiscalAggProd?.sumAct || 0) + (fiscalAggGolden?.sumAct || 0)) / 3600 * charge)}）</div>
@@ -24793,7 +24802,25 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
              // 期間フィルタを反映: 完了が isInDefectPeriod に該当するロットのみ
              const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(toMsAny(l.completedAt) || toMsAny(l.updatedAt)));
 
-             // 自動工程の判定: executionMode='batch' or title に '自動' を含む
+             // 自動工程の判定は共通 isAutoStep (src/domain/workExecution.js) のみを使う。
+
+             // === データ品質の件数 (A.1: taskTimeQualityOf を画面へ接続) ===
+             // 並列作業率が「暫定」である最大の理由を、感想ではなく件数で見せる。
+             //   確定=作業セッションあり(Phase B以降) / 推定=開始〜終了だけ / 低信頼=記録が矛盾 / 記録不足=時刻なし
+             //   ⚠ここは件数を数えるだけ。並列作業率そのものの計算式は Phase B まで変更しない。
+             const timeQualityStats = (() => {
+               const c = { confirmed: 0, estimated: 0, unreliable: 0, missing: 0, usable: 0, total: 0 };
+               completedLots.forEach(lot => {
+                 const tsk = lot.tasks || {};
+                 Object.values(tsk).forEach(t => {
+                   if (!t || (t.status !== 'completed' && t.status !== 'ng')) return;
+                   c.total++;
+                   c[taskTimeQualityOf(t).quality]++;
+                   if (hasUsableInterval(t)) c.usable++;
+                 });
+               });
+               return c;
+             })();
 
              // === 1) 工程別の全社ベースタイム (平均) と最速タイムを事前算出 ===
              const stepGlobalTimes = {}; // stepKey → { times: [], targetTime }
@@ -25105,6 +25132,23 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                         <br/>③ <b>監視(その場を離れられない時間)を引いていません</b> — 安全のため張り付いていた人ほど数字が下がります。
                         <br/>④ 重なった時間の足し方が正確ではありません(和集合にしていない)。
                         <br/><span className="text-[10px] text-slate-500">※ 正しい「自動運転中の活用率」は、作業セッションと機械運転記録を保存する改修(Phase B)以降に出します。それまでは参考値としてのみ見てください。</span>
+                      </div>
+                      {/* データ品質の件数 (A.1) — ①がどれだけ効いているかを実件数で示す */}
+                      <div className="mt-2 pt-2 border-t border-amber-300">
+                        <div className="text-[11px] font-bold text-amber-800 mb-1">
+                          📋 この期間の記録の質（完了タスク {timeQualityStats.total.toLocaleString()} 件）
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 text-[10px]">
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold">確定 {timeQualityStats.confirmed.toLocaleString()}</span>
+                          <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800 font-bold">推定 {timeQualityStats.estimated.toLocaleString()}</span>
+                          <span className="px-1.5 py-0.5 rounded bg-orange-100 text-orange-800 font-bold">低信頼 {timeQualityStats.unreliable.toLocaleString()}</span>
+                          <span className="px-1.5 py-0.5 rounded bg-slate-200 text-slate-700 font-bold">記録不足 {timeQualityStats.missing.toLocaleString()}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-600 mt-1 leading-relaxed">
+                          時間の評価に使える記録は <b>{timeQualityStats.usable.toLocaleString()} 件</b>
+                          （{timeQualityStats.total > 0 ? Math.round(timeQualityStats.usable / timeQualityStats.total * 100) : 0}%）です。
+                          「確定」は作業セッションを保存できるようになってから増えます(現在は0件が正常)。
+                        </div>
                       </div>
                     </div>
                      <div><span className="font-bold text-amber-600">最速記録 / NG発見</span>: 全作業者中で最速タイムを持つ工程数 / 期間内に NG 判定した件数 (品質意識)。</div>
@@ -28598,7 +28642,7 @@ const EditTimeModal = ({ lot, onClose, onSave }) => {
             </thead>
             <tbody>
               {steps.map((step, sIdx) => {
-                const isAuto = step.executionMode === 'batch' || (step.title || '').includes('自動');
+                const isAuto = isAutoStep(step); // 共通判定(A.1)
                 const sTotal = stepTotal(step, sIdx);
                 return (
                   <tr key={step.id || sIdx} className="border-b hover:bg-blue-50/30">

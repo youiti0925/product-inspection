@@ -62,3 +62,11 @@ export function canStartTask({ workerId, targetStep, runningTasks = [], masterIn
   }
   return { ok: true };
 }
+
+// 🚦全開始経路の共通入口 (A.1)。画面タップ/音声/サイン/まとめて開始/ロット1回 は必ずここを通す。
+//   経路ごとに「自分自身を除外する/しない」が食い違っていたのを、除外もここへ集約した。
+//   excludeKey: 再開(paused→processing)時に自分自身のタスクが runningTasks に残っている場合の除外キー。
+export function startGuard({ workerId, targetStep, runningTasks = [], excludeKey = null, masterIndex = null } = {}) {
+  const others = (runningTasks || []).filter(t => t && (excludeKey == null || t.key !== excludeKey));
+  return canStartTask({ workerId, targetStep, runningTasks: others, masterIndex });
+}
