@@ -52,7 +52,19 @@ import {
 import {
   SUSTAIN_DAYS, qualityGuardOf, canCloseEffective, sustainCheckDue, sustainVerdict, cardStageOf
 } from './domain/goal/effectiveGate.js';
-import { isAutoStep, annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occurrence.js';
+import { annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occurrence.js';
+// 🔧 自動工程判定と開始可否は src/domain/workExecution.js が唯一の正 (2026-07-20統一)。
+//   ⚠App.jsx内にローカルの isAutoStep を作り直さないこと。実測で10箇所に散在し、目標計算側と結果が食い違っていた。
+import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, buildStepMasterIndex } from './domain/workExecution.js';
+import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
+// 現行マスタ索引(案②): templates購読で更新する。module-levelの純関数からも参照できるようにするため
+//   Reactのstateではなくモジュール変数に置く(読み取り専用・判定のためだけに使う)。
+let STEP_MASTER_INDEX = null;
+const refreshStepMasterIndex = (templates) => { try { STEP_MASTER_INDEX = buildStepMasterIndex(templates); } catch (e) { STEP_MASTER_INDEX = null; } };
+// アプリ全体はこの1関数だけを使う (索引は自動で効く)
+const isAutoStep = (step) => isAutoStepShared(step, STEP_MASTER_INDEX);
+const isManualStep = (step) => isManualStepShared(step, STEP_MASTER_INDEX);
+const canStartTask = (args) => canStartTaskShared({ ...args, masterIndex: STEP_MASTER_INDEX });
 import { fetchAllPaged, mergeLotsById } from './domain/goal/pager.js';
 import { fiscalRealizedOf, GOAL_PRIMARY_METRICS } from './domain/goal/fiscalMath.js';
 import { goalGapOf, candidateOf, planPortfolio } from './domain/goal/portfolioPlanner.js';
@@ -6876,7 +6888,6 @@ const sameGroupModels = (model, settings) => {
 };
 
 const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
-  const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
   const fallback = opts.fallbackTargetTime ?? 60;
   const quantity = opts.quantity || 1;
@@ -7126,7 +7137,6 @@ const analyzeWorkOrder = (steps = [], completedLots = [], opts = {}) => {
 //   ⑤ それ以外は 台順 × テンプレ順(台内の工程順は維持。並べ替えはしない=2026-05-30方針)
 // move: { type:'batch', stepIdx, units:[], stepKey } | { type:'auto-start'|'task', stepIdx, unitIdx, stepKey } | null
 const nextOptimalMove = (steps, tasks, quantity, analysis, opts = {}) => {
-  const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
   const statusOf = (si, u) => {
     const s = steps[si];
@@ -7209,7 +7219,6 @@ const nextOptimalMove = (steps, tasks, quantity, analysis, opts = {}) => {
 // 主に管理画面のエビデンス表示(「この順番で強制します」プレビュー)と検証用。
 // 時間は analysis.stepStats の実測 median/avg を使う近似。makespan は概算。
 const computeEnforcedSchedule = (steps, quantity, analysis, opts = {}) => {
-  const isAutoStep = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const stepKeyOf = (s, idx) => s?.id || `idx-${idx}`;
   const keyOf = (si, u) => { const s = steps[si]; return s?.id ? `${s.id}-${u}` : `${si}-${u}`; };
   const durOf = (si) => {
@@ -10747,7 +10756,6 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
     unitTh: 'p-2 min-w-[68px]', unitSub: '', cellBtn: 'py-1.5 px-0.5', cellMinH: '52px', cellMark: 'text-sm font-black', cellTime: 'text-xs font-mono',
     batchTd: 'p-1 w-16', batchBtn: 'text-[11px] px-2 py-1.5',
   };
-  const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
   const getTask = (step, sIdx, u) => {
     // ロット1回工程: u は回数k、キーは lot-k
     const k = step?.lotOnce ? `${step.id}-lot-${u}` : (step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
@@ -10795,7 +10803,7 @@ const CustomCompactGrid = ({ localSteps, lot, tasks, batchStartTimes, globalNext
         </thead>
         <tbody>
           {localSteps.map((step, sIdx) => {
-            const isAuto = isAutoStepFn(step);
+            const isAuto = isAutoStep(step);
             const isBatch = !!batchStartTimes[sIdx];
             const resTag = step.workResource;
             return (
@@ -12305,6 +12313,15 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const curNow = tasksRef.current[key] || { status: 'waiting' };
     if (curNow.status === 'waiting' || curNow.status === 'paused') {
       const stepObj = (localSteps || [])[sIdx];
+      // 🚦開始可否ガード(Phase A): 画面と同じ共通判定。音声/サインだけが手動2件同時開始の抜け道にならないようにする。
+      const vGate = canStartTask({
+        workerId: lot?.workerId || '__self__', targetStep: stepObj,
+        runningTasks: Object.entries(tasksRef.current || {})
+          .filter(([k, t]) => t?.status === 'processing' && k !== key)
+          .map(([k]) => ({ workerId: lot?.workerId || '__self__', step: findStepByTaskKey(k) }))
+          .filter(x => x.step),
+      });
+      if (!vGate.ok) return { ok: false, reason: 'parallel', hint: vGate.message };
       // 分割測定の連動工程: ステーション選択+指令送信が必要(素通りすると指令も自動停止も無言で不発)
       if (rotaryConfig?.enabled && stepObj?.rotaryLink && !stepObj?.lotOnce && db) {
         return { ok: false, reason: 'rotary', hint: `${sIdx + 1}工程は分割測定アプリと連動しています。画面からステーションを選んで開始してください` };
@@ -13270,13 +13287,17 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   };
 
   // 手動工程の task が processing 中か (キー形式バグを修正済み)
-  const isManualTaskRunning = useMemo(() => {
-    return Object.keys(tasks).some(key => {
-      if (tasks[key]?.status !== 'processing') return false;
+  // 進行中タスクの一覧 (開始可否ガード canStartTask に渡す)。判定は共通 isAutoStep のみを使う。
+  const runningTaskList = useMemo(() => {
+    const out = [];
+    Object.keys(tasks).forEach(key => {
+      if (tasks[key]?.status !== 'processing') return;
       const step = findStepByTaskKey(key);
-      return step && !step.title.includes('自動');
+      if (step) out.push({ workerId: lot?.workerId || '__self__', step, key });
     });
-  }, [tasks, localSteps]);
+    return out;
+  }, [tasks, localSteps]); // eslint-disable-line
+  const isManualTaskRunning = useMemo(() => runningTaskList.some(t => isManualStep(t.step)), [runningTaskList]);
 
   // 自動測定が今走っているか:
   //   ① 自動工程の task が processing 状態 (自動測定 + 手動チェック型) OR
@@ -13404,7 +13425,6 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   //   2) ある台で自動測定が進行中 → その台は機械占有 → 作業者は他の台へ → 次の台の先頭未着手を指す
   //   3) それ以外 → 台順 (1→2→3) × テンプレ順で最初の未着手タスクを指す
   const globalNextTask = useMemo(() => {
-    const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
     const qty = lot.quantity || 1;
     const getKey = (step, sIdx, u) => (step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`);
     const statusOf = (step, sIdx, u) => {
@@ -13417,7 +13437,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     for (let si = 0; si < localSteps.length; si++) {
       const step = localSteps[si];
       if (step?.lotOnce) continue;
-      if (isAutoStepFn(step)) continue;
+      if (isAutoStep(step)) continue;
       for (let u = 0; u < qty; u++) {
         if (statusOf(step, si, u) === 'processing') return null;
       }
@@ -13444,7 +13464,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       return { sIdx: mv.stepIdx, unitIdx: mv.unitIdx, isAuto: mv.type === 'auto-start' };
     }
     // 各台が「機械占有中 (自動測定 processing)」かどうか
-    const unitHasRunningAuto = (u) => localSteps.some((step, si) => !step?.lotOnce && isAutoStepFn(step) && statusOf(step, si, u) === 'processing');
+    const unitHasRunningAuto = (u) => localSteps.some((step, si) => !step?.lotOnce && isAutoStep(step) && statusOf(step, si, u) === 'processing');
     // 3) 台順 × テンプレ順で最初の未着手を探す (通常工程のみ)。機械占有中の台はスキップ。
     for (let u = 0; u < qty; u++) {
       if (unitHasRunningAuto(u)) continue; // この台は自動測定中 → 作業者は触れない
@@ -13453,7 +13473,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
         if (step?.lotOnce) continue; // ロット1回工程はゲートで扱う
         const st = statusOf(step, si, u);
         if (st === 'waiting' || st === 'paused') {
-          return { sIdx: si, unitIdx: u, isAuto: isAutoStepFn(step) };
+          return { sIdx: si, unitIdx: u, isAuto: isAutoStep(step) };
         }
         // completed/skipped/ng → 次の工程へ。processing(自動) はこの台では上で除外済
       }
@@ -13490,11 +13510,10 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // 「他の台で今やれる作業」をリアルタイム表示する。
   // 自動測定が予定より延びたら (アクシデント等)、空いた時間ぶん追加候補を出す。
   const liveParallelGuide = useMemo(() => {
-    const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
     // このロットで processing 中の自動タスクを探す (最も経過の長いもの)
     let runningAuto = null; // { step, sIdx, unitIdx, startTime, elapsedSec, targetSec }
     localSteps.forEach((step, sIdx) => {
-      if (!isAutoStepFn(step)) return;
+      if (!isAutoStep(step)) return;
       for (let u = 0; u < (lot.quantity || 1); u++) {
         const key = step?.id ? `${step.id}-${u}` : `${sIdx}-${u}`;
         const t = tasks[key] || tasks[`${sIdx}-${u}`];
@@ -13511,7 +13530,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const autoResource = runningAuto.step.workResource || 'measurement-machine';
     // 並列候補キー (機械独立 or 別リソース)
     const candidateOf = (step) => {
-      if (isAutoStepFn(step)) return false;
+      if (isAutoStep(step)) return false;
       if (step.workResource === null || step.workResource === '') return true;
       if (step.workResource && step.workResource !== autoResource) return true;
       if (step.parallelSafe === true) return true;
@@ -13531,7 +13550,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       for (let si = 0; si < localSteps.length; si++) {
         if (blocked) break;
         const step = localSteps[si];
-        if (isAutoStepFn(step)) { blocked = true; break; }
+        if (isAutoStep(step)) { blocked = true; break; }
         if (!candidateOf(step)) { blocked = true; break; }
         // この台×工程の現在ステータス (既に完了してたらスキップ)
         const key = step?.id ? `${step.id}-${otherUnit}` : `${si}-${otherUnit}`;
@@ -13716,6 +13735,15 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     }
 
     if (currentTask.status === 'waiting' || currentTask.status === 'paused') {
+      // 🚦開始可否ガード(Phase A): 同じ作業者の手動+手動を禁止する。自動が動いているかは無関係。
+      //   ⚠UIのdisabledだけに頼らず「書込み直前」でも必ず通す。カード/コンパクト/ロット1回など
+      //     toggleTask を呼ぶ全経路がここを通るため、経路ごとに違う判定が生まれない。
+      const startGate = canStartTask({
+        workerId: lot?.workerId || '__self__',
+        targetStep: (localSteps || [])[stepIdx],
+        runningTasks: runningTaskList.filter(t => t.key !== key),
+      });
+      if (!startGate.ok) { alert('🚫 ' + startGate.message); return; }
       // 分割測定アプリ連携: 連動工程の開始はステーション選択を挟む (マスタON時のみ)。選択後にこの開始処理を skipRotary で再実行する。
       const stepObj = (localSteps || [])[stepIdx];
       // 連動は手動・台ごとの工程専用 (lotOnce だと unitIdx が回数kになり workId が台と噛み合わないため除外: 監査確定)
@@ -14164,6 +14192,12 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
     const now = Date.now();
 
     if (!isBatchStarted) {
+        // 🚦開始可否ガード(Phase A): まとめて開始も同じ規則を通す(手動工程のバッチを、別の手動が走っている最中に始めない)
+        const bGate = canStartTask({
+          workerId: lot?.workerId || '__self__', targetStep: (localSteps || [])[stepIdx],
+          runningTasks: runningTaskList,
+        });
+        if (!bGate.ok) { alert('🚫 ' + bGate.message); return; }
         const previousTasks = { ...tasks };
         const previousBatchStartTimes = { ...batchStartTimes };
         // 対象 unit インデックスのリストを構築 (個別選択優先・なければ範囲)
@@ -15673,8 +15707,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                        toggleTask(sIdx, uIdx);
                        return;
                      }
-                     const isAutoStepFn = (s) => s?.executionMode === 'batch' || (s?.title || '').includes('自動');
-                     const key = step?.id ? `${step.id}-${uIdx}` : `${sIdx}-${uIdx}`;
+                                      const key = step?.id ? `${step.id}-${uIdx}` : `${sIdx}-${uIdx}`;
                      const task = tasks[key] || tasks[`${sIdx}-${uIdx}`] || { status: 'waiting' };
                      if (task.status === 'ng' || task.status === 'reworking') { setCompletedTaskMenu({ key, stepIdx: sIdx, unitIdx: uIdx }); return; }
                      // 順序外判定 (globalNextTask 基準)
@@ -15880,13 +15913,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
                                <div key={uIdx} className="flex flex-col gap-1">
                                  {/* メインボタン（通常 or NG表示） */}
                                  {(() => {
-                                   // 並行手動ブロック判定:
-                                   //   この台が手動工程 (= !isAuto) で、未着手で、まとめて開始モードでもなく、
-                                   //   既に別の手動作業が走っていて、かつ 自動測定が走っていない → BLOCK
-                                   //   自動測定中なら並行作業 OK (本来の目的)
-                                   const blockParallel = !isAuto && task.status === 'waiting' && !isBatch && isManualTaskRunning && !isAnyAutoRunning;
-                                   // 自動測定中で並行可能な状態 → 視覚的に許可されている事を強調
-                                   const parallelAllowedHint = !isAuto && task.status === 'waiting' && !isBatch && isManualTaskRunning && isAnyAutoRunning;
+                                   // 並行手動ブロック判定 (Phase A で是正):
+                                   //   ⚠旧実装は `&& !isAnyAutoRunning` が付いており、自動測定中は手動2件の同時開始が通っていた。
+                                   //     「自動が動いているか」は2件目の手動を許す理由にならない(1人が同時に2つの手作業はできない)。
+                                   //     → 共通 canStartTask と同じ規則(同一作業者の手動+手動は常に禁止)に揃える。
+                                   //   ※実際のブロックは toggleTask 内の startGate(書込み直前)が最終防衛線。ここは見た目の無効化。
+                                   const blockParallel = !isAuto && task.status === 'waiting' && !isBatch && isManualTaskRunning;
+                                   // 自動測定中に「手動が空いている」状態 → 並行作業を促すヒント(手動が走っていない時だけ)
+                                   const parallelAllowedHint = !isAuto && task.status === 'waiting' && !isBatch && !isManualTaskRunning && isAnyAutoRunning;
                                    const blockReason = blockParallel
                                      ? '他の手動作業を実行中です。並行作業は自動測定中のみ可能です。\n先に作業を完了するか、自動工程の「監視」を開始してください。'
                                      : '';
@@ -24760,7 +24794,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
              const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(toMsAny(l.completedAt) || toMsAny(l.updatedAt)));
 
              // 自動工程の判定: executionMode='batch' or title に '自動' を含む
-             const isAutoStep = (step) => step?.executionMode === 'batch' || step?.title?.includes('自動');
 
              // === 1) 工程別の全社ベースタイム (平均) と最速タイムを事前算出 ===
              const stepGlobalTimes = {}; // stepKey → { times: [], targetTime }
@@ -24812,6 +24845,9 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    else bucket.manual.push(interval);
                  });
                });
+               // ⚠意味が逆の既知バグ(Phase Bで是正): monitoring(=その場を離れられない拘束時間)を auto へ「足して」いる。
+               //   本来は活用可能時間の分母から「引く」もの。今のままだと、安全のため張り付いていた人ほど並列率が下がる。
+               //   さらに実際の自動区間と重なると autoTotal が二重計上される。→ 表示側に「暫定・評価に使えません」を明示済み。
                // monitoring interruption も auto レンジに含める
                (lot.interruptions || []).filter(i => i.type === 'monitoring' && i.startTime).forEach(i => {
                  const wid = lot.workerId;
@@ -24875,6 +24911,11 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
 
                // === 並列作業: 自動工程の時間中に手動工程をやっていた秒数を集計 ===
                // ロット境界を越えて検出 (例: ロットAの自動加工中にロットBの梱包)
+               // ⚠この計算は暫定。Phase B で src/domain/timeIntervals.js (merge→intersect→subtract) へ置き換える。
+               //   既知の誤り: ①区間ごとに加算して最後に上限カット(和集合にしていない=水増し)
+               //               ②監視時間を分母から引かず auto へ足している(下の monitoring 加算箇所)
+               //               ③完了タスクは startTime=null のためそもそも大半が拾えていない
+               //   → 画面には「暫定・評価に使えません」を表示し、強み/課題の自動生成は停止済み。
                const { auto: autoIntervals = [], manual: manualIntervals = [] } = intervalsByWorker[w.id] || {};
                let parallelMs = 0;
                let autoTotalMs = 0;
@@ -24934,11 +24975,12 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                  if (w.onTargetRate >= 80) insights.push({ type: 'strength', text: `目標タイム達成率 ${w.onTargetRate.toFixed(0)}% (${w.onTargetCount}/${w.onTargetOpportunities}タスク)` });
                  else if (w.onTargetRate < 50) insights.push({ type: 'gap', text: `目標タイム達成率 ${w.onTargetRate.toFixed(0)}% (${w.onTargetCount}/${w.onTargetOpportunities}タスク) — 半分以下` });
                }
-               // 並列作業 (自動工程中に手動工程を進めた時間 ÷ 自動工程の合計時間)
-               if (w.autoTotalSec >= 60) {
-                 if (w.parallelRate >= 70) insights.push({ type: 'strength', text: `並列作業 ${w.parallelRate.toFixed(0)}% (自動${formatTime(w.autoTotalSec)} のうち ${formatTime(w.parallelSec)} で別工程進行)` });
-                 else if (w.parallelRate <= 30) insights.push({ type: 'gap', text: `並列作業 ${w.parallelRate.toFixed(0)}% (自動${formatTime(w.autoTotalSec)} のうち ${formatTime(w.parallelSec)} のみ) — 自動測定中に他工程を進める余地` });
-               }
+               // 並列作業率からの強み/課題の自動生成は停止 (Phase A・2026-07-20)。
+               //   理由: ①完了タスクは startTime=null で保存されるため完了後は区間が消え 0% になる
+               //         ②「仕事が無かった時間(計画手待ち)」と「候補があったのにやらなかった時間」を区別できない
+               //         ③監視(拘束)時間を分母から引かずに自動時間へ足している
+               //   → 低い値の意味が確定できないものを、作業者の課題として自動で書かない。
+               //      正しい自動中活用率は sessions/machineRuns 導入(Phase B)以降に出す。
                // 最速
                if (w.bestTimeStepCount > 0) insights.push({ type: 'strength', text: `${w.bestTimeStepCount}工程で全作業者中の最速記録 (${w.fastestStepsList.join(' / ') || '—'})` });
                // 品質: NG発見数が平均以上か (NGを見つけることは品質意識の表れ)
@@ -24972,10 +25014,10 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                        <div className="font-black text-slate-800 text-lg">{groupAvgOnTarget.toFixed(0)}%</div>
                        <div className="text-[10px] text-slate-400">targetTime 以内の割合</div>
                      </div>
-                     <div className="bg-white p-2 rounded">
-                       <div className="text-slate-500 font-bold">並列作業率 平均</div>
-                       <div className="font-black text-slate-800 text-lg">{groupAvgParallel.toFixed(0)}%</div>
-                       <div className="text-[10px] text-slate-400">自動工程中の他工程進行</div>
+                     <div className="bg-amber-50 border border-amber-300 p-2 rounded">
+                       <div className="text-amber-800 font-bold">並列作業率 平均 <span className="text-[9px] bg-amber-500 text-white px-1 rounded">暫定</span></div>
+                       <div className="font-black text-slate-500 text-lg">{groupAvgParallel.toFixed(0)}%</div>
+                       <div className="text-[10px] text-amber-700 font-bold">⚠ 評価には使えません</div>
                      </div>
                      <div className="bg-white p-2 rounded">
                        <div className="text-slate-500 font-bold">NG発見 平均</div>
@@ -25019,10 +25061,10 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                            <div className="font-black text-emerald-700 text-lg">{w.onTargetRate.toFixed(0)}%</div>
                            <div className="text-[10px] text-emerald-500">{w.onTargetCount}/{w.onTargetOpportunities}タスク {onTargetDiff !== 0 && `(${onTargetDiff > 0 ? '+' : ''}${onTargetDiff.toFixed(0)}pt)`}</div>
                          </div>
-                         <div className="bg-purple-50 border border-purple-200 p-2 rounded-lg">
-                           <div className="text-[10px] text-purple-600 font-bold mb-0.5">並列作業率</div>
-                           <div className="font-black text-purple-700 text-lg">{w.parallelRate.toFixed(0)}%</div>
-                           <div className="text-[10px] text-purple-500">自動{formatTime(w.autoTotalSec)}中{formatTime(w.parallelSec)} {parallelDiff !== 0 && `(${parallelDiff > 0 ? '+' : ''}${parallelDiff.toFixed(0)}pt)`}</div>
+                         <div className="bg-slate-100 border border-amber-300 p-2 rounded-lg opacity-75">
+                           <div className="text-[10px] text-amber-700 font-bold mb-0.5">並列作業率 <span className="bg-amber-500 text-white px-1 rounded">暫定</span></div>
+                           <div className="font-black text-slate-500 text-lg">{w.parallelRate.toFixed(0)}%</div>
+                           <div className="text-[10px] text-amber-700">⚠ 評価に使えません(下の注記)</div>
                          </div>
                          <div className="bg-amber-50 border border-amber-200 p-2 rounded-lg">
                            <div className="text-[10px] text-amber-600 font-bold mb-0.5">最速記録 / NG発見</div>
@@ -25054,7 +25096,17 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-600">
                      <div><span className="font-bold text-blue-600">平均タスク時間</span>: 期間内に完了したタスクの所要時間平均。全作業者の平均と比較した％を表示。</div>
                      <div><span className="font-bold text-emerald-600">目標達成率</span>: 工程に設定された targetTime 以内に完了したタスクの割合。targetTime 未設定の工程は除外。</div>
-                     <div><span className="font-bold text-purple-600">並列作業率</span>: 自動工程 (executionMode=batch or 工程名に「自動」を含む) の合計時間のうち、同じ作業者が別の手動工程を進めていた時間の割合。<span className="text-[10px]">※ロット境界を越えて検出 (例: ロットAの自動加工中にロットBの梱包)</span></div>
+                     <div className="bg-amber-50 border border-amber-300 rounded p-2">
+                      <span className="font-bold text-amber-800">⚠ 並列作業率は「暫定」です — 作業者の評価・査定に使わないでください</span>
+                      <div className="text-[11px] text-slate-700 mt-1 leading-relaxed">
+                        自動工程の合計時間のうち、同じ作業者が別の手動工程を進めていた時間の割合として計算していますが、次の理由で<b>今の数字は実態を表しません</b>:
+                        <br/>① <b>完了した作業が集計から抜けます</b> — 完了時に開始時刻が消える保存形式のため、作業中はライブで見えても完了後は0%になります。
+                        <br/>② <b>「仕事が無かった時間」と「やらなかった時間」を区別できません</b> — 次のロットが無い・前工程待ち・機械の取り合いなど、作業者にはどうにもできない時間まで低い数字になります。
+                        <br/>③ <b>監視(その場を離れられない時間)を引いていません</b> — 安全のため張り付いていた人ほど数字が下がります。
+                        <br/>④ 重なった時間の足し方が正確ではありません(和集合にしていない)。
+                        <br/><span className="text-[10px] text-slate-500">※ 正しい「自動運転中の活用率」は、作業セッションと機械運転記録を保存する改修(Phase B)以降に出します。それまでは参考値としてのみ見てください。</span>
+                      </div>
+                    </div>
                      <div><span className="font-bold text-amber-600">最速記録 / NG発見</span>: 全作業者中で最速タイムを持つ工程数 / 期間内に NG 判定した件数 (品質意識)。</div>
                    </div>
                    <div className="text-[10px] text-slate-400 mt-2">※ 順位は <span className="font-bold">目標達成率</span> 優先、次に <span className="font-bold">平均タスク時間</span> (速い順)。期間は上部のフィルタで変更可能。</div>
@@ -25065,7 +25117,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
 
            {activeMode === 'improvement' && (() => {
              const completedLots = lots.filter(l => l.status === 'completed' && isInDefectPeriod(toMsAny(l.completedAt) || toMsAny(l.updatedAt)));
-             const isAutoStep = (step) => step?.executionMode === 'batch' || step?.title?.includes('自動');
 
              // === 1) 不要工程あぶり出し ===
              // 各工程の「該当なし率」「不良発生数」「平均時間」を集計し、削除候補をランキング
@@ -29889,7 +29940,6 @@ const DailyWorkerGantt = ({ lots, workers, workSchedule }) => {
   const toLocalDateStr = (ms) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
 
   // 自動工程判定 (executionMode='batch' or 工程名に「自動」を含む)
-  const isAutoStep = (step) => step?.executionMode === 'batch' || (step?.title || '').includes('自動');
 
   // === 純粋表示: 各タスク(項目×台)を、記録された実開始→実終了でそのまま配置する ===
   //   start = firstStartTime || startTime / end = 進行中/修正中:現在 / endTime || (start+所要)
@@ -33349,6 +33399,8 @@ export default function App() {
        onSnapshot(getPath('templates'), { includeMetadataChanges: true }, (snap) => {
            const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
            setTemplates(data);
+           // 自動工程判定の「現行マスタ索引」を更新 (案②: 旧ロットのexecutionMode未設定は今のマスタ設定を優先)
+           refreshStepMasterIndex(data);
         }),
        // 連絡ポータル(?renraku=1)はロット/連絡系だけ購読する(あっち側の携帯に検査アプリ全データを送らない=通信量と露出の削減)
        ...(RENRAKU_PORTAL ? [] : [

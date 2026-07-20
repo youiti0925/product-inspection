@@ -8,12 +8,11 @@
 //   - 通常(毎台)        → 実施率≈1 で従来と同じ
 //   - 年間台数が未登録   → 従来どおり窓内実施回数の365日換算(実施回数ベースなので元々正しい)
 
-// 自動運転系の工程か (титルの型 + 分割測定連携フラグ)。実測: 製品の全時間の53%が該当。
-export const isAutoStep = (step) => {
-  if (!step) return false;
-  if (step.rotaryLink) return true;
-  return /(自動測定|測定開始)/.test(step.title || '');
-};
+// 自動工程判定は src/domain/workExecution.js の共通関数が唯一の正 (2026-07-20統一)。
+//   ここは再エクスポートのみ。独自ロジックを書き戻さないこと
+//   (旧実装は rotaryLink + 名称のみで判定し、executionMode='manual' の工程まで自動にしていた:
+//    実測「分割測定開始_手動」「三次元測定開始」が自動扱いになる不具合があった)。
+export { isAutoStep } from '../workExecution.js';
 
 // 年間実施回数: 登録台数があれば「台数×窓内実施率」、無ければ実測回数の年換算。
 export const annualOccurrencesOf = ({ useActual = false, inputAnnualUnits = 0, windowExecs = 0, windowUnits = 0, measuredAnnualExecs = 0 } = {}) => {
