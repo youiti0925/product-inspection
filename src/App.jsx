@@ -57,6 +57,9 @@ import { annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occ
 //   ⚠App.jsx内にローカルの isAutoStep を作り直さないこと。実測で10箇所に散在し、目標計算側と結果が食い違っていた。
 import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, startGuard as startGuardShared, buildStepMasterIndex } from './domain/workExecution.js';
 import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
+// Phase B: 実績を「区間」で残す。全遷移は WorkExecutionModal の onSave ラッパ1箇所を通る。
+import { applySessionTransitions, setEstimatedSession, sessionsDurationMs, sessionsOf } from './domain/workSessions.js';
+import { applyMachineRunTransitions, machineIntervalsOf, MONITORING_REQUIREMENTS, MONITORING_LABELS, monitoringRequirementOf } from './domain/machineRuns.js';
 // 現行マスタ索引(案②): templates購読で更新する。module-levelの純関数からも参照できるようにするため
 //   Reactのstateではなくモジュール変数に置く(読み取り専用・判定のためだけに使う)。
 let STEP_MASTER_INDEX = null;
@@ -9014,6 +9017,10 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   const [targetTime, setTargetTime] = useState(0);
   // 自動測定 (機械占有) 工程か / この工程は他の台の自動測定中に並行できるか
   const [executionMode, setExecutionMode] = useState('manual'); // 'manual' | 'batch' (= 自動)
+  // Phase B: 自動運転中に人が離れてよいか。workResource(設備の取り合い)だけでは分からないため別に持つ。
+  //   'none'=離れてよい / 'periodic'=定期確認した実時間だけ拘束 / 'continuous'=自動中ずっと拘束
+  //   ''(未設定)は「不明」。既定を none にすると「離れられたのに働かなかった」と誤判定しうるので決めつけない。
+  const [monitoringRequirement, setMonitoringRequirement] = useState('');
   // workResource: この工程が占有するリソース。デフォルト null = 機械独立 (= 並行可)
   // 'measurement-machine' = 測定機を占有 (= 他の台の自動測定中は不可)
   // 'workbench' / その他カスタム
@@ -9161,6 +9168,8 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       workResource: workResource || null,  // null = 機械独立 (並行可)
       // 自動測定の既知時間 (経過で自動終了)。自動工程かつ有効かつ正の秒数のときのみ保存。
       ...(executionMode === 'batch' && autoEndEnabled && autoEndSec > 0 ? { autoEndEnabled: true, autoEndSec: Math.round(autoEndSec) } : {}),
+      // Phase B: 自動工程で「人が離れてよいか」。未設定('')なら保存しない=不明のまま(推測で埋めない)。
+      ...(executionMode === 'batch' && MONITORING_REQUIREMENTS.includes(monitoringRequirement) ? { monitoringRequirement } : {}),
       ...(lotOnce ? { lotOnce: true } : {}),  // ロット1回(段取り)工程
       ...(rotaryLink && !lotOnce && executionMode !== 'batch' ? { rotaryLink: true, rotaryRole, rotaryMode } : {}),  // 分割測定アプリ連携(準備/測定開始の指令送信+測定モード)。lotOnce/batchとは併用不可(workId採番が噛み合わない)
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
@@ -9186,6 +9195,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     // 未設定の旧工程を編集で開いたときの初期値。共通判定と同じ結論にする(A.1)
     //   = 画面の表示・開始ガード・目標計算と、編集画面の初期値が食い違わない。
     setExecutionMode(s.executionMode || (isAutoStep(s) ? 'batch' : 'manual'));
+    setMonitoringRequirement(MONITORING_REQUIREMENTS.includes(s.monitoringRequirement) ? s.monitoringRequirement : '');
     setWorkResource(s.workResource || '');
     setAutoEndEnabled(!!s.autoEndEnabled);
     setAutoEndSec(s.autoEndSec || 0);
@@ -9328,6 +9338,29 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                     </div>
                   )}
                   <div className="text-[10px] text-purple-600 leading-relaxed">開始すると自動でカウントし、登録した時間が経過すると「完了」になります。一時停止中はカウントも止まります。</div>
+
+                  {/* Phase B: 自動運転中に人が離れてよいか。活用可能時間の計算に使う(仕様書 4.4) */}
+                  <div className="pt-1.5 mt-1.5 border-t border-purple-200">
+                    <div className="text-xs font-bold text-purple-800 mb-1">👀 機械が動いている間、人は離れられますか？</div>
+                    <div className="space-y-1">
+                      {MONITORING_REQUIREMENTS.map(v => (
+                        <label key={v} className="flex items-start gap-2 text-[11px] text-slate-700 cursor-pointer">
+                          <input type="radio" name="monitoringRequirement" checked={monitoringRequirement === v}
+                            onChange={() => setMonitoringRequirement(v)} className="mt-0.5 w-3.5 h-3.5 accent-purple-600"/>
+                          <span>{MONITORING_LABELS[v]}</span>
+                        </label>
+                      ))}
+                      <label className="flex items-start gap-2 text-[11px] text-slate-500 cursor-pointer">
+                        <input type="radio" name="monitoringRequirement" checked={!MONITORING_REQUIREMENTS.includes(monitoringRequirement)}
+                          onChange={() => setMonitoringRequirement('')} className="mt-0.5 w-3.5 h-3.5 accent-slate-400"/>
+                        <span>まだ決めていない（未設定）</span>
+                      </label>
+                    </div>
+                    <div className="text-[10px] text-purple-600 leading-relaxed mt-1">
+                      「連続監視」にすると、この工程の自動運転中は<b>別作業を促さず、拘束時間として扱います</b>。
+                      未設定のままだと自動運転中の評価に使えません（勝手に「離れられた」とは判断しません）。
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -11228,7 +11261,7 @@ const GestureConfigModal = ({ cfg, unitWord = '工程', onSave, onClose }) => {
     );
 };
 
-const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true, notifyPush = null, contactMembers = {}, gestureConfig = null, onSaveGestureConfig = null }) => {
+const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinish, defectProcessOptions, complaintOptions, lots, templates = [], comboPresets = [], voiceSettingsConfig = {}, voiceCommandsConfig = null, undoTimeout = 5, sharedNotes = [], onOpenWorkStandards = null, workers = [], mapZones = [], saveData = null, currentUserName = '', strictModeRules = {}, strictModeThreshold = 5, execFontScale = 100, onSetExecFontScale = null, modelGroups = [], customTargetTimes = {}, overrunAlertConfig = {}, db = null, rotaryConfig = {}, observationPlans = [], videoRecipes = [], onSaveVideoRecipe = null, onDeleteVideoRecipe = null, cdByOrder = {}, cdHistoryByModel = {}, contactRequests = [], contactGroups = [], contactEnabled = true, notifyPush = null, contactMembers = {}, gestureConfig = null, onSaveGestureConfig = null }) => {
   // 親側で `lots.find(l => l.id === executionLotId)` が undefined を返すケースに備える。
   // ※ React Hooks ルール準拠: hooks を条件分岐の上に置くと「hooks 呼び出し回数の不一致」エラーになるため、
   //   lot 自体は空 object でフォールバックして hooks を常に同じ回数呼ぶ。実際の render は最後に guard する。
@@ -11238,6 +11271,50 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
   // この検査を実施している作業者名 = ロットの担当者(lot.workerId)。担当を切替えると以降の完了が新担当で記録される。
   // これを各タスクの workerName に焼き付けることで、台ごとに別の人が作業しても集計が正しくなる。
   const inspectorName = (lot.workerId && workers.find(w => w.id === lot.workerId)?.name) || currentUserName || '';
+
+  // ===== Phase B: 実績を「区間」で残す共通入口 =====================================
+  // ⚠設計の要: 開始/再開の遷移は必ず `startTime: <時刻>` を、停止/完了/NG は必ず `startTime: null` を書く。
+  //   この不変条件を使い、保存直前に前回値と比べるだけで 20箇所以上ある遷移点を全部捕捉する。
+  //   propの onSave を onSaveRaw へ改名し、ここで同名の onSave を定義しているため、
+  //   既存の onSave(...) 呼び出しは1つも書き換えずに全部この1本を通る(取りこぼしを構造的に防ぐ)。
+  //   → 新しい保存経路を足す時も onSave を呼ぶ限り自動で記録される。
+  const lastSavedTasksRef = useRef(lot.tasks || {});
+  // taskKey -> { step, unitIdx }。キー形式(step.id / 数値index / ロット1回)の違いをここで吸収する。
+  const resolveTaskKey = (key) => {
+    const step = findStepByTaskKey(key);
+    if (!step) return null;
+    const m = String(key).match(/-(?:lot-)?(\d+)$/);
+    return { step, unitIdx: m ? Number(m[1]) : 0 };
+  };
+  const onSave = (payload) => {
+    if (!payload || !payload.tasks) return onSaveRaw(payload);
+    try {
+      const now = Date.now();
+      const prev = lastSavedTasksRef.current || {};
+      // ① 手動作業セッション (task.sessions)
+      const withSessions = applySessionTransitions({
+        prev, next: payload.tasks, now,
+        workerId: lot.workerId || null, workerName: inspectorName,
+      });
+      // ② 機械運転セッション (lot.machineRuns)。一括5台10分は「10分1件」であって50分ではない。
+      const machineRuns = applyMachineRunTransitions({
+        lot, prev, next: withSessions, now,
+        resolveKey: resolveTaskKey, isAuto: isAutoStep,
+        workerId: lot.workerId || null,
+      });
+      lastSavedTasksRef.current = withSessions;
+      // 自動工程が1つも無いロットに空配列を書き足さない(全ロットに無意味なフィールドを増やさないため)
+      const hadRuns = Array.isArray(lot.machineRuns) && lot.machineRuns.length > 0;
+      const nextHasRuns = Array.isArray(machineRuns) && machineRuns.length > 0;
+      return onSaveRaw({ ...payload, tasks: withSessions, ...((hadRuns || nextHasRuns) ? { machineRuns } : {}) });
+    } catch (e) {
+      // 記録の付加で保存そのものを失敗させない(現場が止まる方が重い)。
+      console.error('[PhaseB] セッション記録に失敗。素の保存を続行します', e);
+      lastSavedTasksRef.current = payload.tasks;
+      return onSaveRaw(payload);
+    }
+  };
+  // ================================================================================
   // 作業中の担当者引き継ぎ: 左上のこのセレクタで担当を切替えると lot.workerId を更新 →
   //   inspectorName が追従し、これ以降に完了する台は新しい担当で記録される(完了済みの台はそのまま=遡及しない)。
   //   例: 4台のうち1・2台目を A が完了→ここで B に切替→3・4台目は B で記録。
@@ -13682,7 +13759,11 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave, onFinish, defectPr
       const fst = Number(t.firstStartTime) || now;
       const dur = Math.round(totalSec);
       // batchOwner/batchStartedAt は完了時に必ず外す(残すと後日の同工程バッチ完了に巻き込まれる)
-      newTasks[key] = { ...t, status: 'completed', duration: dur, startTime: null, firstStartTime: fst, endTime: fst + dur * 1000, manualTime: true, workerName: inspectorName || t.workerName, batchOwner: null, batchStartedAt: null };
+      // Phase B: 時間の直接入力は打刻ではないので、セッションは estimated として1本置く(確定と混ぜない)。
+      newTasks[key] = setEstimatedSession(
+        { ...t, status: 'completed', duration: dur, startTime: null, firstStartTime: fst, endTime: fst + dur * 1000, manualTime: true, workerName: inspectorName || t.workerName, batchOwner: null, batchStartedAt: null },
+        { startTime: fst, durationSec: dur, workerId: lot.workerId || null, workerName: inspectorName || t.workerName || '' }
+      );
     });
     setTasks(newTasks);
     onSave({ tasks: newTasks, status: 'processing' });
