@@ -58,6 +58,7 @@ import { annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occ
 //   ⚠App.jsx内にローカルの isAutoStep を作り直さないこと。実測で10箇所に散在し、目標計算側と結果が食い違っていた。
 import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, startGuard as startGuardShared, buildStepMasterIndex } from './domain/workExecution.js';
 import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
+import { buildAutoOpportunityReport, summaryView } from './domain/autoOpportunityReport.js';
 // Phase B: 実績を「区間」で残す。全遷移は WorkExecutionModal の onSave ラッパ1箇所を通る。
 import { setEstimatedSession, sessionsDurationMs, sessionsOf } from './domain/workSessions.js';
 import { machineIntervalsOf } from './domain/machineRuns.js';
@@ -24894,6 +24895,28 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                return c;
              })();
 
+             // === Phase C: 自動運転中の活用 (autoOpportunityReport) ===
+             //   分母は「その自動運転中に着手できた仕事の量」。自動時間で割らない(=自動中ずっと働け、になる)。
+             //   ①取り逃がし = 候補があったのに取らなかった / ②候補なし = 同ロットに出せる仕事が無かった
+             const autoReport = (() => {
+               try {
+                 return buildAutoOpportunityReport({
+                   lots: completedLots, isAuto: isAutoStep,
+                   resolveWorkerName: (id) => (workers.find(x => x.id === id) || {}).name || '',
+                   resolveTemplateName: (id) => (templates.find(t => t.id === id) || {}).name || '(テンプレ不明)',
+                 });
+               } catch (e) { console.error('[PhaseC] 活用集計に失敗', e); return null; }
+             })();
+             const autoV = autoReport ? {
+               推定: summaryView(autoReport.推定.全体), 実測: summaryView(autoReport.実測.全体),
+             } : null;
+             // 作業者名 → その人の内訳 (実測/推定は混ぜない)
+             const autoByWorker = (name) => {
+               if (!autoReport) return null;
+               const pick = (g) => (g.作業者別 || []).find(x => x.key === name) || null;
+               return { 推定: pick(autoReport.推定), 実測: pick(autoReport.実測) };
+             };
+
              // === 1) 工程別の全社ベースタイム (平均) と最速タイムを事前算出 ===
              const stepGlobalTimes = {}; // stepKey → { times: [], targetTime }
              completedLots.forEach(lot => {
@@ -24916,45 +24939,12 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                stepGlobalMin[k] = Math.min(...v.times);
              });
 
-             // === 2) 作業者ごとに「自動工程の時間範囲」と「手動工程の時間範囲」を集める ===
-             //    これによりロット境界を越えた並列作業 (例: ロットAの自動加工中にロットBの手動作業) を検出
-             const intervalsByWorker = {}; // wid -> { auto: [{s,e}], manual: [{s,e,label}] }
-             const ensureBucket = (wid) => {
-               if (!intervalsByWorker[wid]) intervalsByWorker[wid] = { auto: [], manual: [] };
-               return intervalsByWorker[wid];
-             };
-             completedLots.forEach(lot => {
-               const tasks = lot.tasks || {};
-               const steps = lot.steps || [];
-               const qty = lot.quantity || 1;
-               steps.forEach((step, sIdx) => {
-                 const auto = isAutoStep(step);
-                 const tListI = step.lotOnce
-                   ? lotOnceKeysOf(tasks, step).map(k => tasks[k])
-                   : Array.from({ length: qty }, (_, u) => tasks[`${step?.id}-${u}`] || tasks[`${sIdx}-${u}`]);
-                 tListI.forEach(t => {
-                   if (!t || !t.startTime || !t.duration) return;
-                   // 作業者ID: task.workerName 優先 → lot.workerId
-                   const taskWid = t.workerName ? (workers.find(w => w.name === t.workerName)?.id) : null;
-                   const wid = taskWid || lot.workerId;
-                   if (!wid) return;
-                   const interval = { s: t.startTime, e: t.startTime + t.duration * 1000, lot: lot.orderNo, step: step.title };
-                   const bucket = ensureBucket(wid);
-                   if (auto) bucket.auto.push(interval);
-                   else bucket.manual.push(interval);
-                 });
-               });
-               // ⚠意味が逆の既知バグ(Phase Bで是正): monitoring(=その場を離れられない拘束時間)を auto へ「足して」いる。
-               //   本来は活用可能時間の分母から「引く」もの。今のままだと、安全のため張り付いていた人ほど並列率が下がる。
-               //   さらに実際の自動区間と重なると autoTotal が二重計上される。→ 表示側に「暫定・評価に使えません」を明示済み。
-               // monitoring interruption も auto レンジに含める
-               (lot.interruptions || []).filter(i => i.type === 'monitoring' && i.startTime).forEach(i => {
-                 const wid = lot.workerId;
-                 if (!wid) return;
-                 const interval = { s: i.startTime, e: i.endTime || (i.startTime + (i.duration || 0) * 1000), lot: lot.orderNo, step: i.label || '監視' };
-                 ensureBucket(wid).auto.push(interval);
-               });
-             });
+             // ⚠旧「作業者ごとの自動/手動レンジ収集」は撤去した(Phase C)。既知の誤りが3つあった:
+             //   ①startTime がある行しか拾えない = 完了タスクが全部落ちる(完了は startTime=null で保存する)
+             //   ②monitoring(=拘束時間)を自動レンジへ「足して」いた。本来は分母から引くもので、
+             //     安全のため張り付いた人ほど率が下がる逆の評価になっていた
+             //   ③区間を和集合にせず足していた(水増し)
+             //   現在の集計は domain/autoOpportunityReport.js (下の autoReport)。
 
              // === 3) 作業者ごとの集計 ===
              const workerStats = workers.map(w => {
@@ -25008,36 +24998,15 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                  }
                });
 
-               // === 並列作業: 自動工程の時間中に手動工程をやっていた秒数を集計 ===
-               // ロット境界を越えて検出 (例: ロットAの自動加工中にロットBの梱包)
-               // ⚠この計算は暫定。Phase B で src/domain/timeIntervals.js (merge→intersect→subtract) へ置き換える。
-               //   既知の誤り: ①区間ごとに加算して最後に上限カット(和集合にしていない=水増し)
-               //               ②監視時間を分母から引かず auto へ足している(下の monitoring 加算箇所)
-               //               ③完了タスクは startTime=null のためそもそも大半が拾えていない
-               //   → 画面には「暫定・評価に使えません」を表示し、強み/課題の自動生成は停止済み。
-               const { auto: autoIntervals = [], manual: manualIntervals = [] } = intervalsByWorker[w.id] || {};
-               let parallelMs = 0;
-               let autoTotalMs = 0;
-               autoIntervals.forEach(a => {
-                 autoTotalMs += (a.e - a.s);
-                 manualIntervals.forEach(m => {
-                   const overlapStart = Math.max(a.s, m.s);
-                   const overlapEnd = Math.min(a.e, m.e);
-                   if (overlapEnd > overlapStart) parallelMs += (overlapEnd - overlapStart);
-                 });
-               });
-               // 同じ自動レンジに複数の手動が重なる場合の二重計上を防ぐため、parallelMs は autoTotalMs を超えない
-               parallelMs = Math.min(parallelMs, autoTotalMs);
+               // ⚠旧「並列作業率」(自動時間で割る計算)は撤去した。Phase C の autoOpportunityReport が正。
+               //   同じ画面に前提の違う2つの数字を並べない。区間の重なりは domain/timeIntervals.js の
+               //   merge→intersect で取る(区間ごとに足して上限でカットする旧方式は水増しだった)。
 
                const avgTime = completedTasks > 0 ? totalDuration / completedTasks : 0;
-               const parallelRate = autoTotalMs > 0 ? (parallelMs / autoTotalMs) * 100 : 0;
-               const parallelSec = Math.round(parallelMs / 1000);
-               const autoTotalSec = Math.round(autoTotalMs / 1000);
                const onTargetRate = onTargetOpportunities > 0 ? (onTargetCount / onTargetOpportunities) * 100 : 0;
 
                return {
                  ...w, lotCount: wLots.length, totalTasks, completedTasks, avgTime, totalDuration,
-                 parallelRate, parallelSec, autoTotalSec,
                  onTargetRate, onTargetCount, onTargetOpportunities,
                  bestTimeStepCount, fastestStepsList: fastestStepsList.slice(0, 3),
                  ngCount, reworkTime, stepTimes,
@@ -25048,11 +25017,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
              const allTaskCount = workerStats.reduce((a, w) => a + w.completedTasks, 0);
              const allTotalDur = workerStats.reduce((a, w) => a + w.totalDuration, 0);
              const groupAvgTime = allTaskCount > 0 ? allTotalDur / allTaskCount : 0;
-             // 並列作業: 自動工程時間が一定以上の作業者だけで平均 (1分未満は分母から除外)
-             const parallelEligible = workerStats.filter(w => w.autoTotalSec >= 60);
-             const groupAvgParallel = parallelEligible.length > 0
-               ? parallelEligible.reduce((a, w) => a + w.parallelRate, 0) / parallelEligible.length
-               : 0;
              const groupAvgOnTarget = workerStats.length > 0
                ? workerStats.reduce((a, w) => a + w.onTargetRate, 0) / workerStats.length
                : 0;
@@ -25113,10 +25077,14 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                        <div className="font-black text-slate-800 text-lg">{groupAvgOnTarget.toFixed(0)}%</div>
                        <div className="text-[10px] text-slate-400">targetTime 以内の割合</div>
                      </div>
-                     <div className="bg-amber-50 border border-amber-300 p-2 rounded">
-                       <div className="text-amber-800 font-bold">並列作業率 平均 <span className="text-[9px] bg-amber-500 text-white px-1 rounded">暫定</span></div>
-                       <div className="font-black text-slate-500 text-lg">{groupAvgParallel.toFixed(0)}%</div>
-                       <div className="text-[10px] text-amber-700 font-bold">⚠ 評価には使えません</div>
+                     <div className="bg-indigo-50 border border-indigo-300 p-2 rounded">
+                       <div className="text-indigo-800 font-bold">自動運転中の活用率</div>
+                       <div className="font-black text-indigo-700 text-lg">
+                         {autoV && autoV.推定.率pct !== null ? `${autoV.推定.率pct.toFixed(0)}%` : '—'}
+                       </div>
+                       <div className="text-[10px] text-indigo-700">
+                         {autoV ? <>取れた {autoV.推定.取れた上限h}h 中 {autoV.推定.活用h}h</> : 'データなし'}
+                       </div>
                      </div>
                      <div className="bg-white p-2 rounded">
                        <div className="text-slate-500 font-bold">NG発見 平均</div>
@@ -25131,7 +25099,6 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                    {workerStats.map((w, idx) => {
                      const speedDiff = groupAvgTime > 0 && w.avgTime > 0 ? ((groupAvgTime - w.avgTime) / groupAvgTime) * 100 : 0;
                      const onTargetDiff = w.onTargetRate - groupAvgOnTarget;
-                     const parallelDiff = w.parallelRate - groupAvgParallel;
                      return (
                      <div key={w.id} className="bg-white rounded-xl shadow-sm border-2 p-5 border-slate-200">
                        <div className="flex items-center gap-3 mb-3 pb-3 border-b">
@@ -25160,11 +25127,23 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                            <div className="font-black text-emerald-700 text-lg">{w.onTargetRate.toFixed(0)}%</div>
                            <div className="text-[10px] text-emerald-500">{w.onTargetCount}/{w.onTargetOpportunities}タスク {onTargetDiff !== 0 && `(${onTargetDiff > 0 ? '+' : ''}${onTargetDiff.toFixed(0)}pt)`}</div>
                          </div>
-                         <div className="bg-slate-100 border border-amber-300 p-2 rounded-lg opacity-75">
-                           <div className="text-[10px] text-amber-700 font-bold mb-0.5">並列作業率 <span className="bg-amber-500 text-white px-1 rounded">暫定</span></div>
-                           <div className="font-black text-slate-500 text-lg">{w.parallelRate.toFixed(0)}%</div>
-                           <div className="text-[10px] text-amber-700">⚠ 評価に使えません(下の注記)</div>
-                         </div>
+                         {(() => {
+                           const ao = autoByWorker(w.name);
+                           const est = ao && ao.推定 ? summaryView(ao.推定) : null;
+                           const mea = ao && ao.実測 ? summaryView(ao.実測) : null;
+                           return (
+                             <div className="bg-indigo-50 border border-indigo-200 p-2 rounded-lg">
+                               <div className="text-[10px] text-indigo-600 font-bold mb-0.5">自動運転中の活用率</div>
+                               <div className="font-black text-indigo-700 text-lg">
+                                 {est && est.率pct !== null ? `${est.率pct.toFixed(0)}%` : '—'}
+                                 {mea && mea.率pct !== null && <span className="text-[10px] font-bold text-emerald-600 ml-1">実測{mea.率pct.toFixed(0)}%</span>}
+                               </div>
+                               <div className="text-[10px] text-indigo-700 leading-tight">
+                                 {est ? <>①取り逃がし {est.取り逃がしh}h / ②仕事なし {est.候補なしh}h</> : '対象の自動運転なし'}
+                               </div>
+                             </div>
+                           );
+                         })()}
                          <div className="bg-amber-50 border border-amber-200 p-2 rounded-lg">
                            <div className="text-[10px] text-amber-600 font-bold mb-0.5">最速記録 / NG発見</div>
                            <div className="font-black text-amber-700 text-lg">{w.bestTimeStepCount}<span className="text-xs">工程</span> / {w.ngCount}<span className="text-xs">件</span></div>
@@ -25189,25 +25168,70 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
 
                  {workerStats.length === 0 && <div className="text-center py-20 text-slate-400">評価データがありません (期間内の完了ロットが必要です)</div>}
 
+                 {/* Phase C: 自動運転中に取り逃がした時間 (工程別) — ①今のアプリで取れる / ②別ロットが要る */}
+                 {autoReport && autoReport.推定.工程別.length > 0 && (
+                   <div className="bg-white rounded-xl border-2 border-indigo-200 p-4">
+                     <div className="text-sm font-bold text-indigo-800 mb-1">⚙ 自動運転中に取り逃がした時間（工程別・推定）</div>
+                     <div className="text-[11px] text-slate-600 mb-2 leading-relaxed">
+                       <b>①</b>=出せる仕事があったのに取らなかった時間（今のアプリで取れます）/ <b>②</b>=同じロットに出せる仕事が無かった時間（別のロットを出す機能が要ります）
+                     </div>
+                     <div className="overflow-x-auto">
+                       <table className="w-full text-xs">
+                         <thead><tr className="bg-slate-50 text-slate-600">
+                           <th className="text-left p-1.5">テンプレート / 自動工程</th>
+                           <th className="text-right p-1.5">自動時間</th>
+                           <th className="text-right p-1.5">取れた上限</th>
+                           <th className="text-right p-1.5">活用</th>
+                           <th className="text-right p-1.5 text-rose-600">①取り逃がし</th>
+                           <th className="text-right p-1.5 text-amber-600">②仕事なし</th>
+                           <th className="text-right p-1.5">活用率</th>
+                           <th className="text-right p-1.5">ロット</th>
+                         </tr></thead>
+                         <tbody>
+                           {autoReport.推定.工程別.slice(0, 15).map((g) => {
+                             const v = summaryView(g);
+                             return (
+                               <tr key={g.key} className="border-t hover:bg-indigo-50">
+                                 <td className="p-1.5 font-bold text-slate-700">{g.key}</td>
+                                 <td className="p-1.5 text-right">{v.自動時間h}h</td>
+                                 <td className="p-1.5 text-right">{v.取れた上限h}h</td>
+                                 <td className="p-1.5 text-right text-emerald-700">{v.活用h}h</td>
+                                 <td className="p-1.5 text-right font-black text-rose-600">{v.取り逃がしh}h</td>
+                                 <td className="p-1.5 text-right font-bold text-amber-600">{v.候補なしh}h</td>
+                                 <td className="p-1.5 text-right font-bold">{v.率pct !== null ? `${v.率pct}%` : '—'}</td>
+                                 <td className="p-1.5 text-right text-slate-400">{g.ロット数}</td>
+                               </tr>
+                             );
+                           })}
+                         </tbody>
+                       </table>
+                     </div>
+                     <div className="text-[10px] text-slate-500 mt-2">
+                       ※ 活用率が「—」の行は、その自動運転中に同じロットで出せる仕事が1つも無かった行です（率を0%とは出しません）。
+                     </div>
+                   </div>
+                 )}
+
                  {/* 評価指標の説明 */}
                  <div className="bg-slate-50 rounded-xl p-4 border">
                    <div className="text-sm font-bold text-slate-700 mb-2">評価指標の定義</div>
                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-600">
                      <div><span className="font-bold text-blue-600">平均タスク時間</span>: 期間内に完了したタスクの所要時間平均。全作業者の平均と比較した％を表示。</div>
                      <div><span className="font-bold text-emerald-600">目標達成率</span>: 工程に設定された targetTime 以内に完了したタスクの割合。targetTime 未設定の工程は除外。</div>
-                     <div className="bg-amber-50 border border-amber-300 rounded p-2">
-                      <span className="font-bold text-amber-800">⚠ 並列作業率は「暫定」です — 作業者の評価・査定に使わないでください</span>
+                     <div className="bg-indigo-50 border border-indigo-300 rounded p-2">
+                      <span className="font-bold text-indigo-800">自動運転中の活用率 — 分母は「その時間に着手できた仕事の量」です</span>
                       <div className="text-[11px] text-slate-700 mt-1 leading-relaxed">
-                        自動工程の合計時間のうち、同じ作業者が別の手動工程を進めていた時間の割合として計算していますが、次の理由で<b>今の数字は実態を表しません</b>:
-                        <br/>① <b>完了した作業が集計から抜けます</b> — 完了時に開始時刻が消える保存形式のため、作業中はライブで見えても完了後は0%になります。
-                        <br/>② <b>「仕事が無かった時間」と「やらなかった時間」を区別できません</b> — 次のロットが無い・前工程待ち・機械の取り合いなど、作業者にはどうにもできない時間まで低い数字になります。
-                        <br/>③ <b>監視(その場を離れられない時間)を引いていません</b> — 安全のため張り付いていた人ほど数字が下がります。
-                        <br/>④ 重なった時間の足し方が正確ではありません(和集合にしていない)。
-                        <br/><span className="text-[10px] text-slate-500">※ 正しい「自動運転中の活用率」は、作業セッションと機械運転記録を保存する改修(Phase B)以降に出します。それまでは参考値としてのみ見てください。</span>
+                        機械が自動で回っている間に、<b>他の台でできる仕事が実際にどれだけあったか</b>を数え、それを分母にしています。
+                        自動が20分でも、そのとき出せる仕事が5分ぶんしか無ければ<b>満点は5分</b>です。
+                        <br/>・<b>①取り逃がし</b> = 出せる仕事があったのに取らなかった時間 → <b>今のアプリで取れます</b>（自動中に他の台の作業を開始できます）
+                        <br/>・<b>②仕事なし</b> = 同じロットに出せる仕事が無かった時間（1台のロットなど）→ <b>本人には取りようがありません。</b>別のロットを出す機能が要ります
+                        <br/>・休憩（中断記録）は分母から抜いています。
+                        <br/><b>1台ロットのように出せる仕事が0の時は、率を出しません（—と表示）。</b>0%とは表示しません。
+                        <br/><span className="text-[10px] text-slate-500">※ 自動時間そのもので割る計算(旧「並列作業率」)は廃止しました。「自動中はずっと働けたはず」という前提になり、実態と合わないためです。</span>
                       </div>
-                      {/* データ品質の件数 (A.1) — ①がどれだけ効いているかを実件数で示す */}
-                      <div className="mt-2 pt-2 border-t border-amber-300">
-                        <div className="text-[11px] font-bold text-amber-800 mb-1">
+                      {/* 記録の質 — 実測(作業セッション)と推定を混ぜないための件数 */}
+                      <div className="mt-2 pt-2 border-t border-indigo-300">
+                        <div className="text-[11px] font-bold text-indigo-800 mb-1">
                           📋 この期間の記録の質（完了タスク {timeQualityStats.total.toLocaleString()} 件）
                         </div>
                         <div className="flex flex-wrap gap-1.5 text-[10px]">
@@ -25217,9 +25241,12 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                           <span className="px-1.5 py-0.5 rounded bg-slate-200 text-slate-700 font-bold">記録不足 {timeQualityStats.missing.toLocaleString()}</span>
                         </div>
                         <div className="text-[10px] text-slate-600 mt-1 leading-relaxed">
-                          時間の評価に使える記録は <b>{timeQualityStats.usable.toLocaleString()} 件</b>
-                          （{timeQualityStats.total > 0 ? Math.round(timeQualityStats.usable / timeQualityStats.total * 100) : 0}%）です。
-                          「確定」は作業セッションを保存できるようになってから増えます(現在は0件が正常)。
+                          上の活用率は<b>推定</b>（開始〜終了からの再構成）で出しています。
+                          <b>低信頼（完了の押し忘れ疑い）は集計から外しています</b>
+                          {autoReport && <>（除外 {autoReport.除外.低信頼.toLocaleString()}件）</>}。
+                          作業セッションが保存されたロットが増えると<b>実測</b>が別枠で出ます
+                          {autoReport && <>（現在 実測 {autoReport.区間数.実測.toLocaleString()}区間 / 推定 {autoReport.区間数.推定.toLocaleString()}区間）</>}。
+                          <b>実測と推定は精度が違うので合計しません。</b>
                         </div>
                       </div>
                     </div>
