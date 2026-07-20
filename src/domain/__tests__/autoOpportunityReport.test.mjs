@@ -99,3 +99,54 @@ test('4つの内訳の合計は自動時間に一致する(画面に出す数字
   assert.equal(s.活用ms + s.取り逃がしms + s.候補なしms, s.自動時間ms);
   assert.equal(s.休憩ms, 5 * M, '休憩は窓から抜いて別枠で持つ');
 });
+
+// ===== 是正 第2弾 (ChatGPT指摘 2026-07-21) =====
+// 「実測」と表示する数字に、打刻されていない手作業が混ざっていた件。
+
+const withSessions = (s, e, quality) => done(s, e, { sessions: [{ startTime: s, endTime: e, quality }] });
+
+test('実測の窓に、打刻されていない(推定の)手作業を混ぜない', () => {
+  // 機械は実測(machineRuns)。重なる手作業は sessions が無く 開始〜終了の幅しかない = 推定
+  const mea = lotOf('L1', {
+    quantity: 2,
+    machineRuns: [{ stepId: 'a1', unitIndices: [0], segments: [{ startTime: T0, endTime: T0 + 20 * M }] }],
+    tasks: { 'a1-0': done(T0, T0 + 20 * M, { workerName: '片山' }), 'm1-1': done(T0 + 2 * M, T0 + 7 * M, { workerName: '片山' }) },
+  });
+  const r = buildAutoOpportunityReport({ lots: [mea], isAuto });
+  assert.equal(r.区間数.実測, 1);
+  assert.equal(r.実測.全体.活用ms, 0, '打刻が無い手作業を実測の活用にしない');
+  assert.ok(r.除外.実測窓に重なった未確認手作業ms > 0, '黙って捨てず件数・時間を残す');
+  assert.equal(r.実測.全体.率, 0, '候補はあったが、打刻で確認できた活用は0なので率は0');
+});
+
+test('打刻(quality=confirmed)された手作業は実測の活用に入る', () => {
+  const mea = lotOf('L1', {
+    quantity: 2,
+    machineRuns: [{ stepId: 'a1', unitIndices: [0], segments: [{ startTime: T0, endTime: T0 + 20 * M }] }],
+    tasks: {
+      'a1-0': done(T0, T0 + 20 * M, { workerName: '片山' }),
+      'm1-1': withSessions(T0 + 2 * M, T0 + 7 * M, 'confirmed'),
+    },
+  });
+  const r = buildAutoOpportunityReport({ lots: [mea], isAuto });
+  assert.equal(r.実測.全体.活用ms, 5 * M);
+  assert.equal(r.除外.実測窓に重なった未確認手作業ms, 0);
+});
+
+test('手入力・畳み込みの区間(quality≠confirmed)は打刻として扱わない', () => {
+  const mea = lotOf('L1', {
+    quantity: 2,
+    machineRuns: [{ stepId: 'a1', unitIndices: [0], segments: [{ startTime: T0, endTime: T0 + 20 * M }] }],
+    tasks: {
+      'a1-0': done(T0, T0 + 20 * M, { workerName: '片山' }),
+      'm1-1': withSessions(T0 + 2 * M, T0 + 7 * M, 'manual-entry'),
+    },
+  });
+  const r = buildAutoOpportunityReport({ lots: [mea], isAuto });
+  assert.equal(r.実測.全体.活用ms, 0, '手入力を実測にしない');
+});
+
+test('文言と実際の判定が一致している(実測=機械の運転記録がある区間)', () => {
+  const r = buildAutoOpportunityReport({ lots: [lotOf('L1')], isAuto });
+  assert.match(r.合算しない理由, /機械の運転記録/, 'sessions の有無で説明しない');
+});

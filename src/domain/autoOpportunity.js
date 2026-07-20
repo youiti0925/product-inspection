@@ -107,10 +107,19 @@ export const autoIntervalsByStep = ({ steps = [], tasks = {}, quantity = 1, isAu
     // machineRuns があればそれが機械の実稼働。⚠止まっていた時間を稼働に入れない。
     const myRuns = runs.filter(r => r && r.stepId === step.id && Array.isArray(r.segments));
     if (myRuns.length) {
+      // ⚠同じ機械の区間は必ず和集合にしてから窓にする(ChatGPT指摘 2026-07-21)。
+      //   台ごとに run が分かれると 0-60分 と 30-90分 が別々の窓になり、
+      //   自動時間が120分(実際は90分)、重なった手作業も2回「活用」に数えられていた。
+      const segs = [];
       myRuns.forEach(r => (r.segments || []).forEach(sg => {
         if (!sg?.startTime || !sg?.endTime || sg.endTime <= sg.startTime) return;
-        out.push({ start: sg.startTime, end: sg.endTime, stepId: step.id, title: step.title || '',
-                   units: Array.isArray(r.unitIndices) ? r.unitIndices : [], measured: true });
+        segs.push({ start: sg.startTime, end: sg.endTime, units: Array.isArray(r.unitIndices) ? r.unitIndices : [] });
+      }));
+      mergeIntervals(segs.map(s => ({ start: s.start, end: s.end }))).forEach(iv => out.push({
+        ...iv, stepId: step.id, title: step.title || '',
+        // まとめた区間に少しでも重なる run の台は、その間ずっと機械の上にあるとみなす(触れない)
+        units: [...new Set(segs.filter(s => s.start < iv.end && s.end > iv.start).flatMap(s => s.units))],
+        measured: true,
       }));
       return;
     }
@@ -133,9 +142,11 @@ export const autoIntervalsByStep = ({ steps = [], tasks = {}, quantity = 1, isAu
 // 本体。1ロット分の自動区間を評価して窓の配列を返す。
 //   manualIntervals: 重なりとして数える手作業の区間。省略時はこのロットの手動工程から作る。
 //     ⚠別ロットの手作業も活用として数えたい場合は、呼び出し側で全ロット分を merge して渡すこと。
+//     confirmedManualIntervals: 打刻された(quality==='confirmed')区間だけ。
+//       ⚠実測の窓(machineRuns由来)ではこちらだけを「活用」に数える。省略時は manualIntervals と同じ扱い。
 export const autoOpportunityWindows = ({
   lot = {}, steps = null, tasks = null, quantity = null,
-  isAuto, keyOf = null, manualIntervals = null, breakIntervals = [],
+  isAuto, keyOf = null, manualIntervals = null, confirmedManualIntervals = null, breakIntervals = [],
   autoResource = DEFAULT_AUTO_RESOURCE, defaultTargetSec = 60,
 } = {}) => {
   const st = steps || lot.steps || [];
@@ -160,6 +171,8 @@ export const autoOpportunityWindows = ({
     manual = ivs;
   }
   const manMerged = mergeIntervals(manual);
+  // 実測の窓で「活用」に数えてよいのは打刻された区間だけ。渡されなければ従来どおり全部を使う。
+  const confMerged = Array.isArray(confirmedManualIntervals) ? mergeIntervals(confirmedManualIntervals) : manMerged;
   const brkMerged = mergeIntervals(breakIntervals);
 
   return autoIvs.map(iv => {
@@ -167,7 +180,10 @@ export const autoOpportunityWindows = ({
     const breakMs = durationMs(intersectIntervals(win, brkMerged));
     const effective = subtractIntervals(win, brkMerged);          // 休憩を抜いた実質の窓
     const windowMs = durationMs(effective);
-    const usedMs = durationMs(intersectIntervals(effective, manMerged));
+    const allUsedMs = durationMs(intersectIntervals(effective, manMerged));
+    // 実測の窓は打刻だけ。推定の窓はもともと全部が推定なので区別しない。
+    const usedMs = iv.measured ? durationMs(intersectIntervals(effective, confMerged)) : allUsedMs;
+    const usedUnconfirmedMs = Math.max(0, allUsedMs - usedMs);    // 黙って捨てず残す(記録精度不足)
     const cand = candidateWorkAt({
       steps: st, tasks: tk, quantity: qty, at: iv.start, autoStepId: iv.stepId,
       busyUnits: iv.units, isAuto, autoResource, keyOf: key, defaultTargetSec,
@@ -177,7 +193,7 @@ export const autoOpportunityWindows = ({
     const noCandMs = Math.max(0, windowMs - capMs);               // ② 候補が無い = 別ロットが要る
     return {
       start: iv.start, end: iv.end, stepId: iv.stepId, title: iv.title, units: iv.units || [], measured: !!iv.measured,
-      windowMs, breakMs, candidateMs: cand.ms, capMs, usedMs, missedMs, noCandMs,
+      windowMs, breakMs, candidateMs: cand.ms, capMs, usedMs, usedUnconfirmedMs, missedMs, noCandMs,
       candidates: cand.items, unknownCount: cand.unknownCount,
       // 率を出すなら分母は必ず capMs。windowMs で割らない(=「自動中ずっと働け」になる)
       rate: capMs > 0 ? Math.min(1, usedMs / capMs) : null,

@@ -1,11 +1,14 @@
 // Phase C: 画面へ出すための集計 (純関数)。App.jsx 側に計算を書かないための層。
 //   autoOpportunity.js が「1ロットの自動区間を4つへ割る」担当。ここは複数ロットを束ねる担当。
 //
-// ⚠混ぜないもの:
-//   実測 (sessions がある区間) と 推定 (開始〜終了からの再構成) は別々に集計する。
+// ⚠混ぜないもの (2026-07-21 是正: 文言と実装が食い違っていた):
+//   実測 = 【機械の運転記録(lot.machineRuns)】から作った区間。sessions の有無では決めない。
+//   さらに実測の窓で「活用」に数える手作業は【打刻された区間(quality==='confirmed')】だけ。
+//     機械だけ実測で人が推定(開始〜終了の幅)なら、それは実測の活用に入れず件数・時間を別に残す。
+//   推定 = 開始〜終了からの再構成。実測と合計しない。
 //   低信頼 (完了押し忘れ疑い) は最初から除外し、除外件数だけ返す。
 import { mergeIntervals } from './timeIntervals.js';
-import { autoOpportunityWindows, summarizeWindows, taskWorkIntervals } from './autoOpportunity.js';
+import { autoOpportunityWindows, summarizeWindows, taskWorkIntervals, taskIsMeasured } from './autoOpportunity.js';
 import { taskTimeQualityOf } from './taskTimeQuality.js';
 
 const EMPTY = { 件数: 0, 自動時間ms: 0, 休憩ms: 0, 取れた上限ms: 0, 活用ms: 0, 取り逃がしms: 0, 候補なしms: 0 };
@@ -42,16 +45,21 @@ export const buildAutoOpportunityReport = ({
   }).filter(x => Object.keys(x.tasks).length > 0);
 
   // 2) 全ロット・全作業者の手作業区間 (別ロットの作業も「活用」として数える)
+  //    ⚠打刻された区間と、そうでない区間を分ける。実測の窓では前者しか活用に数えない。
   const manualAll = [];
+  const manualConfirmed = [];
   prepared.forEach(({ lot, tasks }) => {
     const byId = new Map((lot.steps || []).map(s => [s.id, s]));
     Object.entries(tasks).forEach(([k, t]) => {
       const step = byId.get(k.slice(0, k.lastIndexOf('-')));
       if (!step || isAuto(step)) return;
-      taskWorkIntervals(t).forEach(iv => manualAll.push(iv));   // sessions があればそこから
+      const ivs = taskWorkIntervals(t);                          // sessions があればそこから
+      ivs.forEach(iv => manualAll.push(iv));
+      if (taskIsMeasured(t)) ivs.forEach(iv => manualConfirmed.push(iv));
     });
   });
   const manualMerged = mergeIntervals(manualAll);
+  const manualConfirmedMerged = mergeIntervals(manualConfirmed);
 
   const breaksOf = (lot) => (lot.interruptions || [])
     .filter(i => i && i.type === 'break' && i.startTime && i.endTime && i.endTime > i.startTime)
@@ -59,11 +67,14 @@ export const buildAutoOpportunityReport = ({
 
   // 3) 区間を作る
   const rows = [];
+  let unconfirmedMs = 0;                                        // 実測窓に重なったが打刻で確認できなかった手作業
   prepared.forEach(({ lot, tasks }) => {
     autoOpportunityWindows({
       lot: { ...lot, tasks }, isAuto, keyOf,
-      manualIntervals: manualMerged, breakIntervals: breaksOf(lot),
+      manualIntervals: manualMerged, confirmedManualIntervals: manualConfirmedMerged,
+      breakIntervals: breaksOf(lot),
     }).forEach(w => {
+      unconfirmedMs += (w.usedUnconfirmedMs || 0);
       const first = tasks[keyOf(w.stepId, (w.units || [])[0] ?? 0)] || {};
       // ⚠実測= machineRuns の区間から作られた窓だけ。sessions の有無というラベルで判定しない
       //   (ChatGPT指摘 2026-07-21: 実測と表示しながら開始〜終了の幅で計算していた)
@@ -100,8 +111,12 @@ export const buildAutoOpportunityReport = ({
   return {
     実測: build(measured),
     推定: build(estimated),
-    合算しない理由: '実測(作業セッションあり)と推定(開始〜終了からの再構成)は精度が違うため合計しない',
-    除外: { 低信頼: excludedUnreliable, 記録不足: excludedMissing },
+    合算しない理由: '実測(機械の運転記録から作った区間)と推定(開始〜終了からの再構成)は精度が違うため合計しない',
+    除外: {
+      低信頼: excludedUnreliable, 記録不足: excludedMissing,
+      // 機械は実測でも人の記録が打刻でなかった時間。実測の活用には入れないが、黙って消さずに残す。
+      実測窓に重なった未確認手作業ms: unconfirmedMs,
+    },
     区間数: { 実測: measured.length, 推定: estimated.length },
     rows,
   };

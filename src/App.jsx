@@ -25280,9 +25280,13 @@ const AnalysisView = ({ lots, logs, workers, saveData, deleteData = null, settin
                           上の活用率は<b>推定</b>（開始〜終了からの再構成）で出しています。
                           <b>低信頼（完了の押し忘れ疑い）は集計から外しています</b>
                           {autoReport && <>（除外 {autoReport.除外.低信頼.toLocaleString()}件）</>}。
-                          作業セッションが保存されたロットが増えると<b>実測</b>が別枠で出ます
+                          <b>実測</b>は「機械の運転記録が残った区間」だけです
                           {autoReport && <>（現在 実測 {autoReport.区間数.実測.toLocaleString()}区間 / 推定 {autoReport.区間数.推定.toLocaleString()}区間）</>}。
                           <b>実測と推定は精度が違うので合計しません。</b>
+                          {autoReport && autoReport.除外.実測窓に重なった未確認手作業ms > 0 && (
+                            <> なお実測の区間に重なった手作業のうち <b className="text-orange-700">{Math.round(autoReport.除外.実測窓に重なった未確認手作業ms / 36000) / 100}h</b> は
+                            打刻ではなく開始〜終了からの推定だったため、<b>実測の活用時間には入れていません</b>（捨ててはいません）。</>
+                          )}
                         </div>
                       </div>
                     </div>
