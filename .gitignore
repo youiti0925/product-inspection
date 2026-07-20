@@ -28,3 +28,6 @@ dist-ssr
 #   公開リポジトリに「そのまま動く本番の読み出し口」を置かないため。集計済みJSONのみ可。
 audit/**/*.mjs
 audit/**/*.js
+
+# firebase deploy のローカルキャッシュ
+.firebase/
