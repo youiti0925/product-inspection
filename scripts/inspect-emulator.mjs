@@ -1,7 +1,8 @@
 // 🧪 エミュレータのテストロットを覗く (B.1 #7 の検証用)。本番には絶対に繋がらない。
 //   FIRESTORE_EMULATOR_HOST 必須。読み取り専用。
 //
-//   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/inspect-emulator.mjs [lotId]
+//   PowerShell:  $env:FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080"; node scripts/inspect-emulator.mjs [lotId]
+//   bash:        FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/inspect-emulator.mjs [lotId]
 
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, getDoc, connectFirestoreEmulator } from 'firebase/firestore';

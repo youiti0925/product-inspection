@@ -3,8 +3,9 @@
 //
 // 使い方:
 //   1) firebase emulators:start --only firestore,auth --project inspection-time-c4fd3
-//   2) FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-emulator.mjs
-//   3) .env.local に VITE_USE_EMULATOR=1 を書いて npm run dev
+//   2) PowerShell:  $env:FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080"; node scripts/seed-emulator.mjs
+//      bash:        FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-emulator.mjs
+//   3) PowerShell:  $env:VITE_USE_EMULATOR = "1"; npm run dev   (.env.local へは書かない=消し忘れ防止)
 //
 // 入れるもの: 作業者2名(尾田/片山)・自動工程と手動工程を持つテンプレ1件・テスト用ロット1件。
 
@@ -15,7 +16,8 @@ import { getAuth, signInAnonymously, connectAuthEmulator } from 'firebase/auth';
 const HOST = process.env.FIRESTORE_EMULATOR_HOST;
 if (!HOST) {
   console.error('❌ FIRESTORE_EMULATOR_HOST が未設定です。本番へ書き込む事故を防ぐため中止します。');
-  console.error('   例: FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-emulator.mjs');
+  console.error('   PowerShell: $env:FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080"; node scripts/seed-emulator.mjs');
+  console.error('   bash      : FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-emulator.mjs');
   process.exit(1);
 }
 const [h, p] = HOST.split(':');

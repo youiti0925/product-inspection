@@ -14,8 +14,32 @@ Firestore の `setDoc(merge: true)` で保存しています。**トランザク
 これは「二重適用で壊れない」だけで、**競合を解決するものではありません**。
 以前「多端末でも安全」と説明しましたが、**その表現は誤りだったので撤回します。**
 
-- 影響範囲: 同じロットを同時操作した場合の `sessions` / `machineRuns` のみ。
-  従来からある `duration` / `firstStartTime` / `endTime` は変わりません（合計時間は失われません）。
+### 何が失われうるか
+
+以前ここに「影響は sessions / machineRuns だけで、duration などの合計時間は失われない」と書いていましたが、
+**これも誤りでした。撤回します。**
+
+保存は `tasks` マップごと `setDoc(merge: true)` で書きます。
+Firestore の merge は**同じキーに両方が書けば後勝ち**なので、同じロットの同じタスクを2端末が続けて保存すると、
+
+- `status`（作業中／一時停止／完了）
+- `duration`（積み上げた作業秒数）
+- `startTime` / `firstStartTime` / `endTime`
+- `sessions` / `machineRuns`
+
+これら**すべてについて、先に保存した側の変更が失われる可能性があります。**
+
+### ⚠これは Phase B で新しく生じた制約ではありません
+
+`setDoc(merge: true)` による保存はこのアプリの当初からの方式で、
+**同じロットを同時に触った時の「後勝ち」は以前から同じ**です。
+Phase B は、後勝ちで失われうるものに `sessions` / `machineRuns` を追加しただけです。
+
+### 危険なのは「ほぼ同時」だけ
+
+後勝ちが起きるのは、2端末の保存が**保存の往復（およそ1秒）の中で重なった時**です。
+時間をあけた操作（誰かが止めた後に別の人が再開する、など）は従来どおり問題ありません。
+
 - 恒久対策（**未実施**）: `runTransaction` 化、またはセッションを別コレクションへ追記型で持つ。
 
 ## 対象範囲
@@ -47,24 +71,50 @@ Firestore の `setDoc(merge: true)` で保存しています。**トランザク
 - JDK（Firestore エミュレータに必須）。未導入なら `winget install Microsoft.OpenJDK.21`
 - `firebase-tools`
 
-### 手順
+### 手順（Windows PowerShell / これが標準）
 
-```bash
-# 1) エミュレータ起動
-cd product-inspection-app
+この環境は Windows なので、**PowerShell を標準手順とします。**
+`FIRESTORE_EMULATOR_HOST=... node ...` という書き方は PowerShell では動きません（bash の書式です）。
+
+```powershell
+# 1) エミュレータ起動（このウィンドウは開いたままにする）
+cd C:\Users\anrw3\product-inspection-app
 firebase emulators:start --only firestore,auth --project inspection-time-c4fd3
 
-# 2) 別ターミナルでテスト用データを投入
+# 2) 別のPowerShellウィンドウでテスト用データを投入
 #    ⚠FIRESTORE_EMULATOR_HOST が無いとスクリプトが自分で止まります（本番書き込み事故の防止）
-FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-emulator.mjs
+cd C:\Users\anrw3\product-inspection-app
+$env:FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080"
+node scripts/seed-emulator.mjs
 
-# 3) アプリをエミュレータへ向けて起動
-echo "VITE_USE_EMULATOR=1" >> .env.local
+# 3) さらに別のPowerShellウィンドウでアプリをエミュレータへ向けて起動
+#    ⚠.env.local へ書き足す方法は、消し忘れると次回以降も本番が見えなくなるので使いません。
+#      環境変数ならウィンドウを閉じれば消えます。
+cd C:\Users\anrw3\product-inspection-app
+$env:VITE_USE_EMULATOR = "1"
 npm run dev
+
+# 4) 途中経過の確認（2)と同じウィンドウで）
+node scripts/inspect-emulator.mjs
 ```
 
-`.env.local` の `VITE_USE_EMULATOR=1` があるときだけエミュレータへ繋ぎます。
-`import.meta.env.DEV` でも守っているので、**本番ビルドでは絶対に通りません。**
+**このウィンドウを閉じれば設定は消えます。** 別のウィンドウで `npm run dev` すれば通常どおり本番を見ます。
+
+<details>
+<summary>bash / Git Bash の場合</summary>
+
+```bash
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-emulator.mjs
+VITE_USE_EMULATOR=1 npm run dev
+```
+</details>
+
+アプリは `import.meta.env.DEV` かつ `VITE_USE_EMULATOR=1` のときだけエミュレータへ繋ぎます。
+**本番ビルドでは絶対に通りません。**
+繋がっている時はブラウザのコンソールに `🧪 エミュレータ接続中` が出ます。**これが出ていない時は本番を見ています。**
+
+> ⚠ブラウザに本番データのキャッシュ（IndexedDB）が残っていると、エミュレータに繋いでいても
+> 古い本番データが画面に出ます。紛らわしいので、切り替えたら**ブラウザのサイトデータを消して再読み込み**してください。
 
 投入されるもの: 作業者2名（尾田/片山・テスト）、自動＋手動工程を持つテンプレ1件、
 ロット `EMU-0001 / 🧪テスト型式 / 2台`。

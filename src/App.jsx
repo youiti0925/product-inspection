@@ -11288,6 +11288,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
   // B.1 #1: machineRuns も直前に生成した値を引き継ぐ。lot.machineRuns は Firestore の往復が
   //   終わるまで古いため、開始直後に停止すると「開いた run が見つからず閉じられない」事故になる。
   const lastSavedRunsRef = useRef(Array.isArray(lot.machineRuns) ? lot.machineRuns : []);
+  // B.1.1: 担当も同じ理由で「直前に保存した値」を正にする。
+  //   担当変更 onSave({workerId}) の直後、Firestore の購読が lot へ返る前に次の作業を開始すると、
+  //   lot.workerId はまだ旧担当のため、新しいセッションが旧担当で開いてしまう。
+  const lastSavedWorkerIdRef = useRef(lot.workerId || null);
+  // 他端末が担当を変えた場合は prop 追従で取り込む(自端末の変更は下の onSave が即時に上書きする)。
+  useEffect(() => { lastSavedWorkerIdRef.current = lot.workerId || null; }, [lot.workerId]);
+  const workerNameOf = (wid) => (workers.find(w => w.id === wid)?.name) || '';
   // taskKey -> { step, unitIdx }。キー形式(step.id / 数値index / ロット1回)の違いをここで吸収する。
   const resolveTaskKey = (key) => {
     const step = findStepByTaskKey(key);
@@ -11298,14 +11305,19 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
   const onSave = (payload) => {
     if (!payload) return onSaveRaw(payload);
     try {
+      // ⚠lot.workerId ではなく ref を正とする(prop が返る前でも新担当で記録するため)
+      const curWorkerId = lastSavedWorkerIdRef.current || lot.workerId || null;
       const r = buildLotSave({
         payload, lot, now: Date.now(),
         prevTasks: lastSavedTasksRef.current || {},
         prevRuns: lastSavedRunsRef.current,
-        workerId: lot.workerId || null, workerName: inspectorName,
+        workerId: curWorkerId, workerName: workerNameOf(curWorkerId) || inspectorName,
         resolveKey: resolveTaskKey, isAuto: isAutoStep,
-        resolveWorkerName: (wid) => (workers.find(w => w.id === wid)?.name) || '',
+        resolveWorkerName: workerNameOf,
       });
+      // 担当変更は touched の有無に関係なく即時に確定させる。
+      //   進行中タスクが無い(=分割不要でtouched:false)場合でも、次に開始する作業は新担当でなければならない。
+      if (payload.workerId) lastSavedWorkerIdRef.current = payload.workerId;
       if (!r.touched) return onSaveRaw(payload);
       lastSavedTasksRef.current = r.tasks;
       lastSavedRunsRef.current = r.machineRuns;
@@ -11314,6 +11326,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       // 記録の付加で保存そのものを失敗させない(現場が止まる方が重い)。
       console.error('[PhaseB] セッション記録に失敗。素の保存を続行します', e);
       if (payload.tasks) lastSavedTasksRef.current = payload.tasks;
+      if (payload.workerId) lastSavedWorkerIdRef.current = payload.workerId; // 失敗時も担当は進める
       return onSaveRaw(payload);
     }
   };
