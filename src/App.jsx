@@ -27,7 +27,8 @@ import {
   getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot,
   serverTimestamp, query, orderBy, limit, where, getDocs, getDoc, updateDoc,
   deleteField, startAfter,
-  initializeFirestore, persistentLocalCache, persistentMultipleTabManager
+  initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  connectFirestoreEmulator
 } from "firebase/firestore";
 import {
   getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject
@@ -58,8 +59,9 @@ import { annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occ
 import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, startGuard as startGuardShared, buildStepMasterIndex } from './domain/workExecution.js';
 import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
 // Phase B: 実績を「区間」で残す。全遷移は WorkExecutionModal の onSave ラッパ1箇所を通る。
-import { applySessionTransitions, setEstimatedSession, sessionsDurationMs, sessionsOf } from './domain/workSessions.js';
-import { applyMachineRunTransitions, machineIntervalsOf, MONITORING_REQUIREMENTS, MONITORING_LABELS, monitoringRequirementOf } from './domain/machineRuns.js';
+import { setEstimatedSession, sessionsDurationMs, sessionsOf } from './domain/workSessions.js';
+import { machineIntervalsOf, MONITORING_REQUIREMENTS, MONITORING_LABELS, monitoringRequirementOf } from './domain/machineRuns.js';
+import { buildLotSave } from './domain/lotSavePipeline.js';
 // 現行マスタ索引(案②): templates購読で更新する。module-levelの純関数からも参照できるようにするため
 //   Reactのstateではなくモジュール変数に置く(読み取り専用・判定のためだけに使う)。
 let STEP_MASTER_INDEX = null;
@@ -74,7 +76,8 @@ import { fetchAllPaged, mergeLotsById } from './domain/goal/pager.js';
 import { fiscalRealizedOf, GOAL_PRIMARY_METRICS } from './domain/goal/fiscalMath.js';
 import { goalGapOf, candidateOf, planPortfolio } from './domain/goal/portfolioPlanner.js';
 import {
-  getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken
+  getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken,
+  connectAuthEmulator
 } from "firebase/auth";
 
 // 「❓使い方」全画面マニュアル
@@ -11278,7 +11281,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
   //   propの onSave を onSaveRaw へ改名し、ここで同名の onSave を定義しているため、
   //   既存の onSave(...) 呼び出しは1つも書き換えずに全部この1本を通る(取りこぼしを構造的に防ぐ)。
   //   → 新しい保存経路を足す時も onSave を呼ぶ限り自動で記録される。
+  //   変換の中身は src/domain/lotSavePipeline.js の buildLotSave (テスト可能な純関数) に出してある。
+  //   ⚠この保存は setDoc(merge:true) でトランザクションではない。「多端末でも安全」ではない。
+  //     同じロットを同時に2端末で操作すると後勝ちで区間が失われうる(制約として明示・恒久対策は未実施)。
   const lastSavedTasksRef = useRef(lot.tasks || {});
+  // B.1 #1: machineRuns も直前に生成した値を引き継ぐ。lot.machineRuns は Firestore の往復が
+  //   終わるまで古いため、開始直後に停止すると「開いた run が見つからず閉じられない」事故になる。
+  const lastSavedRunsRef = useRef(Array.isArray(lot.machineRuns) ? lot.machineRuns : []);
   // taskKey -> { step, unitIdx }。キー形式(step.id / 数値index / ロット1回)の違いをここで吸収する。
   const resolveTaskKey = (key) => {
     const step = findStepByTaskKey(key);
@@ -11287,30 +11296,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
     return { step, unitIdx: m ? Number(m[1]) : 0 };
   };
   const onSave = (payload) => {
-    if (!payload || !payload.tasks) return onSaveRaw(payload);
+    if (!payload) return onSaveRaw(payload);
     try {
-      const now = Date.now();
-      const prev = lastSavedTasksRef.current || {};
-      // ① 手動作業セッション (task.sessions)
-      const withSessions = applySessionTransitions({
-        prev, next: payload.tasks, now,
+      const r = buildLotSave({
+        payload, lot, now: Date.now(),
+        prevTasks: lastSavedTasksRef.current || {},
+        prevRuns: lastSavedRunsRef.current,
         workerId: lot.workerId || null, workerName: inspectorName,
-      });
-      // ② 機械運転セッション (lot.machineRuns)。一括5台10分は「10分1件」であって50分ではない。
-      const machineRuns = applyMachineRunTransitions({
-        lot, prev, next: withSessions, now,
         resolveKey: resolveTaskKey, isAuto: isAutoStep,
-        workerId: lot.workerId || null,
+        resolveWorkerName: (wid) => (workers.find(w => w.id === wid)?.name) || '',
       });
-      lastSavedTasksRef.current = withSessions;
-      // 自動工程が1つも無いロットに空配列を書き足さない(全ロットに無意味なフィールドを増やさないため)
-      const hadRuns = Array.isArray(lot.machineRuns) && lot.machineRuns.length > 0;
-      const nextHasRuns = Array.isArray(machineRuns) && machineRuns.length > 0;
-      return onSaveRaw({ ...payload, tasks: withSessions, ...((hadRuns || nextHasRuns) ? { machineRuns } : {}) });
+      if (!r.touched) return onSaveRaw(payload);
+      lastSavedTasksRef.current = r.tasks;
+      lastSavedRunsRef.current = r.machineRuns;
+      return onSaveRaw(r.payload);
     } catch (e) {
       // 記録の付加で保存そのものを失敗させない(現場が止まる方が重い)。
       console.error('[PhaseB] セッション記録に失敗。素の保存を続行します', e);
-      lastSavedTasksRef.current = payload.tasks;
+      if (payload.tasks) lastSavedTasksRef.current = payload.tasks;
       return onSaveRaw(payload);
     }
   };
@@ -33478,8 +33481,18 @@ export default function App() {
        console.warn('Firestore persistence unavailable, falling back', e?.message);
        firestore = getFirestore(app);
      }
+     // 🧪 開発時のみ: Firestore/Auth エミュレータへ繋ぐ (B.1 #7)。
+     //   .env.local の VITE_USE_EMULATOR=1 のときだけ有効。本番ビルドでは未設定なので絶対に通らない。
+     //   本番データを一切使わずに 開始→停止→再開→担当変更→完了 を画面操作で確認するために使う。
+     if (import.meta.env.DEV && String(import.meta.env.VITE_USE_EMULATOR || '') === '1') {
+       try {
+         connectFirestoreEmulator(firestore, '127.0.0.1', 8080);
+         connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+         console.warn('🧪 エミュレータ接続中 (本番Firestoreには繋がっていません)');
+       } catch (e) { console.error('エミュレータ接続に失敗', e); }
+     }
      setDb(firestore);
- 
+
      const initAuth = async () => {
        try {
          // Check if using user-defined config

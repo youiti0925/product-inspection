@@ -41,6 +41,46 @@ test('時刻が無いタスクは 記録不足 (0秒として評価しない)', 
   assert.equal(taskTimeQualityOf(null).quality, 'missing');
 });
 
+// ---- B.1 #2: セッションが「有る」だけで確定にしない ----
+
+test('B.1 #2 手入力(manual-entry)のセッションを「確定」と表示しない', () => {
+  const t = { status: 'completed', duration: 600, sessions: [
+    { id: 'est1', startTime: T0, endTime: T0 + 600000, source: 'manual-entry', quality: 'estimated' },
+  ] };
+  const q = taskTimeQualityOf(t);
+  assert.equal(q.quality, 'estimated');
+  assert.equal(q.ms, 600000, '時間そのものは出す(捨てない)');
+  assert.match(q.reason, /打刻ではない/);
+});
+
+test('B.1 #2 確定と推定が混在するタスクは「確定」にしない', () => {
+  const t = { status: 'completed', duration: 900, sessions: [
+    { id: 'a', startTime: T0, endTime: T0 + 300000, quality: 'confirmed' },
+    { id: 'b', startTime: T0 + 600000, endTime: T0 + 1200000, source: 'folded', quality: 'estimated' },
+  ] };
+  const q = taskTimeQualityOf(t);
+  assert.equal(q.quality, 'estimated', '1本でも推定が混ざれば確定にしない');
+  assert.equal(q.sessionCount, 2);
+  assert.equal(q.estimatedSessionCount, 1);
+  assert.match(q.reason, /混在/);
+});
+
+test('B.1 #2 全部が打刻済みなら従来どおり確定', () => {
+  const t = { status: 'completed', duration: 360, sessions: [
+    { id: 'a', startTime: T0, endTime: T0 + 120000, quality: 'confirmed' },
+    { id: 'b', startTime: T0 + 300000, endTime: T0 + 540000, quality: 'confirmed' },
+  ] };
+  const q = taskTimeQualityOf(t);
+  assert.equal(q.quality, 'confirmed');
+  assert.equal(q.estimatedSessionCount, 0);
+  assert.equal(q.ms, 360000);
+});
+
+test('B.1 #2 quality 未設定の古いセッションは確定として扱う(既存挙動を壊さない)', () => {
+  const t = { status: 'completed', duration: 120, sessions: [{ id: 'a', startTime: T0, endTime: T0 + 120000 }] };
+  assert.equal(taskTimeQualityOf(t).quality, 'confirmed');
+});
+
 test('A13 autoLaborPct分離: 手動設定値を実測活用率として扱わない', () => {
   assert.equal(autoLaborPctIsMeasured(), false);
   assert.match(autoLaborPctLabel(30), /設定値 30%/);

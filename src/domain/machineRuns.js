@@ -49,10 +49,34 @@ export const machineIntervalsOf = (lot, { now = null } = {}) => {
 // ---- 保存直前の一括適用 (作業セッションと同じ choke point で呼ぶ) ----
 // resolveKey: taskKey -> { step, unitIdx } | null   (キー形式の違いを呼び出し側で吸収する)
 // isAuto:     step -> boolean                       (共通 isAutoStep を渡す)
+// 運転が終わった理由を「呼び出し側の申告」ではなく実データから決める (B.1)。
+//   ⚠B.0の不具合: closeReason を引数の既定値 'manual' で決めていたため、実画面からは常に 'manual' になり、
+//     再開時に探す `closeReason === 'pause'` が絶対に一致せず、一時停止→再開が別runに割れていた。
+//     (テスト側が 'pause' を明示的に渡していたため隠れていた)
+const closeReasonFor = (stepId, next, resolveKey) => {
+  let sawPaused = false, sawAutoEnd = false, sawBatch = 0;
+  Object.keys(next || {}).forEach(key => {
+    const r = resolveKey(key);
+    if (!r || !r.step || (r.step.id || r.step.title) !== stepId) return;
+    const t = next[key];
+    if (!t) return;
+    if (t.status === 'paused') sawPaused = true;
+    if (t.autoEnded) sawAutoEnd = true;
+    if (t.status === 'completed' || t.status === 'ng') sawBatch += 1;
+  });
+  if (sawPaused) return 'pause';       // 停止 = 同じ運転の続きになりうる
+  if (sawAutoEnd) return 'auto-end';
+  if (sawBatch > 1) return 'batch';    // 複数台が同時に完了 = まとめて完了
+  return 'manual';
+};
+
 export const applyMachineRunTransitions = ({
-  lot = {}, prev = {}, next = {}, now, resolveKey, isAuto, workerId = null, closeReason = 'manual',
+  lot = {}, prev = {}, next = {}, now, resolveKey, isAuto, workerId = null,
+  prevRuns = null,   // B.1: 直前に生成した machineRuns。Firestoreのprop更新を待たずに引き継ぐ
+  closeReason = null, // 明示指定は上書き(テスト用)。通常は next から推論する
 } = {}) => {
-  if (!now || !next || typeof resolveKey !== 'function' || typeof isAuto !== 'function') return machineRunsOf(lot);
+  const baseRuns = Array.isArray(prevRuns) ? prevRuns : machineRunsOf(lot);
+  if (!now || !next || typeof resolveKey !== 'function' || typeof isAuto !== 'function') return baseRuns;
 
   // 自動工程ごとに「今 動いている台」と「さっき動いていた台」を集める
   const running = new Map();  // stepId -> { step, units:Set }
@@ -67,7 +91,7 @@ export const applyMachineRunTransitions = ({
   });
   scan(next, running);
 
-  let runs = machineRunsOf(lot).map(r => ({ ...r, segments: (r.segments || []).map(s => ({ ...s })) }));
+  let runs = baseRuns.map(r => ({ ...r, segments: (r.segments || []).map(s => ({ ...s })) }));
 
   // ① 動き出した / 動き続けている
   running.forEach(({ step, units }, stepId) => {
@@ -106,7 +130,7 @@ export const applyMachineRunTransitions = ({
     if (running.has(run.stepId)) return; // まだ動いている
     const last = run.segments[run.segments.length - 1];
     last.endTime = Math.max(now, last.startTime);
-    run.closeReason = closeReason;
+    run.closeReason = closeReason || closeReasonFor(run.stepId, next, resolveKey);
   });
 
   return runs;

@@ -17,7 +17,22 @@ export const taskTimeQualityOf = (task) => {
   if (!task) return { quality: 'missing', ms: 0, reason: 'タスクなし' };
   if (Array.isArray(task.sessions) && task.sessions.length > 0) {
     const ms = task.sessions.reduce((s, x) => s + Math.max(0, (x?.endTime || 0) - (x?.startTime || 0)), 0);
-    return { quality: 'confirmed', ms, reason: '' };
+    // ⚠B.1 是正: セッションが「有る」だけで確定にしてはいけない。
+    //   手入力(manual-entry)や上限超過で畳んだ区間(folded)は quality='estimated' で、打刻ではない。
+    //   1本でも estimated が混ざっていれば、そのタスク全体を確定として見せない。
+    const list = task.sessions.filter(Boolean);
+    const est = list.filter(x => x.quality && x.quality !== 'confirmed');
+    if (est.length > 0) {
+      const allEst = est.length === list.length;
+      return {
+        quality: 'estimated', ms,
+        sessionCount: list.length, estimatedSessionCount: est.length,
+        reason: allEst
+          ? '打刻ではない区間から算出(手入力・畳み込み)'
+          : `確定${list.length - est.length}本と推定${est.length}本が混在(確定として扱わない)`,
+      };
+    }
+    return { quality: 'confirmed', ms, sessionCount: list.length, estimatedSessionCount: 0, reason: '' };
   }
   const durMs = (task.duration || 0) * 1000;
   const first = task.firstStartTime || task.startTime || null;

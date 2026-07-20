@@ -13,10 +13,13 @@
 //   よって「保存直前に前回値と比べて startTime の出入りを見る」だけで、
 //   20箇所以上ある遷移点を個別に改造せずに全経路を捕捉できる。
 //
-// ⚠多端末前提 (memory: multi-device-shared-decision):
-//   同じ遷移が別端末の書き込み経由で二度適用されうるため、開閉は冪等にする。
-//     開く: 既に開いているセッションがあれば何もしない
-//     閉じる: 開いているセッションが無ければ何もしない
+// ⚠同時編集について — 「多端末でも安全」ではない (B.1 で表現を訂正):
+//   開閉は冪等にしてあるが (開く: 既に開いていれば何もしない / 閉じる: 開いていなければ何もしない)、
+//   保存は setDoc(merge:true) でありトランザクションではない。
+//   同じロットを同時に2端末で操作すると、後から保存した側の sessions 配列で丸ごと上書きされ、
+//   もう一方が記録した区間は失われる。冪等性は「二重適用で壊れない」だけで、競合を解決しない。
+//   → 運用制約: 同じロットを同時に複数端末で操作しないこと。
+//   → 恒久対策(未実施): runTransaction 化、またはセッションを別コレクションへ追記型で持つ。
 //
 // ⚠容量 (実測 2026-07-20):
 //   製品検査の最大ロットは 143KB / 最大 tasks 71件。Firestore上限は1ドキュメント約1MB。
@@ -133,7 +136,11 @@ export const applySessionTransitions = ({ prev = {}, next = {}, now, workerId = 
     if (!wasRunning && isRunning) {
       out[key] = openSession(after, { now: after.startTime, workerId, workerName });
     } else if (wasRunning && !isRunning) {
-      out[key] = closeSession(after, { now: after.endTime || now, workerId, workerName });
+      // ⚠区間の終わりは「アプリが実際に使った時刻」に合わせる。
+      //   保存時刻(now)で閉じると duration との間に毎回1〜2秒ずれる(実機で実測)。
+      //   完了は endTime、一時停止は pausedAt、NGは ngAt が正。どれも無ければ now。
+      const closeAt = after.endTime || after.pausedAt || after.ngAt || now;
+      out[key] = closeSession(after, { now: closeAt, workerId, workerName });
     }
     // 変化なし = 触らない (durationだけの更新などで余計な書き込みを増やさない)
   });
