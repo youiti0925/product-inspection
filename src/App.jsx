@@ -59,6 +59,7 @@ import { annualOccurrencesOf, laborSecOf, machineSecOf } from './domain/goal/occ
 import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, canStartTask as canStartTaskShared, startGuard as startGuardShared, buildStepMasterIndex } from './domain/workExecution.js';
 import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
 import { buildAutoOpportunityReport, summaryView } from './domain/autoOpportunityReport.js';
+import { crossLotCandidates } from './domain/crossLotGuide.js';
 // Phase B: 実績を「区間」で残す。全遷移は WorkExecutionModal の onSave ラッパ1箇所を通る。
 import { setEstimatedSession, sessionsDurationMs, sessionsOf } from './domain/workSessions.js';
 import { machineIntervalsOf } from './domain/machineRuns.js';
@@ -10688,7 +10689,7 @@ const MeasurementInputPanel = ({ config, values, onChange, onComplete, pastData,
 // コンパクト版ライブ並行ガイド: 1行ヘッダー＋細い進捗＋横並びチップ。onHide で非表示にできる。
 const LiveParallelGuide = ({ guide, fmtTime, onHide }) => {
   if (!guide || !guide.runningAuto) return null;
-  const { runningAuto, planned, extra, isOverrun, overrunSec, remainingSec } = guide;
+  const { runningAuto, planned, extra, crossLot = [], isOverrun, overrunSec, remainingSec } = guide;
   const elapsed = runningAuto.elapsedSec;
   const target = runningAuto.targetSec;
   const pct = target > 0 ? Math.min(100, Math.round((elapsed / target) * 100)) : 0;
@@ -10716,7 +10717,28 @@ const LiveParallelGuide = ({ guide, fmtTime, onHide }) => {
       {/* 本体: 横並びチップ */}
       <div className="bg-white px-2 py-1.5">
         {planned.length === 0 && extra.length === 0 ? (
-          <div className="text-[11px] text-slate-400 italic">並行できる作業なし（他台なし／機械独立工程なし）</div>
+          crossLot.length > 0 ? (
+            <div>
+              <div className="text-[10px] font-bold text-teal-700 mb-1 flex items-center gap-0.5">
+                <Zap className="w-3 h-3" />このロットで並行できる作業はありません。<span className="text-teal-800">他のロットなら できます:</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1">
+                {crossLot.map((c, i) => (
+                  <span key={`x${i}`} className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] border ${c.fits ? 'bg-teal-50 border-teal-300' : 'bg-slate-50 border-slate-200'}`}>
+                    <span className="bg-teal-600 text-white text-[10px] font-black px-1 rounded">{c.orderNo || c.model || '別ロット'}</span>
+                    <span className="text-slate-500 text-[10px]">#{c.unitIdx + 1}</span>
+                    <span className="font-bold text-slate-800">{c.stepTitle}</span>
+                    <span className="text-slate-400 font-mono text-[10px]">{fmtTime(c.targetSec)}</span>
+                    {c.sameZone && <span className="text-teal-700 text-[10px] font-bold">同エリア</span>}
+                    {!c.fits && <span className="text-slate-400 text-[10px]">残り時間を超えます</span>}
+                  </span>
+                ))}
+              </div>
+              <div className="text-[10px] text-slate-500 mt-1">※ 検査リストからそのロットを開いて開始してください（ここからは開始しません）。誰かが作業中のロットは出しません。</div>
+            </div>
+          ) : (
+            <div className="text-[11px] text-slate-400 italic">並行できる作業なし（他の台も、他のロットも 出せる仕事がありません）</div>
+          )
         ) : (
           <div className="flex flex-wrap items-center gap-1">
             <span className="text-[10px] font-bold text-purple-700 mr-0.5 flex items-center gap-0.5"><Zap className="w-3 h-3" />他の台で並行:</span>
@@ -13642,15 +13664,26 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       }
     }
     const isOverrun = runningAuto.targetSec > 0 && runningAuto.elapsedSec > runningAuto.targetSec;
+    const remainSec = runningAuto.targetSec > 0 ? Math.max(0, runningAuto.targetSec - runningAuto.elapsedSec) : 0;
+    // Phase C ②: 同じロットで出せる仕事が無くなった時だけ、他のロットの「次にやる工程」を出す。
+    //   実測(2026-07-20)で未活用27.3hが「同ロットに候補なし」だった。ここは本人にはどうにもできない時間だった。
+    //   ⚠ここから他ロットの作業を開始はしない(表示だけ)。順番飛ばし・取り合いは crossLotGuide 側で弾く。
+    const crossLot = (planned.length === 0 && extra.length === 0)
+      ? crossLotCandidates({
+          lots: lots || [], currentLotId: lot.id, remainingSec: remainSec,
+          isAuto: isAutoStep, sameZoneId: lot.mapZoneId || null, maxItems: 3,
+        })
+      : [];
     return {
       runningAuto,
       planned,
       extra,
+      crossLot,
       isOverrun,
       overrunSec: isOverrun ? runningAuto.elapsedSec - runningAuto.targetSec : 0,
-      remainingSec: runningAuto.targetSec > 0 ? Math.max(0, runningAuto.targetSec - runningAuto.elapsedSec) : 0,
+      remainingSec: remainSec,
     };
-  }, [tasks, localSteps, lot.quantity, otherAutoTick]);
+  }, [tasks, localSteps, lot.quantity, lot.id, lot.mapZoneId, lots, otherAutoTick]);
 
   // 自動測定 (別エリア or このロット) がある間 1秒毎に更新
   useEffect(() => {

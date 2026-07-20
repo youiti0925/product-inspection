@@ -64,10 +64,28 @@ await setDoc(base('lots', 'lot-emu-1'), {
   createdAt: Date.now(),
 });
 
+// Phase C ②の検証用: 1台ロット(=同ロットに並行候補が無い) と、別ロット(=他ロットの候補)
+await setDoc(base('lots', 'lot-emu-2'), {
+  id: 'lot-emu-2',
+  orderNo: 'EMU-0002',
+  model: '🧪テスト型式(1台)',
+  quantity: 1,
+  templateId: 'tpl-emu',
+  steps: STEPS,
+  tasks: {},
+  status: 'processing',
+  location: 'inspection',
+  executionType: 'custom',
+  workerId: 'wA',
+  entryAt: Date.now(),
+  createdAt: Date.now(),
+});
+
 await setDoc(base('settings', 'config'), {
   workers: [], customTargetTimes: {}, modelGroups: [],
 });
 
-console.log('✅ エミュレータへ投入しました (workers 2 / templates 1 / lots 1)');
-console.log('   ロット: EMU-0001 / 🧪テスト型式 / 2台 / 担当=尾田(テスト)');
+console.log('✅ エミュレータへ投入しました (workers 2 / templates 1 / lots 2)');
+console.log('   EMU-0001 / 🧪テスト型式 / 2台   … 同ロット内の並行ガイド用');
+console.log('   EMU-0002 / 1台               … Phase C ② (他ロット候補) の検証用');
 process.exit(0);
