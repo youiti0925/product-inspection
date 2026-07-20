@@ -16,11 +16,16 @@ export const MONITORING_LABELS = {
   periodic: '定期確認（確認した実時間だけ拘束）',
   continuous: '連続監視（自動中ずっと離れられない）',
 };
-// 未設定の既定。⚠'none' を既定にすると「離れられたのに働かなかった」と誤判定しうるため、
-//   設定されるまでは判定に使わない扱い(unknown)にし、画面側で「未設定」と出す。
+// 未設定の既定は 'periodic'。⚠人に設定させる必要はない。答えはアプリの作りに既にある:
+//   ① canStartTask が「自動+手動=許可」と決めている = 自動運転中は離れて別作業してよい設計
+//   ② 張り付いた時間は interruptions(type='monitoring') で実際に記録される仕組みが既にある
+//   よって「既定は離れてよい・拘束は監視した実時間だけ」= periodic が現行仕様そのもの。
+//   'unknown' を既定にしていたのは実装者の誤り(全工程を手で設定させる宿題を作っていた)。
+//   明示設定が要るのは「本当に離れられない工程(continuous)」など例外だけ。
+export const MONITORING_DEFAULT = 'periodic';
 export const monitoringRequirementOf = (step) => {
   const v = step?.monitoringRequirement;
-  return MONITORING_REQUIREMENTS.includes(v) ? v : 'unknown';
+  return MONITORING_REQUIREMENTS.includes(v) ? v : MONITORING_DEFAULT;
 };
 
 export const machineRunsOf = (lot) => (Array.isArray(lot?.machineRuns) ? lot.machineRuns : []);

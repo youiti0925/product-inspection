@@ -60,7 +60,7 @@ import { isAutoStep as isAutoStepShared, isManualStep as isManualStepShared, can
 import { taskTimeQualityOf, hasUsableInterval, autoLaborPctLabel } from './domain/taskTimeQuality.js';
 // Phase B: 実績を「区間」で残す。全遷移は WorkExecutionModal の onSave ラッパ1箇所を通る。
 import { setEstimatedSession, sessionsDurationMs, sessionsOf } from './domain/workSessions.js';
-import { machineIntervalsOf, MONITORING_REQUIREMENTS, MONITORING_LABELS, monitoringRequirementOf } from './domain/machineRuns.js';
+import { machineIntervalsOf, MONITORING_REQUIREMENTS, MONITORING_LABELS, MONITORING_DEFAULT, monitoringRequirementOf } from './domain/machineRuns.js';
 import { buildLotSave } from './domain/lotSavePipeline.js';
 // 現行マスタ索引(案②): templates購読で更新する。module-levelの純関数からも参照できるようにするため
 //   Reactのstateではなくモジュール変数に置く(読み取り専用・判定のためだけに使う)。
@@ -9023,7 +9023,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
   // Phase B: 自動運転中に人が離れてよいか。workResource(設備の取り合い)だけでは分からないため別に持つ。
   //   'none'=離れてよい / 'periodic'=定期確認した実時間だけ拘束 / 'continuous'=自動中ずっと拘束
   //   ''(未設定)は「不明」。既定を none にすると「離れられたのに働かなかった」と誤判定しうるので決めつけない。
-  const [monitoringRequirement, setMonitoringRequirement] = useState('');
+  const [monitoringRequirement, setMonitoringRequirement] = useState(MONITORING_DEFAULT);
   // workResource: この工程が占有するリソース。デフォルト null = 機械独立 (= 並行可)
   // 'measurement-machine' = 測定機を占有 (= 他の台の自動測定中は不可)
   // 'workbench' / その他カスタム
@@ -9172,7 +9172,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
       // 自動測定の既知時間 (経過で自動終了)。自動工程かつ有効かつ正の秒数のときのみ保存。
       ...(executionMode === 'batch' && autoEndEnabled && autoEndSec > 0 ? { autoEndEnabled: true, autoEndSec: Math.round(autoEndSec) } : {}),
       // Phase B: 自動工程で「人が離れてよいか」。未設定('')なら保存しない=不明のまま(推測で埋めない)。
-      ...(executionMode === 'batch' && MONITORING_REQUIREMENTS.includes(monitoringRequirement) ? { monitoringRequirement } : {}),
+      ...(executionMode === 'batch' && MONITORING_REQUIREMENTS.includes(monitoringRequirement) && monitoringRequirement !== MONITORING_DEFAULT ? { monitoringRequirement } : {}),
       ...(lotOnce ? { lotOnce: true } : {}),  // ロット1回(段取り)工程
       ...(rotaryLink && !lotOnce && executionMode !== 'batch' ? { rotaryLink: true, rotaryRole, rotaryMode } : {}),  // 分割測定アプリ連携(準備/測定開始の指令送信+測定モード)。lotOnce/batchとは併用不可(workId採番が噛み合わない)
       ...(type === 'measurement' && measurementConfig ? { measurementConfig } : {}),
@@ -9198,7 +9198,7 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
     // 未設定の旧工程を編集で開いたときの初期値。共通判定と同じ結論にする(A.1)
     //   = 画面の表示・開始ガード・目標計算と、編集画面の初期値が食い違わない。
     setExecutionMode(s.executionMode || (isAutoStep(s) ? 'batch' : 'manual'));
-    setMonitoringRequirement(MONITORING_REQUIREMENTS.includes(s.monitoringRequirement) ? s.monitoringRequirement : '');
+    setMonitoringRequirement(MONITORING_REQUIREMENTS.includes(s.monitoringRequirement) ? s.monitoringRequirement : monitoringRequirementOf(s));
     setWorkResource(s.workResource || '');
     setAutoEndEnabled(!!s.autoEndEnabled);
     setAutoEndSec(s.autoEndSec || 0);
@@ -9353,15 +9353,11 @@ const TemplateEditor = ({ template, onSave, onCancel, customLayouts = {}, onSave
                           <span>{MONITORING_LABELS[v]}</span>
                         </label>
                       ))}
-                      <label className="flex items-start gap-2 text-[11px] text-slate-500 cursor-pointer">
-                        <input type="radio" name="monitoringRequirement" checked={!MONITORING_REQUIREMENTS.includes(monitoringRequirement)}
-                          onChange={() => setMonitoringRequirement('')} className="mt-0.5 w-3.5 h-3.5 accent-slate-400"/>
-                        <span>まだ決めていない（未設定）</span>
-                      </label>
                     </div>
                     <div className="text-[10px] text-purple-600 leading-relaxed mt-1">
-                      「連続監視」にすると、この工程の自動運転中は<b>別作業を促さず、拘束時間として扱います</b>。
-                      未設定のままだと自動運転中の評価に使えません（勝手に「離れられた」とは判断しません）。
+                      <b>ふつうは触らなくて大丈夫です</b>（既定＝「定期確認」）。このアプリは自動運転中に別作業を開始できる作りなので、
+                      <b>離れてよい前提</b>で計算し、実際に張り付いた時間は作業画面の<b>「監視」</b>で記録された分だけを拘束時間にします。
+                      <br/>変えるのは<b>その機械から絶対に離れられない工程だけ</b>（→「連続監視」。別作業を促さず、自動時間の全部を拘束として扱います）。
                     </div>
                   </div>
                 </div>

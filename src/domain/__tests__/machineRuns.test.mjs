@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyMachineRunTransitions, machineIntervalsOf, machineRunsOf,
-  monitoringRequirementOf, MONITORING_REQUIREMENTS,
+  monitoringRequirementOf, MONITORING_REQUIREMENTS, MONITORING_DEFAULT,
 } from '../machineRuns.js';
 import { mergeIntervals, durationMs } from '../timeIntervals.js';
 import { isAutoStep } from '../workExecution.js';
@@ -73,10 +73,15 @@ test('手動工程は machineRun を作らない', () => {
   assert.equal(machineRunsOf(lot).length, 0);
 });
 
-test('T14 monitoringRequirement: 未設定は unknown。設定値はそのまま run へ焼き込む', () => {
-  assert.equal(monitoringRequirementOf({}), 'unknown', '未設定を none と決めつけない');
+test('T14 monitoringRequirement: 未設定の既定は periodic (人に設定させない)。設定値はそのまま run へ焼き込む', () => {
+  // 答えはアプリの作りに既にある: 自動+手動=許可(離れてよい設計) + 監視は interruptions で実記録。
+  // よって「離れてよい・拘束は監視した実時間だけ」= periodic が現行仕様。unknown を既定にして
+  // 全工程を手で設定させていたのは実装者の誤りだった。
+  assert.equal(monitoringRequirementOf({}), 'periodic', '未設定でもそのまま評価に使える');
+  assert.equal(monitoringRequirementOf({}), MONITORING_DEFAULT);
+  assert.notEqual(monitoringRequirementOf({}), 'none', '監視した実時間は拘束として引く(noneだと無視される)');
   assert.equal(monitoringRequirementOf({ monitoringRequirement: 'continuous' }), 'continuous');
-  assert.equal(monitoringRequirementOf({ monitoringRequirement: 'でたらめ' }), 'unknown');
+  assert.equal(monitoringRequirementOf({ monitoringRequirement: 'でたらめ' }), 'periodic', '不正値も既定へ落とす');
   assert.deepEqual(MONITORING_REQUIREMENTS, ['none', 'periodic', 'continuous']);
 
   const step = { ...AUTO, monitoringRequirement: 'continuous' };
