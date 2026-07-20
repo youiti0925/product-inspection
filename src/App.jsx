@@ -10724,13 +10724,14 @@ const LiveParallelGuide = ({ guide, fmtTime, onHide }) => {
               </div>
               <div className="flex flex-wrap items-center gap-1">
                 {crossLot.map((c, i) => (
-                  <span key={`x${i}`} className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] border ${c.fits ? 'bg-teal-50 border-teal-300' : 'bg-slate-50 border-slate-200'}`}>
+                  <span key={`x${i}`} className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] border ${c.fits === true ? 'bg-teal-50 border-teal-300' : 'bg-slate-50 border-slate-200'}`}>
                     <span className="bg-teal-600 text-white text-[10px] font-black px-1 rounded">{c.orderNo || c.model || '別ロット'}</span>
                     <span className="text-slate-500 text-[10px]">#{c.unitIdx + 1}</span>
                     <span className="font-bold text-slate-800">{c.stepTitle}</span>
                     <span className="text-slate-400 font-mono text-[10px]">{fmtTime(c.targetSec)}</span>
                     {c.sameZone && <span className="text-teal-700 text-[10px] font-bold">同エリア</span>}
-                    {!c.fits && <span className="text-slate-400 text-[10px]">残り時間を超えます</span>}
+                    {c.fits === false && <span className="text-slate-400 text-[10px]">残り時間を超えます</span>}
+                    {c.fits === null && <span className="text-slate-400 text-[10px]">残り時間は不明</span>}
                   </span>
                 ))}
               </div>
@@ -13664,7 +13665,9 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       }
     }
     const isOverrun = runningAuto.targetSec > 0 && runningAuto.elapsedSec > runningAuto.targetSec;
-    const remainSec = runningAuto.targetSec > 0 ? Math.max(0, runningAuto.targetSec - runningAuto.elapsedSec) : 0;
+    // ⚠残り時間が分からない時(目標未設定・予定超過)は null。0 を渡すと「全部収まる」になる不具合があった
+    const remainSec = (runningAuto.targetSec > 0 && runningAuto.elapsedSec < runningAuto.targetSec)
+      ? runningAuto.targetSec - runningAuto.elapsedSec : null;
     // Phase C ②: 同じロットで出せる仕事が無くなった時だけ、他のロットの「次にやる工程」を出す。
     //   実測(2026-07-20)で未活用27.3hが「同ロットに候補なし」だった。ここは本人にはどうにもできない時間だった。
     //   ⚠ここから他ロットの作業を開始はしない(表示だけ)。順番飛ばし・取り合いは crossLotGuide 側で弾く。
@@ -13681,7 +13684,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       crossLot,
       isOverrun,
       overrunSec: isOverrun ? runningAuto.elapsedSec - runningAuto.targetSec : 0,
-      remainingSec: remainSec,
+      remainingSec: remainSec == null ? 0 : remainSec,
     };
   }, [tasks, localSteps, lot.quantity, lot.id, lot.mapZoneId, lots, otherAutoTick]);
 

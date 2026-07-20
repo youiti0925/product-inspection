@@ -29,7 +29,7 @@ const nextStepForUnit = ({ steps, tasks, unitIdx, isAuto, canParallel, keyOf }) 
 };
 
 export const crossLotCandidates = ({
-  lots = [], currentLotId = null, remainingSec = 0,
+  lots = [], currentLotId = null, remainingSec = null,   // null = 残り時間が分からない(予定超過・目標未設定)
   isAuto, keyOf = (stepId, u) => `${stepId}-${u}`,
   autoResource = DEFAULT_AUTO_RESOURCE,
   sameZoneId = null,          // 今いる作業者エリア。同じエリアを上に出す(データが無ければ無視)
@@ -62,7 +62,8 @@ export const crossLotCandidates = ({
         orderNo: lot.orderNo || '', model: lot.model || '', mapZoneId: lot.mapZoneId || null,
         dueDate: lot.dueDate || '', priority: lot.priority || null,
         stepId: nx.step.id, stepTitle: nx.step.title || '', unitIdx: u, targetSec: nx.targetSec,
-        fits: remainingSec > 0 ? nx.targetSec <= remainingSec : true,   // 残り時間に収まるか
+        // ⚠不明を「収まる」と決めつけない(ChatGPT指摘 2026-07-21)。null = 判定できない
+        fits: (remainingSec === null || remainingSec === undefined) ? null : nx.targetSec <= remainingSec,
         sameZone: !!(sameZoneId && lot.mapZoneId === sameZoneId),
       });
       break;   // 1ロットにつき1件だけ (同じロットの台を並べても意味がない)
@@ -71,7 +72,9 @@ export const crossLotCandidates = ({
 
   // 並び: ①残り時間に収まる ②同じエリア ③納期が近い ④短い順
   const dueMs = (d) => { const t = Date.parse(String(d || '').replace(/[年月]/g, '/').replace(/[日（(].*$/, '')); return Number.isFinite(t) ? t : Infinity; };
+  const fitRank = (f) => (f === true ? 2 : f === null || f === undefined ? 1 : 0);   // 収まる → 不明 → 収まらない
   out.sort((a, b) =>
-    (b.fits - a.fits) || (b.sameZone - a.sameZone) || (dueMs(a.dueDate) - dueMs(b.dueDate)) || (a.targetSec - b.targetSec));
+    (fitRank(b.fits) - fitRank(a.fits)) || (b.sameZone - a.sameZone)
+    || (dueMs(a.dueDate) - dueMs(b.dueDate)) || (a.targetSec - b.targetSec));
   return out.slice(0, maxItems);
 };

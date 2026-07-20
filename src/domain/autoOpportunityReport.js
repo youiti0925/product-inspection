@@ -5,7 +5,7 @@
 //   実測 (sessions がある区間) と 推定 (開始〜終了からの再構成) は別々に集計する。
 //   低信頼 (完了押し忘れ疑い) は最初から除外し、除外件数だけ返す。
 import { mergeIntervals } from './timeIntervals.js';
-import { autoOpportunityWindows, summarizeWindows } from './autoOpportunity.js';
+import { autoOpportunityWindows, summarizeWindows, taskWorkIntervals } from './autoOpportunity.js';
 import { taskTimeQualityOf } from './taskTimeQuality.js';
 
 const EMPTY = { 件数: 0, 自動時間ms: 0, 休憩ms: 0, 取れた上限ms: 0, 活用ms: 0, 取り逃がしms: 0, 候補なしms: 0 };
@@ -48,8 +48,7 @@ export const buildAutoOpportunityReport = ({
     Object.entries(tasks).forEach(([k, t]) => {
       const step = byId.get(k.slice(0, k.lastIndexOf('-')));
       if (!step || isAuto(step)) return;
-      const s = t.firstStartTime || t.startTime, e = t.endTime;
-      if (s && e && e > s) manualAll.push({ start: s, end: e });
+      taskWorkIntervals(t).forEach(iv => manualAll.push(iv));   // sessions があればそこから
     });
   });
   const manualMerged = mergeIntervals(manualAll);
@@ -66,7 +65,9 @@ export const buildAutoOpportunityReport = ({
       manualIntervals: manualMerged, breakIntervals: breaksOf(lot),
     }).forEach(w => {
       const first = tasks[keyOf(w.stepId, (w.units || [])[0] ?? 0)] || {};
-      const measured = Array.isArray(first.sessions) && first.sessions.length > 0;
+      // ⚠実測= machineRuns の区間から作られた窓だけ。sessions の有無というラベルで判定しない
+      //   (ChatGPT指摘 2026-07-21: 実測と表示しながら開始〜終了の幅で計算していた)
+      const measured = !!w.measured;
       rows.push({
         ...w, lotId: lot.id || lot.__id || null, qty: lot.quantity || 1,
         model: lot.model || '(型式なし)',

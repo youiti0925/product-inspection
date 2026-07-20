@@ -13,12 +13,16 @@ const done = (s, e, extra = {}) => ({ status: 'completed', firstStartTime: s, en
 
 const lotOf = (id, over = {}) => ({
   id, quantity: 2, model: 'RTT-311', templateId: 'tpl1', workerId: 'w1',
-  steps: [AUTO, MANUAL], tasks: {}, ...over,
+  steps: [MANUAL, AUTO], tasks: {},   // 実際の並び: 手動 → 自動
+  ...over,
 });
 
 test('実測(sessions有)と推定を合算しない。別々のまとまりで返る', () => {
   const est = lotOf('L1', { tasks: { 'a1-0': done(T0, T0 + 20 * M, { workerName: '尾田' }), 'm1-1': { status: 'waiting' } } });
+  // ⚠実測= machineRuns(機械の実稼働)から作られた区間だけ。sessions が付いているだけでは実測にしない
+  //   (ChatGPT指摘 2026-07-21 の是正。以前は「実測」と表示しながら開始〜終了の幅で計算していた)
   const mea = lotOf('L2', {
+    machineRuns: [{ stepId: 'a1', unitIndices: [0], segments: [{ startTime: T0 + 60 * M, endTime: T0 + 80 * M }] }],
     tasks: {
       'a1-0': done(T0 + 60 * M, T0 + 80 * M, { workerName: '片山', sessions: [{ startTime: T0 + 60 * M, endTime: T0 + 80 * M, quality: 'confirmed' }] }),
       'm1-1': { status: 'waiting' },

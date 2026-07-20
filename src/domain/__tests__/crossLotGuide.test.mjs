@@ -77,3 +77,27 @@ test('1ロットにつき1件まで。件数上限を守る', () => {
   assert.equal(r.length, 3);
   assert.equal(new Set(r.map(x => x.lotId)).size, 3, '同じロットを重複して出さない');
 });
+
+// ===== 是正 (ChatGPT指摘 2026-07-21) =====
+
+test('残り時間が分からない時(予定超過・目標未設定)は「収まる」と決めつけない', () => {
+  const short = lot('S', { steps: [PREP] });
+  const r = crossLotCandidates({ lots: [lot('CUR'), short], currentLotId: 'CUR', isAuto, remainingSec: null });
+  assert.equal(r.length, 1);
+  assert.equal(r[0].fits, null, '不明は null。true にしない');
+});
+
+test('残り0秒は「収まらない」。不明(null)と区別する', () => {
+  const short = lot('S', { steps: [PREP] });
+  const r = crossLotCandidates({ lots: [lot('CUR'), short], currentLotId: 'CUR', isAuto, remainingSec: 0 });
+  assert.equal(r[0].fits, false);
+});
+
+test('並びは 収まる → 不明 → 収まらない の順', () => {
+  const a = lot('FIT', { steps: [PREP] });          // 5分
+  const b = lot('BIG', { steps: [VIS] });           // 10分
+  const known = crossLotCandidates({ lots: [lot('CUR'), b, a], currentLotId: 'CUR', isAuto, remainingSec: 420 });
+  assert.deepEqual(known.map(x => x.fits), [true, false]);
+  const unknown = crossLotCandidates({ lots: [lot('CUR'), b, a], currentLotId: 'CUR', isAuto, remainingSec: null });
+  assert.deepEqual(unknown.map(x => x.fits), [null, null]);
+});

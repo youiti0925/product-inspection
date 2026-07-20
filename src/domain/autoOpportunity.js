@@ -33,6 +33,20 @@ export const taskStatusAt = (task, at) => {
   return 'unknown';
 };
 
+// 実際に働いた区間。⚠sessions があればそれが正 (開始〜終了の幅には停止時間が混ざる)。
+//   ChatGPT指摘(2026-07-21)の是正: 「実測」と表示しながら幅で計算していた。
+export const taskWorkIntervals = (task) => {
+  const ss = Array.isArray(task?.sessions) ? task.sessions.filter(x => x && x.startTime && x.endTime && x.endTime > x.startTime) : [];
+  if (ss.length) return ss.map(x => ({ start: x.startTime, end: x.endTime }));
+  const s = task?.firstStartTime || task?.startTime, e = task?.endTime;
+  return (s && e && e > s) ? [{ start: s, end: e }] : [];
+};
+// 打刻された区間だけを実測とする。手入力・畳み込み(quality!=='confirmed')は実測にしない。
+export const taskIsMeasured = (task) => {
+  const ss = Array.isArray(task?.sessions) ? task.sessions.filter(Boolean) : [];
+  return ss.length > 0 && ss.every(x => !x.quality || x.quality === 'confirmed');
+};
+
 // 既定の並行可否。自動工程は不可。測定機を占有する工程は、その自動が測定機を使っているなら不可。
 export const DEFAULT_AUTO_RESOURCE = 'measurement-machine';
 export const isParallelCandidateStep = (step, { isAuto, autoResource = DEFAULT_AUTO_RESOURCE } = {}) => {
@@ -57,29 +71,30 @@ export const candidateWorkAt = ({
   const busy = busyUnits instanceof Set ? busyUnits : new Set(Array.isArray(busyUnits) ? busyUnits : []);
   const items = [];
   let unknownCount = 0;
-  steps.forEach(step => {
-    if (!step || step.id === autoStepId || step.lotOnce) return;
-    if (!isParallelCandidateStep(step, { isAuto, autoResource })) return;
-    const units = Math.max(1, quantity);
-    for (let u = 0; u < units; u++) {
-      if (busy.has(u)) continue;                                    // 機械に乗っている台は触れない
+  const units = Math.max(1, quantity);
+  for (let u = 0; u < units; u++) {
+    if (busy.has(u)) continue;                                      // 機械に乗っている台は触れない
+    for (let si = 0; si < steps.length; si++) {
+      const step = steps[si];
+      if (!step || step.lotOnce) continue;
+      if (isAuto(step)) break;                                      // 自動が来たら打ち切り
+      if (!isParallelCandidateStep(step, { isAuto, autoResource })) break;  // 機械を取り合う工程で打ち切り
       const t = tasks[key(step.id, u)];
-      // タスクの行そのものが無い = 一度も触っていない = 待ち。
-      // ⚠アプリの推奨(globalNextTask)も「タスクが無ければ waiting」として候補に出しているので、ここも揃える。
       const st = t ? taskStatusAt(t, at) : 'waiting';
+      if (st === 'completed' || st === 'processing') continue;      // 済み・進行中は飛ばす(打ち切りではない)
       if (st === 'unknown') { unknownCount++; continue; }
-      if (st !== 'waiting') continue;                                // 進行中・完了は候補でない
       const sec = Number(step.targetTime) > 0 ? Number(step.targetTime) : defaultTargetSec;
       items.push({ stepId: step.id, title: step.title || '', unitIdx: u, ms: sec * 1000 });
     }
-  });
+  }
   return { ms: items.reduce((s, x) => s + x.ms, 0), items, unknownCount };
 };
 
 // 自動区間の一覧 (台数で掛けない = 同じ工程の台は merge して機械の壁時計にする)
-export const autoIntervalsByStep = ({ steps = [], tasks = {}, quantity = 1, isAuto, keyOf = null } = {}) => {
+export const autoIntervalsByStep = ({ steps = [], tasks = {}, quantity = 1, isAuto, keyOf = null, machineRuns = null } = {}) => {
   const key = keyOf || ((stepId, u) => `${stepId}-${u}`);
   const out = [];
+  const runs = Array.isArray(machineRuns) ? machineRuns : [];
   steps.forEach(step => {
     if (!step || typeof isAuto !== 'function' || !isAuto(step)) return;
     const ivs = [];
@@ -88,6 +103,16 @@ export const autoIntervalsByStep = ({ steps = [], tasks = {}, quantity = 1, isAu
       const t = tasks[key(step.id, u)];
       const s = t && (t.firstStartTime || t.startTime), e = t && t.endTime;
       if (s && e && e > s) ivs.push({ start: s, end: e });
+    }
+    // machineRuns があればそれが機械の実稼働。⚠止まっていた時間を稼働に入れない。
+    const myRuns = runs.filter(r => r && r.stepId === step.id && Array.isArray(r.segments));
+    if (myRuns.length) {
+      myRuns.forEach(r => (r.segments || []).forEach(sg => {
+        if (!sg?.startTime || !sg?.endTime || sg.endTime <= sg.startTime) return;
+        out.push({ start: sg.startTime, end: sg.endTime, stepId: step.id, title: step.title || '',
+                   units: Array.isArray(r.unitIndices) ? r.unitIndices : [], measured: true });
+      }));
+      return;
     }
     const units2 = [];
     for (let u = 0; u < units; u++) {
@@ -99,6 +124,7 @@ export const autoIntervalsByStep = ({ steps = [], tasks = {}, quantity = 1, isAu
       ...iv, stepId: step.id, title: step.title || '',
       // この区間に機械へ乗っていた台 (= 触れない台)
       units: units2.filter(x => x.s < iv.end && x.e > iv.start).map(x => x.u),
+      measured: false,
     }));
   });
   return out.sort((a, b) => a.start - b.start);
@@ -118,7 +144,7 @@ export const autoOpportunityWindows = ({
   const key = keyOf || ((stepId, u) => `${stepId}-${u}`);
   if (typeof isAuto !== 'function') return [];
 
-  const autoIvs = autoIntervalsByStep({ steps: st, tasks: tk, quantity: qty, isAuto, keyOf: key });
+  const autoIvs = autoIntervalsByStep({ steps: st, tasks: tk, quantity: qty, isAuto, keyOf: key, machineRuns: lot.machineRuns });
   if (!autoIvs.length) return [];
 
   let manual = manualIntervals;
@@ -128,9 +154,7 @@ export const autoOpportunityWindows = ({
       if (!step || isAuto(step)) return;
       const units = step.lotOnce ? 1 : Math.max(1, qty);
       for (let u = 0; u < units; u++) {
-        const t = tk[key(step.id, u)];
-        const s = t && (t.firstStartTime || t.startTime), e = t && t.endTime;
-        if (s && e && e > s) ivs.push({ start: s, end: e });
+        taskWorkIntervals(tk[key(step.id, u)]).forEach(iv => ivs.push(iv));
       }
     });
     manual = ivs;
@@ -152,7 +176,7 @@ export const autoOpportunityWindows = ({
     const missedMs = Math.max(0, capMs - usedMs);                 // ① 取り逃がし
     const noCandMs = Math.max(0, windowMs - capMs);               // ② 候補が無い = 別ロットが要る
     return {
-      start: iv.start, end: iv.end, stepId: iv.stepId, title: iv.title, units: iv.units || [],
+      start: iv.start, end: iv.end, stepId: iv.stepId, title: iv.title, units: iv.units || [], measured: !!iv.measured,
       windowMs, breakMs, candidateMs: cand.ms, capMs, usedMs, missedMs, noCandMs,
       candidates: cand.items, unknownCount: cand.unknownCount,
       // 率を出すなら分母は必ず capMs。windowMs で割らない(=「自動中ずっと働け」になる)
