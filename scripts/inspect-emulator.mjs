@@ -47,7 +47,7 @@ const runs = Array.isArray(lot.machineRuns) ? lot.machineRuns : [];
 console.log(`\n--- machineRuns: ${runs.length}件 ---`);
 runs.forEach(r => {
   const wall = (r.segments || []).reduce((s, sg) => s + Math.max(0, (sg.endTime || 0) - sg.startTime), 0);
-  console.log(`  ${r.stepTitle} 台=[${(r.unitIndices || []).join(',')}] segments=${(r.segments || []).length} 壁時計=${mins(wall)}分 監視=${r.monitoringRequirement} closeReason=${r.closeReason}`);
+  console.log(`  ${r.stepTitle} 台=[${(r.unitIndices || []).join(',')}] segments=${(r.segments || []).length} 壁時計=${mins(wall)}分 closeReason=${r.closeReason}`);
   (r.segments || []).forEach((sg, i) => console.log(`      seg${i + 1} ${hhmm(sg.startTime)}〜${hhmm(sg.endTime)}`));
 });
 process.exit(0);

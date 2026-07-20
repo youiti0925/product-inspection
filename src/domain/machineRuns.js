@@ -10,23 +10,12 @@
 // segments: 停止を挟んだら区間を分ける。和集合は timeIntervals.js 側で取る。
 // closeReason: 'manual'(手で完了) / 'auto-end'(自動終了) / 'batch'(まとめて完了) / 'reset'(やり直し)
 
-export const MONITORING_REQUIREMENTS = ['none', 'periodic', 'continuous'];
-export const MONITORING_LABELS = {
-  none: '離れてよい（自動開始後は別作業可）',
-  periodic: '定期確認（確認した実時間だけ拘束）',
-  continuous: '連続監視（自動中ずっと離れられない）',
-};
-// 未設定の既定は 'periodic'。⚠人に設定させる必要はない。答えはアプリの作りに既にある:
-//   ① canStartTask が「自動+手動=許可」と決めている = 自動運転中は離れて別作業してよい設計
-//   ② 張り付いた時間は interruptions(type='monitoring') で実際に記録される仕組みが既にある
-//   よって「既定は離れてよい・拘束は監視した実時間だけ」= periodic が現行仕様そのもの。
-//   'unknown' を既定にしていたのは実装者の誤り(全工程を手で設定させる宿題を作っていた)。
-//   明示設定が要るのは「本当に離れられない工程(continuous)」など例外だけ。
-export const MONITORING_DEFAULT = 'periodic';
-export const monitoringRequirementOf = (step) => {
-  const v = step?.monitoringRequirement;
-  return MONITORING_REQUIREMENTS.includes(v) ? v : MONITORING_DEFAULT;
-};
+// ⚠ monitoringRequirement(「機械が動いている間、人は離れられますか？」)は撤去した。
+//   仕様書 4.4 にあったので実装したが、答えはこのアプリの作りに既にあり、人に設定させる意味がなかった:
+//     ① canStartTask が「自動+手動=許可」と決めている = 自動運転中は離れて別作業してよい設計
+//     ② 張り付いた時間は interruptions(type='monitoring') で実際に記録される仕組みが既にある
+//   よって Phase C は「マスタの申告値」ではなく「実際に監視・中断が記録された時間」だけを差し引く。
+//   ⚠既に保存済みの古い step.monitoringRequirement は消さない。読まない(無視する)だけ。
 
 export const machineRunsOf = (lot) => (Array.isArray(lot?.machineRuns) ? lot.machineRuns : []);
 
@@ -122,7 +111,6 @@ export const applyMachineRunTransitions = ({
       stepTitle: step.title || '',
       unitIndices: [...units].sort((a, b) => a - b),
       resourceId: step.workResource || null,
-      monitoringRequirement: monitoringRequirementOf(step),
       workerId,
       segments: [{ startTime: now, endTime: null }],
       closeReason: null,

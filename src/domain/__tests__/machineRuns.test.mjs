@@ -3,8 +3,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyMachineRunTransitions, machineIntervalsOf, machineRunsOf,
-  monitoringRequirementOf, MONITORING_REQUIREMENTS, MONITORING_DEFAULT,
 } from '../machineRuns.js';
+import * as machineRunsModule from '../machineRuns.js';
 import { mergeIntervals, durationMs } from '../timeIntervals.js';
 import { isAutoStep } from '../workExecution.js';
 
@@ -73,26 +73,39 @@ test('手動工程は machineRun を作らない', () => {
   assert.equal(machineRunsOf(lot).length, 0);
 });
 
-test('T14 monitoringRequirement: 未設定の既定は periodic (人に設定させない)。設定値はそのまま run へ焼き込む', () => {
-  // 答えはアプリの作りに既にある: 自動+手動=許可(離れてよい設計) + 監視は interruptions で実記録。
-  // よって「離れてよい・拘束は監視した実時間だけ」= periodic が現行仕様。unknown を既定にして
-  // 全工程を手で設定させていたのは実装者の誤りだった。
-  assert.equal(monitoringRequirementOf({}), 'periodic', '未設定でもそのまま評価に使える');
-  assert.equal(monitoringRequirementOf({}), MONITORING_DEFAULT);
-  assert.notEqual(monitoringRequirementOf({}), 'none', '監視した実時間は拘束として引く(noneだと無視される)');
-  assert.equal(monitoringRequirementOf({ monitoringRequirement: 'continuous' }), 'continuous');
-  assert.equal(monitoringRequirementOf({ monitoringRequirement: 'でたらめ' }), 'periodic', '不正値も既定へ落とす');
-  assert.deepEqual(MONITORING_REQUIREMENTS, ['none', 'periodic', 'continuous']);
+test('T14(撤去) monitoringRequirement は書かない。API も残さない', () => {
+  // 「人は離れられますか？」設定は撤去した。答えはアプリの作りに既にあり、人に設定させる意味がなかった:
+  //   自動+手動=許可(離れてよい設計) + 張り付いた時間は interruptions(type='monitoring') で実記録。
+  ['MONITORING_REQUIREMENTS', 'MONITORING_LABELS', 'MONITORING_DEFAULT', 'monitoringRequirementOf']
+    .forEach(k => assert.equal(machineRunsModule[k], undefined, `${k} は撤去済みであること`));
 
-  const step = { ...AUTO, monitoringRequirement: 'continuous' };
-  const steps2 = [step];
-  const rk = (key) => ({ step, unitIdx: Number(key.split('-').pop()) });
   const runs = applyMachineRunTransitions({
     lot: {}, prev: { 'st-auto-0': { status: 'waiting', startTime: null } },
+    next: { 'st-auto-0': proc(T0) }, now: T0, resolveKey, isAuto,
+  });
+  assert.equal(runs.length, 1);
+  assert.ok(!('monitoringRequirement' in runs[0]), '新しい run に監視区分を焼き込まない');
+});
+
+test('古いデータに monitoringRequirement が残っていてもエラーにならず、無視される', () => {
+  // 既存 Firestore の step / machineRun に残った旧フィールドは削除も移行もしない。読まないだけ。
+  const step = { ...AUTO, monitoringRequirement: 'continuous' };
+  const rk = (key) => ({ step, unitIdx: Number(key.split('-').pop()) });
+  const oldLot = {
+    machineRuns: [{
+      id: 'old1', stepId: 'st-auto', stepTitle: '回転自動測定開始', unitIndices: [0],
+      monitoringRequirement: 'continuous',            // ← 旧フィールド
+      segments: [{ startTime: T0 - 30 * M, endTime: T0 - 20 * M }], closeReason: 'manual',
+    }],
+  };
+  const runs = applyMachineRunTransitions({
+    lot: oldLot, prev: { 'st-auto-0': { status: 'waiting', startTime: null } },
     next: { 'st-auto-0': proc(T0) }, now: T0, resolveKey: rk, isAuto,
   });
-  assert.equal(runs[0].monitoringRequirement, 'continuous');
-  assert.ok(steps2.length === 1);
+  assert.equal(runs.length, 2, '旧runは残したまま新runを足す');
+  assert.equal(runs[0].monitoringRequirement, 'continuous', '旧データは書き換えない(一括削除しない)');
+  assert.ok(!('monitoringRequirement' in runs[1]), '新しい run には付けない');
+  assert.equal(min(durationMs(machineIntervalsOf({ ...oldLot, machineRuns: runs }, { now: T0 + 5 * M }))), 15);
 });
 
 test('進行中の運転は now を渡した時だけ区間になる(開きっぱなしを0分にも無限にもしない)', () => {

@@ -37,7 +37,7 @@ const base = (col, id) => doc(db, 'artifacts', NS, 'public', 'data', col, id);
 const STEPS = [
   { id: 'st-prep',  title: '準備',            type: 'normal', targetTime: 120, executionMode: 'manual' },
   { id: 'st-auto',  title: '回転自動測定開始', type: 'normal', targetTime: 600, executionMode: 'batch',
-    workResource: 'measurement-machine', monitoringRequirement: 'periodic' },
+    workResource: 'measurement-machine' },
   { id: 'st-visual', title: '外観検査',        type: 'normal', targetTime: 180, executionMode: 'manual' },
 ];
 
