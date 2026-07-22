@@ -5094,6 +5094,26 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
   const [showAsk, setShowAsk] = useState(false);
   const [showSend, setShowSend] = useState(false);
   const [showCfg, setShowCfg] = useState(false);
+  // 宛先・公開設定のタイル(排他アコーディオン)。開いたタイルを枠の一番上へ寄せて中身が下に隠れないようにする。
+  //   toggle はバブリングしないので capture で拾う(最終検査と同じ直し 2026-07-23)。
+  const cfgBoxRef = useRef(null);
+  useEffect(() => {
+    const box = cfgBoxRef.current;
+    if (!showCfg || !box) return;
+    const onTog = (e) => {
+      const d = e.target;
+      if (!d || d.tagName !== 'DETAILS' || !d.open) return;
+      requestAnimationFrame(() => {
+        try {
+          const br = box.getBoundingClientRect();
+          const dr = d.getBoundingClientRect();
+          box.scrollBy({ top: dr.top - br.top, behavior: 'smooth' });
+        } catch (_) {}
+      });
+    };
+    box.addEventListener('toggle', onTog, true);
+    return () => box.removeEventListener('toggle', onTog, true);
+  }, [showCfg]);
   const [newGroup, setNewGroup] = useState('');
   const [copied, setCopied] = useState(false);
   const groups = contactGroupsOf(settings);
@@ -5228,20 +5248,20 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
       {/* 「アプリとして入れる」= 通知に気づかせる唯一の打ち手。連絡タブを開いた瞬間に見える所に置く。
           ⚠設定やヘルプの奥に置くと辿り着けない(実際「ヘルプがどこか分からない」「インストールなんて無い」と言われた)。
           入れ終わった端末では InstallAppButton 側が「✅入っています」に変わるだけなので邪魔にならない。 */}
-      <div className="shrink-0 bg-white rounded-xl border-2 border-emerald-300 px-3 py-2.5 flex flex-col gap-1.5">
+      <div className={`shrink-0 bg-white rounded-xl border-2 border-emerald-300 px-3 py-2.5 flex flex-col gap-1.5 ${showCfg ? 'hidden' : ''}`}>
         <div className="text-sm font-black text-emerald-800">⬇️ このアプリを端末に入れる（通知に気づかない人は必ず）</div>
         <div className="text-[11px] text-slate-500">入れると端末の設定に「このアプリ」の項目が現れ、<b>通知の重要度を「緊急」</b>に上げられます。ブラウザのタブのままだとその設定が存在せず、通知は埋もれたままです。<b>入れた後に重要度を上げるまでが1セット</b>（やり方は右上の「ヘルプ」→<b>⬇️アプリとして入れる</b>）。</div>
         <InstallAppButton compact />
       </div>
       {showCfg && (
-        <div className="shrink-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-2 max-h-[62vh] overflow-y-auto overscroll-contain">
+        <div ref={cfgBoxRef} className="flex-1 min-h-0 bg-white rounded-xl border border-slate-200 p-3 flex flex-col gap-2 overflow-y-auto overscroll-contain">
           <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-500 flex items-center gap-2">
             <span className="text-lg">👆</span>
             <span>下のカードを<b className="text-slate-700">1枚タップ</b>すると、その中だけ開きます（ほかは自動で閉じます）。ふだんは閉じたままでOK。</span>
           </div>
           {/* 検査完了→次工程(組立)への完了連絡 のON/OFFと宛先 */}
           {(() => { const cc = contactCompleteOf(settings); const mg = Object.entries(cc.modelGroups).filter(([, g]) => g); return (
-            <details name="cfgacc" className="group bg-emerald-50/50 border-2 border-emerald-200 rounded-2xl overflow-hidden">
+            <details name="cfgacc" className="shrink-0 group bg-emerald-50/50 border-2 border-emerald-200 rounded-2xl overflow-hidden">
               <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-emerald-50">
                 <span className="text-2xl shrink-0">✅</span>
                 <div className="flex-1 min-w-0">
@@ -5291,7 +5311,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
           ); })()}
           {/* 到着予定 → 入荷時間への自動反映 */}
           {(() => { const ca = contactArrivalOf(settings); return (
-            <details name="cfgacc" className="group bg-teal-50/50 border-2 border-teal-200 rounded-2xl overflow-hidden">
+            <details name="cfgacc" className="shrink-0 group bg-teal-50/50 border-2 border-teal-200 rounded-2xl overflow-hidden">
               <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-teal-50">
                 <span className="text-2xl shrink-0">🚚</span>
                 <div className="flex-1 min-w-0">
@@ -5314,7 +5334,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             const patch = (p) => saveSettings({ contactArrival: { ...(settings?.contactArrival || {}), ...p } });
             const DOW = [['日', 0], ['月', 1], ['火', 2], ['水', 3], ['木', 4], ['金', 5], ['土', 6]];
             return (
-              <details name="cfgacc" className="group bg-teal-50/40 border-2 border-teal-200 rounded-2xl overflow-hidden">
+              <details name="cfgacc" className="shrink-0 group bg-teal-50/40 border-2 border-teal-200 rounded-2xl overflow-hidden">
                 <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-teal-50">
                   <span className="text-2xl shrink-0">⏰</span>
                   <div className="flex-1 min-w-0">
@@ -5402,7 +5422,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
               </details>
             );
             return (
-              <details name="cfgacc" className="group bg-sky-50/40 border-2 border-sky-200 rounded-2xl overflow-hidden">
+              <details name="cfgacc" className="shrink-0 group bg-sky-50/40 border-2 border-sky-200 rounded-2xl overflow-hidden">
                 <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-sky-50">
                   <span className="text-2xl shrink-0">🔔</span>
                   <div className="flex-1 min-w-0">
@@ -5544,7 +5564,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             const others = prefixes.filter(x => pgroup[x] === 'other' && x !== PORTAL_NO_PREFIX);
             const move = (pre, gid) => (saveShared || saveSettings)({ portalModelPrefixMap: portalModelPrefixMapWith(settings, pre, gid) });
             return (
-              <details name="cfgacc" className="group bg-violet-50/50 border-2 border-violet-200 rounded-2xl overflow-hidden">
+              <details name="cfgacc" className="shrink-0 group bg-violet-50/50 border-2 border-violet-200 rounded-2xl overflow-hidden">
                 <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-violet-50">
                   <span className="text-2xl shrink-0">🔎</span>
                   <div className="flex-1 min-w-0">
@@ -5581,7 +5601,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             );
           })()}
           {/* ① グループとメンバー */}
-          <details name="cfgacc" className="group bg-blue-50/40 border-2 border-blue-200 rounded-2xl overflow-hidden">
+          <details name="cfgacc" className="shrink-0 group bg-blue-50/40 border-2 border-blue-200 rounded-2xl overflow-hidden">
             <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-blue-50">
               <span className="text-2xl shrink-0">👥</span>
               <div className="flex-1 min-w-0">
@@ -5627,7 +5647,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             </div>
           </details>
           {/* ② 通知の宛先ルールと再通知 */}
-          <details name="cfgacc" className="group bg-amber-50/40 border-2 border-amber-200 rounded-2xl overflow-hidden">
+          <details name="cfgacc" className="shrink-0 group bg-amber-50/40 border-2 border-amber-200 rounded-2xl overflow-hidden">
             <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-amber-50">
               <span className="text-2xl shrink-0">📨</span>
               <div className="flex-1 min-w-0">
@@ -5692,7 +5712,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             </div>
           </details>
           {/* ③ ポータル公開とURL */}
-          <details name="cfgacc" className="group bg-emerald-50/40 border-2 border-emerald-200 rounded-2xl overflow-hidden">
+          <details name="cfgacc" className="shrink-0 group bg-emerald-50/40 border-2 border-emerald-200 rounded-2xl overflow-hidden">
             <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-emerald-50">
               <span className="text-2xl shrink-0">🌐</span>
               <div className="flex-1 min-w-0">
@@ -5723,7 +5743,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
             </div>
           </details>
           {/* ④ プッシュ通知(VAPID/端末) */}
-          <details name="cfgacc" className="group bg-slate-50 border-2 border-slate-200 rounded-2xl overflow-hidden">
+          <details name="cfgacc" className="shrink-0 group bg-slate-50 border-2 border-slate-200 rounded-2xl overflow-hidden">
             <summary className="cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden flex items-center gap-3 px-3.5 py-3 hover:bg-slate-100">
               <span className="text-2xl shrink-0">📳</span>
               <div className="flex-1 min-w-0">
@@ -5756,7 +5776,7 @@ const ContactView = ({ contactRequests, arrivalTimes, lots, settings, saveSettin
           ))}
         </div>
       )}
-      <div className="flex-1 min-h-0 overflow-y-auto bg-white rounded-xl border border-slate-200">
+      <div className={`flex-1 min-h-0 overflow-y-auto bg-white rounded-xl border border-slate-200 ${showCfg ? 'hidden' : ''}`}>
         <table className="w-full text-sm">
           <thead className="sticky top-0 bg-slate-50 text-[11px] text-slate-500 z-10">
             <tr className="border-b border-slate-200">
