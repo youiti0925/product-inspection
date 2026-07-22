@@ -12975,7 +12975,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
           <div className="flex items-center justify-between px-3 py-1.5 bg-slate-800">
             <span className="text-[11px] font-black flex items-center gap-1.5">
               <span className={`w-2 h-2 rounded-full ${gestureState.phase === 'ready' ? 'bg-emerald-400 animate-pulse' : gestureState.phase === 'error' ? 'bg-red-500' : 'bg-amber-400 animate-pulse'}`} />
-              ✋ サイン操作(試験)
+              ✋ サイン操作
             </span>
             <span className="flex items-center gap-1">
               <button onClick={() => setShowGestureCfg(true)} className="text-[11px] font-bold bg-slate-600 hover:bg-slate-500 rounded px-1.5 py-0.5" title="サイン・キープ時間などの設定">⚙</button>
@@ -15584,7 +15584,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
                    {voiceEnabled ? <Mic className="w-5 h-5"/> : <MicOff className="w-5 h-5"/>}
                  </button>
                  {/* ✋ サイン操作(カメラ・試験): ONで左下に小窓。長押し的にサインをキープすると発火。⚙は設定 */}
-                 <button onClick={startGesture} className={`p-2 rounded-full transition-all text-sm font-black ${gestureOn ? 'bg-emerald-500 text-white animate-pulse ring-2 ring-emerald-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={gestureOn ? 'サイン操作OFF' : 'サイン操作ON(カメラ・試験)。映像は端末内判定のみで保存しません'}>✋</button>
+                 <button onClick={startGesture} className={`p-2 rounded-full transition-all text-sm font-black ${gestureOn ? 'bg-emerald-500 text-white animate-pulse ring-2 ring-emerald-300' : 'bg-white/10 text-white/60 hover:bg-white/20'}`} title={gestureOn ? 'サイン操作OFF' : 'サイン操作ON(カメラ)。映像は端末内判定のみで保存しません'}>✋</button>
                  <button onClick={() => setShowGestureCfg(true)} className="p-1.5 rounded-full bg-white/10 text-white/50 hover:bg-white/20 text-xs" title="サイン操作の設定(サイン割り当て・キープ時間・感度・ヘルプ)">⚙</button>
                  {gestureWidget}
                  {onSetExecFontScale && (
