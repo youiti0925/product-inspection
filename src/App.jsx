@@ -11127,22 +11127,58 @@ const GESTURE_ACTION_SHORT = Object.fromEntries(GESTURE_ACTIONS.map(a => [a.key,
 const GESTURE_DEFAULT_CFG = {
     holdMs: 1800, cooldownMs: 4000, minScore: 0.55, res: 640, beep: true,
     flash: true, flashMs: 1600, flashSize: 'huge', // 発火時の全画面表示(離れていても見える)
+    blink: true, blinkMs: 500,                     // 白と黒を交互に(離れていても視界の端で気づく) ※最終検査と同型
+    confirm: true, confirmSec: 5,                  // 実行の前に「何秒後に何をするか」を出して待つ
+    cancelSign: 'Closed_Fist', cancelHoldMs: 700,  // その待ち時間に見せると中止できるサイン
     // 既定=✋で全台まとめて / 👍で1台ずつ。現場はサインの出し分けで切り替えられる(設定で自由に変更可)。
     map: { Open_Palm: 'complete_next', Thumb_Up: 'complete_next_one', Victory: 'none', Closed_Fist: 'none', Pointing_Up: 'none', Thumb_Down: 'none', ILoveYou: 'none' },
 };
-// 発火した瞬間だけ画面いっぱいに「認識OK＋次にやること」を出す。1.5m離れていても読めるよう vw 単位の特大文字。
-//   操作は一切奪わない(pointer-events-none)。表示時間・文字サイズ・ON/OFFは設定で変えられる。
-const GestureFlashOverlay = ({ flash }) => {
-    if (!flash) return null;
-    const warn = flash.tone === 'warn';
-    const huge = flash.size !== 'big';
+// 画面いっぱいの大きな表示(最終検査と同型)。1.5m離れていても読めるよう vw/vh の特大文字。
+//   kind='flash'   … 実行した直後の結果(すぐ消える・操作は奪わない)
+//   kind='confirm' … 実行の前の待ち時間。「あと何秒で何をするか」と「やめ方」を出す。画面タップでも中止できる。
+//   点滅(blink)は白⇄黒の反転。いちばん遠くから気づきやすいが、苦手な人のために設定でOFFにできる。
+//   ⚠点滅の速さは 400ms(毎秒2.5回)より速くしない — 速い明滅は体調を崩す人がいる。
+const GestureBigOverlay = ({ data, onCancel }) => {
+    const [inv, setInv] = useState(false);
+    const blink = !!(data && data.blink);
+    const bms = Math.max(400, Number(data && data.blinkMs) || 500);
+    const sig = data ? `${data.kind}|${data.main}|${data.id || ''}` : '';
+    useEffect(() => {
+        setInv(false);
+        if (!blink || !sig) return;
+        const id = setInterval(() => setInv(v => !v), bms);
+        return () => clearInterval(id);
+    }, [sig, blink, bms]);
+    if (!data) return null;
+    const warn = data.tone === 'warn';
+    const huge = data.size !== 'big';
+    const confirm = data.kind === 'confirm';
+    // ⚠横幅(vw)だけで決めると横長画面で縦にはみ出して「やめ方」の行が画面外に落ちる。高さ(vh)との小さい方を採る。
+    const fs = (vw, vh) => `min(${vw}vw, ${vh}vh)`;
+    const bg = blink ? (inv ? (warn ? '#facc15' : '#ffffff') : '#000000') : (warn ? 'rgba(180,83,9,0.95)' : 'rgba(4,120,87,0.95)');
+    const fg = blink ? (inv ? '#000000' : '#ffffff') : '#ffffff';
     return (
-        <div className="fixed inset-0 z-[90] flex flex-col items-center justify-center pointer-events-none px-6 text-center"
-             style={{ background: warn ? 'rgba(180,83,9,0.93)' : 'rgba(4,120,87,0.93)' }}>
-            <div style={{ fontSize: huge ? '13vw' : '9vw', lineHeight: 1 }} className="font-black text-white">{flash.icon || '✅'}</div>
-            <div style={{ fontSize: huge ? '3.2vw' : '2.4vw' }} className="font-black text-white/80 tracking-widest mt-2">{warn ? '認識しましたが…' : '認識OK'}</div>
-            <div style={{ fontSize: huge ? '6.5vw' : '4.5vw', lineHeight: 1.15 }} className="font-black text-white mt-3 max-w-[92vw] break-words">{flash.main}</div>
-            {flash.sub && <div style={{ fontSize: huge ? '3.4vw' : '2.6vw' }} className="font-bold text-white/85 mt-3 max-w-[90vw] break-words">{flash.sub}</div>}
+        <div
+            className={`fixed inset-0 z-[90] flex flex-col items-center justify-center px-6 text-center ${confirm ? 'cursor-pointer' : 'pointer-events-none'}`}
+            style={{ background: bg, color: fg }}
+            onClick={confirm && onCancel ? onCancel : undefined}
+        >
+            <div style={{ fontSize: huge ? fs(11, 13) : fs(8, 10), lineHeight: 1 }} className="font-black">{data.icon || '✅'}</div>
+            <div style={{ fontSize: huge ? fs(3.2, 3.6) : fs(2.4, 3) }} className="font-black tracking-widest mt-1 opacity-80">
+                {confirm ? '認識しました' : (warn ? '認識しましたが…' : '認識OK')}
+            </div>
+            {confirm && (
+                <div style={{ fontSize: huge ? fs(16, 20) : fs(12, 16), lineHeight: 1 }} className="font-black tabular-nums mt-1">
+                    あと {Math.max(0, Number(data.remain) || 0)}
+                </div>
+            )}
+            <div style={{ fontSize: huge ? fs(6, 8) : fs(4.5, 6), lineHeight: 1.15 }} className="font-black mt-3 max-w-[92vw] break-words">{data.main}</div>
+            {data.sub && <div style={{ fontSize: huge ? fs(3.2, 4) : fs(2.6, 3.4) }} className="font-bold mt-3 max-w-[90vw] break-words opacity-90">{data.sub}</div>}
+            {confirm && (
+                <div style={{ fontSize: huge ? fs(3, 3.6) : fs(2.4, 3), borderColor: fg }} className="font-black mt-5 px-6 py-2 rounded-2xl border-4 max-w-[92vw] break-words">
+                    {data.cancelText}
+                </div>
+            )}
         </div>
     );
 };
@@ -11235,6 +11271,52 @@ const GestureConfigModal = ({ cfg, unitWord = '工程', onSave, onClose }) => {
                                         <option value="big">大(近くで見る)</option>
                                     </select>
                                 </label>
+                            </div>
+                        )}
+                        <label className="flex items-center gap-2 cursor-pointer mt-3 pt-3 border-t border-emerald-200">
+                            <input type="checkbox" checked={!!d.blink} onChange={e => set({ blink: e.target.checked })} className="w-4 h-4" />
+                            <span className="font-black text-emerald-800">⬛⬜ 白と黒で点滅させる（いちばん遠くから気づく）</span>
+                        </label>
+                        <div className="text-[10px] text-slate-500 mt-1">画面全体が白と黒に反転しながら点滅します。<b>離れていても視界のすみで気づけます</b>。まぶしい・苦手な人はOFFにしてください。</div>
+                        {d.blink && (
+                            <label className="block mt-2">
+                                <div className="font-bold text-slate-700 text-xs mb-1">点滅の速さ: <b className="text-emerald-700">{(d.blinkMs / 1000).toFixed(1)}秒ごと</b></div>
+                                <input type="range" min="400" max="1500" step="50" value={d.blinkMs} onChange={e => set({ blinkMs: Number(e.target.value) })} className="w-full" />
+                                <div className="text-[10px] text-slate-400">速いほど目立ちます。体調への配慮から、これより速くはできません。</div>
+                            </label>
+                        )}
+                    </div>
+                    <div className="border-2 border-amber-300 bg-amber-50/70 rounded-lg p-3">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" checked={!!d.confirm} onChange={e => set({ confirm: e.target.checked })} className="w-4 h-4" />
+                            <span className="font-black text-amber-900">⏳ すぐ実行せず「何秒後に何をするか」を出して待つ</span>
+                        </label>
+                        <div className="text-[10px] text-slate-600 mt-1">
+                            サインが通ると<b>すぐには実行せず</b>、画面いっぱいに「あと5 — ○○を全4台まとめて開始します」と出して待ちます。
+                            違っていたら、その間に<b>やめるサイン</b>を見せるか画面をタップすれば中止できます。離れた場所から使うときの誤操作よけです。
+                        </div>
+                        {d.confirm && (
+                            <div className="grid grid-cols-2 gap-3 mt-2">
+                                <label className="block">
+                                    <div className="font-bold text-slate-700 text-xs mb-1">待つ時間: <b className="text-amber-700">{d.confirmSec}秒</b></div>
+                                    <input type="range" min="2" max="20" step="1" value={d.confirmSec} onChange={e => set({ confirmSec: Number(e.target.value) })} className="w-full" />
+                                    <div className="flex gap-1 mt-1">{[3, 5, 8, 10].map(s => <button key={s} onClick={() => set({ confirmSec: s })} className={`px-2 py-0.5 rounded text-[10px] font-bold border ${d.confirmSec === s ? 'bg-amber-600 text-white border-amber-700' : 'bg-white text-slate-500 border-slate-200'}`}>{s}秒</button>)}</div>
+                                </label>
+                                <div className="space-y-2">
+                                    <label className="block">
+                                        <div className="font-bold text-slate-700 text-xs mb-1">やめるサイン</div>
+                                        <select value={d.cancelSign} onChange={e => set({ cancelSign: e.target.value })} className="w-full border border-slate-200 rounded p-1.5 text-xs font-bold">
+                                            {GESTURE_DEFS.map(g => <option key={g.key} value={g.key}>{g.emoji} {g.label}</option>)}
+                                        </select>
+                                        {(d.map[d.cancelSign] || 'none') !== 'none' && (
+                                            <div className="text-[10px] text-rose-600 font-bold mt-0.5">⚠ このサインは「{GESTURE_ACTION_SHORT[d.map[d.cancelSign]]}」にも使っています。別のサインにしてください。</div>
+                                        )}
+                                    </label>
+                                    <label className="block">
+                                        <div className="font-bold text-slate-700 text-xs mb-1">やめるサインのキープ: <b className="text-amber-700">{((d.cancelHoldMs || 700) / 1000).toFixed(1)}秒</b></div>
+                                        <input type="range" min="300" max="2000" step="100" value={d.cancelHoldMs || 700} onChange={e => set({ cancelHoldMs: Number(e.target.value) })} className="w-full" />
+                                    </label>
+                                </div>
                             </div>
                         )}
                     </div>
@@ -12585,7 +12667,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
   const showGestureFlash = (icon, main, sub = '', tone = 'ok') => {
     const cfg = gcfgRef.current;
     if (!cfg.flash) return;
-    setGestureFlash({ icon, main, sub, tone, size: cfg.flashSize });
+    setGestureFlash({ kind: 'flash', id: Date.now(), icon, main, sub, tone, size: cfg.flashSize, blink: !!cfg.blink, blinkMs: cfg.blinkMs });
     if (gestureFlashTimer.current) clearTimeout(gestureFlashTimer.current);
     gestureFlashTimer.current = setTimeout(() => setGestureFlash(null), Math.max(400, cfg.flashMs));
   };
@@ -12603,7 +12685,8 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
     } catch (e) { /* 音が出せない端末でも続行 */ }
   };
   // サイン発火の実処理。mode: complete_next | complete_only | start_next
-  const gestureFire = (mode) => {
+  // dryRun=true のときは書き込まず「何が完了して何が始まるか」だけ返す(確認カウントダウンの文面に使う)。
+  const gestureFire = (mode, dryRun = false) => {
     const base = tasksRef.current; const now = Date.now();
     const nt = { ...base };
     const doneTitles = []; let doneN = 0; const doneSIdxs = [];
@@ -12688,6 +12771,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       }
     }
     if (!doneN && !startedLabel) {
+      if (dryRun) return { nothing: true, doneN: 0, doneTitles: [], startedLabel: null, strictNote };
       const why = strictNote
         ? '次の工程は画面をタップで開始してください'
         : (oneUnit ? '計測中の工程も、未着手の台もありません' : '計測中の工程も、まるごと未着手の工程もありません（途中まで進んだ工程は「1台だけ」のサインで続けられます）');
@@ -12695,6 +12779,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       showGestureFlash('⚠', strictNote ? '厳密モード中です' : '対象がありません', why, 'warn');
       return;
     }
+    if (dryRun) return { nothing: false, doneN, doneTitles, startedLabel, startedBatchSIdx, strictNote };
     setTasks(nt);
     setBatchStartTimes(prev => {
       const c = { ...prev };
@@ -12712,9 +12797,63 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       doneN ? `完了: ${doneTitles.join('・') || `${doneN}件`}${strictNote ? ` ／ ${strictNote}` : ''}` : (strictNote || '次の工程は画面をタップで開始'),
     );
   };
+  // RAFループ(長寿命クロージャ)から実行しても常に最新renderの関数を使う
+  const gestureFireRef = useRef(gestureFire);
+  gestureFireRef.current = gestureFire;
+
+  // ⏳ 実行の前に「あと何秒で何をするか」を画面いっぱいに出して待つ(離れた場所からの誤操作よけ・最終検査と同型)。
+  //   待っている間に「やめるサイン」か画面タップで中止できる。中止しても記録は一切変わらない。
+  const [gesturePending, setGesturePending] = useState(null);
+  const gesturePendingRef = useRef(null);
+  gesturePendingRef.current = gesturePending;
+  const cancelGesturePending = () => {
+    if (!gesturePendingRef.current) return;
+    setGesturePending(null);
+    gesturePendingRef.current = null;
+    showGestureToast('✋ やめました（記録は変わっていません）');
+    showGestureFlash('✋', 'やめました', '記録は変わっていません', 'warn');
+  };
+  const cancelGesturePendingRef = useRef(cancelGesturePending);
+  cancelGesturePendingRef.current = cancelGesturePending;
+  useEffect(() => {
+    if (!gesturePending) return;
+    const id = setInterval(() => {
+      const p = gesturePendingRef.current;
+      if (!p) return;
+      if (Date.now() >= p.endsAt) {
+        setGesturePending(null);
+        gesturePendingRef.current = null;
+        gestureFireRef.current(p.action); // 実行の瞬間に最新状態で計画し直す
+        return;
+      }
+      const remain = Math.max(1, Math.ceil((p.endsAt - Date.now()) / 1000));
+      if (remain !== p.remain) setGesturePending({ ...p, remain });
+    }, 200);
+    return () => clearInterval(id);
+  }, [gesturePending && gesturePending.id]);
+
   const gestureDo = (action) => {
     if (!action || action === 'none') return;
-    gestureFire(action);
+    const cfg = gcfgRef.current;
+    // 製品の動作はどれも記録を変えるので、確認ONなら待ってから実行する
+    if (!cfg.confirm) return gestureFire(action);
+    const pv = gestureFire(action, true); // 下見(書き込まない)
+    if (!pv || pv.nothing) {
+      showGestureToast(pv?.strictNote || '操作の対象がありません');
+      showGestureFlash('⚠', pv?.strictNote ? '厳密モード中です' : '対象がありません', pv?.strictNote ? '次の工程は画面をタップで開始してください' : '計測中の工程も、対象の台もありません', 'warn');
+      return;
+    }
+    const cs = GESTURE_DEFS.find(g => g.key === cfg.cancelSign) || GESTURE_DEFS[3];
+    const sec = Math.max(2, Number(cfg.confirmSec) || 5);
+    gestureBeep();
+    setGesturePending({
+      kind: 'confirm', id: Date.now(), action, endsAt: Date.now() + sec * 1000, remain: sec,
+      icon: '✋',
+      main: pv.startedLabel ? `${pv.startedLabel} を開始します` : '計測中の工程を完了します',
+      sub: pv.doneN ? `完了する工程: ${pv.doneTitles.join('・') || `${pv.doneN}件`}` : '',
+      cancelText: `違うときは ${cs.emoji} ${cs.label} を見せる／画面をタップ`,
+      tone: 'ok', size: cfg.flashSize, blink: !!cfg.blink, blinkMs: cfg.blinkMs,
+    });
   };
   const gestureDoRef = useRef(gestureDo);
   gestureDoRef.current = gestureDo;
@@ -12722,11 +12861,13 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
     if (gestureRafRef.current) { cancelAnimationFrame(gestureRafRef.current); gestureRafRef.current = null; }
     if (gestureStreamRef.current) { try { gestureStreamRef.current.getTracks().forEach(t => t.stop()); } catch (e) {} gestureStreamRef.current = null; }
     if (gestureRecRef.current) { try { gestureRecRef.current.close(); } catch (e) {} gestureRecRef.current = null; }
-    gestureHoldRef.current = { name: '', since: 0, lastSeen: 0, cooledUntil: 0, lastTs: 0 };
+    gestureHoldRef.current = { name: '', since: 0, lastSeen: 0, cooledUntil: 0, lastTs: 0, cname: '', csince: 0, clast: 0 };
     setGestureProgress(0);
     setGestureLive(null);
     setGestureState({ phase: 'off', msg: '' });
     setGestureOn(false);
+    // カメラを止めたら、待ち中の実行も取り消す(見えないところで勝手に実行されないように)
+    if (gesturePendingRef.current) { setGesturePending(null); gesturePendingRef.current = null; }
   };
   const startGesture = async () => {
     if (gestureOn) { stopGesture(); return; }
@@ -12773,6 +12914,24 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
         } catch (e) { return; }
         const nowMs = Date.now();
         const cfg = gcfgRef.current;
+        // ⏳ 実行待ち(カウントダウン)の間は「やめるサイン」だけを見る。他のサインには反応しない。
+        if (gesturePendingRef.current) {
+          if (name && name === cfg.cancelSign && score >= cfg.minScore) {
+            if (H.cname !== name) { H.cname = name; H.csince = nowMs; }
+            H.clast = nowMs;
+            setGestureLive(name);
+            const cp = Math.min(1, (nowMs - H.csince) / Math.max(300, Number(cfg.cancelHoldMs) || 700));
+            setGestureProgress(cp);
+            if (cp >= 1) {
+              H.cname = ''; H.csince = 0; H.cooledUntil = nowMs + cfg.cooldownMs;
+              setGestureProgress(0);
+              cancelGesturePendingRef.current();
+            }
+          } else if (H.csince && nowMs - (H.clast || 0) > 400) {
+            H.cname = ''; H.csince = 0; setGestureProgress(0); setGestureLive(null);
+          }
+          return;
+        }
         if (nowMs < H.cooledUntil) { setGestureProgress(0); setGestureLive(null); return; }
         const action = name ? (cfg.map[name] || 'none') : 'none';
         const isSign = action !== 'none' && score >= cfg.minScore;
@@ -12831,12 +12990,14 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
               <div className="absolute top-1 left-1 bg-emerald-500/90 text-white text-[11px] font-black rounded px-1.5 py-0.5">{(GESTURE_DEFS.find(g => g.key === gestureLive) || {}).emoji} 認識中…</div>
             )}
             {gestureState.phase === 'ready' && gestureProgress > 0 && (
-              <div className="absolute bottom-0 left-0 right-0 h-2 bg-black/50"><div className="h-full bg-emerald-400" style={{ width: `${Math.round(gestureProgress * 100)}%` }} /></div>
+              <div className="absolute bottom-0 left-0 right-0 h-2 bg-black/50"><div className={`h-full ${gesturePending ? 'bg-rose-400' : 'bg-emerald-400'}`} style={{ width: `${Math.round(gestureProgress * 100)}%` }} /></div>
             )}
           </div>
           <div className="px-3 py-1.5 text-[10px] leading-tight text-slate-300">
             {gestureState.phase === 'ready' ? (
-              gestureProgress > 0
+              gesturePending
+                ? <b className="text-rose-300 text-xs">やめるなら {(GESTURE_DEFS.find(g => g.key === gcfg.cancelSign) || {}).emoji} をキープ</b>
+                : gestureProgress > 0
                 ? <b className="text-emerald-300 text-xs">そのままキープ…</b>
                 : (
                   <span className="flex flex-wrap gap-1 items-center">
@@ -12853,7 +13014,7 @@ const WorkExecutionModal = ({ lot: _lotProp, onClose, onSave: onSaveRaw, onFinis
       {gestureToast && (
         <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[65] bg-emerald-600 text-white rounded-xl shadow-2xl px-4 py-2 text-sm font-black max-w-[80vw] truncate pointer-events-none">{gestureToast}</div>
       )}
-      <GestureFlashOverlay flash={gestureFlash} />
+      <GestureBigOverlay data={gesturePending || gestureFlash} onCancel={cancelGesturePending} />
       {showGestureCfg && (
         <GestureConfigModal
           cfg={gcfg}
